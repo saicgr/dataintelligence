@@ -15,6 +15,20 @@
         ],
         "accent": "bug"
       }
+    ],
+    "followups": [
+      {
+        "q": "If you must use query-based CDC, how can you still capture deletes?",
+        "a": "You can't see physical deletes from a poll, so the source must model them as soft deletes: a `deleted_at` or `is_deleted` flag that bumps `updated_at` like any other change. Alternatively, periodically reconcile by full-key diff against the source to detect missing PKs. Both add cost; if hard deletes matter, that's the signal to move to log-based CDC."
+      },
+      {
+        "q": "What operational burden does log-based CDC put on the source database?",
+        "a": "The source must retain transaction logs long enough for the consumer to read them, so a slow or stalled consumer can force WAL/binlog to pile up and fill disk. Postgres replication slots in particular hold the log until acknowledged, which can crash a primary if the consumer dies. You must monitor slot lag and log retention windows actively."
+      },
+      {
+        "q": "Why might trigger-based CDC still be chosen despite its write overhead?",
+        "a": "When you lack log access (locked-down managed DBs, insufficient privileges) or need application-level semantics in the change record, triggers let you capture custom logic synchronously in the same transaction. They also work on engines without a usable log feed. The trade is roughly doubled write amplification and trigger maintenance coupled to schema changes."
+      }
     ]
   },
   {
@@ -22,14 +36,42 @@
     "a": "The transaction log only contains changes from a point in time forward, not the full current state of the table. So CDC tools first take a consistent snapshot of existing rows, record the log position (LSN/binlog offset/SCN) at snapshot time, then stream all changes from that position onward. Without the snapshot you would only ever see rows that changed after CDC started, leaving historical data missing.",
     "fs": "Snapshot establishes the baseline; the captured log offset is the seam where streaming picks up with no gap or overlap.",
     "fj": "Assuming the binlog/WAL already contains all history, so you can just stream and skip the snapshot.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do tools avoid locking the whole table for the duration of a large snapshot?",
+        "a": "Modern connectors use incremental snapshotting (Debezium's signal-based watermark approach) that chunks the table and interleaves snapshot reads with live log streaming, deduping via low/high watermarks. This avoids a long-held lock or a global read lock and lets the snapshot run concurrently with ongoing changes without blocking writes."
+      },
+      {
+        "q": "What goes wrong if the snapshot and the recorded log offset aren't captured consistently?",
+        "a": "If the offset is taken after the snapshot read, changes between the two are lost (a gap); if taken too early, you may double-apply changes already in the snapshot. Correctness requires the offset to mark exactly the consistent point of the snapshot, which is why tools take it inside the same transaction/read view rather than as two independent steps."
+      },
+      {
+        "q": "When would you deliberately skip the snapshot and stream from the current log position?",
+        "a": "When you only need go-forward changes and the destination already holds history (e.g., re-establishing CDC after a controlled cutover, or feeding an event stream where backfill is handled separately). Debezium supports `snapshot.mode=never`/`schema_only` for exactly this, accepting that pre-existing rows won't appear unless they change."
+      }
+    ]
   },
   {
     "q": "What does Fivetran's history mode do, and how does it differ from a standard sync?",
     "a": "A standard Fivetran sync upserts each row in place, so the destination only reflects the latest state. History mode instead keeps every version of a record using Type 2 slowly-changing-dimension semantics, stamping each version with active/inactive windows. With a CDC source it captures the changes that happened between syncs, so even multiple updates in one interval are preserved rather than collapsed.",
     "fs": "History mode = Type 2 SCD managed for you; with CDC you keep intermediate changes, not just the value at sync time.",
     "fj": "Thinking history mode just keeps a backup copy or that it captures every change even on a non-CDC connector.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How do you query for the current version of a record in a history-mode table?",
+        "a": "Filter on the active flag, typically `WHERE _fivetran_active = TRUE` (and exclude `_fivetran_deleted`). Each version carries `_fivetran_start` and `_fivetran_end` validity timestamps, so point-in-time queries use a `BETWEEN start AND end` predicate against the date of interest rather than picking the latest by `_fivetran_synced`."
+      },
+      {
+        "q": "What is the cost trade-off of enabling history mode?",
+        "a": "Every change spawns a new row instead of updating in place, so storage grows monotonically and table scans get heavier over time. On MAR-priced connectors the volume effect is more about warehouse storage and query cost than billing, but high-churn tables can balloon. You typically enable it only on dimensions where audit/history genuinely matters."
+      },
+      {
+        "q": "Why does history mode still depend on the source being a true CDC source to be complete?",
+        "a": "Without CDC, Fivetran only sees the row's state at each polling interval, so multiple changes between syncs collapse to the last value before the read. History mode then records versions only at sync boundaries, missing intra-interval transitions. True CDC feeds every committed change, so the version chain is complete rather than sampled."
+      }
+    ]
   },
   {
     "q": "How does Fivetran handle a deleted row in the source, and why does it matter for queries?",
@@ -47,6 +89,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does Fivetran soft-delete instead of hard-deleting the row?",
+        "a": "Soft deletes preserve auditability and let downstream incremental models and snapshots detect the deletion event rather than silently losing the row. A hard delete would be invisible to anything that already copied the row, and would break Type 2 history. The tombstone is the signal that propagates the delete deterministically through the pipeline."
+      },
+      {
+        "q": "Can a soft-deleted row ever come back, and how is that handled?",
+        "a": "Yes, if the same primary key is re-inserted in the source, Fivetran flips `_fivetran_deleted` back to FALSE and updates the row in place rather than creating a duplicate, since dedup is on PK. So your models should always key on the current `_fivetran_deleted` state, not assume a deleted PK stays gone forever."
+      },
+      {
+        "q": "What happens to delete detection if the source table has no primary key?",
+        "a": "Fivetran can't reliably identify which row was removed without a key, so it may fall back to a full table re-sync or fail to soft-delete at all, leaving stale rows. The fix is to define a primary key (or synthetic key) on the source/connector so deletes can be tombstoned incrementally instead of via expensive full re-imports."
+      }
     ]
   },
   {
@@ -54,77 +110,231 @@
     "a": "Fivetran prices on Monthly Active Rows (MAR), counting each distinct primary key that is inserted, updated, or deleted in a month. MAR resets monthly, so a row that is updated repeatedly counts once that month but counts fresh again next month, which produces a predictable spike on day one. Re-syncs and tables that can't sync incrementally (forcing full re-imports) also inflate MAR.",
     "fs": "MAR counts distinct active PKs per month and resets monthly, so the first-of-month uptick is expected, not a bug.",
     "fj": "Blaming sync frequency: assuming syncing more often multiplies MAR (it counts distinct rows, not syncs).",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Given MAR counts distinct PKs per month, does increasing sync frequency from daily to hourly raise the bill?",
+        "a": "Generally no, because a row updated 24 times in a day still counts once for the month. Higher frequency mainly affects latency and compute, not MAR. The exception is if more frequent syncs surface more distinct changed PKs that a sparser schedule would have collapsed, or if it triggers extra full re-syncs."
+      },
+      {
+        "q": "How would you reduce MAR on a high-churn table without losing data?",
+        "a": "Identify whether the churn is real business change or noise like an `updated_at` touched on every read. Exclude unneeded high-volume tables/columns, block append-only audit tables you don't query, and ensure the connector syncs incrementally so it isn't re-importing the whole table. Consolidating frequently-rewritten rows upstream also cuts distinct active PKs."
+      },
+      {
+        "q": "Why is the first historical sync usually not the thing that spikes the recurring bill?",
+        "a": "Fivetran typically does not bill MAR on the initial historical load, so the big one-time backfill is free or discounted. Recurring cost comes from ongoing distinct active PKs each month. The day-one spike is the monthly MAR reset re-counting still-active rows, not the original snapshot being re-billed."
+      }
+    ]
   },
   {
     "q": "What is schema drift, and how does Fivetran respond when a source adds a new column?",
     "a": "Schema drift is any change to source structure over time: added/removed columns, type changes, or new tables. When a source adds a column, Fivetran detects it, adds the matching column in the destination, and backfills where possible. Column removals are soft-deleted (kept, future rows NULL), and an incompatible type change is handled losslessly by keeping the old column and creating a new one that fits both old and new data.",
     "fs": "Drift is automated and non-destructive: add propagates+backfills, drop soft-deletes, type change forks a new column.",
     "fj": "Expecting a source drop to drop the destination column, or assuming a type change rewrites data in place.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why does Fivetran fork a new column on an incompatible type change instead of altering in place?",
+        "a": "Altering a column's type can fail or corrupt existing rows that don't fit the new type, and many warehouses can't cheaply rewrite a populated column. Forking preserves all historical data losslessly and avoids a destructive, irreversible operation. Downstream models then choose which column to read, with the migration made explicit rather than silent."
+      },
+      {
+        "q": "What breaks downstream when drift adds a column, and how do you guard against it?",
+        "a": "`SELECT *` models and BI tools can silently pull the new column or break on width changes, and dbt tests may not cover it. Guard with explicit column selection, schema tests (e.g., dbt contracts/`accepted_values`), and CI that fails on unexpected columns, so drift surfaces as a reviewed change rather than a surprise in production dashboards."
+      },
+      {
+        "q": "How does backfilling a newly added column behave for rows synced before it existed?",
+        "a": "Fivetran backfills where the source can supply historical values, but it can only fill what the source still holds; for log-based CDC, pre-existing rows that never change again may stay NULL because no new change event carries the value. A re-sync may be needed to populate the column fully across old rows."
+      }
+    ]
   },
   {
     "q": "Sr: A new source column appeared but is missing downstream. What schema-handling setting likely caused this?",
     "a": "Fivetran's schema change handling has modes: 'Allow all' (new tables and columns sync), 'Allow columns' (only new columns on existing tables), and 'Block all' (nothing new syncs until approved). If the connection is set to block, the new column is detected but excluded until someone explicitly unblocks it in the schema tab. The fix is to check the schema config and the connection's excluded objects, not the transformation layer.",
     "fs": "Knows drift is governed by the connector's schema-change policy, and checks excluded/blocked objects first.",
     "fj": "Immediately blaming dbt or the warehouse instead of the connector's block-new-columns setting.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why would a team deliberately set 'Block all' despite the maintenance overhead?",
+        "a": "To protect cost and governance: 'Allow all' can silently sync a giant new table and spike MAR, or pull in PII columns that shouldn't leave the source. Blocking forces a human review before new objects land, which suits regulated environments and tight budgets at the cost of someone having to approve each addition."
+      },
+      {
+        "q": "Once you unblock the column, does historical data for it appear automatically?",
+        "a": "Not necessarily. Unblocking starts syncing it forward, but rows synced while it was blocked may stay NULL unless the connector can backfill from the source or you trigger a re-sync of the table. So unblocking fixes go-forward visibility but may need an explicit re-sync to populate history."
+      },
+      {
+        "q": "How do you diagnose this without warehouse access, just from Fivetran?",
+        "a": "Check the connector's Schema tab for the column's enabled/blocked state and the connection's schema-change policy, then inspect the sync logs which record detected-but-excluded objects. The MAR/row-count for that table also tells you whether it's even being read. This pinpoints the connector layer before you ever look at dbt or the warehouse."
+      }
+    ]
   },
   {
     "q": "In SnapLogic, what is the difference between a Snap, a Pipeline, and a Snaplex?",
     "a": "A Snap is a single pre-built connector or operation (read a file, do a join, call REST). A Pipeline is a directed graph of Snaps wired together by document streams that defines the data flow. A Snaplex is the execution grid of nodes (Groundplex on your infra, or Cloudplex managed by SnapLogic) where pipelines actually run. So Snaps compose into Pipelines, which run on a Snaplex.",
     "fs": "Crisp layering: Snap (operation) -> Pipeline (graph) -> Snaplex (runtime cluster).",
     "fj": "Using Snap, pipeline, and Snaplex interchangeably or thinking the Snaplex is just one server.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "When would you choose a Groundplex over a Cloudplex?",
+        "a": "Choose a Groundplex when data must stay inside your network or on-prem for compliance, or to reach systems behind a firewall without exposing them publicly. The Groundplex runs on your infrastructure so you control patching and capacity. A Cloudplex is SnapLogic-hosted and lower-maintenance, better for cloud-to-cloud flows with no private-network requirement."
+      },
+      {
+        "q": "What flows between Snaps in a pipeline, and why does that model matter?",
+        "a": "Snaps pass JSON-like documents through binary document streams, processing them in a streaming, record-by-record fashion rather than materializing whole datasets. This lets pipelines handle large or unbounded inputs with bounded memory and enables per-document error handling. It's why a single bad document can be routed out without failing the batch."
+      },
+      {
+        "q": "How does a Snaplex scale when one node can't keep up?",
+        "a": "A Snaplex is a cluster, so you add nodes and the load balancer distributes pipeline executions across them; SnapLogic can also scale node count to handle concurrent task load. Memory- or CPU-heavy pipelines benefit from more/larger nodes, and you size the Snaplex to peak concurrency rather than treating it as a single server."
+      }
+    ]
   },
   {
     "q": "How does the SnapLogic Pipeline Execute Snap enable error handling for child pipelines?",
     "a": "Pipeline Execute runs a child pipeline from a parent on a chosen Snaplex, passing parameters. You route child failures by enabling the Snap's error view: errors from the child surface on the parent's error view instead of aborting the parent, so you can log them, write to a dead-letter target, or continue with the remaining documents. This is the standard pattern for parent/child error isolation, especially since child-level error handling isn't supported inside Ultra parent pipelines.",
     "fs": "Catch child failures on the Pipeline Execute error view so the parent keeps processing instead of crashing.",
     "fj": "Assuming a child pipeline's own error pipeline will catch failures when run under an Ultra parent.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What's the difference between running a child pipeline in the same execution vs as a separate task?",
+        "a": "Pipeline Execute can run the child in-process on the same node (lower overhead, shared lifecycle) or as a separate execution (its own resources, isolation, independent scaling). Separate executions isolate failures and memory but add startup cost and cross-node data transfer. You pick in-process for tight loops and separate for heavy or independently-scaled child workloads."
+      },
+      {
+        "q": "When you fan out many child executions via Pipeline Execute, how do you control concurrency?",
+        "a": "Pipeline Execute exposes a pool/concurrency setting that bounds how many child instances run at once, so you don't overwhelm the Snaplex or a downstream API. You tune it against node capacity and target-system rate limits, and combine it with the error view so one failing branch doesn't stall or crash the whole fan-out."
+      },
+      {
+        "q": "Why is child-level error handling unreliable specifically under an Ultra parent?",
+        "a": "Ultra pipelines are persistent, low-latency, and implicitly add error views to every Snap, which changes how failures propagate; nested error-pipeline semantics aren't honored the same way as in non-Ultra runs. So you must catch failures on the parent's Pipeline Execute error view rather than relying on the child's own error-handling pipeline."
+      }
+    ]
   },
   {
     "q": "When would you choose a SnapLogic Ultra Task over a Triggered or Scheduled Task?",
     "a": "Ultra Tasks keep a pipeline running continuously to serve low-latency, always-on requests (e.g., real-time API/event processing) with feeder-managed delivery. Triggered Tasks spin up a pipeline per HTTP request, and Scheduled Tasks run on a cron-like cadence for batch. You pick Ultra when you need sustained sub-second responsiveness; its constraint is that not all Snaps are Ultra-compatible and error views are implicitly added to every Snap in Ultra mode.",
     "fs": "Ultra = persistent, low-latency, always-on; Triggered = per-request; Scheduled = batch on a clock.",
     "fj": "Reaching for Ultra for batch jobs, or not knowing some Snaps are unsupported in Ultra pipelines.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why are some Snaps incompatible with Ultra, and what's a common offender?",
+        "a": "Ultra streams one document at a time with no defined batch boundary, so Snaps that need the full dataset before emitting — Aggregate, Sort, Join, Group By — can't operate, since they'd never see an end-of-stream. Those batch-oriented Snaps are the typical blockers, and you must restructure or push that work to a child/triggered pipeline."
+      },
+      {
+        "q": "How does an Ultra Task achieve lower latency than a Triggered Task for the same logic?",
+        "a": "A Triggered Task instantiates and tears down a pipeline per request, paying startup cost each time. An Ultra Task keeps the pipeline warm and resident on the Snaplex, with the FeedMaster delivering requests into the running instance, so there's no per-request spin-up. That's the source of its sub-second, sustained responsiveness."
+      },
+      {
+        "q": "What's the resource cost of always-on Ultra Tasks you must plan for?",
+        "a": "Because the pipeline stays resident, it consumes Snaplex node memory and a slot continuously even during idle periods, and you typically run redundant instances for availability. You size the Snaplex for the sum of all always-on Ultra pipelines plus headroom, unlike Scheduled/Triggered tasks that only consume resources while actually running."
+      }
+    ]
   },
   {
     "q": "In SnapLogic, what is the difference between the error view and a try/catch-style error pipeline?",
     "a": "Every Snap can expose an error view, a second output that emits a document for each record that errored (with error, reason, and the original payload) instead of failing the whole pipeline. You then wire that error view to logging or a dead-letter sink. An error pipeline is a separate pipeline invoked to centrally handle those error documents. Together they let you continue processing good records while quarantining bad ones.",
     "fs": "Error view routes bad records out as documents so the happy path keeps flowing; error pipeline centralizes handling.",
     "fj": "Letting one bad record fail the entire pipeline because no error view was enabled.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "What information does a document on the error view carry?",
+        "a": "It carries the error message and reason, a resolution hint, the Snap that failed, and crucially the original input document that triggered the failure. Having the payload means you can quarantine it to a DLQ with full context for replay after fixing the root cause, rather than just logging an opaque stack trace with no way to reprocess."
+      },
+      {
+        "q": "What's the risk of routing every error view straight to 'continue/ignore'?",
+        "a": "Silently swallowing errors hides systemic failures: if a downstream API is down, you'll happily drop thousands of records while the pipeline reports success. Error views should route to a monitored DLQ with alerting on volume, so errors are visible and recoverable, not just suppressed to keep the green checkmark."
+      },
+      {
+        "q": "How do pipeline-level error-handling settings interact with per-Snap error views?",
+        "a": "A pipeline can be configured to retry, fail, or route to a designated error pipeline as its overall policy, while individual Snap error views handle record-level failures inline. Use error views for per-document quarantine and the pipeline error policy for catastrophic, pipeline-wide failures; they're complementary layers, not substitutes."
+      }
+    ]
   },
   {
     "q": "In Informatica, what is the difference between an active and a passive transformation? Give examples.",
     "a": "An active transformation can change the number of rows, change row order, or change which rows are tagged for which target; a passive transformation always returns the same number of output rows it received. Aggregator, Filter, Joiner, Router, and Normalizer are active; Expression and (Connected) Lookup are passive. This matters for mapping design because active transformations can't always be combined freely and affect where you can branch the pipeline.",
     "fs": "Active changes row count/order/flagging (Aggregator, Filter, Joiner); passive preserves row count (Expression, Lookup).",
     "fj": "Calling Lookup active or thinking 'active' just means 'connected', confusing the two axes.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Why can't you always merge two pipelines that pass through different active transformations?",
+        "a": "Active transformations can change the number and ordering of rows, so two branches that went through different active logic no longer share a consistent row count or correspondence. Re-merging them with a passive Snap would mismatch rows. Informatica enforces this by restricting which pipeline branches can be joined back together to prevent silent row-alignment bugs."
+      },
+      {
+        "q": "Is an unconnected Lookup active or passive, and does the connected/unconnected axis change that?",
+        "a": "Lookup is passive regardless of connected vs unconnected: it returns values without changing the count of rows flowing through the pipeline. The connected/unconnected distinction is about how it's invoked and how many ports it returns, an orthogonal axis. Conflating the two is the classic trap the front of this card warns about."
+      },
+      {
+        "q": "Why is a Sequence Generator considered passive even though it produces values?",
+        "a": "It hands each incoming row a new sequence value but never adds, drops, or reorders rows, so the output row count equals the input count, which is the definition of passive. Generating a value per row is not the same as changing cardinality; only transformations that alter how many rows emerge (or their target tagging) are active."
+      }
+    ]
   },
   {
     "q": "In Informatica, when do you use a Joiner vs a Lookup transformation?",
     "a": "Use a Joiner to combine two heterogeneous pipelines (e.g., a file and a table) on a join condition; it's active and supports normal, master outer, detail outer, and full outer joins, designating the smaller side as master to reduce cache. Use a Lookup to enrich each incoming row with attributes from a reference table without changing row count; it's passive, can be connected or unconnected, and is ideal for code-to-description style lookups. Joiner merges streams, Lookup decorates a stream.",
     "fs": "Joiner = merge two pipelines (active, master is the small side); Lookup = enrich one pipeline (passive).",
     "fj": "Using a Joiner just to fetch one reference value, or thinking Lookup can merge two full data streams.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why designate the smaller table as the Joiner's master side?",
+        "a": "The Joiner caches the master rows in memory and streams the detail side against that cache, so making the smaller dataset the master minimizes cache size and memory pressure. If you flip it, you cache the large side and risk spilling to disk or OOM. It's purely a performance/resource choice, not a semantic one for inner joins."
+      },
+      {
+        "q": "What happens to row count when a Lookup finds multiple matches?",
+        "a": "A connected Lookup returns the first matching row (per its lookup policy on multiple match) without multiplying input rows, so it stays passive. If you actually need the row to fan out per match, that's a Joiner's job, which is active. So a Lookup can't be used to deliberately expand rows the way a one-to-many join does."
+      },
+      {
+        "q": "When is a cached Lookup the wrong choice versus an uncached one?",
+        "a": "A cached Lookup pre-loads the reference table into memory, great for many lookups against a stable table but wasteful or stale for a huge table hit only a few times. An uncached Lookup issues a DB query per row, better for low row counts or volatile data needing current values. Choose based on reference size, hit count, and freshness needs."
+      }
+    ]
   },
   {
     "q": "What is the difference between a connected and an unconnected Lookup in Informatica?",
     "a": "A connected Lookup sits in the data flow, receives input ports from the pipeline, and can return multiple output ports for every row. An unconnected Lookup is not in the data flow; it's called like a function from an expression with :LKP, takes input via parameters, and returns exactly one value via the return port. Use unconnected when you need the same lookup conditionally or from multiple places, or to return a single value.",
     "fs": "Connected = inline, many outputs per row; unconnected = called via :LKP from an expression, returns one value.",
     "fj": "Thinking unconnected lookups can return multiple ports, or that connected lookups can be called conditionally.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How does an unconnected Lookup let you avoid redundant lookups across a mapping?",
+        "a": "Because it's called by name via `:LKP` from any expression, a single unconnected Lookup definition can be invoked from multiple Snaps/ports, reusing one cache instead of defining the same connected Lookup repeatedly. You also gate the call behind a condition (IIF) so it only fires when needed, saving work on rows that don't require the lookup."
+      },
+      {
+        "q": "What's a downside of unconnected Lookups for maintainability?",
+        "a": "The dependency is hidden inside an expression string rather than visible as a wired link on the canvas, so impact analysis and debugging are harder; a renamed port or changed signature breaks the `:LKP` call without an obvious visual cue. Connected Lookups make the data flow explicit, which is usually preferred unless you specifically need conditional reuse."
+      },
+      {
+        "q": "How do connected and unconnected Lookups differ in handling a no-match?",
+        "a": "A connected Lookup returns NULLs for its output ports on no match (and can apply default values), flowing the row through unchanged in count. An unconnected Lookup returns NULL from its single return port, which the calling expression must then handle explicitly. Either way the row isn't dropped, since Lookup is passive."
+      }
+    ]
   },
   {
     "q": "What is pushdown optimization (PDO) in Informatica Cloud, and when does it break?",
     "a": "PDO translates mapping transformation logic into SQL and pushes it to the source or target database engine so data isn't pulled into the Secure Agent. Modes are Source-side, Target-side, and Full pushdown; Full requires source and target to be compatible (often the same system) so the whole pipeline runs as SQL. It falls back to partial or none when a transformation has no SQL equivalent (certain expressions, Java, some lookups), which the PDO preview will flag.",
     "fs": "PDO converts the mapping to SQL in the DB; full PDO needs compatible endpoints, and unsupported logic forces fallback.",
     "fj": "Assuming PDO always runs end-to-end in the database regardless of transformations used.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why does Full pushdown typically require source and target to be the same system?",
+        "a": "Full PDO runs the entire mapping as a single SQL statement, which the database can only execute if it can read the source and write the target within one engine and connection. Cross-engine SQL can't join a Snowflake source to an Oracle target in one statement, so the data has to flow through the agent for at least part of the pipeline, downgrading to partial PDO."
+      },
+      {
+        "q": "What's the risk of subtle result differences when logic runs as DB SQL versus in the engine?",
+        "a": "Functions can differ in semantics between Informatica's engine and the database: NULL handling, string trimming, date formatting, rounding, and case sensitivity may not match exactly. So a mapping can produce slightly different output with PDO on versus off. You validate parity on edge cases rather than assuming the pushed-down SQL is byte-identical."
+      },
+      {
+        "q": "How do you tell which part of a mapping pushed down before running it?",
+        "a": "IICS provides a PDO preview/optimization report that shows the generated SQL and flags transformations that couldn't be converted, marking where it falls back to the Secure Agent. You read that report to confirm the heavy work ran in the DB and to spot a Java/expression Snap that's silently forcing data extraction."
+      }
+    ]
   },
   {
     "q": "How is an SCD Type 2 typically implemented in an Informatica mapping?",
@@ -145,6 +355,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "How do you detect a 'changed' row efficiently without comparing every column?",
+        "a": "Compute a hash (MD5/CRC) of the concatenated tracked columns and store it on the current version; compare the incoming hash to the stored one. A mismatch means a tracked attribute changed without inspecting each field individually. This also cleanly handles many columns and is easy to maintain when the column list grows."
+      },
+      {
+        "q": "Why is a surrogate key essential for SCD Type 2 rather than using the business key as PK?",
+        "a": "Type 2 keeps multiple versions of the same business key over time, so the business key is no longer unique in the dimension. A surrogate key gives each version a unique identity that fact tables reference, preserving the point-in-time relationship. Without it you couldn't join a fact to the correct historical version of the dimension row."
+      },
+      {
+        "q": "What ordering hazard exists when the insert-new and expire-old run in the same batch?",
+        "a": "If the new version is inserted before the old one is expired (or both stay flagged current), a point-in-time query sees two current rows for the same business key. You must ensure the expire-update and insert happen atomically/ordered, often expiring first or using a single transaction, so there's never more than one active version."
+      }
     ]
   },
   {
@@ -164,6 +388,20 @@
           "WHEN NOT MATCHED THEN INSERT ...;"
         ],
         "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is full partition overwrite often more robust than row-level MERGE for batch loads?",
+        "a": "Overwriting a deterministic partition (e.g., one day's data) makes the load self-correcting: a re-run replaces the partition wholesale, so partial prior writes, dupes, or late corrections all reconcile in one shot. MERGE depends on a perfect key and correct match logic; partition overwrite needs only that the boundary is deterministic and the source complete for that window."
+      },
+      {
+        "q": "When is an upsert not enough to guarantee idempotency?",
+        "a": "When the operation isn't a pure replace, like incrementing a counter or appending to an array, replaying it double-applies even with a MERGE. Aggregations and accumulations must be made idempotent by recomputing from raw inputs or deduping on event id first, not by upserting a delta. State-changing side effects (emails, payments) also need their own dedup keys."
+      },
+      {
+        "q": "What makes a good idempotency key when the source lacks a natural primary key?",
+        "a": "Derive a deterministic key from immutable fields, e.g., a hash of (source, business timestamp, payload). It must be stable across retries and unique per logical record; including a retry counter or processing time would break it. For streams, the broker's partition+offset or a producer-assigned event id is a reliable deterministic key."
       }
     ]
   },
@@ -188,6 +426,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does jitter matter beyond plain exponential backoff?",
+        "a": "Without jitter, many clients that failed at the same moment retry on the same synchronized schedule, hammering a recovering service in waves (the thundering herd) and re-triggering the outage. Adding randomness spreads retries across the interval so load is smooth, which is why AWS-style full jitter is the recommended pattern over fixed backoff steps."
+      },
+      {
+        "q": "A 429 includes a Retry-After header. How should that change your backoff?",
+        "a": "Honor `Retry-After`: the server is telling you exactly when capacity frees up, so wait that long instead of your computed backoff. Ignoring it and retrying sooner just earns more 429s and may trip stricter throttling or bans. Treat the header as an authoritative override of your exponential schedule for that request."
+      },
+      {
+        "q": "Why might a 500 actually be non-retryable, and how do you tell?",
+        "a": "Some 5xx responses are deterministic server-side bugs on your specific payload (e.g., a malformed field crashing the handler), so retrying loops forever and inflates the DLQ slowly. If the same payload reproduces the 500 every time while others succeed, treat it as a poison message: cap attempts and route to the DLQ for inspection rather than retrying indefinitely."
+      }
     ]
   },
   {
@@ -195,42 +447,126 @@
     "a": "A DLQ is a holding location for records or messages that repeatedly fail processing after exhausting retries, so they're quarantined instead of dropped or blocking the stream. Route non-retryable failures (schema violations, poison messages, validation errors) there, keep the original payload plus the error reason, and alert/monitor on DLQ depth. This keeps the main pipeline flowing while preserving bad data for replay or investigation once the issue is fixed.",
     "fs": "DLQ isolates poison/non-retryable records with their error context so the main flow never stalls or loses data.",
     "fj": "Dropping failed records silently, or letting one bad message block the whole consumer indefinitely.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "What metadata should you store alongside the dead-lettered record?",
+        "a": "Store the original payload, the error message/exception, a timestamp, the source/topic+offset, and a retry count. This lets you triage by failure type, reproduce the error, and replay after a fix. Without the original payload and offset you can quarantine the failure but can't reprocess it, defeating the DLQ's recovery purpose."
+      },
+      {
+        "q": "How do you safely replay a DLQ once the bug is fixed?",
+        "a": "Re-publish DLQ records back to the source topic or a dedicated reprocessing path, but only after the consumer is idempotent so replays don't create duplicates. Replay in controlled batches with monitoring, and ensure the original failure cause is actually resolved, otherwise records just bounce straight back into the DLQ in a loop."
+      },
+      {
+        "q": "Why is alerting on DLQ depth and growth rate important, not just its existence?",
+        "a": "A DLQ silently accumulating means data loss in slow motion and an unaddressed systemic problem (bad deploy, upstream schema change). Alerting on depth and rate-of-growth turns the DLQ into a health signal: a sudden spike flags an outage or breaking change immediately, rather than discovering thousands of skipped records days later."
+      }
+    ]
   },
   {
     "q": "Why is orchestrating CDC ingestion harder than orchestrating a nightly batch, and how do you make it reliable?",
     "a": "CDC is a continuous, ordered stream tied to a log position (LSN/offset/SCN), so you must persist that offset transactionally and resume exactly where you left off, never re-snapshotting on every run. The orchestration concern shifts from 'did the batch finish' to 'is the stream healthy and is consumer lag bounded', so you monitor replication lag, handle log retention/rotation before you fall off the end, and ensure consumers write idempotently to absorb at-least-once redelivery on restart. Downstream batch jobs then key off watermarks rather than fixed schedules.",
     "fs": "Persist the log offset and monitor lag/retention; downstream is driven by watermarks, with idempotent consumers for replays.",
     "fj": "Treating CDC like a cron batch and re-running a full snapshot each cycle, or ignoring replication lag and log retention.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What happens if the consumer falls behind and the source rotates the log out from under it?",
+        "a": "If retention is exceeded, the offset you saved no longer exists in the log, so you can't resume from it and must re-snapshot the whole table to re-establish a baseline. That's expensive and causes a data gap. Prevention is monitoring lag against retention and sizing log/slot retention with enough headroom for the worst-case consumer stall."
+      },
+      {
+        "q": "Why must the offset be committed only after the data it covers is durably written?",
+        "a": "If you advance the offset before the records are persisted and then crash, those records are skipped forever, since you'll resume past them. Committing the offset only after a successful, durable write gives at-least-once semantics: a crash re-delivers the uncommitted range, which idempotent writes absorb. Order of operations is the whole game."
+      },
+      {
+        "q": "How do downstream batch models avoid processing a partially-arrived CDC window?",
+        "a": "They key off a watermark/low-water-mark that only advances once all events up to a point are confirmed landed, rather than reading on a clock. A scheduled run that fires before the stream has caught up would see a half-filled window. Watermark-driven triggering ensures the batch reads a complete, consistent slice of the change stream."
+      }
+    ]
   },
   {
     "q": "Why can a Fivetran connector force a full re-sync of a table instead of an incremental one, and what's the impact?",
     "a": "Fivetran syncs incrementally using a cursor or the source's change feed, but if it can't reliably fetch only changes, for example the source lacks a usable cursor/CDC, a schema change requires a backfill, or the connector was re-synced, it re-imports the whole table. The impact is a large burst of rows that inflates MAR and lengthens sync time. You mitigate it by enabling proper CDC/change tracking on the source, avoiding unnecessary manual re-syncs, and choosing tables with reliable cursors.",
     "fs": "No reliable cursor/CDC (or a backfill-triggering change) forces a full re-import, spiking MAR and runtime.",
     "fj": "Assuming Fivetran is always incremental and that re-syncs are free because initial historical loads aren't billed.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why does a re-sync inflate MAR when the initial historical load didn't?",
+        "a": "The first historical load is typically exempt from MAR, but a re-sync re-imports rows as active changes within the billing month, so every PK counts again. So an operator who thinks 'history was free, re-syncs are free' gets surprised. Treat manual re-syncs as a billable, MAR-spiking event and avoid them unless genuinely necessary."
+      },
+      {
+        "q": "What kinds of schema changes specifically trigger a backfill re-import?",
+        "a": "Changes that alter how Fivetran must read or reconcile the table — adding a primary key, certain type-change forks, or enabling a column that needs historical values — can force a full re-read to populate the new structure. Additive, backward-compatible changes usually don't, but anything requiring historical rows to be re-derived does."
+      },
+      {
+        "q": "How do you make a cursor-only (non-CDC) table sync incrementally and reliably?",
+        "a": "Ensure the table has a monotonic, indexed cursor column (a reliable `updated_at` that's touched on every change, or an ever-increasing id) and a primary key. A cursor that can move backward or isn't updated on all changes causes missed or duplicated rows, pushing Fivetran toward full re-imports. Where possible, enable native CDC/change tracking instead of relying on a cursor."
+      }
+    ]
   },
   {
     "q": "What is the difference between Airbyte Open Source and Airbyte Cloud, and how do you choose?",
     "a": "Both run the same connector catalog and the same low-code CDK and Connector Builder; the difference is who operates them. Open Source is free to self-host but you own the infrastructure, upgrades, observability, and on-call runbooks. Airbyte Cloud is fully managed with volume-based pricing and enterprise features like SSO and support, trading spend for reduced ops burden. Choose OSS when you have platform capacity and want cost control, and Cloud when you'd rather not run the infrastructure.",
     "fj": "Airbyte Cloud has more connectors than the open-source version, so pick Cloud for coverage.",
     "fs": "Knows both share the same connectors/CDK and the real trade is self-managed ops and cost (OSS) vs managed convenience and enterprise features (Cloud).",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "What's the hidden operational cost of self-hosting Airbyte OSS that teams underestimate?",
+        "a": "Beyond compute, you own connector upgrades, schema-change handling, scaling the workers/orchestrator, monitoring failed syncs, and being on-call when a sync stalls overnight. The software is free but the platform engineering time isn't. Teams often discover that one engineer's ongoing maintenance exceeds the Cloud bill they were avoiding."
+      },
+      {
+        "q": "Since both share connectors, when does a connector behave differently between OSS and Cloud?",
+        "a": "Cloud runs vetted, certified connector versions on a managed schedule, while OSS lets you pin or run newer/older versions, so behavior diverges by version, not by edition. You might hit a bug fixed in a later release that Cloud already runs, or run a community connector Cloud doesn't certify. The catalog is shared; the version and support tier differ."
+      },
+      {
+        "q": "How does Airbyte's volume-based Cloud pricing differ from Fivetran's MAR model?",
+        "a": "Airbyte Cloud has historically priced on data volume/rows synced (capacity or credits) rather than counting distinct active primary keys per month. So a high-churn table updated repeatedly bills differently than under Fivetran's MAR. You compare on your actual change pattern: many distinct rows vs. heavy re-churn of few rows can favor one model over the other."
+      }
+    ]
   },
   {
     "q": "What is reverse ETL and how does it differ from ETL/ELT?",
     "a": "ETL/ELT moves data from operational sources into a warehouse for analytics. Reverse ETL goes the other direction: it syncs modeled data out of the warehouse into operational SaaS tools like Salesforce, HubSpot, or ad platforms so business teams can act on it. Tools like Hightouch and Census map warehouse columns to destination fields and run continuous syncs, keeping the warehouse as the single source of truth rather than creating a second one. It's the activation half of the data loop.",
     "fj": "Reverse ETL is just ELT run backwards to back up SaaS data into the warehouse.",
     "fs": "Frames reverse ETL as warehouse-to-operational-tool activation that preserves one source of truth, not a backup or a literal reversal of load direction.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "How does reverse ETL detect what changed so it doesn't re-push the whole table each sync?",
+        "a": "It diffs the current query result against a stored snapshot of the last sync to compute added/changed/removed rows, then pushes only the delta to the destination. This keeps API calls bounded and avoids overwriting unchanged fields. Without change detection you'd hammer destination API rate limits and risk clobbering fields edited downstream."
+      },
+      {
+        "q": "What's the biggest operational hazard when writing into destinations like Salesforce?",
+        "a": "Destination API rate limits and quotas: a large delta can exhaust the daily API allowance or get throttled mid-sync, leaving partial state. You also risk overwriting human-edited fields in the CRM. So reverse ETL tools batch, respect limits, and let you scope which fields are managed, treating the SaaS tool as a constrained, shared system."
+      },
+      {
+        "q": "Why is keeping activation in reverse ETL better than building point-to-point integrations?",
+        "a": "Point-to-point syncs duplicate business logic per destination and drift apart, recreating multiple sources of truth. Reverse ETL centralizes the definitions in the warehouse (often via dbt models) and fans them out consistently, so a metric like 'active customer' is defined once and identical everywhere. It preserves one source of truth and cuts integration sprawl."
+      }
+    ]
   },
   {
     "q": "How does Airbyte's low-code CDK and Connector Builder let you build an API connector quickly?",
     "a": "For REST APIs you assemble a connector from configurable building blocks described in YAML: a base URL and authenticator, stream definitions, a paginator, an incremental cursor, and record selectors. The Connector Builder is a UI over that same YAML where you test against live responses as you go, so a connector can be stood up in minutes without a full language CDK. When the declarative blocks fall short, you drop into Python custom components for just the awkward parts rather than coding the whole connector.",
     "fj": "Every Airbyte connector has to be written from scratch in Python.",
     "fs": "Knows the low-code path is declarative YAML (auth, streams, paginator, cursor) via the Connector Builder, with Python custom components only for edge cases, not a full hand-written connector.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "What configuration makes a low-code stream sync incrementally rather than full-refresh?",
+        "a": "You define an incremental sync with a cursor field (e.g., `updated_at`) and a start/datetime parameter the paginator injects into requests, plus state tracking so the next run resumes from the saved cursor. Without a declared cursor the stream runs full-refresh every time. The DatetimeBasedCursor block handles the request-time window and state persistence."
+      },
+      {
+        "q": "When does an API force you out of pure YAML into a Python custom component?",
+        "a": "When request or response handling isn't expressible declaratively: signed/HMAC auth, dynamically derived request bodies, non-standard pagination (e.g., a token buried in a header you must compute), or response shapes needing custom parsing. You implement just that piece as a Python component and keep the rest declarative, rather than abandoning the low-code framework."
+      },
+      {
+        "q": "How does the Connector Builder reduce the test-debug loop versus the Python CDK?",
+        "a": "It executes real requests against the live API as you edit and shows the raw response, extracted records, and pagination state inline, so you validate auth, selectors, and the paginator immediately. There's no local build/run cycle. That tight feedback is why a working REST connector can be assembled in minutes instead of a full code-test-deploy iteration."
+      }
+    ]
   },
   {
     "q": "What problem does the transactional outbox pattern solve in CDC, and how does Debezium use it?",
@@ -252,6 +588,20 @@
           "COMMIT;"
         ],
         "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "The outbox guarantees at-least-once. How do consumers avoid acting on duplicate events?",
+        "a": "Each outbox row carries a unique event id, and consumers dedup on it (idempotency table or upsert keyed by event id) so a redelivered event is a no-op. The outbox solves producer-side atomicity, not consumer-side exactly-once; the consumer must still be idempotent because Debezium can re-emit on restart or rebalance."
+      },
+      {
+        "q": "Does the outbox table grow forever, and how is it managed?",
+        "a": "Yes if untended, so you prune it: either delete rows shortly after insert (Debezium still captures the INSERT from the log before deletion in most configs) or run a periodic purge of already-captured rows. Some setups treat outbox writes as fire-and-forget INSERTs that are immediately deletable since the log, not the table, is the source of truth."
+      },
+      {
+        "q": "Why use Debezium to read the outbox instead of having the app poll it?",
+        "a": "App-side polling adds query load, latency, and its own at-least-once/locking complexity to mark rows processed. Debezium reads the transaction log with near-zero source impact, preserves commit order, and resumes from the offset on restart. The Outbox Event Router also maps rows to topics declaratively, so you get reliable, ordered emission without bespoke poller code."
       }
     ]
   },
@@ -276,6 +626,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Exactly how does offset pagination produce duplicates or gaps under concurrent writes?",
+        "a": "Offset addresses position by count, not identity. If a new row is inserted before your current offset between pages, every subsequent row shifts down one, so you re-read a row (duplicate) on the next page; a deletion shifts the other way and skips a row (gap). Keyset anchors on a stable indexed value, so inserts/deletes elsewhere don't move your read position."
+      },
+      {
+        "q": "What must be true about the column keyset pagination orders by?",
+        "a": "It must be unique and stable (or a composite that's unique, like `(created_at, id)`), and indexed. If the order column has ties and isn't tie-broken by a unique key, rows at the page boundary can be skipped or repeated. Indexing is what makes each page an O(1) indexed seek rather than a scan-and-skip."
+      },
+      {
+        "q": "Why follow the server's next pointer instead of building cursor values yourself?",
+        "a": "The cursor is typically opaque (often encoding sort key + tie-breaker, sometimes signed) and the server controls its format and validity window. Reconstructing it couples you to internal details that can change and breaks if the encoding rotates. Following `next_cursor`/`next` URL until empty is the contract the API guarantees, so it stays correct across server changes."
+      }
     ]
   },
   {
@@ -283,14 +647,42 @@
     "a": "MuleSoft is an iPaaS plus full-lifecycle API management built around API-led connectivity, organizing integrations into reusable System, Process, and Experience API layers with DataWeave transformations. It shines at real-time, app-to-app, request/response integration across complex hybrid enterprises and API governance. ELT tools like Fivetran and Airbyte are purpose-built to land source data into a warehouse for analytics. You can do ETL in MuleSoft, but for straightforward warehouse loading it's heavier and needs specialized DataWeave skills, so it's usually overkill there.",
     "fj": "MuleSoft and Fivetran are basically the same kind of tool, just different brands.",
     "fs": "Positions MuleSoft as API-led iPaaS for real-time app integration and governance, versus warehouse-loading ELT tools, and flags the DataWeave skill cost for using it as ETL.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "What do the System, Process, and Experience API layers actually buy you?",
+        "a": "They decouple change: System APIs wrap raw backends (DB, SAP), Process APIs orchestrate business logic across them, and Experience APIs shape data for a specific channel (mobile, web). Swapping a backend only touches its System API, and a new channel only adds an Experience API, so the reusable middle layer isn't rewritten each time. It's modularity for enterprise integration."
+      },
+      {
+        "q": "Give a concrete scenario where MuleSoft is the right tool and Fivetran is not.",
+        "a": "A real-time order placed on a web app must synchronously validate inventory in SAP, charge a payment gateway, and confirm to the user in one request/response flow. That's app-to-app, transactional, low-latency orchestration with error compensation, which MuleSoft handles and Fivetran can't, since Fivetran only batch-loads source data into a warehouse for analytics."
+      },
+      {
+        "q": "Why is using MuleSoft purely to load a warehouse considered overkill?",
+        "a": "You'd hand-build DataWeave transforms, connection logic, pagination, and schema handling that Fivetran/Airbyte provide out of the box, plus you carry API-management machinery you don't need for batch loads. That's more cost, specialized skills, and maintenance for a problem a purpose-built ELT connector solves with a few clicks and automated schema drift."
+      }
+    ]
   },
   {
     "q": "What is a data contract, and how do compatibility modes keep producers and consumers from breaking each other?",
     "a": "A data contract is an agreement between a producer and its consumers covering schema, semantics, SLAs, quality rules, and ownership, versioned in git and reviewed via pull requests. Schema evolution is governed by compatibility modes in a registry: BACKWARD lets new schemas read old data (safe to add optional fields), FORWARD lets old schemas read new data, and FULL guarantees both. Enforcement shifts left, validating changes in CI and rejecting incompatible schemas before they reach production rather than discovering breakage downstream.",
     "fj": "A data contract is just documentation describing the table's columns.",
     "fs": "Defines a contract as enforceable schema-plus-SLA-plus-ownership and uses registry compatibility modes (backward/forward/full) gated in CI, not passive docs.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Under BACKWARD compatibility, which schema changes are allowed and which are blocked?",
+        "a": "BACKWARD means new schema can read data written by the old schema, so you can add optional fields (with defaults) and delete fields, but you cannot add a required field without a default or change a field's type incompatibly, since old data wouldn't satisfy it. It's the common default because consumers upgrade before producers in many setups."
+      },
+      {
+        "q": "When would you require FULL compatibility instead of just BACKWARD?",
+        "a": "When producers and consumers deploy independently and in any order, so you can't guarantee which side upgrades first. FULL (both backward and forward) ensures old consumers can read new data and new consumers can read old data, making the change safe regardless of rollout order. The cost is the most restrictive set of allowed changes."
+      },
+      {
+        "q": "Why enforce contracts in CI rather than catching violations at runtime?",
+        "a": "Runtime breakage means production pipelines have already failed and bad data may have landed downstream before anyone notices. Validating the schema change against the registry's compatibility mode in CI rejects the breaking PR before merge, so the failure is a code-review comment, not a 2am page. Shifting enforcement left turns silent downstream breakage into a blocked build."
+      }
+    ]
   },
   {
     "q": "An at-least-once pipeline is producing duplicate rows. How do you design for idempotency and dedup?",
@@ -311,6 +703,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is SELECT-then-INSERT a broken dedup strategy under concurrency?",
+        "a": "It's a race: two concurrent workers both SELECT, both see the row absent, and both INSERT, producing the duplicate the check was meant to prevent. The check and the write aren't atomic. A MERGE/upsert (or a unique constraint with ON CONFLICT) pushes the dedup into a single atomic operation the database serializes, closing the window."
+      },
+      {
+        "q": "Why is windowed dedup on event id used for streams instead of dedup-against-all-history?",
+        "a": "Keeping every event id forever to dedup is unbounded state that doesn't scale. A bounded window (or TTL'd dedup store) covers the realistic redelivery horizon (a restart or rebalance re-sends recent, not ancient, events) at constant memory. The trade is you can't dedup a duplicate that arrives after the window expires, which is acceptable given how redelivery actually happens."
+      },
+      {
+        "q": "When does broker partition+offset work as the idempotency key, and when does it fail?",
+        "a": "Partition+offset is a perfect natural key as long as you read the same topic and offsets are immutable, ideal for landing raw events idempotently. It fails the moment data is reprocessed from a different topic, repartitioned, or replayed after a topic rebuild, where offsets change for the same logical event. Then you need an application-level event id instead."
+      }
     ]
   },
   {
@@ -318,6 +724,20 @@
     "a": "Debezium gives you open-source, low-latency, log-based streaming into Kafka with full control over topics, transforms, and routing, but you operate Kafka Connect, manage offsets, slot/log retention, schema registry, and on-call. Fivetran is a managed connector: it handles snapshot, CDC, schema drift, and retries for you, billed on Monthly Active Rows, with less operational burden but less control and a usage-based cost that can spike on re-syncs. Choose Debezium for streaming control and event-driven architectures, Fivetran for fast, low-maintenance batch-to-warehouse replication.",
     "fj": "Debezium and Fivetran do the same thing, so just pick whichever is cheaper.",
     "fs": "Weighs operational ownership and latency (self-run Debezium/Kafka streaming) against managed convenience and MAR cost (Fivetran), matching each to streaming vs warehouse-replication needs.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "If you only need data in Snowflake for analytics, why might Debezium be the wrong choice despite lower latency?",
+        "a": "Debezium lands events in Kafka, not the warehouse, so you still build and operate the sink connector, schema mapping, and merge-into-Snowflake logic, plus run Kafka Connect on-call. Fivetran delivers warehouse-ready tables with schema drift and merges handled. For batch analytics where sub-second latency adds no value, Debezium is operational overhead for a problem Fivetran solves turnkey."
+      },
+      {
+        "q": "What latency floor does Fivetran have that Debezium avoids, and when does it matter?",
+        "a": "Fivetran syncs on an interval (commonly minutes), so the destination is eventually consistent with a few minutes' lag at best. Debezium streams changes within seconds of commit. The gap matters for event-driven use cases — fraud detection, real-time cache invalidation, microservice choreography — and is irrelevant for dashboards refreshed hourly."
+      },
+      {
+        "q": "Both rely on the source's transaction log. What shared source-side risk must either approach manage?",
+        "a": "Both create a replication slot / read the binlog, so a stalled consumer causes log/slot retention to grow and can fill the primary's disk or, on Postgres, prevent WAL recycling. Whichever you pick, you must monitor replication lag and retention and ensure the connector keeps up, because the source-side hazard is inherent to log-based capture, not the vendor."
+      }
+    ]
   }
 ]

@@ -26,6 +26,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Can one view be used in many explores, and can a view appear twice in the same explore?",
+        "a": "Yes to both. A view is a reusable field definition, so any number of explores can start from or join it. To join the same view twice in one explore (e.g. `shipping_address` and `billing_address` both from `addresses`), you alias the second join with `from:` or `view_name:` so the two instances have distinct scopes and don't collide."
+      },
+      {
+        "q": "If a field's SQL lives in a view, why does the model file need the connection declared too?",
+        "a": "Views are dialect-agnostic field definitions and carry no connection. The model file's `connection:` parameter binds those views to one physical database, so the same view files can be reused against different connections by different models. Looker can't generate or run SQL until a model supplies that connection."
+      },
+      {
+        "q": "What happens to an explore if you delete a view it joins but leave the join in the model?",
+        "a": "LookML validation fails: the explore references a view that no longer resolves, so Looker blocks deploy and surfaces a validator error pointing at the dangling `join`. Nothing reaches production until you remove the join or restore the view, which is exactly why the Git/validate gate exists before merge."
+      }
     ]
   },
   {
@@ -49,6 +63,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why can't a dimension reference a measure, mechanically?",
+        "a": "A dimension expands into the SELECT/GROUP BY at row grain, before any aggregation runs, while a measure is the aggregation itself. Letting a dimension call `${some_measure}` would put an aggregate inside a non-aggregated context, which is invalid SQL. Looker enforces this at compile time. If you need a per-row value of an aggregate, compute it in a derived table or use a `type: number` measure."
+      },
+      {
+        "q": "How do you build a metric that divides two measures, like average order value?",
+        "a": "Use a `type: number` measure whose `sql` references other measures, e.g. `sql: ${total_revenue} / NULLIF(${order_count},0) ;;`. Because it references measures, the division happens after aggregation at the query's grain, so it stays correct as the user changes group-bys. Guard the denominator with `NULLIF` to avoid divide-by-zero."
+      },
+      {
+        "q": "When would you set hidden: yes on a dimension rather than deleting it?",
+        "a": "When the field is needed as a building block (a `${amount}` feeding measures, a join key, a `primary_key`) but shouldn't clutter the user's field picker. `hidden: yes` keeps it usable in LookML SQL while removing it from the Explore UI. Deleting it instead would break every measure and join that references it."
+      }
     ]
   },
   {
@@ -71,6 +99,20 @@
           "  }",
           "}"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is defaulting everything to many_to_many actively harmful, not just sloppy?",
+        "a": "`many_to_many` tells Looker the join may fan out on both sides, so it always applies symmetric aggregates even when unnecessary. That bloats the SQL with PK-hash dedup machinery, hurting performance, and it can mask a genuinely wrong join condition. Worse, if the real relationship is `many_to_one` you've paid the cost for nothing. Declare the true cardinality."
+      },
+      {
+        "q": "What does sql_on let you do that a foreign_key join can't?",
+        "a": "`sql_on` accepts an arbitrary boolean expression, so you can join on multiple columns, ranges, casts, or Liquid-templated conditions (e.g. `${a.region}=${b.region} AND ${a.date} BETWEEN ${b.start} AND ${b.end}`). The older `foreign_key` shortcut only matches a single dimension to another view's primary key, so `sql_on` is the general, preferred form."
+      },
+      {
+        "q": "How does relationship interact with join type when both base and joined rows can be missing?",
+        "a": "They're orthogonal: `type` (left/inner/full) decides which rows survive the join, `relationship` only governs fanout/symmetric-aggregate correctness. A `many_to_one left_outer` keeps all base rows and never fans out; an `inner` with the same relationship just drops unmatched base rows. Set type for row survival, relationship for measure correctness."
       }
     ]
   },
@@ -97,6 +139,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why do symmetric aggregates struggle with type: average_distinct and COUNT(DISTINCT)?",
+        "a": "Symmetric aggregates hash the PK so each row contributes once to additive measures like SUM and COUNT. Non-additive aggregates (`count_distinct`, `average_distinct`, medians) can't be re-summed from deduplicated parts, so Looker uses heavier exact-or-approximate logic, slower and approximate on some dialects. That's why distinct-heavy measures are the usual fanout pain point."
+      },
+      {
+        "q": "What's the performance cost of symmetric aggregates and when would you avoid the fanout entirely?",
+        "a": "Symmetric aggregate SQL hashes the PK and often casts to large numerics, which is correct but heavier than a plain SUM, especially on wide fanouts. For very large fan-out joins it's frequently faster to pre-aggregate the many-side into a derived table or PDT at the base grain, then `many_to_one` join the rollup, eliminating the fanout instead of deduping it row by row."
+      },
+      {
+        "q": "If a PK is a compound key, how do you make symmetric aggregates work?",
+        "a": "Looker's `primary_key` marks a single dimension, so you create one concatenated dimension, e.g. `sql: CONCAT(${a},'-',${b}) ;;` with `primary_key: yes`, ensuring the concatenation is genuinely unique at the row grain. If the composite isn't unique, dedup is wrong and measures silently corrupt, so verify uniqueness in SQL Runner first."
+      }
     ]
   },
   {
@@ -104,14 +160,42 @@
     "a": "The primary_key is what symmetric aggregates use to deduplicate rows when a join fans out. If a view that contains a measure has no primary key, Looker cannot safely aggregate it through a fanout join and the measure either errors or is blocked from coming through the join. If the declared primary key is not actually unique, the dedup logic is wrong and you get silently incorrect sums/counts. So: exactly one primary_key per view, and it must be genuinely unique at the grain of the table.",
     "fs": "primary_key drives symmetric-aggregate dedup, so a missing or non-unique PK silently breaks measures across joins.",
     "fj": "Primary keys are optional; Looker figures out uniqueness automatically from the data.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How would you detect a wrongly-declared non-unique primary_key before users do?",
+        "a": "Run a uniqueness check in SQL Runner: `SELECT pk, COUNT(*) FROM table GROUP BY pk HAVING COUNT(*) > 1`. Any rows back mean the PK isn't unique. Looker won't catch this at compile time because it trusts your declaration, so non-unique PKs surface only as quietly-wrong aggregates through fanouts. Add this check to PR review for fact views."
+      },
+      {
+        "q": "Does a view with only dimensions and no measures still need a primary_key?",
+        "a": "Not strictly for correctness, since symmetric aggregates only matter for measures. But it's still best practice: it enables drilling, makes the view safe to extend with measures later, and avoids surprises if it's joined into an explore where another view's measures fan out through it. Cheap insurance, so declare it anyway."
+      },
+      {
+        "q": "What if your table genuinely has no single unique column?",
+        "a": "Build a synthetic key as a dimension, e.g. `sql: CONCAT(${col_a},'|',${col_b},'|',${col_c}) ;;` chosen so the combination is unique at the table grain, and mark it `primary_key: yes`. Verify uniqueness in SQL Runner. If even that can't be made unique, the table is at a coarser grain than you think and the measures need rethinking."
+      }
+    ]
   },
   {
     "q": "Why might a measure fail to come through a join, and how do you fix it?",
     "a": "The classic cause is a missing or incorrect primary_key in the joined view: without it, symmetric aggregates can't deduplicate, so Looker refuses to bring the measure through the fanout (you may see a 'requires a primary key' error). Other causes: wrong relationship parameter, or the joined view not actually being joined into the explore. Fix by defining an accurate, unique primary_key in every view with measures and setting the correct relationship on each join.",
     "fs": "Almost always a missing/incorrect primary_key in the joined view; add an accurate unique PK and verify the relationship.",
     "fj": "It's a permissions problem; grant the user access to the measure.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "A measure works alone but returns wrong totals only when a second view is added. What's happening?",
+        "a": "Adding the second view introduces a fanout: a `one_to_many` join duplicates the base rows, inflating an additive measure. The measure isn't broken; the new join's `relationship` is wrong or its joined view lacks a correct `primary_key`, so symmetric aggregates can't dedup. Fix the relationship/PK on that second join, not the measure itself."
+      },
+      {
+        "q": "How do you confirm it's a fanout and not a bad join condition?",
+        "a": "Open the SQL tab and inspect the generated query, or add the joined view's `count` to the result: if base-row counts multiply when the join is present, it's fanout-driven duplication. If instead rows vanish or mismatch, it's a bad `sql_on`. The generated SQL is the ground truth; read it before guessing."
+      },
+      {
+        "q": "Could a required_access_grants gate ever look like a 'measure won't come through' error?",
+        "a": "Yes, but it presents differently: an access-grant block hides the field from that user entirely (it's absent from the field picker), not a primary-key error in the SQL. So if some users can pull the measure and others can't, suspect `required_access_grants`/permissions; if nobody can and you see a PK error, it's symmetric aggregates."
+      }
+    ]
   },
   {
     "q": "What is a derived table, and what's the difference between a SQL-based and native derived table?",
@@ -136,6 +220,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "When does a native derived table outgrow itself and force you back to raw SQL?",
+        "a": "When you need SQL that has no LookML equivalent: complex window functions over arbitrary frames, recursive CTEs, dialect-specific functions, or UNIONs across unrelated tables. `explore_source` can only emit what the modeled explore can express, so anything beyond modeled dimensions/measures, derived columns, and filters pushes you to a `derived_table.sql` block."
+      },
+      {
+        "q": "What's the cost of an ephemeral derived table that isn't persisted?",
+        "a": "Looker wraps it as a subquery (CTE/inline view) that re-runs on every query that touches it, so an expensive transform is recomputed each time and can't be shared across queries or used by aggregate awareness. For anything heavy or hit repeatedly, persist it as a PDT; reserve ephemeral DTs for cheap, query-specific shaping."
+      },
+      {
+        "q": "Why is a native derived table safer to maintain than the equivalent raw SQL?",
+        "a": "Because it references modeled fields by name, a change to a dimension's underlying SQL (a renamed column, a fixed business rule) propagates automatically. A raw-SQL DT hard-codes column expressions, so the same change must be hand-edited and can silently drift from the model's definition of that metric."
+      }
     ]
   },
   {
@@ -158,6 +256,20 @@
           "  }",
           "}"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What connection-level setup does a PDT require that an ephemeral DT doesn't?",
+        "a": "The connection must have a writable scratch schema (a temp database) configured and 'Persistent Derived Tables' enabled, plus a DB user with CREATE/DROP rights there. Looker materializes the PDT into that schema. Without it, the DT can only be ephemeral. This is why PDTs are a connection-admin decision, not just a LookML one."
+      },
+      {
+        "q": "What happens to queries while a large PDT is mid-rebuild?",
+        "a": "Looker keeps serving the previous materialized table until the new build completes, then atomically swaps to it, so users don't see a half-built table. If a build fails, the old table stays in place and Looker retries on the next trigger. You can watch build state in Admin > Database > Persistent Derived Tables or the System Activity PDT Builds explore."
+      },
+      {
+        "q": "When is an incremental PDT preferable to a full-rebuild PDT?",
+        "a": "For large append-mostly tables where rebuilding everything nightly is wasteful. Add `increment_key` (a time dimension) and optional `increment_offset` so Looker only queries and appends the newest increments, plus a few prior periods for late-arriving data. It requires a dialect supporting DDL insert/delete, but it slashes build time versus full rebuilds."
       }
     ]
   },
@@ -183,6 +295,20 @@
           "datagroup_trigger: daily_etl"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is it best practice to make a sql_trigger_value return exactly one row and one column?",
+        "a": "Looker compares the single returned value to the prior run to decide whether to rebuild. Returning multiple rows/columns is ambiguous about which value triggers, confuses future developers, and on non-streaming dialects can load a large result set into memory just to check freshness. Keep it to one scalar like `SELECT MAX(loaded_at) FROM etl_log`."
+      },
+      {
+        "q": "A team sets sql_trigger_value: SELECT CURRENT_DATE. What's the subtle gotcha?",
+        "a": "It rebuilds once per calendar day at midnight regardless of whether the source data actually changed, and it's evaluated on Looker's regen schedule, so the rebuild can lag midnight. It also won't pick up intraday loads. If freshness should follow the ETL, trigger on `MAX(loaded_at)` from the load log instead of the clock."
+      },
+      {
+        "q": "How does the PDT regenerator scheduling interact with these triggers?",
+        "a": "Triggers don't fire continuously; Looker's PDT regenerator checks them on an interval (default ~5 min, set by `pdt_looker_max_interval`/cron). So a value or datagroup change isn't seen until the next check, meaning real-world freshness lags the trigger condition by up to that interval. Tune the regenerator cadence if you need tighter SLAs."
+      }
     ]
   },
   {
@@ -207,6 +333,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why define both sql_trigger and max_cache_age on the same datagroup?",
+        "a": "`sql_trigger` is the primary signal but depends on the trigger query succeeding; `max_cache_age` is a backstop that guarantees cache expires after a bounded time even if the trigger query errors or the ETL log stalls. Together you get event-driven freshness with a safety net, which is the recommended belt-and-suspenders pattern."
+      },
+      {
+        "q": "What's the difference between attaching a datagroup via persist_with versus datagroup_trigger?",
+        "a": "`persist_with` is set on an explore to govern its query result caching against the datagroup's policy; `datagroup_trigger` is set on a PDT/aggregate to govern when that materialization rebuilds. Same datagroup, two attachment points: one drives the result cache, the other drives table rebuilds, so both refresh in lockstep when the trigger fires."
+      },
+      {
+        "q": "If two PDTs share a datagroup but one's source updates more often, what's the risk?",
+        "a": "Both rebuild together whenever the shared trigger fires, so the slower-changing PDT rebuilds needlessly (wasted compute) or the faster one waits for the shared signal (stale). When refresh cadences genuinely differ, split them into separate datagroups so each tracks its own source rather than forcing one schedule."
+      }
     ]
   },
   {
@@ -214,7 +354,21 @@
     "a": "When a query runs, Looker stores its results in a cache keyed by the generated SQL. A repeat of the identical query returns cached results without hitting the database, as long as the cache hasn't expired. max_cache_age (on a datagroup) sets the maximum age before cached results are considered stale; a datagroup's sql_trigger can also invalidate the cache early when source data changes. Cache is bypassed when the SQL differs (new filters/fields) or when a user clicks 'Clear Cache & Refresh'. Persistence (PDTs) and result caching are related but distinct layers.",
     "fs": "Result cache is keyed on generated SQL and bounded by datagroup max_cache_age or sql_trigger invalidation; identical queries reuse it, different SQL or a refresh bypasses it.",
     "fj": "Looker caches everything for 1 hour and there's no way to control it.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Two users run what looks like the same dashboard tile but one gets cache and one doesn't. Why?",
+        "a": "The cache key is the exact generated SQL. If `access_filter` injects a different WHERE per user (different region/tenant), the SQL differs and so do the cache entries, no sharing. Same with different timezone settings or user-attribute-driven Liquid. Identical generated SQL is required for a cache hit, not just an identical-looking UI."
+      },
+      {
+        "q": "Does changing only the visualization type re-hit the database?",
+        "a": "No. Caching is keyed on the data query SQL, not the chart. Switching a table to a bar chart, recoloring, or pivoting in-browser reuses the cached result set because the underlying SQL is unchanged. You only re-query when you alter fields, filters, sorts, or limits that change the generated SQL."
+      },
+      {
+        "q": "How does PDT persistence relate to the result cache when both apply to one explore?",
+        "a": "They're stacked layers. The PDT materializes the heavy table (rebuilt on its `datagroup_trigger`); the result cache stores the final query output keyed on SQL (bounded by `max_cache_age`). A query can hit a fresh result cache and never touch even the PDT. Using one datagroup for both keeps the two layers invalidating together."
+      }
+    ]
   },
   {
     "q": "What is aggregate awareness in Looker and how does it speed up queries?",
@@ -239,6 +393,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "How do you verify Looker actually used an aggregate table for a given query?",
+        "a": "Open the query's SQL tab: the `FROM` clause will reference the aggregate table's scratch-schema name instead of the base fact table. Looker also shows an 'aggregated' indicator on the explore. The Aggregate Awareness section of the docs recommends building the suggested aggregates that the explore surfaces, then confirming via the generated SQL."
+      },
+      {
+        "q": "Can a single query be served partly from an aggregate and partly from base data?",
+        "a": "No, a given query resolves against one source table. Looker picks the smallest single aggregate that fully covers the requested fields at a compatible grain; if none covers everything, it falls back entirely to base. That's why you design a small ladder of aggregates at common grains rather than expecting partial composition."
+      },
+      {
+        "q": "Why must aggregate tables be PDTs, and what does that imply operationally?",
+        "a": "Aggregate awareness rewrites the FROM to a materialized table, so the rollup must physically exist in the scratch schema, i.e. it's a PDT. That means it inherits PDT requirements: a writable scratch schema, persistence via `datagroup_trigger`, build-time cost, and freshness bounded by its trigger. Stale aggregates serve stale numbers until rebuilt."
+      }
     ]
   },
   {
@@ -246,21 +414,63 @@
     "a": "An aggregate table can answer a query only if it contains every dimension and measure the query needs (or can derive them), at a grain that is the same as or coarser than the query, and the measures are additively rollup-safe. For example a monthly revenue aggregate keyed on month can serve a query grouped by month or year, but not one grouped by day or one that adds a new dimension it doesn't contain. Non-additive measures like COUNT(DISTINCT) generally can't be safely re-aggregated from a rollup, so Looker won't use the aggregate for them. If nothing matches, Looker falls back to the base table.",
     "fs": "The aggregate must cover all requested fields at an equal-or-coarser, additively-safe grain; otherwise Looker falls back to base, and distinct counts usually can't roll up.",
     "fj": "Any query automatically uses any aggregate table that exists on the explore.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why can a monthly aggregate serve a yearly query but not the reverse?",
+        "a": "Rolling up is safe when the target grain is coarser: monthly sums re-sum cleanly into yearly. Going finer is impossible because the monthly table has already collapsed the daily detail, so the day breakdown no longer exists to recover. Aggregate awareness only matches equal-or-coarser grains for exactly this reason."
+      },
+      {
+        "q": "How can you make an approximate distinct count usable from an aggregate?",
+        "a": "Use HLL sketches. On dialects like BigQuery you store a HyperLogLog sketch column in the aggregate and set `allow_approximate_optimization: yes` on the measure, so Looker merges sketches across rolled-up rows to approximate the distinct count. It trades exactness for the ability to roll up `count_distinct`, which exact distincts can't do."
+      },
+      {
+        "q": "What happens if a query adds a filter on a dimension the aggregate doesn't contain?",
+        "a": "Filtering requires the dimension's values to be present at row grain; if the aggregate already collapsed that dimension away, it can't apply the filter, so Looker won't use it and falls back to the base table. The fix is to include commonly-filtered dimensions in the aggregate's `query` block, accepting a larger rollup."
+      }
+    ]
   },
   {
     "q": "How does the Git workflow work for a Looker developer?",
     "a": "Each LookML project is backed by a Git repository, and each developer's personal dev branch maps to a Git branch. You enter Development Mode, edit LookML in your branch in isolation (production users are unaffected), then commit and push. You pull/merge from the shared production branch (usually main/master) to deploy. Looker validates LookML before you can deploy. Larger teams enable pull-request and required-review workflows so changes are reviewed before they hit production, and Advanced Deploy Mode lets you deploy a specific SHA/tag.",
     "fs": "Dev Mode = an isolated personal Git branch; you commit, validate, then merge to the production branch, optionally gated by PR review and Advanced Deploy Mode.",
     "fj": "Everyone edits production LookML directly and there's no branching.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "What does Advanced Deploy Mode add over the default 'deploy to production' button?",
+        "a": "By default, merging to the production branch immediately makes that commit live. Advanced Deploy Mode decouples merge from deploy: production tracks a specific commit SHA or tag that you explicitly choose, so you can merge several PRs, then deploy a known-good SHA, and roll back to a prior SHA if something breaks. It's the controlled-release path for production."
+      },
+      {
+        "q": "Two developers edit the same view file on their own branches. How is the conflict handled?",
+        "a": "It's ordinary Git: whoever merges to production first lands cleanly; the second developer must pull/merge the production branch into their branch and resolve the conflict before they can deploy. Looker surfaces the merge conflict in the IDE. Dev Mode isolation prevents seeing each other's uncommitted work, not the eventual merge collision."
+      },
+      {
+        "q": "How does LookML validation gate the workflow, and is it the same as testing data?",
+        "a": "Validation is a static compile check, syntax, references, join integrity, and is required before deploy, so broken LookML can't reach production. It does not run your queries or verify data correctness; a measure can validate yet still be logically wrong. For data assertions you add LookML `test:` blocks (Data Tests) that run queries and check expected results."
+      }
+    ]
   },
   {
     "q": "What is the difference between Development Mode and Production Mode in Looker?",
     "a": "Development Mode is a per-user sandbox: you're on your own Git branch, your LookML edits and uncommitted changes are visible only to you, and you can iterate without affecting anyone. Production Mode reflects the LookML currently deployed to the production branch—what all your end users see. Changes only reach production after you commit them to your branch and deploy/merge to the shared production branch. This separation is what lets you safely test new explores, fields, or PDTs before release.",
     "fs": "Dev Mode is an isolated per-user branch for safe iteration; Production Mode is the deployed branch all users see, reached only after commit and merge.",
     "fj": "Dev Mode and Production Mode show the same code; the toggle just changes the theme.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Why do PDTs built in Dev Mode get a different table name than in production?",
+        "a": "Looker scopes dev PDTs separately (a dev-prefixed table in the scratch schema) so your in-progress derived-table SQL doesn't overwrite the production materialization other users rely on. When the LookML deploys, the production PDT builds under its own name. This is why a PDT can look fine in Dev but needs a production rebuild after deploy."
+      },
+      {
+        "q": "Can an end user without developer permission ever be in Development Mode?",
+        "a": "No, Dev Mode requires the `develop` permission. Pure consumers always see Production Mode, i.e. the deployed branch, and can't toggle into a branch or see uncommitted LookML. This is the governance guarantee: model changes are gated behind the developer role and the deploy step, never exposed half-finished to viewers."
+      },
+      {
+        "q": "You changed a dimension in Dev and it works, but production users still see the old field. What's the gap?",
+        "a": "Your edit lives only on your dev branch until you commit and deploy/merge to the production branch. Production Mode reflects the last deployed commit, so until you complete the Git deploy step the change is invisible to everyone else. The fix is simply commit then deploy, not re-editing."
+      }
+    ]
   },
   {
     "q": "How do access grants and required_access_grants implement object-level security?",
@@ -284,6 +494,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If a field requires two grants via required_access_grants, is the logic AND or OR?",
+        "a": "Within a single field's `required_access_grants: [a, b]` list the grants are combined with AND, so the user needs every listed grant. Nesting (a field's grant inside a view's grant) is also additive/AND. There's no built-in OR across grants; to express OR you model a single grant whose `allowed_values` covers all the qualifying attribute values."
+      },
+      {
+        "q": "A gated dimension is hidden, but its value still leaks through a measure that references it. How?",
+        "a": "Gating the dimension hides the field, but a measure like `sum: ${ssn}`... or more realistically an aggregate built on a sensitive column, can still expose information if the measure itself isn't gated. Access grants are per-object, so you must also attach `required_access_grants` to any measure, derived field, or drill that surfaces the protected data."
+      },
+      {
+        "q": "How is gating an entire explore different from gating individual fields?",
+        "a": "Gating the `explore` removes the whole query surface from unauthorized users, they can't even open it. Gating individual fields lets everyone use the explore but hides specific columns. Use explore-level grants for whole subject areas a team shouldn't touch, and field-level grants for PII columns inside an otherwise-shared explore."
+      }
     ]
   },
   {
@@ -305,6 +529,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What does an access_filter do when the user's user_attribute is empty or null?",
+        "a": "By default an empty access-filter attribute means the user matches nothing, so they see zero rows, fail-closed, which is the safe behavior for security. If you want an empty value to mean 'see everything' (e.g. an admin), you must explicitly design for it, typically with a separate access_grant bypass or a sentinel value, not by leaving the attribute blank."
+      },
+      {
+        "q": "How do you give a manager access to several regions through one access_filter?",
+        "a": "Set the user attribute to a comma-separated list (e.g. `east,west,central`) and Looker expands the injected filter into an IN-list over those values. The same `access_filter` definition handles both a single-region rep and a multi-region manager purely by what's stored in their attribute, no LookML change needed per user."
+      },
+      {
+        "q": "Why is access_filter safer than just adding always_filter for tenant isolation?",
+        "a": "`always_filter` forces a default but the user can change its value, so they could pivot to another tenant's data. `access_filter` is bound to the user's own attribute and is non-editable and non-removable, so the WHERE is enforced server-side per identity. For real multi-tenant isolation you need the unremovable guarantee, which only `access_filter` (or `sql_always_where` with Liquid) provides."
+      }
     ]
   },
   {
@@ -312,7 +550,21 @@
     "a": "They solve different problems. Access grants (access_grant + required_access_grants) are object/feature-level: they decide whether a user can see an explore, view, join, or field at all, by checking their user attribute against a fixed allowed_values list. Access filters (access_filter) are row-level: every matching row is filtered by comparing a field's value to the user's attribute value, with no predefined value list. Rule of thumb: grants control which columns/explores exist for you; filters control which rows you get within them. They're often combined.",
     "fs": "Grants gate whole objects/fields against an allowed_values list; filters restrict rows by matching a field to the user's attribute—object-level vs row-level.",
     "fj": "They're two names for the same row-filtering feature.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Give a scenario where you'd need both a grant and a filter on the same explore.",
+        "a": "A multi-tenant sales explore: an `access_filter` on `tenant_id` keyed to each user's attribute isolates their rows, while a `required_access_grants` on the `commission_amount` column hides that sensitive measure from everyone except the finance team. Rows are scoped by tenant; one sensitive column is additionally gated by role, two orthogonal controls."
+      },
+      {
+        "q": "When you template a filter into SQL yourself instead of using access_filter, what must you watch for?",
+        "a": "If you interpolate a raw `_user_attributes['x']` value into SQL, you're responsible for injection safety, append `| sql_quote` for strings, and for the fail-closed behavior on empty attributes that `access_filter` gives you for free. Hand-rolled `sql_always_where` Liquid is more flexible but shifts the security burden onto you, so it's easy to leave a hole."
+      },
+      {
+        "q": "Can a user remove or bypass either control in the Explore UI?",
+        "a": "No. Both are enforced server-side in the generated SQL and cannot be edited or removed by the user. A gated field simply doesn't appear; an access-filtered query always carries the injected WHERE. Unlike `always_filter` (editable default), grants and access filters are hard security boundaries, which is why they're the right tools for compliance, not convenience filters."
+      }
+    ]
   },
   {
     "q": "What is Liquid in LookML and where can you use it?",
@@ -333,6 +585,20 @@
           "    {% else %}{{ value }}{% endif %} ;;",
           "}"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When does Liquid evaluate, and why does that matter for performance?",
+        "a": "`sql`-context Liquid evaluates at query-generation time, before the SQL is sent, so it can change the FROM/WHERE per query but must produce static SQL once resolved. `html`/`link` Liquid evaluates per cell at render. Heavy `{% if %}` logic in `sql` is fine (run once), but render-context Liquid runs per row, so keep it cheap on large result sets."
+      },
+      {
+        "q": "Why use {{ rendered_value }} instead of {{ value }} in an html parameter?",
+        "a": "`{{ value }}` is the raw underlying value; `{{ rendered_value }}` is the formatted display value (currency symbols, `value_format`, label maps applied). For HTML you almost always want `rendered_value` so the styled cell shows '$1,200' not '1200'. Use `value` only when you need the raw number for a comparison like `{% if value > 1000 %}`."
+      },
+      {
+        "q": "What's the risk of interpolating _filters['view.field'] directly into sql?",
+        "a": "It injects the user's raw filter string into your SQL, an injection vector, and it only gives you the unparsed text, not the operators (ranges, IN-lists). Looker warns and recommends `| sql_quote` for string safety. For real filter logic you should use `{% condition %}` instead, which expands the full operator-aware expression safely."
       }
     ]
   },
@@ -358,6 +624,20 @@
           "  orders.created_at {% endcondition %}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is pushing a {% condition %} into a derived table's SQL a major performance win?",
+        "a": "It lets the user's filter be applied inside the derived table's subquery, so the database filters before the heavy transform/aggregation runs, rather than after. Without it, Looker materializes the full derived table then filters outside, scanning far more data. Filter pushdown via `{% condition %}` is the standard way to keep DTs and PDTs from doing unbounded work."
+      },
+      {
+        "q": "What does Looker emit if the user leaves the templated filter empty?",
+        "a": "An empty filter expands to a no-op true condition (effectively `1=1`), so the query returns all rows for that predicate rather than erroring. That's usually desired, but if a filter must be supplied you should pair it with `always_filter` or `sql_always_where` to force a value, since `{% condition %}` alone won't require input."
+      },
+      {
+        "q": "Can {% condition %} reference a parameter different from the field it constrains?",
+        "a": "Yes, the named filter and the column SQL are decoupled: `{% condition some_filter %} a_different_column {% endcondition %}` applies the user's `some_filter` input to whatever SQL you place inside the tag. This lets one declared `filter:` field drive a condition on a derived or aliased column that isn't itself a normal dimension."
+      }
     ]
   },
   {
@@ -365,14 +645,42 @@
     "a": "Looker's semantic layer is the centralized, version-controlled LookML model that encodes business definitions—what 'revenue', 'active user', or 'churn' means—once, in views and explores, instead of in each report. Every query, dashboard, the API, and downstream tools resolve those metrics through the same model, so everyone gets consistent numbers and the SQL is generated, not hand-written per analyst. Benefits: a single source of truth for metrics, governance and access control in one place, reusable joins/measures, and the ability to expose governed data to BI, embedded apps, and other tools via the model.",
     "fs": "The semantic layer centralizes metric definitions in governed LookML so all queries, APIs, and tools return one consistent, reusable source of truth.",
     "fj": "The semantic layer is just Looker's name for the dashboard gallery.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How do tools like Connected Sheets or Power BI consume Looker's semantic layer without re-modeling?",
+        "a": "Through governed interfaces over the LookML model: Connected Sheets for Looker queries the model directly from Sheets, and the Open SQL Interface exposes LookML metrics over JDBC so SQL-speaking tools (Power BI, Tableau, ThoughtSpot) hit the same definitions. They inherit the model's metrics and access controls instead of redefining 'revenue' in each tool."
+      },
+      {
+        "q": "Why is a semantic layer increasingly pitched as 'grounding' for AI/LLM analytics?",
+        "a": "An LLM left to write raw SQL can invent inconsistent definitions of a metric. Pointing it at the governed semantic model means it answers in terms of the one approved definition of 'churn' or 'active user', with access controls applied, so AI answers stay consistent with human dashboards. That's the 'ground your AI in truth' positioning around Looker's open semantic layer."
+      },
+      {
+        "q": "What's the trade-off of centralizing every metric in one LookML model?",
+        "a": "Consistency and governance come at the cost of a bottleneck: every metric change flows through the modeling team's Git/deploy process, which can slow ad-hoc needs. Over-centralization can also make the model sprawling and hard to navigate. Teams balance this with refinements, project splits, and clear ownership so the single source of truth doesn't become a single point of contention."
+      }
+    ]
   },
   {
     "q": "How would you design a fast revenue explore over a large fact table balancing freshness and speed?",
     "a": "Layer the model. Define clean views with accurate primary_key and relationship so symmetric aggregates keep measures correct across joins. Push heavy transforms into a PDT persisted by a datagroup_trigger tied to your ETL completion, so it rebuilds exactly when data lands rather than on a guessed schedule. Add aggregate_table rollups (also datagroup-persisted) for the common monthly/regional grains so Looker rewrites most queries to small tables while still allowing drill-down to raw rows. Govern with access_filter for tenant/region row-level security and required_access_grants for sensitive columns. Use one datagroup as the shared cache/persistence policy so query cache, PDTs, and aggregates all refresh together when the ETL signals new data.",
     "fs": "Correct PKs/relationships, ETL-tied datagroup persistence, aggregate-aware rollups for common grains, and access_filter/grants—one datagroup unifies cache and rebuilds.",
     "fj": "Just set persist_for: 5 minutes everywhere and add indexes in the database.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "The fact table grows append-only and nightly full PDT rebuilds now blow the SLA. What do you change?",
+        "a": "Convert the heavy PDT (and aggregates) to incremental: add `increment_key` on a load-date dimension with a small `increment_offset` for late-arriving rows, so Looker only appends new partitions instead of rebuilding everything. Keep the same `datagroup_trigger` for invalidation. Requires a DDL-capable dialect, but build time drops to roughly the new-data slice."
+      },
+      {
+        "q": "How do you decide which grains to materialize as aggregate tables versus serving from base?",
+        "a": "Mine System Activity / query history for the most common dimension+measure combinations and their cost, then build aggregates only for those high-frequency grains (e.g. month-by-region revenue). Each aggregate is a PDT with build cost, so over-building wastes compute; target the Pareto few that cover most query volume and let the long tail fall back to base."
+      },
+      {
+        "q": "What goes wrong if the access_filter is added after the aggregates are designed?",
+        "a": "If aggregates roll up away the tenant/region column the `access_filter` needs, queries can't apply the row filter against the aggregate and fall back to base, killing the speedup, or worse, leak if mis-modeled. So tenant-isolation columns must be carried in the aggregate's `query` block from the start, designed together with the security model, not bolted on."
+      }
+    ]
   },
   {
     "q": "What is the difference between a Look and a dashboard in Looker?",
@@ -380,7 +688,21 @@
     "fs": "A Look is one saved explore-backed query/visualization; a dashboard is a multi-tile page with shared cascading filters, where tiles can be inline or linked Looks.",
     "fj": "A Look and a dashboard are the same thing with different names.",
     "level": "Jr",
-    "asked": 7
+    "asked": 7,
+    "followups": [
+      {
+        "q": "What breaks if you delete a Look that several dashboard tiles link to?",
+        "a": "Tiles built from a linked Look (rather than inline queries) lose their source and error out, since they depend on the saved Look's definition. This is the maintenance argument for inline (dashboard-defined) tiles in production dashboards: they're self-contained. Linked Looks are convenient for reuse but create a deletion dependency you must track."
+      },
+      {
+        "q": "Why might a single value need to be a tile on a dashboard rather than a standalone Look?",
+        "a": "Because a dashboard's cross-filtering and dashboard filters let that single-value KPI react to the same controls as the rest of the page, e.g. one date filter cascades to every tile. A standalone Look is isolated and can't participate in shared dashboard filters or cross-filtering between tiles, so KPIs that should move together belong on a dashboard."
+      },
+      {
+        "q": "Can a Look and a dashboard tile diverge in results even from the same explore?",
+        "a": "Yes, if the dashboard applies dashboard-level filters, a different `max_cache_age` via the explore's datagroup, or the tile overrides the Look's filters. The underlying explore is the same, but the effective query (and thus cache entry) differs, so the numbers can differ. Always reconcile filters before assuming a discrepancy is a modeling bug."
+      }
+    ]
   },
   {
     "q": "What is the difference between a user-defined dashboard and a LookML dashboard?",
@@ -388,7 +710,21 @@
     "fs": "User-defined dashboards live in folders, are UI-authored and unversioned (good for ad-hoc); LookML dashboards are .dashboard.lookml files in Git, deployed like code, for governed production use.",
     "fj": "All dashboards are stored as LookML files and version-controlled by default.",
     "level": "Jr",
-    "asked": 6
+    "asked": 6,
+    "followups": [
+      {
+        "q": "Can end users edit a LookML dashboard directly in the UI?",
+        "a": "No, its definition lives in the `.dashboard.lookml` file, so edits must go through the Git/dev/deploy workflow like any LookML change. Users can interact (filter, drill) but can't persist layout/tile changes from the UI. To allow ad-hoc edits you'd 'Save as' a user-defined copy, which then drifts from the versioned source."
+      },
+      {
+        "q": "Why convert a polished UI dashboard to LookML rather than leaving it as user-defined?",
+        "a": "To get change tracking, code review, and repeatable deploys across instances (dev/prod), and to keep it from being accidentally edited or deleted by a user. LookML dashboards also support templating and inclusion across projects. The trade is losing in-UI editability, so you convert once a dashboard is 'production' and stable."
+      },
+      {
+        "q": "How do LookML dashboard filters bind to model fields differently from UI dashboards?",
+        "a": "In a LookML dashboard you declare `filters:` and wire them to tiles via `listen:` mapping the dashboard filter to each tile's explore field explicitly in code. UI dashboards do this binding through the visual filter editor. The LookML form is more verbose but reviewable and diffable, which is the whole point of version-controlling it."
+      }
+    ]
   },
   {
     "q": "What join types can an explore use, and how do you choose between them?",
@@ -411,6 +747,20 @@
           "  }",
           "}"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why can an inner join silently change a measure's value that a left_outer wouldn't?",
+        "a": "An inner join drops base rows with no match in the joined view, so a `SUM` over the base now excludes those unmatched rows, changing the total even though the measure SQL is unchanged. A `left_outer` keeps them. So switching to `inner` to 'filter' can quietly alter aggregates; if you only want to filter, prefer a WHERE/`sql_always_where`."
+      },
+      {
+        "q": "When is a cross join legitimate in an explore rather than a mistake?",
+        "a": "For deliberate Cartesian needs: joining a small parameter/date-spine table to generate combinations, or a single-row constants view. It has no `sql_on`. It's dangerous on large tables because rows multiply, so use it only when one side is tiny and the combinatorial expansion is intended, e.g. building a dense date grid."
+      },
+      {
+        "q": "Does join order affect the generated SQL or results in an explore?",
+        "a": "Looker determines the join sequence from dependencies in `sql_on` (a join can reference earlier-joined views), and the base view is always first. Order can affect which views are reachable and, with outer joins, can interact with row survival, but Looker handles the SQL ordering for you. The relationships and types you declare matter far more to correctness than authoring order."
       }
     ]
   },
@@ -436,6 +786,20 @@
           "    ${orders.total_revenue} > 0 ;;",
           "}"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why can't you put a measure threshold in sql_always_where?",
+        "a": "`sql_always_where` lands in the WHERE clause, which is evaluated per row before aggregation, so it can't reference an aggregated measure that only exists after GROUP BY. A measure threshold like 'revenue > 0' must go in `sql_always_having`, which constrains the HAVING clause post-aggregation. Putting a measure in WHERE is a SQL error."
+      },
+      {
+        "q": "Is sql_always_where a security control or just a default?",
+        "a": "It's a hard, hidden, non-removable predicate, so it scopes data more firmly than `always_filter`, but it's static, not per-user. For genuine per-user row security you want `access_filter` (or `sql_always_where` with Liquid `_user_attributes`). Plain `sql_always_where` is great for global scoping like 'exclude test accounts', not for tenant isolation that varies by identity."
+      },
+      {
+        "q": "How does always_filter interact with a dashboard filter the user sets?",
+        "a": "`always_filter` provides a required default value on the explore; if a dashboard or the user supplies a value for that same field, it overrides the default value but can't remove the filter entirely. So the field is always constrained, the user just chooses the value. This differs from `sql_always_where`, which the user can neither see nor change at all."
       }
     ]
   },
@@ -463,6 +827,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why use type: unquoted for a parameter, and what's the injection risk?",
+        "a": "`type: unquoted` injects the value verbatim with no quotes, needed when the value is a column name or SQL keyword (e.g. `GROUP BY {% parameter x %}`). The risk is SQL injection, since it's raw, so you must constrain it with `allowed_value` lists so users can only pick safe, predefined options. Never use `unquoted` with free-text input."
+      },
+      {
+        "q": "What's the difference between {% parameter %} and {% if param._parameter_value %}?",
+        "a": "`{% parameter view.name %}` substitutes the chosen value directly into SQL. `{% if view.name._parameter_value == 'x' %}` branches on it without printing it, letting you emit entirely different SQL per choice (a full `CASE`/expression swap). Use `{% parameter %}` to drop the value in; use `_parameter_value` in conditionals to choose between SQL fragments."
+      },
+      {
+        "q": "Can a parameter change which physical table an explore queries?",
+        "a": "Yes, that's a powerful pattern: put `{% parameter %}` (or a Liquid `if`) inside `sql_table_name` to switch between tables/schemas based on the user's pick, e.g. a 'data source' selector. Combined with `allowed_value` guards it's safe. It effectively makes one explore serve multiple backing tables, though it can complicate caching since the generated SQL differs per choice."
+      }
     ]
   },
   {
@@ -489,6 +867,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why are refinements especially valuable when extending a remote/imported project?",
+        "a": "You can't edit files in a project pulled in via `remote_dependency`, so to tweak its views you refine them locally with `view: +name`, layering your overrides on top without forking the upstream code. This keeps you on the imported version (the lock file still pins it) while customizing behavior, which `extends` (a new object) wouldn't do as cleanly."
+      },
+      {
+        "q": "What does final: yes actually protect against?",
+        "a": "It asserts that a given refinement is the last one in the include chain to touch that object; if another refinement tries to apply after it, Looker raises an error instead of silently overriding. It's a guardrail so a downstream include can't quietly change a definition you intended to be authoritative. Without it, last-in-include-order simply wins."
+      },
+      {
+        "q": "If a refinement and the base both define the same dimension, what's the resolution rule?",
+        "a": "Refinements apply in include order and the last write to a given property wins, so the refinement overrides the base's value for that property (other untouched properties remain). It's a merge, not a replace of the whole field. Order matters, so include sequencing is part of the contract; reorder includes and you can change which value wins."
+      }
     ]
   },
   {
@@ -497,7 +889,21 @@
     "fs": "Signed/SSO embed serves an HMAC-signed URL carrying identity and attributes so external users need no login; cookieless embed uses short-lived backend tokens to survive third-party-cookie blocking.",
     "fj": "Embedding just means pasting a public dashboard URL into an iframe with no auth.",
     "level": "Sr",
-    "asked": 6
+    "asked": 6,
+    "followups": [
+      {
+        "q": "Why must the signed embed URL be generated server-side and never in the browser?",
+        "a": "Signing requires the embed secret to compute the HMAC. Exposing that secret in client JavaScript would let anyone forge URLs impersonating any user with any permissions and user attributes, a total auth bypass. So the signing step lives on your backend; the browser only ever receives the already-signed, single-use URL."
+      },
+      {
+        "q": "How do embed user attributes tie into row-level security for external customers?",
+        "a": "At sign time you pass user attributes (e.g. `tenant_id`) in the embed URL/token; an `access_filter` keyed on that attribute then injects the per-tenant WHERE for that embedded session. This is how one embedded dashboard safely shows each external customer only their own data, the model enforces isolation from the attributes you assert per signed session."
+      },
+      {
+        "q": "What concretely changes when you move from signed to cookieless embedding?",
+        "a": "Cookieless embedding stops relying on third-party cookies (which browsers increasingly block in iframes) and instead has your backend acquire short-lived auth and navigation tokens the Embed SDK passes per request. You add a token-acquisition endpoint and handle refresh, but identity/attribute mapping and `access_filter` security work the same. It's the modern default given cookie restrictions."
+      }
+    ]
   },
   {
     "q": "How do you reuse code across LookML files and projects with include, extends, and the manifest?",
@@ -520,6 +926,20 @@
           "  /views/dates.view.lkml\"",
           "include: \"/views/*.view.lkml\""
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does the manifest lock file pin, and why does it matter for remote_dependency?",
+        "a": "For a `remote_dependency`, the lock file records the exact Git commit/ref of the external project you imported, so everyone builds against the same version and an upstream change can't silently alter your model. You update it deliberately (re-pull/refresh the dependency), giving you reproducible, reviewable upgrades rather than drifting with the remote's latest commit."
+      },
+      {
+        "q": "Why does include order matter when files redefine or refine objects?",
+        "a": "Refinements apply in include order (last write wins), and an object must be included before something can `extends` it. So a wrong include sequence can change which refinement wins or break inheritance. With wildcard includes you have less explicit control, so for refinement-heavy projects teams often order includes deliberately rather than relying on glob order."
+      },
+      {
+        "q": "When would you choose remote_dependency over copying shared views into each project?",
+        "a": "When multiple projects need the same canonical definitions (a shared date spine, common dimensions) and you want one source of truth with versioned upgrades. Copying duplicates logic and drifts over time; `remote_dependency` keeps one upstream repo, pinned by the lock file, that all consumers import, then locally refine. The cost is managing the dependency/version bumps."
       }
     ]
   }

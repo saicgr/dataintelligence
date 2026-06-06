@@ -187,6 +187,7 @@ function CardView() {
                   fj={card.fj}
                   fs={card.fs}
                   code={card.code}
+                  followups={card.followups}
                   sourceUrl={card.sourceUrl}
                   sourceLabel={card.sourceLabel}
                   publishedAt={card.publishedAt}>
@@ -409,6 +410,7 @@ function Reveal({
   fj,
   fs,
   code,
+  followups,
   sourceUrl,
   sourceLabel,
   publishedAt,
@@ -418,6 +420,7 @@ function Reveal({
   fj: string;
   fs: string;
   code?: import('../lib/content').CodePanel[];
+  followups?: { q: string; a: string }[];
   sourceUrl?: string;
   sourceLabel?: string;
   publishedAt?: string;
@@ -428,8 +431,54 @@ function Reveal({
       <RichAnswer text={answer} size={13} />
       {code?.length ? <CodePanels panels={code} /> : null}
       <RedFlag fj={fj} fs={fs} />
+      {followups?.length ? <Followups items={followups} /> : null}
       {sourceUrl ? <SourceRow url={sourceUrl} label={sourceLabel} publishedAt={publishedAt} /> : null}
       {children}
+    </View>
+  );
+}
+
+/** Drill-down: tappable follow-up questions that expand to reveal their answer. */
+function Followups({ items }: { items: { q: string; a: string }[] }) {
+  const { c } = useTheme();
+  const [open, setOpen] = useState<number | null>(null);
+  return (
+    <View style={{ marginTop: 13, gap: 7 }}>
+      <T muted weight="800" size={11} style={{ letterSpacing: 0.4 }}>
+        DRILL DEEPER
+      </T>
+      {items.map((f, i) => {
+        const isOpen = open === i;
+        return (
+          <Pressable
+            key={i}
+            onPress={() => {
+              haptic.selection();
+              setOpen(isOpen ? null : i);
+            }}
+            style={{
+              borderWidth: 1,
+              borderColor: c.border,
+              borderRadius: radius.md,
+              padding: 11,
+              backgroundColor: isOpen ? c.surface : 'transparent',
+            }}>
+            <Row style={{ alignItems: 'flex-start', gap: 8 }}>
+              <T size={12.5} weight="800" color={c.accent}>
+                {isOpen ? '▾' : '▸'}
+              </T>
+              <T size={13} weight="700" style={{ flex: 1, lineHeight: 19 }}>
+                {f.q}
+              </T>
+            </Row>
+            {isOpen ? (
+              <View style={{ marginTop: 8, paddingLeft: 20 }}>
+                <RichAnswer text={f.a} size={12.5} />
+              </View>
+            ) : null}
+          </Pressable>
+        );
+      })}
     </View>
   );
 }

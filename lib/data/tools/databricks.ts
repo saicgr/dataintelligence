@@ -1079,6 +1079,689 @@ export const levels: Partial<Record<Level, { authored: Authored[]; topics: ToolT
           "Architecture design discussion at a Databricks customer migrating from Airflow-orchestrated notebooks"
         ]
       },
+      // ── deep-dive: failed-run backlog cascade ─────────────────
+      {
+        category: "deep-dives",
+        riskLevel: "high",
+        asked: 19,
+        questionText:
+          "A batch job runs every 4 hours (~10 GB per run). The 12pm run fails. At 4pm the job must process both the missed data and the new data — now ~20 GB. That larger batch is more likely to fail, which would delay a daily report and all downstream outputs. Did you build architecture around this? If not, how would you approach it?",
+        code: [
+          {
+            lang: "pyspark",
+            label: "Bounded Auto Loader + Trigger.AvailableNow (Bronze ingestion)",
+            lines: [
+              "CHECKPOINT = \"/mnt/checkpoints/bronze_events\"",
+              "",
+              "bronze_stream = (",
+              "  spark.readStream",
+              "    .format(\"cloudFiles\")",
+              "    .option(\"cloudFiles.format\", \"json\")",
+              "    .option(\"cloudFiles.schemaLocation\", CHECKPOINT + \"/schema\")",
+              "    # hard cap: ≤500 files per micro-batch regardless of backlog",
+              "    .option(\"cloudFiles.maxFilesPerTrigger\", \"500\")",
+              "    # soft cap: ~5 GB per micro-batch — backlog drains in N bounded passes",
+              "    .option(\"cloudFiles.maxBytesPerTrigger\", \"5g\")",
+              "    .load(\"s3://raw-bucket/events/\")",
+              ")",
+              "",
+              "# Trigger.AvailableNow: batch cost profile + streaming checkpointing.",
+              "# Processes everything since last committed watermark across multiple",
+              "# bounded micro-batches, then stops. Run on the 4-hour schedule.",
+              "bronze_stream.writeStream \\",
+              "  .format(\"delta\") \\",
+              "  .outputMode(\"append\") \\",
+              "  .option(\"checkpointLocation\", CHECKPOINT) \\",
+              "  .trigger(availableNow=True) \\",
+              "  .toTable(\"bronze.raw_events\")",
+            ],
+          },
+          {
+            lang: "pyspark",
+            label: "Idempotent foreachBatch MERGE (Silver upsert)",
+            lines: [
+              "from delta.tables import DeltaTable",
+              "",
+              "APP_ID = \"silver_events_writer\"  # stable across restarts",
+              "",
+              "def upsert_to_silver(batch_df, batch_id):",
+              "    # Dedup within batch to latest record per key",
+              "    from pyspark.sql import functions as F",
+              "    from pyspark.sql.window import Window",
+              "    w = Window.partitionBy(\"event_id\").orderBy(F.desc(\"event_ts\"))",
+              "    latest = (",
+              "        batch_df",
+              "        .withColumn(\"_rn\", F.row_number().over(w))",
+              "        .filter(\"_rn = 1\")",
+              "        .drop(\"_rn\")",
+              "    )",
+              "    # txnAppId + txnVersion: Delta skips this batch_id if already committed",
+              "    (DeltaTable.forName(spark, \"silver.events\").alias(\"t\")",
+              "        .merge(latest.alias(\"s\"), \"t.event_id = s.event_id\")",
+              "        .whenMatchedUpdateAll()",
+              "        .whenNotMatchedInsertAll()",
+              "        .execute())",
+              "    # idempotent append guard for pure-append paths:",
+              "    # batch_df.write.format(\"delta\")",
+              "    #   .option(\"txnAppId\", APP_ID)",
+              "    #   .option(\"txnVersion\", batch_id)",
+              "    #   .mode(\"append\").saveAsTable(\"silver.events\")",
+              "",
+              "silver_stream = (",
+              "  spark.readStream",
+              "    .format(\"delta\")",
+              "    .option(\"maxBytesPerTrigger\", \"5g\")  # same cap on silver reads",
+              "    .table(\"bronze.raw_events\")",
+              ")",
+              "",
+              "silver_stream.writeStream \\",
+              "  .foreachBatch(upsert_to_silver) \\",
+              "  .option(\"checkpointLocation\", \"/mnt/checkpoints/silver_events\") \\",
+              "  .trigger(availableNow=True) \\",
+              "  .start()",
+            ],
+          },
+        ],
+        answerStructured:
+          "- **The core antipattern to name first**: batch size is **coupled to downtime duration**. A 4-hour failure means the next run doubles. A second failure means the run after that is 3x normal. The batch gets heavier precisely when the system is already struggling — a self-reinforcing cascade. Breaking that coupling is the entire solution.\n- **Bound the batch independent of backlog**: set `cloudFiles.maxBytesPerTrigger` (soft cap, ~5 GB) and `cloudFiles.maxFilesPerTrigger` (hard cap, e.g. 500 files) on the Auto Loader `readStream`. With `Trigger.AvailableNow`, a 20 GB backlog drains as four constant-size micro-batches rather than one fragile 20 GB mega-batch. The job stays inside its proven resource envelope regardless of how long the system was down.\n- **Checkpoint/watermark-driven recovery instead of wall-clock arithmetic**: Auto Loader (`cloudFiles`) stores every discovered file key in a **RocksDB checkpoint**. On restart it picks up exactly where it left off — no manual date arithmetic, no risk of skipping or double-counting files. `Trigger.AvailableNow` replays everything since the last committed checkpoint offset.\n- **Idempotent writes so reprocessing cannot double-count**: use a `foreachBatch` MERGE on the primary key for silver upserts. For append-only Bronze paths, use `txnAppId` + `txnVersion` (the batch ID) — Delta records the transaction token and silently skips a batch that has already been committed, even if the job crashed and restarted mid-write.\n- **Decouple ingestion from heavy transformation**: Bronze is a cheap, append-only Delta table. The expensive Silver transformation is a separate job reading from Bronze. A failed Bronze run does not block Silver for already-landed data; Silver catches up incrementally on its own bounded schedule.\n- **Decouple the daily report from wall-clock time**: do not trigger the downstream report at e.g. `23:59`. Trigger it off a **completion signal** (a Delta table watermark column, a workflow task dependency, or a sentinel record). Build the report aggregation as a MERGE/upsert so a late or reprocessed batch self-corrects the numbers rather than producing a wrong or empty report.\n- **Job-level retries with backoff** and **autoscaling** are secondary mitigations — useful, but they address symptoms not the structural cause. Bounding the batch is the fix; retries just reduce the blast radius of a single transient failure.\n- **Backfill path**: keep a parameterized backfill notebook that accepts `start_date / end_date` and replays Bronze → Silver for a date range using the same bounded stream pattern. Run it as a separate Workflow task; never re-run the live job on historical data.",
+        explanationDeep:
+          "The failure mode the interviewer is probing is a **positive feedback loop**: a batch fails, the next batch is larger, the larger batch is more likely to fail, the run after that is larger still. Most candidates intuitively respond with 'give the next job a bigger cluster,' which addresses none of the structural coupling. The correct decomposition is: (1) why does the batch grow? because it has no bound — it processes everything since the last success. (2) how do you break that? bound the batch to a fixed data volume regardless of elapsed time.\n\n`Trigger.AvailableNow` with `cloudFiles.maxBytesPerTrigger` is the Databricks-idiomatic solution. Rather than one 20 GB pass, you get four 5 GB passes in the same job run, each with its own Spark stage, GC cycle, and failure surface. If one micro-batch fails, only that micro-batch retries — the checkpoint records everything before it as committed. The total work is the same; the failure blast radius is a fraction. Critically, the option names differ by source: `cloudFiles.maxBytesPerTrigger` for Auto Loader, `maxBytesPerTrigger` for Delta table streaming reads — getting this right in a code panel signals you have actually read the docs rather than guessing.\n\nIdempotency deserves a separate beat. MERGE on a primary key is idempotent by definition — running the same source data twice produces the same silver state. For append-only Bronze where MERGE is too expensive, `txnAppId` + `txnVersion` lets Delta record a 'I have already written batch 47 from app X' token in the transaction log. A restart that replays batch 47 finds the token and skips the write entirely. If you delete the checkpoint and start fresh, you must change `txnAppId` — otherwise batch numbering restarts at 0 and Delta will refuse to write, thinking batch 0 already happened. This is a subtle gotcha that interviewers love to probe.\n\nThe downstream decoupling point is where most candidates stop short even if they get the bounding right. A daily report that reads from a Silver table and runs at midnight will produce wrong numbers if Silver is mid-recovery. The production pattern is: the report job declares a task dependency on the Silver job in the Workflow DAG, so it only starts when Silver confirms it finished for the relevant watermark. The report aggregation itself uses MERGE so a late correction to Silver auto-corrects the report on the next run without manual intervention.",
+        interviewerLens:
+          "The phrase I wait for is 'the batch size grows with downtime, and that is the coupling I want to break.' If a candidate says that in the first 30 seconds, I know they have built pipelines that failed under load. Most candidates jump straight to 'retry the job' or 'add nodes,' which are operational band-aids. The structural answer has three parts: bound the batch (maxBytesPerTrigger), checkpoint-driven recovery (not date arithmetic), and idempotent writes (MERGE or txnAppId). All three must be present for a senior pass. Where people most often fail: (1) they describe Trigger.AvailableNow without knowing it supports bounded micro-batches via maxBytesPerTrigger — they think it processes everything in one shot; (2) they know MERGE is idempotent but cannot explain why, or they do not know txnAppId exists for append paths; (3) they fix the ingestion layer but leave the downstream report coupled to wall-clock time. The follow-up about individually huge files is a trap: if a single source file is 50 GB, maxBytesPerTrigger cannot split it — the correct answer is to re-examine the source or use a different ingestion pattern. Candidates who say 'just set maxBytesPerTrigger higher' have missed the point.",
+        followupChain: [
+          {
+            question: "What if the source files themselves are individually large — say each file is 15 GB? Does maxBytesPerTrigger still help?",
+            answer: "No — maxBytesPerTrigger is a soft limit that defers to 'the smallest input unit.' If the smallest unit is a 15 GB file, a single micro-batch will process at least that much regardless of the cap. The fix has to move upstream: work with the producer to write smaller files (split by hour or by record count), or stage the large files to a landing zone, split them in a preprocessing step (spark.read + repartition + write to a staging prefix), and point Auto Loader at the staging prefix. maxBytesPerTrigger is for bounding a well-sized file stream, not for splitting individual large files."
+          },
+          {
+            question: "How do you prevent the daily report from going out on incomplete data if Silver is still mid-recovery?",
+            answer: "Two mechanisms work together. First, declare a task dependency in the Databricks Workflow DAG: the report task waits for the Silver streaming job to report success for the relevant partition window before it starts. Second, write the report aggregation as a MERGE or INSERT OVERWRITE on a partition key (e.g. report_date), so if Silver finishes late and the report re-runs, it overwrites the prior output with the correct numbers rather than appending a duplicate. Add a data completeness check as an Expectation or a COUNT assertion before the report task: if Silver row count for today is below a threshold, fail the report task and page on-call rather than publishing a wrong number."
+          },
+          {
+            question: "How do you backfill a week of missed runs without disrupting the live 4-hour schedule?",
+            answer: "Run the backfill as a separate Workflow with a different Spark application ID and a different checkpoint directory than the live job. The live job keeps its own checkpoint and keeps processing new data normally — the two jobs do not share state. The backfill job reads from Bronze (already landed) using Trigger.AvailableNow with the same maxBytesPerTrigger cap and a date range filter on the Bronze ingestion timestamp. Because Silver writes are idempotent (MERGE on primary key), both the live job and the backfill job can write to Silver simultaneously without corrupting it — Delta's optimistic concurrency handles the concurrent MERGE. When backfill finishes, decommission it; the live job has not been disturbed."
+          }
+        ],
+        redFlags: [
+          {
+            junior: "\"I'd give the 4pm job a bigger cluster so it can handle the extra data.\"",
+            senior: "\"A bigger cluster treats the symptom, not the cause. The cause is that batch size grows linearly with downtime. The fix is bounding the batch with maxBytesPerTrigger so the job always processes a fixed data volume — a 20 GB backlog becomes four 5 GB passes, each safely inside the proven resource envelope.\""
+          },
+          {
+            junior: "\"I'd add retry logic to the job so it re-runs automatically if it fails.\"",
+            senior: "\"Retries help with transient failures but make the coupling problem worse if the root cause is batch size: retrying a 20 GB job just runs the 20 GB job again. The right order is: bound the batch first, add retries second — then a retry is replaying a small bounded micro-batch, not the entire backlog.\""
+          }
+        ],
+        alternatePhrasings: [
+          "\"How do you prevent a cascade failure when a batch ingestion job misses a run?\"",
+          "\"Your 4-hour ETL failed once and now the next run is double the normal size. What is your architecture?\"",
+          "\"Walk me through how you'd make a periodic batch job resilient to missed runs without the backlog growing unbounded.\""
+        ],
+        interviewContexts: [
+          "Asked in a senior data engineer design round at a Series C analytics company running Databricks-based medallion pipelines",
+          "Came up in a staff-level interview at a fintech with tight daily reporting SLAs — interviewer specifically asked about downstream report impact",
+          "Reported on Reddit r/dataengineering as a real interview question at a mid-size e-commerce company evaluating pipeline reliability architecture"
+        ]
+      },
+      // ── deep-dive: late-arriving data ────────────────────────
+      {
+        category: "deep-dives",
+        riskLevel: "high",
+        asked: 21,
+        questionText:
+          "Your daily report runs at midnight. At 2am, events timestamped for yesterday arrive from offline mobile clients. The report is now wrong. Design a pipeline that handles late data correctly without a full recompute every night.",
+        code: [
+          {
+            lang: "pyspark",
+            label: "Watermark-bounded stream + idempotent MERGE correction",
+            lines: [
+              "from delta.tables import DeltaTable",
+              "",
+              "# --- Step 1: streaming aggregation bounded by watermark ---",
+              "# Accept events up to 3 hours late; drop anything beyond that.",
+              "# Unbounded watermark = unbounded state = OOM in production.",
+              "agg_stream = (",
+              "  spark.readStream",
+              "    .format('delta')",
+              "    .table('bronze.mobile_events')",
+              "    .withWatermark('event_ts', '3 hours')",
+              "    .groupBy(",
+              "        F.window('event_ts', '1 day').alias('day_window'),",
+              "        'user_id'",
+              "    )",
+              "    .agg(F.count('*').alias('event_count'))",
+              ")",
+              "",
+              "# foreachBatch: MERGE keyed on grain so late batches self-correct",
+              "def upsert_gold(batch_df, batch_id):",
+              "    grain_df = batch_df.select(",
+              "        F.col('day_window.start').cast('date').alias('report_date'),",
+              "        'user_id', 'event_count'",
+              "    )",
+              "    (DeltaTable.forName(spark, 'gold.daily_user_counts').alias('t')",
+              "      .merge(grain_df.alias('s'),",
+              "             't.report_date = s.report_date AND t.user_id = s.user_id')",
+              "      .whenMatchedUpdateAll()",
+              "      .whenNotMatchedInsertAll()",
+              "      .execute())",
+              "",
+              "agg_stream.writeStream \\",
+              "  .foreachBatch(upsert_gold) \\",
+              "  .option('checkpointLocation', '/ckpt/gold_daily') \\",
+              "  .trigger(availableNow=True) \\",
+              "  .start()",
+              "",
+              "# --- Step 2: replaceWhere for corrections beyond the watermark ---",
+              "# If a late batch slips past the 3-hour watermark, reprocess",
+              "# ONLY the affected partition from bronze without touching other days.",
+              "late_fix = spark.table('bronze.mobile_events') \\",
+              "    .filter(\"event_date = '2024-01-14'\") \\",
+              "    .groupBy('event_date', 'user_id') \\",
+              "    .agg(F.count('*').alias('event_count'))",
+              "",
+              "(late_fix.write",
+              "  .format('delta')",
+              "  .mode('overwrite')",
+              "  .option('replaceWhere', \"report_date = '2024-01-14'\")",
+              "  .saveAsTable('gold.daily_user_counts'))",
+            ],
+          },
+        ],
+        answerStructured:
+          "- **Root cause**: the pipeline uses wall-clock time (midnight) to close the reporting window, but mobile clients produce events on event-time — those timestamps are yesterday even though the events arrive hours later.\n- **Step 1 — watermark on the stream**: use `.withWatermark('event_ts', '3 hours')` so the streaming aggregation accepts events up to 3 hours late into stateful computations. The engine drops events that arrive more than 3 hours after the watermark high-water mark. **Never leave the watermark unbounded** — unbounded watermark = state that grows forever = eventual OOM or checkpoint bloat.\n- **Step 2 — idempotent MERGE on the gold grain**: write aggregation results via a `foreachBatch` MERGE keyed on `(report_date, user_id)`. When a late batch arrives within the watermark, the MERGE corrects only the affected grain rows — the report self-heals on the next run without a full recompute.\n- **Step 3 — `replaceWhere` for corrections beyond the watermark**: for events that slip past the watermark (offline clients reconnecting after days), trigger a targeted reprocess: read from bronze filtered to just the affected date, recompute, and write back with `.option('replaceWhere', \"report_date = '2024-01-14'\")`. This atomically replaces only the matching partition — other days are never touched, readers see no partial state.\n- **Report trigger**: decouple the report from midnight. Trigger it off a Workflow dependency on the gold job or a data-completeness assertion, so it runs only after the SLA window for late arrivals has closed.",
+        explanationDeep:
+          "The failure mode here is treating streaming as a wall-clock system when events are timestamped by the client. The correct mental model is event-time vs processing-time: event-time is when something happened on the device; processing-time is when it lands in the pipeline. For mobile clients, these can be hours or days apart.\n\nThe watermark is the core control. `.withWatermark('event_ts', '3 hours')` tells Spark: the current event-time watermark is `max(observed event_ts) - 3h`. State for windows whose end time is below the watermark is finalized and purged. Events arriving after their window falls below the watermark are dropped from stateful aggregations. This is deliberate — without a finite watermark, every window stays open forever because a late event could theoretically arrive at any time. The business team sets the lateness SLA (e.g. 'we accept events up to 3 hours late'); that SLA directly maps to the watermark duration. Setting it too tight drops valid events; too loose causes state to grow without bound.\n\nThe MERGE on the gold grain is what makes the pipeline self-correcting. Instead of writing aggregate results as an append, you MERGE on the reporting grain. When the 2am late batch arrives and produces an updated count for yesterday, the MERGE overwrites the affected rows in gold. The report re-run for yesterday's date returns the corrected number automatically. For events that arrive so late that they fall outside even the watermark window, `replaceWhere` provides a surgical correction: recompute from bronze for just that date partition and atomically swap it in. The atomicity guarantee means no reader ever sees a partially-updated partition.",
+        interviewerLens:
+          "The first signal I wait for is 'event-time vs processing-time.' Candidates who jump to 'run the report again' or 'add a 2am cron job' have not internalized why this is a streaming design problem. The watermark detail is the senior gate: I want to hear that the watermark duration maps to the lateness SLA, and critically that an unbounded watermark is not an option — it is the specific failure mode that kills stateful streaming jobs in production. The MERGE-on-grain pattern shows they have built gold layers that actually self-correct rather than accumulate wrong rows. The replaceWhere for beyond-watermark corrections is the bonus that shows they have thought through the edge case where even a generous watermark is not enough.",
+        followupChain: [
+          {
+            question: "What happens in the streaming aggregation if an event arrives after its window has dropped below the watermark?",
+            answer: "The event is silently dropped from the stateful aggregation. Spark has already finalized and emitted results for that window and purged its state. This is by design — the watermark is a commitment that no events older than the threshold will be incorporated. If late arrivals beyond the watermark must be handled, they need a separate correction path (replaceWhere reprocess or a scheduled backfill job reading directly from bronze)."
+          },
+          {
+            question: "Why is `replaceWhere` safer than a DELETE followed by INSERT for a late-data correction?",
+            answer: "DELETE then INSERT is two separate commits. Between them, readers see a table with the affected rows deleted but the new rows not yet inserted — a window of incorrect/empty data. `replaceWhere` is a single atomic commit: it writes the new data files, validates the predicate, and records the removes and adds in one transaction log entry. Readers either see the old state or the new state, never an intermediate state."
+          },
+          {
+            question: "How do you decide what lateness SLA to put in the watermark?",
+            answer: "Work with the business and ops teams to establish the maximum tolerable late-arrival window. Check actual late-arrival distributions from your bronze logs: what is p95, p99 latency between event_ts and ingestion_ts for the client type? Set the watermark to cover p95 or p99 depending on business tolerance. Document the SLA explicitly — 'events arriving more than 3 hours late are not included in the daily report' — so downstream consumers understand the guarantee. Revisit if the distribution shifts (e.g., a new region with poor connectivity)."
+          }
+        ],
+        redFlags: [
+          {
+            junior: "\"I'd re-run the report every time late data arrives.\"",
+            senior: "\"Re-running is a full recompute and races with the live pipeline. I'd use a watermark-bounded stream with a MERGE on the gold grain so late arrivals within the SLA window self-correct on the next micro-batch, and replaceWhere for corrections beyond the watermark — targeted, atomic, no full recompute.\""
+          },
+          {
+            junior: "\"I'd set the watermark to a very long duration like 30 days to catch all late data.\"",
+            senior: "\"A 30-day watermark means the engine holds state for every event window of the last 30 days — that is unbounded state growth in practice. The watermark must match the actual lateness SLA, not be set defensively to infinity.\""
+          }
+        ],
+        alternatePhrasings: [
+          "\"Mobile events arrive hours after their event timestamp. How do you handle them in a daily report pipeline?\"",
+          "\"What is a watermark in Structured Streaming and how do you set it for a late-data SLA?\"",
+          "\"How do you correct a gold aggregation table when late events arrive after the daily report has already run?\""
+        ],
+        interviewContexts: [
+          "Senior data engineer loop at a Series C consumer app with offline mobile clients",
+          "Streaming pipeline design round at a B2B SaaS company with globally distributed event sources",
+          "Asked as a scenario question at a fintech with strict T+1 reporting requirements"
+        ]
+      },
+      // ── deep-dive: data skew ──────────────────────────────────
+      {
+        category: "deep-dives",
+        riskLevel: "high",
+        asked: 23,
+        questionText:
+          "A Spark stage in your Databricks job has 199 tasks finish in 8 seconds and one task runs for an hour. The stage is a shuffle join. Diagnose what is happening and fix it.",
+        code: [
+          {
+            accent: "bug",
+            lang: "pyspark",
+            label: "Hot-key join: one partition holds millions of rows",
+            lines: [
+              "# orders joined on retailer_id",
+              "# retailer_id = 'amazon' has 70% of rows",
+              "result = orders.join(retailers, 'retailer_id')",
+              "# -> 1 reducer gets 70M rows, others get ~350k",
+              "# -> 1 task runs 1 hour; 199 finish in 8 sec",
+            ],
+          },
+          {
+            accent: "fix",
+            lang: "pyspark",
+            label: "Fix 1: let AQE split the skewed partition automatically",
+            lines: [
+              "# AQE skew-join is ON by default in Databricks Runtime.",
+              "# Verify or force-enable:",
+              "spark.conf.set('spark.sql.adaptive.enabled', 'true')",
+              "spark.conf.set('spark.sql.adaptive.skewJoin.enabled', 'true')",
+              "# Tune thresholds if partition doesn't cross defaults",
+              "# (factor=5x median AND size > 256 MB):",
+              "spark.conf.set(",
+              "  'spark.sql.adaptive.skewJoin.skewedPartitionFactor', '3')",
+              "spark.conf.set(",
+              "  'spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes',",
+              "  '64m')",
+              "result = orders.join(retailers, 'retailer_id')",
+            ],
+          },
+          {
+            accent: "fix",
+            lang: "pyspark",
+            label: "Fix 2: salt the hot key manually (when AQE is not enough)",
+            lines: [
+              "import pyspark.sql.functions as F",
+              "SALT_BUCKETS = 50",
+              "",
+              "# Add random salt to the large side",
+              "orders_salted = orders.withColumn(",
+              "  'retailer_id_salted',",
+              "  F.concat('retailer_id',",
+              "           F.lit('_'),",
+              "           (F.rand() * SALT_BUCKETS).cast('int').cast('string'))",
+              ")",
+              "",
+              "# Explode the small side to match every salt value",
+              "retailers_exploded = retailers.withColumn(",
+              "  'salt', F.explode(F.array([F.lit(i) for i in range(SALT_BUCKETS)]))",
+              ").withColumn(",
+              "  'retailer_id_salted',",
+              "  F.concat('retailer_id', F.lit('_'), F.col('salt').cast('string'))",
+              ")",
+              "",
+              "result = orders_salted.join(",
+              "  retailers_exploded, 'retailer_id_salted'",
+              ").drop('retailer_id_salted', 'salt')",
+              "",
+              "# Null handling: filter nulls out before join,",
+              "# process separately, union back.",
+            ],
+          },
+        ],
+        answerStructured:
+          "- **Diagnosis — data skew**: one partition holds a disproportionate share of the data (a hot key — e.g., a dominant retailer, a NULL key that maps millions of rows). In the Spark UI, the task timeline for the stage shows 199 short bars and one enormous bar; the shuffle read size for the slow task dwarfs the others. This is data skew, not slow hardware.\n- **Why it happens**: shuffle joins hash-partition rows by the join key. If one key value represents 70% of the data, 70% of all rows land in a single reducer task.\n- **Fix 1 — AQE skew-join handling (try first)**: AQE is enabled by default in Databricks Runtime. It detects skewed partitions at runtime (partition size > `skewedPartitionFactor` × median AND > `skewedPartitionThresholdInBytes`, defaults 5× and 256 MB) and automatically splits the skewed partition into sub-tasks and replicates the matching small-side data. This requires no code change.\n- **Fix 2 — broadcast the small side**: if the `retailers` table is small (< a few hundred MB), force a broadcast join with `F.broadcast(retailers)`. This eliminates the shuffle entirely — every executor gets a full copy of `retailers` and joins locally. No shuffle means no skew problem.\n- **Fix 3 — salting (when AQE is insufficient)**: add a random suffix (0 to N-1) to the join key on the large side; explode the small side to have one row per salt value. This distributes one logical key across N physical partitions. Handle NULLs separately — NULL keys must be extracted, joined on a non-NULL surrogate or processed independently, then unioned back.\n- **What NOT to say**: adding more executors does not help — skew means one executor still gets the hot partition. Raising `spark.sql.shuffle.partitions` does not help either — the hot key rows all hash to the same partition regardless of total partition count.",
+        explanationDeep:
+          "Data skew is one of the most common senior Spark debugging scenarios because it is invisible until you look at the Spark UI task timeline. The 199/1 pattern is the classic tell: every task except one completes quickly, and that one task is the bottleneck for the entire stage. The job's wall-clock time is completely determined by that single task.\n\nAQE's skew-join handling (introduced in Spark 3.0, enabled by default in Databricks Runtime) resolves most cases automatically. It works post-shuffle: after the shuffle data is written, AQE inspects the partition sizes. If a partition is both 5× the median partition size and larger than 256 MB, AQE splits it into multiple sub-tasks. The matching build-side data is replicated across those sub-tasks. The result is the same join semantics but distributed across many tasks. Tuning the thresholds (`skewedPartitionFactor` down to 3, `skewedPartitionThresholdInBytes` down to 64 MB) catches skew that falls below the defaults.\n\nBroadcast joins short-circuit the problem completely by eliminating the shuffle. When the smaller side fits in executor memory, broadcasting it turns the join into a local lookup on every executor — no partitioning, no skew. The practical limit is typically 200–300 MB before the broadcast itself becomes a bottleneck (network + memory pressure on every executor).\n\nSalting is the manual escape valve when AQE and broadcast both fail — typically when both sides are large and the hot key is a business-meaningful value (not a NULL). Salting splits one logical hot key into N physical keys, distributing its rows across N partitions. The cost is exploding the small side (N× larger) and the added code complexity. NULL keys deserve special mention: salting a NULL key doesn't work because random salt makes matching nulls impossible — they must be handled in a separate path.",
+        interviewerLens:
+          "The test is whether you go to the Spark UI immediately or start guessing. 'Look at the task duration distribution in the stage detail view' is the first correct sentence. From there I want: the word 'skew' with an explanation of why shuffle joins amplify skew, AQE as the first fix (and knowing it's on by default — candidates who say 'enable AQE' without knowing it's already on are reciting docs they haven't used), broadcast as the second fix for small tables, and salting as the manual fallback. The NULL-key edge case is what separates engineers who have salted in production from those who have only read about it. 'Add more executors' or 'increase shuffle partitions' are the canonical wrong answers.",
+        followupChain: [
+          {
+            question: "How do you confirm data skew is the cause rather than a slow node or a garbage collection pause?",
+            answer: "In the Spark UI stage detail, look at the shuffle read size distribution across tasks, not just task duration. If the slow task has 100× the shuffle read bytes of other tasks, it is data skew. A slow node due to GC or hardware issues would show multiple tasks taking longer, not just one, and the task durations would not correlate cleanly with shuffle read sizes. The Executors tab can confirm GC time per executor if needed."
+          },
+          {
+            question: "AQE split the skewed partition but the job is still slow. What next?",
+            answer: "Check whether AQE is splitting into enough sub-tasks. By default AQE splits a skewed partition into at most 2 sub-tasks. For extreme skew (one key holding 90% of data), 2 sub-tasks may not be enough. Tune `spark.sql.adaptive.skewJoin.skewedPartitionFactor` and `skewedPartitionThresholdInBytes` to lower thresholds so AQE splits into more sub-tasks. If AQE still cannot handle it, fall back to manual salting."
+          },
+          {
+            question: "How do you handle a skewed GROUP BY (not a join) where salting is not directly applicable?",
+            answer: "Use a two-phase aggregation. In the first phase, add a random salt column (0 to N-1) to the key and perform a partial aggregation — this distributes the hot key's rows across N partitions. In the second phase, group by the original key (without salt) and aggregate the partial results. Spark's optimizer often does this automatically for commutative aggregations like SUM and COUNT, but for custom aggregations or when the optimizer doesn't kick in, implement it explicitly."
+          }
+        ],
+        redFlags: [
+          {
+            junior: "\"I'd add more executors so the slow task has more resources.\"",
+            senior: "\"More executors don't help with skew — the single hot partition still lands on one executor no matter how many executors exist. The fix is distributing the hot partition: let AQE split it, broadcast the small side, or salt the key manually.\""
+          },
+          {
+            junior: "\"I'd increase `spark.sql.shuffle.partitions` to 2000 to spread the data.\"",
+            senior: "\"Increasing shuffle partitions doesn't help with a hot key — all rows for that key hash to the same partition regardless of the total partition count. AQE, broadcast, or salting are the actual fixes.\""
+          }
+        ],
+        alternatePhrasings: [
+          "\"One task in your Spark job takes 100× longer than all others. How do you diagnose and fix it?\"",
+          "\"What is data skew in Spark and what are your options for fixing it?\"",
+          "\"How does AQE handle skewed partitions and when is it not enough?\""
+        ],
+        interviewContexts: [
+          "Senior data engineer loop at a Series D e-commerce company with heavily skewed retailer join keys",
+          "Databricks performance tuning round at a financial services firm",
+          "Asked as a live debugging exercise at a staff data engineer interview at a logistics company"
+        ]
+      },
+      // ── deep-dive: SCD type 2 ─────────────────────────────────
+      {
+        category: "deep-dives",
+        riskLevel: "high",
+        asked: 19,
+        questionText:
+          "A customer's shipping address changes. The business requires that every historical order shows the address as it was at the time of the order. Model and load this in Delta Lake.",
+        code: [
+          {
+            lang: "sql",
+            label: "SCD Type 2 table DDL",
+            lines: [
+              "CREATE TABLE dim_customer (",
+              "  customer_sk    BIGINT GENERATED ALWAYS AS IDENTITY,",
+              "  customer_id    STRING NOT NULL,   -- natural key",
+              "  name           STRING,",
+              "  address        STRING,",
+              "  effective_from DATE NOT NULL,",
+              "  effective_to   DATE,               -- NULL = current row",
+              "  is_current     BOOLEAN NOT NULL",
+              ") USING DELTA;",
+            ],
+          },
+          {
+            lang: "sql",
+            label: "Two-branch SCD2 MERGE: close old row, insert new",
+            lines: [
+              "-- staged_updates has: customer_id, name, address,",
+              "--   effective_from = TODAY, merge_key",
+              "MERGE INTO dim_customer AS t",
+              "USING (",
+              "  -- Pass 1: match existing current rows to close",
+              "  SELECT customer_id AS merge_key, customer_id,",
+              "         name, address, effective_from",
+              "  FROM staged_updates",
+              "  UNION ALL",
+              "  -- Pass 2: insert new rows (merge_key = NULL prevents match)",
+              "  SELECT NULL AS merge_key, customer_id,",
+              "         name, address, effective_from",
+              "  FROM staged_updates",
+              ") AS s",
+              "ON t.customer_id = s.merge_key",
+              "",
+              "-- Close the old current row",
+              "WHEN MATCHED AND t.is_current = TRUE",
+              "  AND (t.address <> s.address OR t.name <> s.name)",
+              "THEN UPDATE SET",
+              "  t.is_current    = FALSE,",
+              "  t.effective_to  = DATE_SUB(s.effective_from, 1)",
+              "",
+              "-- Insert new current row (merge_key=NULL never matches)",
+              "WHEN NOT MATCHED",
+              "THEN INSERT (customer_id, name, address,",
+              "             effective_from, effective_to, is_current)",
+              "     VALUES  (s.customer_id, s.name, s.address,",
+              "              s.effective_from, NULL, TRUE);",
+            ],
+          },
+          {
+            lang: "sql",
+            label: "DLT declarative alternative (STORED AS SCD TYPE 2)",
+            lines: [
+              "-- In a Delta Live Tables pipeline:",
+              "APPLY CHANGES INTO live.dim_customer",
+              "FROM stream(live.bronze_customer_changes)",
+              "KEYS (customer_id)",
+              "SEQUENCE BY updated_at",
+              "STORED AS SCD TYPE 2;",
+              "-- DLT manages __START_AT and __END_AT automatically.",
+              "-- Replaces the entire MERGE block above.",
+            ],
+          },
+        ],
+        answerStructured:
+          "- **Type 1 vs Type 2**: Type 1 updates the row in place — the current address overwrites the old one and history is lost. Type 2 preserves history by never deleting or overwriting: each change creates a new row. This is the required model when facts must join back to the dimension as it existed at transaction time.\n- **Schema**: surrogate key (`customer_sk`, IDENTITY column), natural key (`customer_id`), versioned attributes (address, name), and three history-tracking columns: `effective_from` (when this version became active), `effective_to` (when it was superseded — NULL for the current row), and `is_current` (boolean flag for quick current-row lookup).\n- **Two-branch MERGE**: the standard SCD2 MERGE uses a UNION ALL trick to produce two rows per incoming change in the source — one with the real `merge_key` to match and close the old current row, and one with `NULL` as `merge_key` (which never matches) to insert the new current row in a single atomic commit.\n  - `WHEN MATCHED AND is_current = TRUE AND attribute changed`: set `is_current = FALSE`, set `effective_to = today - 1`.\n  - `WHEN NOT MATCHED`: insert new row with `is_current = TRUE`, `effective_to = NULL`.\n- **Fact joins**: fact tables store `customer_sk` at transaction time. Queries recover the address at order time with `JOIN dim_customer ON order.customer_sk = dim_customer.customer_sk`.\n- **DLT alternative**: `APPLY CHANGES INTO ... STORED AS SCD TYPE 2` replaces the MERGE entirely. DLT manages `__START_AT` and `__END_AT` columns and handles out-of-order and late-arriving changes via the `SEQUENCE BY` column.",
+        explanationDeep:
+          "The crucial concept is that a Type 1 update destroys history irreversibly. If a customer moves and the fact table stores only the customer's natural key, all historical orders will incorrectly show the new address — a compliance issue for invoicing, a correctness issue for geographic analytics, and potentially a legal issue for regulated industries. The surrogate key pattern is the defense: facts capture the surrogate key at write time, and the surrogate key points to the exact version of the dimension row that was current then.\n\nThe two-branch UNION ALL in the MERGE is the idiomatic Delta implementation and the most commonly asked code pattern in senior interviews. The trick is that a single `MERGE` statement can only insert one row per source row. SCD2 needs two operations per change: close the old row and insert the new one. The workaround is to produce two source rows from each incoming change: one with the real join key (for the MATCHED UPDATE that closes the old row) and one with NULL as the join key (which matches nothing, falls through to NOT MATCHED, and inserts the new row). Both operations happen in a single atomic commit — there is no window where neither the old nor the new row is current.\n\nDLT's `APPLY CHANGES INTO ... STORED AS SCD TYPE 2` abstracts all of this. The `__START_AT` and `__END_AT` timestamps DLT manages are functionally equivalent to `effective_from` / `effective_to`. The `SEQUENCE BY` column (typically a CDC timestamp or version number) handles out-of-order delivery — DLT uses it to reconstruct the correct historical order regardless of which batch a change arrived in. For greenfield DLT pipelines, this is the cleaner approach; the MERGE pattern is necessary for hand-written jobs or when migrating an existing SCD2 table.",
+        interviewerLens:
+          "The first thing I listen for is 'Type 1 destroys history — that is wrong for this use case.' Candidates who describe Type 2 without first explaining why Type 1 is the wrong choice have memorized the pattern without understanding the problem it solves. The MERGE code is where most candidates stumble: the UNION ALL trick with NULL merge_key is non-obvious and directly distinguishes engineers who have implemented SCD2 from those who have only read about it. For DLT candidates, knowing `STORED AS SCD TYPE 2` with `SEQUENCE BY` and the automatic `__START_AT`/`__END_AT` management shows current platform knowledge. Surrogate key vs natural key in the fact join is the senior-level nuance: facts must store the surrogate to preserve point-in-time correctness.",
+        followupChain: [
+          {
+            question: "How does a fact table query recover the address as it was at order time?",
+            answer: "The fact table stores `customer_sk` — the surrogate key of the dim row that was current when the order was written. The join is simply `JOIN dim_customer ON orders.customer_sk = dim_customer.customer_sk`. If the fact table stores only the natural key (`customer_id`), you must join with a date-between predicate: `ON orders.customer_id = dim_customer.customer_id AND orders.order_date BETWEEN dim_customer.effective_from AND COALESCE(dim_customer.effective_to, '9999-12-31')`. The surrogate-key pattern is far simpler and more performant."
+          },
+          {
+            question: "What happens if two changes to the same customer arrive in the same batch?",
+            answer: "The two-branch MERGE will produce conflicting operations: two rows trying to close the same old row and insert two new rows. You must deduplicate the incoming batch to the latest change per customer_id before running the MERGE — keep only the most recent change per natural key, ordered by the CDC sequence column. Applying the MERGE to a batch with multiple changes for the same key without deduplication will produce incorrect or duplicate history rows."
+          },
+          {
+            question: "How do you handle a SCD2 table where a customer appears in the source with the same attribute values as the current row — a no-op change?",
+            answer: "Add a change-detection predicate to the MATCHED clause: `WHEN MATCHED AND t.is_current = TRUE AND (t.address <> s.address OR t.name <> s.name)`. Without this predicate, every run would close the current row and insert an identical new one, producing spurious history versions. The predicate ensures the MERGE only fires for genuine attribute changes."
+          }
+        ],
+        redFlags: [
+          {
+            junior: "\"I'd UPDATE the customer's address in place when it changes.\"",
+            senior: "\"That is a Type 1 update — it destroys history. Every historical order would then show the new address, which is incorrect for invoicing, analytics, and regulatory reporting. Type 2 is required: close the old row with an effective_to date and insert a new current row, so each historical order joins to the address that was current at the time it was placed.\""
+          },
+          {
+            junior: "\"I'd use a single WHEN MATCHED ... INSERT in the MERGE.\"",
+            senior: "\"A single MERGE can only produce one row per source row. SCD2 needs two operations: close the old row and insert the new one. The pattern is a UNION ALL source that produces two source rows per change — one with the real key (to match and close the old row) and one with NULL key (to fall through to NOT MATCHED and insert the new row) — all in one atomic commit.\""
+          }
+        ],
+        alternatePhrasings: [
+          "\"How do you implement SCD Type 2 in Delta Lake?\"",
+          "\"A dimension table needs to track historical attribute changes. How do you model and load it?\"",
+          "\"What is the MERGE pattern for closing and inserting SCD2 rows in Delta?\""
+        ],
+        interviewContexts: [
+          "Senior data engineer interview at a Series B e-commerce company with customer address history requirements",
+          "Data modeling design round at a logistics firm tracking carrier rate changes over time",
+          "Asked in a dimensional modeling deep-dive at a fintech with regulatory point-in-time reporting requirements"
+        ]
+      },
+      // ── deep-dive: replaceWhere selective backfill ─────────────
+      {
+        category: "deep-dives",
+        riskLevel: "high",
+        asked: 18,
+        questionText:
+          "Yesterday's pipeline load had a bug that produced wrong aggregation values for 2024-01-14 only. The table is multi-TB and partitioned by date. Fix just that one day without rebuilding the whole table or breaking in-flight reads.",
+        code: [
+          {
+            accent: "bug",
+            lang: "pyspark",
+            label: "Wrong: full overwrite touches every partition",
+            lines: [
+              "# Destroys all other days atomically,",
+              "# forces a full recompute of the entire table.",
+              "(corrected_df.write",
+              "  .format('delta')",
+              "  .mode('overwrite')",
+              "  .saveAsTable('gold.daily_metrics'))",
+            ],
+          },
+          {
+            accent: "bug",
+            lang: "pyspark",
+            label: "Wrong: DELETE then INSERT is two commits (non-atomic)",
+            lines: [
+              "spark.sql(\"DELETE FROM gold.daily_metrics\",",
+              "          \"WHERE report_date = '2024-01-14'\")",
+              "# Between DELETE and INSERT readers see missing data.",
+              "corrected_df.write \\",
+              "  .mode('append') \\",
+              "  .saveAsTable('gold.daily_metrics')",
+            ],
+          },
+          {
+            accent: "fix",
+            lang: "pyspark",
+            label: "Correct: replaceWhere — single atomic commit, one partition",
+            lines: [
+              "# Recompute only the affected day from bronze/silver:",
+              "corrected_df = (",
+              "  spark.table('silver.events')",
+              "    .filter(\"event_date = '2024-01-14'\")",
+              "    .groupBy('report_date', 'region')",
+              "    .agg(F.sum('revenue').alias('total_revenue'))",
+              ")",
+              "",
+              "# replaceWhere atomically swaps matching rows in one commit.",
+              "# Other partitions (2024-01-13, 2024-01-15, ...) are untouched.",
+              "# Readers see old state or new state, never partial state.",
+              "(corrected_df.write",
+              "  .format('delta')",
+              "  .mode('overwrite')",
+              "  .option('replaceWhere', \"report_date = '2024-01-14'\")",
+              "  .saveAsTable('gold.daily_metrics'))",
+              "",
+              "# For a date range: expand the predicate",
+              ".option('replaceWhere',",
+              "        \"report_date BETWEEN '2024-01-14' AND '2024-01-16'\")",
+            ],
+          },
+        ],
+        answerStructured:
+          "- **Why not overwrite the whole table**: a full overwrite rewrites every Parquet file for every partition in a multi-TB table — hours of compute for a one-day bug. It also blocks readers during the write window and defeats the purpose of partitioning.\n- **Why not DELETE then INSERT**: two separate commits. Between the DELETE commit and the INSERT commit, readers see a table with the affected date completely missing — a window of data loss that is visible to any concurrent query or downstream job reading that partition.\n- **`replaceWhere` — the correct tool**: `.option('replaceWhere', \"report_date = '2024-01-14'\")` with `.mode('overwrite')` writes the corrected data files, validates that every row in the new DataFrame matches the predicate, and records the old partition files as removed and the new files as added in a **single atomic commit**. Other partitions are never touched. Concurrent readers see either the old state or the new corrected state, never an intermediate.\n- **Reprocess from the upstream source**: do not use the gold table as input to the reprocess — it contains the bug. Read from bronze or silver (which was correct), recompute the aggregation for 2024-01-14, and write via `replaceWhere`.\n- **Predicate must match the data**: Delta enforces by default that every row in the written DataFrame matches the `replaceWhere` predicate. If a row falls outside the predicate, the write fails. This prevents accidentally over-replacing more data than intended.\n- **Idempotent**: running `replaceWhere` twice with the same DataFrame produces the same result — safe to retry if the job fails mid-write.",
+        explanationDeep:
+          "The `replaceWhere` pattern solves a class of problems that otherwise require a full table rebuild or a risky non-atomic operation. In a multi-TB partitioned table, rebuilding the whole table for a one-row bug in one partition is operationally equivalent to burning down the warehouse to fix a leaky faucet. The cost is proportional to the table size, not the scope of the bug.\n\nThe DELETE-then-INSERT anti-pattern is subtly dangerous. It looks atomic — you delete the bad data, then insert the good data. But they are two separate Delta commits. Any reader that executes between commit 1 (the delete) and commit 2 (the insert) sees a table where 2024-01-14 simply does not exist. For a pipeline whose downstream job reads that partition every 15 minutes, that is a real data loss event for whatever ran during that window.\n\n`replaceWhere` resolves this by making the replacement a single commit. The mechanism: Delta writes the new Parquet files to the table directory, then records in one transaction log entry: 'remove these old files, add these new files, condition = report_date = 2024-01-14.' The commit is the indivisible unit. Readers that started before the commit see the old files; readers that start after see the new files. There is no intermediate state.\n\nThe predicate constraint check is a safety net worth understanding. If your corrected DataFrame accidentally contains a row with `report_date = '2024-01-15'` (perhaps a JOIN produced an off-by-one date), Delta will reject the entire write with an error by default. You can disable this check with `spark.databricks.delta.replaceWhere.constraintCheck.enabled = false`, but doing so allows you to silently over-replace more data than you intended — leave it enabled and fix the DataFrame instead.",
+        interviewerLens:
+          "The primary test is whether you know `replaceWhere` exists and can articulate why it is strictly better than both the full-overwrite and the DELETE-then-INSERT alternatives. Most candidates who have not hit this problem in production will answer 'overwrite the partition' without knowing that is non-atomic if done as DELETE+INSERT. The atomicity argument — 'readers never see partial state because it is one commit' — is the senior signal. The 'reprocess from bronze, not gold' point shows they have thought about data lineage: the gold table contains the bug, so using it as input to the reprocess replicates the bug into the corrected output.",
+        followupChain: [
+          {
+            question: "What happens if the corrected DataFrame contains a row that does not match the replaceWhere predicate?",
+            answer: "By default, Delta rejects the entire write and throws an AnalysisException. The table is unchanged. This is a safety guardrail: it prevents accidentally over-replacing more data than intended. If you deliberately want rows outside the predicate to be included (e.g., the predicate is a soft guide, not a hard constraint), you can disable the check with `spark.databricks.delta.replaceWhere.constraintCheck.enabled = false`, but this is unusual and should be documented as intentional."
+          },
+          {
+            question: "How does replaceWhere interact with Delta's time travel? Can you recover the wrong data if needed?",
+            answer: "Yes. `replaceWhere` is a normal Delta commit — it is recorded in the transaction log as a new version. The previous version (containing the wrong aggregation values) is still accessible via `SELECT * FROM gold.daily_metrics VERSION AS OF <n>` until VACUUM removes the underlying Parquet files. If the correction turns out to be wrong, you can `RESTORE TABLE gold.daily_metrics TO VERSION AS OF <n>` to roll back to the pre-correction state. This is why committing from bronze is correct: bronze is append-only and always restorable."
+          },
+          {
+            question: "Would you use replaceWhere on an unpartitioned table?",
+            answer: "Yes — replaceWhere works on unpartitioned, partitioned, and liquid-clustered tables. On an unpartitioned table, it identifies matching rows across all files, rewrites only the files that contain matching rows, and replaces them atomically. The predicate still applies and non-matching files are untouched. The efficiency advantage is smaller on an unpartitioned table if the matching rows are spread across many files, but the atomicity guarantee is the same."
+          }
+        ],
+        redFlags: [
+          {
+            junior: "\"I'd delete the bad rows and reinsert the corrected ones.\"",
+            senior: "\"DELETE then INSERT is two separate commits. Between them, readers see the affected date missing entirely. replaceWhere is a single atomic commit: it removes the old files and adds the new files in one transaction log entry — readers see either the old bad data or the new corrected data, never a gap.\""
+          },
+          {
+            junior: "\"I'd overwrite the whole table to be safe.\"",
+            senior: "\"Overwriting the whole table rewrites every partition in a multi-TB table for a bug affecting one day — hours of unnecessary compute. replaceWhere writes only the corrected partition. The blast radius is exactly the scope of the bug.\""
+          }
+        ],
+        alternatePhrasings: [
+          "\"How do you reprocess a single partition of a large Delta table without touching other partitions?\"",
+          "\"What is replaceWhere and how does it differ from a full overwrite?\"",
+          "\"A one-day data bug needs to be corrected in a 10 TB table. What is your approach?\""
+        ],
+        interviewContexts: [
+          "Senior data engineer design round at a Series C company with daily partitioned gold tables",
+          "Asked in a data reliability interview at a fintech with strict daily close reporting",
+          "Came up as a production incident scenario at a staff data engineer loop at a retail analytics company"
+        ]
+      },
+      // ── deep-dive: concurrent writers / ConcurrentAppendException
+      {
+        category: "deep-dives",
+        riskLevel: "high",
+        asked: 16,
+        questionText:
+          "Two jobs MERGE into the same Delta table concurrently. One fails with `ConcurrentAppendException`. Explain why this happens and how you design around it.",
+        code: [
+          {
+            accent: "bug",
+            lang: "pyspark",
+            label: "Two concurrent MERGEs on the same partition: conflict",
+            lines: [
+              "# Job A and Job B both run simultaneously:",
+              "# Job A: MERGE INTO orders USING source_a ON ...",
+              "#   WHERE order_date = '2024-01-14'",
+              "# Job B: MERGE INTO orders USING source_b ON ...",
+              "#   WHERE order_date = '2024-01-14'",
+              "#",
+              "# Both read version N of the table.",
+              "# Job A commits version N+1.",
+              "# Job B tries to commit N+1 — slot taken.",
+              "# Delta checks overlap: both touched the same partition files.",
+              "# -> ConcurrentAppendException (one of them fails).",
+            ],
+          },
+          {
+            accent: "fix",
+            lang: "pyspark",
+            label: "Fix 1: partition-isolate writers (no file overlap)",
+            lines: [
+              "# Table is partitioned by (region, order_date).",
+              "# Include partition columns in the MERGE condition",
+              "# so Delta knows the operations touch disjoint files.",
+              "#",
+              "# Job A — EU region:",
+              "spark.sql(\"\"\"",
+              "  MERGE INTO orders t USING source_a s",
+              "  ON t.order_id = s.order_id",
+              "     AND t.region = 'EU'",
+              "     AND t.order_date = '2024-01-14'",
+              "  WHEN MATCHED THEN UPDATE SET *",
+              "  WHEN NOT MATCHED THEN INSERT *",
+              "\"\"\")",
+              "#",
+              "# Job B — US region:",
+              "spark.sql(\"\"\"",
+              "  MERGE INTO orders t USING source_b s",
+              "  ON t.order_id = s.order_id",
+              "     AND t.region = 'US'",
+              "     AND t.order_date = '2024-01-14'",
+              "  WHEN MATCHED THEN UPDATE SET *",
+              "  WHEN NOT MATCHED THEN INSERT *",
+              "\"\"\")",
+              "# Delta sees disjoint file sets -> no conflict -> both commit.",
+            ],
+          },
+          {
+            accent: "fix",
+            lang: "pyspark",
+            label: "Fix 2: retry with exponential backoff (idempotent MERGE)",
+            lines: [
+              "import time, random",
+              "from delta.exceptions import ConcurrentAppendException",
+              "",
+              "def merge_with_retry(source_df, max_retries=5):",
+              "    for attempt in range(max_retries):",
+              "        try:",
+              "            (DeltaTable.forName(spark, 'orders').alias('t')",
+              "              .merge(source_df.alias('s'),",
+              "                     't.order_id = s.order_id')",
+              "              .whenMatchedUpdateAll()",
+              "              .whenNotMatchedInsertAll()",
+              "              .execute())",
+              "            return  # success",
+              "        except ConcurrentAppendException:",
+              "            if attempt == max_retries - 1:",
+              "                raise",
+              "            wait = (2 ** attempt) + random.random()",
+              "            time.sleep(wait)  # exponential backoff + jitter",
+            ],
+          },
+        ],
+        answerStructured:
+          "- **How Delta concurrency works**: Delta uses **optimistic concurrency control** — there is no lock manager. Each writer reads the current table version, does its work, writes new Parquet data files, then attempts to commit the next version number in the transaction log. The conflict check happens at commit time, not at read time.\n- **Why the exception occurs**: `ConcurrentAppendException` is raised when a concurrent operation has added files in the same partition (or anywhere in an unpartitioned table) that the current operation also reads. Both jobs read version N, both write data, then Job A commits version N+1. Job B attempts to commit N+1 — the slot is taken. Delta retries at N+2 but checks whether Job A's commit overlaps with Job B's read set. If both touched the same partition files, Delta detects a conflict and raises `ConcurrentAppendException`.\n- **Fix 1 — partition-isolate writers**: include the partition column in the MERGE ON condition so Delta can prove the two operations touch disjoint file sets. Job A writes `WHERE region = 'EU'`; Job B writes `WHERE region = 'US'`. Delta sees no overlapping files and allows both commits. This requires the table to be partitioned on the column that isolates the writers.\n- **Fix 2 — serialize writers that truly overlap**: if both jobs genuinely write to the same data, serialize them (Workflow task ordering, Databricks Workflows dependency, or an external mutex). True concurrent writes to the same logical data are a design issue — serialization is the honest answer.\n- **Fix 3 — retry with backoff**: for transient conflicts (e.g., occasional overlap from concurrent jobs with mostly non-overlapping data), catch `ConcurrentAppendException` and retry with exponential backoff and jitter. Safe only if the MERGE is idempotent (keyed MERGE is).",
+        explanationDeep:
+          "The common misconception is that Delta Lake has a lock manager like a transactional database. It does not. Delta uses optimistic concurrency: assume there is no conflict, do the work, then check at commit time. This design is efficient for the common case (most writers work on different data) but means conflicts are detected late and resolved by failing one writer rather than queuing it.\n\nThe three-stage commit protocol matters here. Stage 1 (read): the writer reads the current log version to discover which files exist. Stage 2 (write): the writer writes new Parquet files to the table directory but does not yet update the log — these files are invisible. Stage 3 (validate and commit): the writer atomically writes the next log entry. At this stage, Delta checks whether any commits since Stage 1 have added files in the same partition that the current operation also read. If yes — `ConcurrentAppendException`.\n\nPartition isolation is the cleanest fix because it changes the problem from a runtime conflict to a design invariant. If the table is partitioned by region and Job A's MERGE condition includes `t.region = 'EU'`, Delta's file listing for that MERGE covers only EU partition files. Job B's MERGE covers only US partition files. The file sets are disjoint by construction, so Delta's conflict check never fires — both writers can commit concurrently without contention. The critical implementation detail: the partition column must be in the MERGE ON condition, not just in a WHERE clause on the source. Delta uses the join condition to determine the target file set; a source filter alone does not constrain the target scan.\n\nThe retry pattern is appropriate for genuinely transient conflicts in pipelines that are mostly non-overlapping. Exponential backoff with jitter prevents thundering herd: if 10 jobs all fail at the same moment and all retry after a fixed 5 seconds, they collide again. Jitter randomizes the retry interval, spreading the retry attempts across time.",
+        interviewerLens:
+          "The two wrong answers I listen for are 'Delta can't handle concurrent writes' (wrong — it handles them fine when designed correctly) and 'add a lock' (Delta does not have a lock API and adding application-level locks is fragile). The correct answer starts with explaining optimistic concurrency — no lock manager, conflict detected at commit time — and then moves to the partition-isolation fix as the primary design solution. Candidates who immediately say 'include the partition column in the MERGE condition so Delta sees disjoint file sets' have clearly hit this problem in production. The retry-with-backoff detail for transient conflicts, and especially the 'MERGE is idempotent so retrying is safe' reasoning, is the senior polish.",
+        followupChain: [
+          {
+            question: "Does Delta ever allow two concurrent writes to succeed even if they touch the same table?",
+            answer: "Yes — if the operations are non-conflicting. Delta's conflict matrix: concurrent INSERTs on different partitions succeed. A compaction (OPTIMIZE) with `dataChange=false` does not conflict with concurrent INSERTs. Concurrent INSERT + INSERT (append-only, no reads) succeed in most cases. What conflicts is when one writer reads a set of files that another writer has added or removed in an overlapping commit. The exact conflict rules depend on the isolation level (WriteSerializable vs Serializable — WriteSerializable is the default and more permissive)."
+          },
+          {
+            question: "What is the difference between ConcurrentAppendException and ConcurrentModificationException in Delta?",
+            answer: "`ConcurrentAppendException` is raised when a concurrent operation appended files to a partition that the current operation also read from. `ConcurrentModificationException` is the broader parent class for conflicts detected at commit time, including cases where files the current operation expected to be present have been removed by a concurrent DELETE, UPDATE, or OPTIMIZE. Both indicate a commit-time conflict; `ConcurrentAppendException` specifically names the append overlap case."
+          },
+          {
+            question: "If you serialize the two MERGE jobs instead of partition-isolating them, what are the trade-offs?",
+            answer: "Serialization eliminates conflicts entirely but removes parallelism: the second job waits for the first to finish. For jobs that could logically run in parallel on disjoint data, this is unnecessary latency. Partition isolation preserves concurrency — both jobs run and commit simultaneously — but requires the table to be partitioned on the right column and the MERGE conditions to explicitly reference it. For jobs that genuinely share overlapping data (e.g., both update the same rows), serialization is the only correct option — partition isolation cannot help if the file sets actually overlap."
+          }
+        ],
+        redFlags: [
+          {
+            junior: "\"Delta can't handle concurrent writes — you need to serialize all writers.\"",
+            senior: "\"Delta handles concurrent writes via optimistic concurrency. Writers on disjoint partitions can commit simultaneously with no conflict. You only need to serialize writers that genuinely touch the same data, and partition isolation in the MERGE condition is the design tool to prove disjointness to Delta.\""
+          },
+          {
+            junior: "\"I'd add a distributed lock around each MERGE to prevent the exception.\"",
+            senior: "\"Application-level locks are fragile and defeat the purpose of Delta's concurrency model. The correct fix is designing the writers to be partition-disjoint so Delta's own conflict detection never fires — or retry with backoff for genuinely transient conflicts, since keyed MERGE is idempotent.\""
+          }
+        ],
+        alternatePhrasings: [
+          "\"Two Spark jobs write to the same Delta table and one fails. How do you fix the architecture?\"",
+          "\"What is ConcurrentAppendException and how do you prevent it?\"",
+          "\"How does Delta's optimistic concurrency control work and when does it fail?\""
+        ],
+        interviewContexts: [
+          "Senior data engineer screen at a company with multiple regional ingestion jobs writing to a shared orders table",
+          "Platform reliability discussion at a Series D SaaS company after a production concurrency incident",
+          "Asked as a design scenario at a staff-level Databricks interview at a logistics firm"
+        ]
+      },
       // ── tool-comparison ───────────────────────────────────────
       {
         category: "tool-comparison",
@@ -1124,12 +1807,22 @@ export const levels: Partial<Record<Level, { authored: Authored[]; topics: ToolT
         "How does the Photon engine differ from Tungsten and when does it provide the most speedup?",
         "Explain Unity Catalog’s row-level security and column masking — how are policies enforced at query time?",
         "How do you implement a lakehouse pattern for feature engineering — serving both ML training and online inference?",
-        "What is Databricks Asset Bundles and how does it enable CI/CD for notebooks and DLT pipelines?"
+        "What is Databricks Asset Bundles and how does it enable CI/CD for notebooks and DLT pipelines?",
+        "A periodic batch job misses a run and the next batch is double the normal size — how do you bound the backlog and prevent a cascade failure?",
+        "Design a pipeline for late-arriving mobile events with a 3-hour lateness SLA — watermark, MERGE, and replaceWhere correction path",
+        "One Spark task runs for an hour while 199 others finish in seconds — diagnose data skew and walk through AQE, broadcast, and salting fixes",
+        "Implement SCD Type 2 for a customer dimension in Delta Lake — schema, two-branch MERGE, and the DLT declarative alternative",
+        "Reprocess a single buggy day in a multi-TB partitioned Delta table without touching other partitions or breaking reads — the replaceWhere approach",
+        "Two MERGE jobs on the same Delta table fail with ConcurrentAppendException — explain optimistic concurrency and design the partition-isolation fix"
       ],
       decisions: [
         "Liquid clustering vs Z-ORDER vs Hive partitioning for a new 10TB Delta table with multi-column filters?",
         "DLT vs hand-written Workflows for a 50-table medallion pipeline with strict quality SLAs?",
-        "Serverless SQL Warehouse vs provisioned cluster for an ad-hoc analyst team?"
+        "Serverless SQL Warehouse vs provisioned cluster for an ad-hoc analyst team?",
+        "Trigger.AvailableNow + maxBytesPerTrigger vs a plain scheduled batch job — when does bounded streaming pay off?",
+        "withWatermark duration vs replaceWhere backfill — when does each handle late data correctly?",
+        "Partition-isolate concurrent writers vs serialize them vs retry-with-backoff — choose the right concurrency fix for your use case",
+        "SCD Type 1 vs Type 2 vs Type 6 — when does each model apply and what does each cost in Delta?"
       ],
       quickRef: [
         "What does `OPTIMIZE FULL` do in DBR 16.0+?",
@@ -1141,7 +1834,13 @@ export const levels: Partial<Record<Level, { authored: Authored[]; topics: ToolT
         "What is the DLT event log and where is it stored?",
         "Unity Catalog three-tier namespace?",
         "What is a UC External Location?",
-        "What does `VACUUM RETAIN 0 HOURS` do to time-travel capability?"
+        "What does `VACUUM RETAIN 0 HOURS` do to time-travel capability?",
+        "Default AQE skewedPartitionFactor and skewedPartitionThresholdInBytes?",
+        "What happens to events that arrive after their watermark window has closed?",
+        "replaceWhere: what error occurs if a row in the DataFrame falls outside the predicate?",
+        "ConcurrentAppendException vs ConcurrentModificationException — which is broader?",
+        "SCD Type 2 MERGE: why does the source use UNION ALL with a NULL merge_key?",
+        "DLT STORED AS SCD TYPE 2: what columns does DLT manage automatically?"
       ],
       redFlags: [
         {
@@ -1155,6 +1854,26 @@ export const levels: Partial<Record<Level, { authored: Authored[]; topics: ToolT
         {
           junior: "\"Unity Catalog is just Glue but for Databricks.\"",
           senior: "\"UC is a full governance layer with deny-by-default RBAC, row/column-level security, automatic lineage, and cross-workspace discovery — far beyond a metadata catalog.\""
+        },
+        {
+          junior: "\"I’d set the watermark to 30 days to catch all late events.\"",
+          senior: "\"A 30-day watermark means holding state for every event window in the last 30 days — unbounded state growth. The watermark duration must equal the business lateness SLA, not be set defensively to infinity.\""
+        },
+        {
+          junior: "\"I’d add more executors to fix the slow Spark task.\"",
+          senior: "\"More executors don’t fix data skew — the hot partition still lands on one executor. The fix is AQE skew-join splitting, broadcasting the small side, or salting the hot key.\""
+        },
+        {
+          junior: "\"I’d UPDATE the address in place when a customer moves.\"",
+          senior: "\"That is SCD Type 1 — it destroys history. Historical orders would show the wrong address. SCD Type 2 is required: close the old row with effective_to and insert a new current row.\""
+        },
+        {
+          junior: "\"I’d DELETE then INSERT to fix a bad partition.\"",
+          senior: "\"DELETE then INSERT is two commits — readers see the partition missing between them. replaceWhere is a single atomic commit: old files out, new files in, no intermediate state visible to readers.\""
+        },
+        {
+          junior: "\"Delta can’t handle concurrent writes — serialize everything.\"",
+          senior: "\"Delta handles concurrent writes via optimistic concurrency. Include partition columns in the MERGE condition so Delta sees disjoint file sets — both jobs commit simultaneously with no conflict.\""
         }
       ],
       checklist: [
@@ -1162,17 +1881,26 @@ export const levels: Partial<Record<Level, { authored: Authored[]; topics: ToolT
         "Explain Unity Catalog: three-tier namespace, deny-by-default, row filters, column masks, lineage",
         "Compare DLT vs hand-written Workflows with concrete trade-offs for both",
         "Know liquid clustering vs Z-ORDER vs partitioning decision matrix",
-        "Articulate cost control levers: job clusters, spot, cluster policies, Photon, attribution tagging"
+        "Articulate cost control levers: job clusters, spot, cluster policies, Photon, attribution tagging",
+        "Design a late-data pipeline: withWatermark duration = lateness SLA, MERGE for self-correction, replaceWhere for beyond-watermark fixes",
+        "Diagnose data skew from Spark UI task timeline; apply AQE, broadcast, or salting in order",
+        "Implement SCD Type 2 two-branch MERGE (UNION ALL with NULL merge_key) and know the DLT STORED AS SCD TYPE 2 alternative",
+        "Use replaceWhere for atomic single-partition correction; explain why DELETE+INSERT is non-atomic",
+        "Explain ConcurrentAppendException root cause and the partition-isolation fix in the MERGE ON condition"
       ],
       behavioral: [
         "Tell me about a Delta table performance incident you diagnosed and resolved.",
         "Describe a lakehouse governance problem you solved — how did you approach access control?",
-        "A time you had to choose between DLT and a custom pipeline approach — what drove the decision and what was the outcome?"
+        "A time you had to choose between DLT and a custom pipeline approach — what drove the decision and what was the outcome?",
+        "Describe a late-data incident that broke a report — how did you detect it and what architectural change did you make?",
+        "Tell me about a data skew problem you fixed in a production Spark job — how did you diagnose it and what was the fix?"
       ],
       reverse: [
         "Are you on liquid clustering or still using Z-ORDER / traditional partitioning for your core tables?",
         "How mature is your Unity Catalog rollout — row-level security in production?",
-        "What’s the split between DLT pipelines and hand-written jobs in your platform today?"
+        "What’s the split between DLT pipelines and hand-written jobs in your platform today?",
+        "How do you handle late-arriving data today — is there a defined lateness SLA and a correction path for events beyond it?",
+        "Have you hit ConcurrentAppendException in production? How did you resolve it?"
       ]
     }
   }

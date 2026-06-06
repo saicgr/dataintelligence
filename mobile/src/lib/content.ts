@@ -178,6 +178,7 @@ export interface SessionCard {
   a?: string;
   fj: string; // junior tell
   fs: string; // senior tell
+  followups?: { q: string; a: string }[]; // drill-down Q&As under the answer
   // Pillar 1 — articulation scenario
   framing?: string;
   arc?: ArcStep[];
@@ -343,6 +344,7 @@ function cardFromGenerated(t: Track, c: GeneratedCard, i: number): SessionCard {
     fj: c.fj,
     fs: c.fs,
     code: c.code,
+    followups: c.followups,
   };
 }
 

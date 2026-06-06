@@ -4,7 +4,21 @@
     "a": "ACID is the set of guarantees a relational transaction provides. Atomicity: all statements in a transaction succeed or none do (no partial commits). Consistency: a committed transaction moves the database from one valid state to another, preserving constraints, foreign keys, and triggers. Isolation: concurrent transactions behave as if they ran one at a time, to the degree the isolation level promises. Durability: once COMMIT returns, the change survives crashes (typically via a write-ahead log flushed to disk).",
     "fs": "Atomicity and Durability are about a single transaction surviving failures; Isolation and Consistency are about correctness under concurrency and constraints.",
     "fj": "Thinking ACID just means 'the database is reliable' without being able to name what each letter actually guarantees.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "The 'C' in ACID and the 'C' in CAP both mean consistency. Are they the same thing?",
+        "a": "No, and conflating them is a classic mistake. ACID consistency means a transaction preserves declared invariants (constraints, FKs, triggers) and is largely the application's job. CAP consistency means linearizability: every read sees the latest write across replicas. ACID-C is about a single node's rules; CAP-C is about agreement across distributed copies."
+      },
+      {
+        "q": "Which ACID property is the application responsible for, not the database engine?",
+        "a": "Consistency is partly on you. The engine enforces declared constraints, but it cannot know your business invariants unless you encode them as constraints, triggers, or correct transaction logic. If your code debits without crediting, every ACID property holds yet the data is wrong. Atomicity, Isolation, and Durability are mechanical guarantees the engine owns."
+      },
+      {
+        "q": "Can you have durability without a write-ahead log?",
+        "a": "Yes, but it is far more expensive. Without a WAL you would have to fsync the actual data pages on every commit, paying random I/O. The WAL achieves the same guarantee by durably appending a sequential log record before COMMIT returns, then flushing pages lazily. Some in-memory stores instead get durability via synchronous replication to N nodes rather than disk."
+      }
+    ]
   },
   {
     "q": "What is a database transaction, and why wrap multiple statements in one?",
@@ -25,6 +39,20 @@
           "COMMIT;  -- both apply or neither"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If you never write BEGIN, is each statement still transactional?",
+        "a": "Yes. Most engines run in autocommit mode, so a bare statement is implicitly wrapped in its own transaction that commits on success. That gives you atomicity for that single statement, including a multi-row UPDATE. You only need explicit `BEGIN`/`COMMIT` when two or more statements must succeed or fail together."
+      },
+      {
+        "q": "What is a SAVEPOINT and when would you use one?",
+        "a": "A `SAVEPOINT` marks a point inside an open transaction you can roll back to without aborting the whole thing. It enables nested error handling: try a risky statement, and on failure `ROLLBACK TO savepoint` to undo just that part while keeping earlier work. ORMs use them to emulate nested transactions, since true nested transactions do not exist in Postgres."
+      },
+      {
+        "q": "What happens to your locks and changes if the client disconnects mid-transaction?",
+        "a": "The server detects the broken connection and aborts the in-flight transaction, rolling back all its changes and releasing its locks. Nothing partial persists. The risk is the window before detection: with no TCP keepalive or statement timeout, the backend can sit idle in `idle in transaction` holding locks until the OS finally tears down the socket."
+      }
     ]
   },
   {
@@ -32,14 +60,42 @@
     "a": "From weakest to strongest: READ UNCOMMITTED allows dirty reads (seeing another transaction's uncommitted data). READ COMMITTED prevents dirty reads but allows non-repeatable reads. REPEATABLE READ prevents dirty and non-repeatable reads but the standard allows phantom reads. SERIALIZABLE prevents all three. Each step up forbids one more anomaly: dirty read, then non-repeatable read, then phantom read.",
     "fs": "The ladder maps cleanly: dirty read -> non-repeatable read -> phantom read, each level forbidding one more anomaly.",
     "fj": "Confusing the order or thinking a higher isolation level is strictly better, ignoring the concurrency and retry costs.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "What is write skew, and why don't the four standard anomalies cover it?",
+        "a": "Write skew is when two transactions each read an overlapping set, then each writes based on its read, and together they violate an invariant neither would alone (e.g., both doctors go off-call because each saw the other on-call). It is not a dirty, non-repeatable, or phantom read, so REPEATABLE READ/snapshot isolation permits it. Only true SERIALIZABLE prevents it."
+      },
+      {
+        "q": "Why doesn't READ UNCOMMITTED exist in PostgreSQL?",
+        "a": "Because MVCC makes dirty reads structurally impossible: a reader only ever sees committed row versions per its snapshot, never another transaction's uncommitted data. Postgres accepts `READ UNCOMMITTED` syntactically but silently treats it as `READ COMMITTED`. There is simply no code path that exposes uncommitted versions."
+      },
+      {
+        "q": "Is a higher isolation level ever the wrong choice?",
+        "a": "Often. `SERIALIZABLE` and `REPEATABLE READ` increase serialization failures that you must catch and retry, add lock or SSI tracking overhead, and can tank throughput under contention. If your transaction's correctness doesn't actually depend on stronger guarantees, you pay for retries and latency you didn't need. Match the level to the specific anomaly that would corrupt your data."
+      }
+    ]
   },
   {
     "q": "What is the difference between a non-repeatable read and a phantom read?",
     "a": "A non-repeatable read is when you read a row, another transaction commits an UPDATE/DELETE to that same row, and re-reading it returns different data. A phantom read is when you run a range query (e.g., WHERE age > 30), another transaction commits an INSERT/DELETE that matches that predicate, and re-running the query returns a different set of rows. Non-repeatable is about an existing row changing; phantom is about the membership of a result set changing.",
     "fs": "Non-repeatable read = an individual row's values change; phantom read = the row count for a predicate changes due to inserts or deletes.",
     "fj": "Treating the two as the same thing, or assuming REPEATABLE READ alone always blocks phantoms in every engine.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How does a snapshot-isolation engine block phantoms without predicate locks?",
+        "a": "It takes one consistent snapshot at transaction start, so any row inserted by a transaction that committed after that snapshot is simply invisible to you. Re-running the range query sees the exact same set because it reads against the frozen snapshot, not live data. There's no need to lock the gap, the way a lock-based REPEATABLE READ would with range/next-key locks."
+      },
+      {
+        "q": "If you need to prevent phantoms with explicit locking, what tool do you use?",
+        "a": "Predicate or range locks. MySQL InnoDB uses next-key locks (a row lock plus a gap lock on the range before it) so a `SELECT ... FOR UPDATE WHERE age > 30` blocks inserts into that gap. Postgres lacks gap locks, so to lock a predicate you either escalate to `SERIALIZABLE` (SSI) or take a coarser lock like locking the parent row or table."
+      },
+      {
+        "q": "Why is a phantom harder to prevent than a non-repeatable read?",
+        "a": "A non-repeatable read concerns a row that exists, so you can lock that specific row when you read it. A phantom concerns rows that don't exist yet, so there's nothing to lock; you'd have to lock the absence of rows matching a predicate. That requires predicate/gap locking or snapshot isolation, which is why the standard puts phantoms one rung higher."
+      }
+    ]
   },
   {
     "q": "What is the default isolation level in PostgreSQL, and what surprises people about its REPEATABLE READ?",
@@ -60,6 +116,20 @@
           "COMMIT;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What error must application code handle under Postgres SERIALIZABLE that it can ignore under READ COMMITTED?",
+        "a": "The `40001` serialization_failure (`could not serialize access due to read/write dependencies`). SSI detects a dangerous dependency cycle and aborts one transaction to preserve serial equivalence. Your app must catch it and retry the whole transaction from the top. READ COMMITTED never raises it, so code written for it needs a retry loop added before moving up."
+      },
+      {
+        "q": "Under READ COMMITTED, how can a single UPDATE statement still see a newer row version than its snapshot?",
+        "a": "Through the EvalPlanQual recheck. If an UPDATE's target row is changed and committed by another transaction after the statement's snapshot, Postgres doesn't fail; it re-reads the latest committed version, re-evaluates the WHERE on it, and applies the update if it still matches. So a write can act on data newer than the read snapshot, a subtle source of lost-update surprises."
+      },
+      {
+        "q": "Why might a long-running REPEATABLE READ transaction hurt the whole database?",
+        "a": "Its snapshot pins the oldest visible transaction id, so VACUUM cannot remove dead tuples newer than that snapshot anywhere in the database. A single long REPEATABLE READ or idle-in-transaction session can block cleanup cluster-wide, causing bloat and, in the extreme, transaction-id wraparound risk. This is why monitoring for long transactions matters."
+      }
     ]
   },
   {
@@ -67,14 +137,42 @@
     "a": "MVCC (Multi-Version Concurrency Control) lets readers and writers avoid blocking each other by keeping multiple versions of a row. In PostgreSQL, an UPDATE does not overwrite in place; it writes a new row version and marks the old one obsolete. Each row carries xmin (the txid that created it) and xmax (the txid that deleted/replaced it). A transaction compares these against its snapshot to decide visibility, so reads never wait on writes. The cost is dead tuples that VACUUM must later reclaim.",
     "fs": "MVCC trades storage and vacuuming for non-blocking reads; visibility is decided by comparing per-row xmin/xmax against the transaction's snapshot.",
     "fj": "Believing the database edits rows in place and that a long-running reader must therefore block writers.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is a HOT update and how does it reduce MVCC's overhead?",
+        "a": "Heap-Only Tuple updates apply when the changed columns aren't indexed and the new version fits on the same page. Postgres chains the new tuple from the old one within the page and skips creating new index entries, since indexes still point to the old slot. That avoids index bloat and lets cheap page-level cleanup reclaim space. A `fillfactor` below 100 leaves room to make HOT updates more likely."
+      },
+      {
+        "q": "How does MySQL InnoDB's MVCC differ from Postgres's row-versioning approach?",
+        "a": "InnoDB keeps the latest row version in place and stores old versions in the undo log (rollback segments). Readers reconstruct an older view by applying undo records backward. So InnoDB has less heap bloat and cheaper `count(*)`-style scans, but purge of old undo can stall on long transactions. Postgres keeps versions in the heap itself, trading that for VACUUM."
+      },
+      {
+        "q": "What is transaction-id wraparound and why is it MVCC's existential threat?",
+        "a": "Visibility relies on comparing 32-bit transaction ids, which wrap after ~4 billion. If a row's xmin is never frozen, an old row could suddenly appear to be in the future and vanish from view, corrupting visibility. Postgres runs aggressive anti-wraparound autovacuums to `FREEZE` old tuples; if you outrun them it forces the database into read-only mode to protect data."
+      }
+    ]
   },
   {
     "q": "Under MVCC, do readers block writers or writers block readers?",
     "a": "No. The whole point of MVCC is that ordinary reads never block writes and writes never block reads, because each reader sees a consistent snapshot of older row versions while a writer creates new versions. Two writers touching the same row still conflict: the second waits for the first to commit or roll back (row-level write lock). So write-write contention remains, but read-write contention is largely eliminated.",
     "fs": "Read-write contention disappears under MVCC; only write-write on the same row still serializes via row locks.",
     "fj": "Claiming MVCC removes all locking, or that a SELECT can block an UPDATE on the same row.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "When does a SELECT block a writer despite MVCC?",
+        "a": "When it's a locking read. `SELECT ... FOR UPDATE` or `FOR SHARE` takes explicit row locks, so it conflicts with concurrent writers on the same rows. Plain MVCC snapshot reads don't, but you opt into blocking precisely when you need to read-then-write atomically, like reserving inventory. `FOR UPDATE SKIP LOCKED` lets you sidestep the wait for queue-style workloads."
+      },
+      {
+        "q": "Two writers update the same row; what determines which one waits and what it sees?",
+        "a": "The first to reach the row takes the row lock and proceeds; the second blocks until the first commits or rolls back. On commit, under READ COMMITTED the waiter re-reads the new version (EvalPlanQual) and re-applies; under REPEATABLE READ it instead errors with a serialization failure because the row changed beneath its snapshot. So the isolation level decides between retry-internally and abort."
+      },
+      {
+        "q": "Does MVCC eliminate lost updates?",
+        "a": "No. Two transactions can each read a value, compute, and write back, and the second silently overwrites the first's change, a lost update, without any blocking. MVCC prevents dirty reads, not this. You guard against it with `SELECT ... FOR UPDATE`, an atomic `SET x = x + 1`, an optimistic version check, or `SERIALIZABLE` isolation."
+      }
+    ]
   },
   {
     "q": "How does a B-tree index work, and why is it the default index type?",
@@ -95,6 +193,20 @@
           "ORDER BY created_at;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why a B+-tree instead of a balanced binary tree like a red-black tree?",
+        "a": "Because indexes live on disk and read in fixed-size pages. A B+-tree packs hundreds of keys per node, so its fan-out is huge and its height tiny, meaning a lookup costs only 3-4 page reads versus ~30 for a binary tree on the same data. Fewer page fetches means fewer disk/random I/O operations, which dominate cost. Leaves are also linked for fast in-order range scans."
+      },
+      {
+        "q": "Why does LIKE 'abc%' use a B-tree but LIKE '%abc' cannot?",
+        "a": "A B-tree is sorted left-to-right by the full key, so a known prefix maps to a contiguous range of leaves the engine can seek to and scan. A leading wildcard gives no prefix to anchor on, so matching rows are scattered everywhere in sort order and the index can't narrow the search. The leading-wildcard case needs a trigram (GIN) or full-text index instead."
+      },
+      {
+        "q": "What's the downside of a B-tree index on a column with random UUID values for inserts?",
+        "a": "Random keys scatter inserts across the whole tree, so each insert dirties a different page, causing page splits, poor cache locality, and write amplification. A monotonically increasing key appends to the rightmost leaf, far cheaper. This is why UUIDv7/ULID (time-ordered) are preferred over UUIDv4 for primary keys, restoring insert locality."
+      }
     ]
   },
   {
@@ -102,7 +214,21 @@
     "a": "A hash index stores a hash of the key, giving roughly O(1) average lookups for exact equality (= or IN). For pure equality on a high-cardinality column with many point lookups, it can be faster and smaller than a B-tree. Its limitation is fundamental: because hashing destroys ordering, it cannot serve range queries (<, >, BETWEEN), ORDER BY, or prefix LIKE. In practice B-trees are preferred because they handle equality well too and are far more flexible.",
     "fs": "Hash indexes win only for high-volume exact-match lookups; they are useless for ranges, sorting, or prefixes because hashing throws away order.",
     "fj": "Reaching for a hash index by default, not realizing it cannot do range scans or ordering.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why were Postgres hash indexes avoided before version 10?",
+        "a": "Before Postgres 10 hash indexes weren't WAL-logged, so they weren't crash-safe and couldn't be replicated, requiring a `REINDEX` after a crash. That single flaw made them unusable in production, so everyone just used B-trees. Version 10 added WAL logging, but B-trees on equality are already so good that hash indexes remain a narrow niche."
+      },
+      {
+        "q": "A hash index gives O(1), a B-tree O(log n). Why isn't the hash index dramatically faster in practice?",
+        "a": "Because B-tree height is tiny (3-4 levels for billions of rows), so O(log n) is effectively a small constant of page reads. The asymptotic edge of hashing is swamped by hash collisions, bucket overflow chains, and the B-tree's far better cache behavior and versatility. The lookup-cost difference is usually marginal, so the B-tree's flexibility wins."
+      },
+      {
+        "q": "Can a hash index enforce uniqueness or be part of a multicolumn index?",
+        "a": "In Postgres, no on both counts: hash indexes support only single-column indexing and historically can't back a unique constraint or be used for exclusion. They also can't be a covering/index-only scan because they don't store the key, only its hash. Those restrictions further shrink their already-narrow use case to single-column exact-match lookups."
+      }
+    ]
   },
   {
     "q": "How do you read an EXPLAIN / query plan, and what does EXPLAIN ANALYZE add?",
@@ -121,6 +247,20 @@
           "-- look for Seq Scan vs Index Scan",
           "-- and rows=est vs actual rows"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does the difference between a node's startup cost and total cost tell you?",
+        "a": "Cost is shown as `startup..total`. Startup cost is work before the first row emits; total is for all rows. A high startup cost means a blocking step like a sort or hash build that must finish before any output, which matters for `LIMIT` queries and pipelined plans. A node that can stream rows (index scan) has near-zero startup cost."
+      },
+      {
+        "q": "EXPLAIN ANALYZE on a node shows loops=1000; how do you read its rows and time?",
+        "a": "The reported `rows` and `actual time` are per-loop averages, not totals. To get the true row count and time for that node you multiply by `loops`. This is the trap on the inner side of a nested loop: a node that looks cheap (rows=2, time=0.01) is actually executed 1000 times, dominating the query. Always multiply before judging a nested-loop inner node."
+      },
+      {
+        "q": "Why can EXPLAIN ANALYZE's reported time be misleadingly high or low?",
+        "a": "Two reasons. Running it actually executes the query (and side-effects for writes, so wrap in a rollback), and the per-row timing instrumentation itself adds overhead, inflating times on millions of rows; `EXPLAIN (ANALYZE, TIMING OFF)` reduces that. Also the first run pays cold-cache I/O; `BUFFERS` shows shared hit vs read so you can tell cache misses from real CPU work."
       }
     ]
   },
@@ -149,6 +289,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Why might the planner choose a seq scan even when an index would return only a few rows?",
+        "a": "Random-access cost. Each index match needs a heap fetch, and `random_page_cost` (default 4) is much higher than `seq_page_cost` (1). If the matched rows are scattered across many pages, the planner estimates many random reads cost more than one sequential sweep. On SSDs lowering `random_page_cost` to ~1.1 often corrects over-eager seq scans."
+      },
+      {
+        "q": "A WHERE col = 123 ignores an index on a varchar col. What's happening?",
+        "a": "An implicit type cast. Comparing a text/varchar column to an integer literal makes Postgres cast the column to a comparable type, and a cast on the column side is non-sargable, so the index is bypassed. The fix is to pass the literal as the matching type (`'123'`) so the comparison stays on the raw column the index is built on."
+      },
+      {
+        "q": "Stats look fresh but the estimate is still wrong on a correlated multi-column filter. What now?",
+        "a": "Default stats assume column independence, so `WHERE city = ? AND state = ?` multiplies selectivities and badly underestimates when the columns are correlated. Create extended statistics with `CREATE STATISTICS ... (dependencies, ndistinct)` on those columns so the planner knows the correlation and picks a sane plan."
+      }
     ]
   },
   {
@@ -156,21 +310,63 @@
     "a": "Normalization organizes columns and tables to reduce redundancy and update anomalies. 1NF: atomic values, no repeating groups or arrays in a column. 2NF: 1NF plus every non-key column depends on the whole composite key, not just part of it. 3NF: 2NF plus no transitive dependencies, i.e., non-key columns depend only on the key, not on other non-key columns. The payoff is each fact stored once, so updates touch one place.",
     "fs": "3NF means every non-key column depends on the key, the whole key, and nothing but the key; the goal is eliminating update anomalies.",
     "fj": "Reciting 'normalization removes duplicates' without being able to state what distinguishes 2NF from 3NF.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Give a concrete example of an update anomaly that 3NF prevents.",
+        "a": "Suppose an `employees` table stores `dept_id` and `dept_name` together (a transitive dependency: name depends on dept_id, not the employee key). Renaming a department forces you to update every employee row, and missing one leaves contradictory names. 3NF splits department into its own table, so the name is stored once and updated in one place."
+      },
+      {
+        "q": "What does BCNF fix that 3NF can leave behind?",
+        "a": "BCNF (Boyce-Codd) requires that every determinant be a candidate key. 3NF tolerates an edge case where a non-prime attribute determines part of a candidate key (overlapping composite keys). BCNF eliminates that anomaly by demanding the left side of every functional dependency be a superkey. It's stricter, but decomposing to BCNF can sometimes sacrifice dependency preservation."
+      },
+      {
+        "q": "Can over-normalization hurt? When?",
+        "a": "Yes. Splitting every fact into its own table means common queries must join many tables, adding planning and join cost, and deep snowflake schemas hurt read latency and developer ergonomics. For read-heavy analytics or hot paths the join tax outweighs the storage savings, which is exactly when you deliberately denormalize back. Normalize for correctness, denormalize for measured performance."
+      }
+    ]
   },
   {
     "q": "When would you deliberately denormalize, and what do you trade away?",
     "a": "You denormalize when read performance and query simplicity matter more than write efficiency, typically in analytics/reporting or hot read paths where joins are too expensive. You duplicate data (e.g., store a customer_name on the orders table, or pre-aggregate totals) to avoid joins. The trade-off is that the same fact now lives in multiple places, so writes must update all copies and you risk inconsistency; you accept that complexity in exchange for faster reads.",
     "fs": "Denormalize to trade write complexity and redundancy for faster, simpler reads, common in OLAP star schemas and read-heavy paths.",
     "fj": "Denormalizing prematurely for convenience and then silently letting copies drift out of sync.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How do you keep denormalized copies from drifting out of sync?",
+        "a": "Make the duplication a derived, maintained artifact rather than hand-managed. Options: triggers that update the copy in the same transaction, a materialized view refreshed on a schedule, CDC streaming into the denormalized store, or batch recompute jobs. The key is a single authoritative source plus an automatic, idempotent path that rebuilds the copy, so manual updates can't diverge."
+      },
+      {
+        "q": "Is storing a computed aggregate like order_total denormalization, and what's the risk?",
+        "a": "Yes, it's a precomputed redundancy. The risk is that the cached total drifts from the line items if an item is edited without recomputing, so reports silently lie. Mitigate by recomputing inside the same transaction that changes line items (trigger), or treat it as a cache you can rebuild and periodically reconcile against the source of truth."
+      },
+      {
+        "q": "Why is denormalization often mandatory in wide-column stores like Cassandra rather than optional?",
+        "a": "Because they have no joins and query efficiently only by partition key. You must model tables query-first, duplicating the same data across multiple tables, one per access pattern. Denormalization isn't a performance tweak there; it's the data-modeling paradigm. You write the same fact many times and rely on idempotent writes and application-level consistency to keep them aligned."
+      }
+    ]
   },
   {
     "q": "What is a deadlock, and how does the database detect and resolve one?",
     "a": "A deadlock is a cycle where transaction A holds a lock B wants while B holds a lock A wants, so neither can proceed. The database runs a deadlock detector that builds a wait-for graph (an edge from each waiting transaction to the one it waits on) and looks for a cycle. When it finds one, it cannot wait it out, so it chooses a victim and aborts that transaction with a deadlock error, breaking the cycle. The victim's application is expected to retry.",
     "fs": "Deadlock detection is cycle-finding in a wait-for graph; the engine resolves it by aborting a victim, so apps must be retry-safe.",
     "fj": "Believing the database will eventually 'untangle' a deadlock on its own without aborting anyone.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How does the engine pick which transaction to abort as the deadlock victim?",
+        "a": "Heuristically, to minimize rollback cost. Postgres aborts the transaction whose statement triggered detection. MySQL InnoDB tends to roll back the transaction that has done the least work (fewest rows changed / smallest undo). The goal is breaking the cycle cheaply, not fairness, so a large transaction can repeatedly win and starve out small ones."
+      },
+      {
+        "q": "Lock timeouts also break stuck transactions. Why have a dedicated deadlock detector at all?",
+        "a": "A timeout can only guess: it waits a fixed interval and aborts, which falsely kills transactions that were merely slow, and lets real deadlocks hang for the whole timeout. The wait-for-graph detector positively identifies a true cycle and breaks it immediately, with no false positives and no wasted waiting. Timeouts are a coarse backstop; detection is precise."
+      },
+      {
+        "q": "Can two single-statement transactions deadlock each other?",
+        "a": "Yes. A single statement can lock many rows, and two such statements acquiring overlapping rows in different orders deadlock, e.g., two `UPDATE ... WHERE id IN (...)` that lock rows in opposite sequence, or two inserts contending on overlapping unique-index/FK locks. Deadlocks are about lock acquisition order, not the number of statements."
+      }
+    ]
   },
   {
     "q": "How do you prevent deadlocks in application code?",
@@ -192,6 +388,20 @@
           "COMMIT;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does ORDER BY in a SELECT ... FOR UPDATE not reliably guarantee lock ordering?",
+        "a": "Because the planner may lock rows in scan order, not the ORDER BY output order, and a sort can happen after locking. To force a deterministic acquisition order you often need to lock rows one at a time in id order, or rely on the fact that all transactions touch the same canonical ordering. The intent is right, but you must verify the engine actually locks in that sequence."
+      },
+      {
+        "q": "Foreign keys cause surprising deadlocks. Why, and how do you reduce them?",
+        "a": "Inserting or updating a child row takes a shared lock on the referenced parent row to ensure it still exists. Many children pointing at overlapping parents, combined with a concurrent parent update, create lock cycles. Reduce them by indexing FK columns, keeping parent updates short, and inserting children in a consistent parent-id order so the shared parent locks are acquired uniformly."
+      },
+      {
+        "q": "What should a deadlock retry loop do beyond just retrying?",
+        "a": "Retry only on the deadlock error code (Postgres `40P01`, serialization `40001`), cap attempts, and use exponential backoff with jitter so retrying transactions don't re-collide in lockstep. The transaction must be idempotent or fully rolled back before retry so re-running doesn't double-apply. Blindly retrying without backoff or idempotency just reproduces the deadlock and can corrupt data."
+      }
     ]
   },
   {
@@ -211,6 +421,20 @@
           "-- 0 rows updated => retry"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is optimistic locking the natural fit for stateless web requests?",
+        "a": "Because a user reads a record on one HTTP request and saves on a later one, you can't hold a database lock across that think-time, it would tie up a connection for seconds or minutes. Optimistic locking carries a version number to the client and re-checks it at save time, so no lock is held between requests. Pessimistic locking across user think-time is an anti-pattern."
+      },
+      {
+        "q": "Under high contention, why does optimistic locking degrade badly?",
+        "a": "Every conflict means a wasted read-compute-write cycle plus a retry, and under heavy contention most attempts lose the version race and retry repeatedly, wasting CPU and possibly livelocking. The expected work per successful update balloons. When conflicts are frequent, pessimistic locking, which queues writers once, is cheaper than the optimistic retry storm."
+      },
+      {
+        "q": "How do you stop a version-column update from silently doing nothing on conflict?",
+        "a": "Check the affected-row count: a compare-and-set `WHERE id=? AND version=?` returns 0 rows updated when the version moved, and you must treat that as a conflict, not success. ORMs do this automatically and raise a `StaleObjectStateException`/`OptimisticLockException`. The bug is firing the UPDATE and ignoring the row count, so a lost update passes unnoticed."
+      }
     ]
   },
   {
@@ -218,49 +442,147 @@
     "a": "Both split a large dataset into pieces, but scope differs. Partitioning divides one table into parts (partitions) typically within a single database/server, e.g., by date range or hash, to make scans and maintenance cheaper while the engine still presents one logical table. Sharding is horizontal partitioning across multiple independent database servers, each shard holding a subset of rows on its own machine. Partitioning scales a single node's manageability; sharding scales out writes and storage beyond one machine.",
     "fs": "Partitioning splits a table within one server; sharding spreads partitions across independent servers to scale writes and storage horizontally.",
     "fj": "Using 'sharding' and 'partitioning' interchangeably, missing that sharding is specifically across separate machines.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "What does single-node partitioning actually buy you if it's not adding machines?",
+        "a": "Partition pruning and cheap maintenance. The planner skips partitions that can't match a predicate, so a query on last month scans one partition instead of the whole table. You can drop or detach an old partition instantly (a metadata op) instead of a slow bulk DELETE+VACUUM, and `VACUUM`/index rebuilds run per smaller partition. It improves manageability, not raw capacity."
+      },
+      {
+        "q": "Why is sharding considered a last resort compared to partitioning or replication?",
+        "a": "Because crossing machine boundaries breaks the things a single database gives you free: cross-shard transactions, joins, and unique constraints all become application problems, and rebalancing data is operationally painful. You only shard when one node truly can't hold the write volume or data. Partitioning, read replicas, and bigger hardware are exhausted first."
+      },
+      {
+        "q": "Can you combine partitioning and sharding, and why would you?",
+        "a": "Yes, commonly. Each shard holds a subset of rows by shard key, and within each shard the table is range-partitioned by time. That gives horizontal write scale across machines plus cheap time-based retention (drop old partitions) and pruning inside each shard. The two operate at different levels, so they compose cleanly."
+      }
+    ]
   },
   {
     "q": "What is the difference between horizontal and vertical partitioning?",
     "a": "Horizontal partitioning splits a table by rows: each partition has the same columns but a disjoint subset of rows (e.g., orders from 2025 vs 2026, or users hashed by id). Vertical partitioning splits by columns: you move some columns into a separate table (e.g., keep hot, frequently read columns in one table and large blob columns in another) joined by the key. Horizontal addresses row volume and distribution; vertical addresses wide rows and access-pattern separation.",
     "fs": "Horizontal = same schema, different rows; vertical = same rows, different columns split by access pattern.",
     "fj": "Thinking partitioning is only ever by rows, and not knowing vertical splits columns.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "What performance problem does vertical partitioning specifically solve in a row store?",
+        "a": "Wide rows hurt cache density. In a row store the engine reads whole rows (or pages of them), so a rarely used large `TEXT`/`blob` column bloats every row and evicts more useful data from the buffer cache. Splitting that column into a side table keeps the hot table narrow, so more rows fit per page and per cache line, speeding the common scans."
+      },
+      {
+        "q": "Doesn't columnar storage make vertical partitioning unnecessary?",
+        "a": "Largely, yes, for analytics. Columnar layout already stores each column separately, so a query reads only the columns it touches, achieving vertical partitioning's benefit automatically. You still might separate truly cold/huge columns or those with different security or update patterns, but the I/O motivation evaporates in a column store."
+      },
+      {
+        "q": "What does vertical partitioning cost you on queries that need both halves?",
+        "a": "A join. Any query touching columns from both tables must join them on the key, adding cost and complexity, and you lose the ability to enforce some cross-column constraints in one place. So you only split columns whose access patterns rarely overlap; if most queries need both halves, the join tax outweighs the cache benefit."
+      }
+    ]
   },
   {
     "q": "How do you choose a shard key, and what goes wrong with a bad one?",
     "a": "A good shard key spreads both data and traffic evenly and keeps related rows that are queried together on the same shard. A bad choice causes hotspots: a low-cardinality or monotonically increasing key (like an auto-increment id or current timestamp) sends most new writes to one shard. It also forces cross-shard 'scatter-gather' queries and expensive rebalancing. You also lose easy cross-shard transactions and unique constraints, so the key should match your dominant query and write pattern.",
     "fs": "Pick a high-cardinality key aligned to your access pattern; monotonic or low-cardinality keys create hotspots and scatter-gather queries.",
     "fj": "Sharding on an auto-increment id or timestamp, which funnels all new writes into the newest shard.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Even with a high-cardinality key, you still get one hot shard. What likely happened?",
+        "a": "A skewed access distribution, not low cardinality, a celebrity/whale problem. Sharding by user_id spreads users evenly, but one tenant or influencer generates a disproportionate share of traffic, so its shard is hot regardless. Mitigate by splitting that key's hot value (compound key with a sub-bucket), isolating the whale on its own shard, or salting the key."
+      },
+      {
+        "q": "Why is changing the shard key later so painful?",
+        "a": "The shard key determines physical placement of every row, so changing it means relocating essentially the entire dataset across shards while live traffic continues, usually via dual-writes, backfill, and cutover, with consistency hazards throughout. It's effectively a full re-shard. That irreversibility is why the key choice is treated as a one-way architectural decision."
+      },
+      {
+        "q": "How does consistent hashing reduce the cost of adding a shard?",
+        "a": "Plain `hash(key) % N` remaps almost every key when N changes, forcing a near-total reshuffle. Consistent hashing places shards and keys on a ring, so adding a node only moves the keys in that node's arc, roughly 1/N of the data, leaving the rest in place. Virtual nodes further smooth the distribution and the rebalancing load."
+      }
+    ]
   },
   {
     "q": "What is database replication, and what is the difference between synchronous and asynchronous?",
     "a": "Replication keeps copies of the data on multiple servers, usually one primary that takes writes and replicas that receive changes. In synchronous replication, the primary does not acknowledge a commit until at least one replica has confirmed it, so no committed data is lost on failover, at the cost of higher write latency. In asynchronous replication, the primary commits and acknowledges immediately and ships changes later, giving lower latency but a window of possible data loss (replication lag) if the primary fails.",
     "fs": "Synchronous trades write latency for zero data loss on failover; asynchronous trades a data-loss window for lower latency.",
     "fj": "Assuming replicas are always perfectly up to date, ignoring asynchronous replication lag.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "With synchronous replication, what happens to writes if the only sync replica goes down?",
+        "a": "The primary blocks: it can't get the required acknowledgment, so commits hang and writes stall, you've traded availability for durability. That's why production uses quorum/semi-sync (ack from any 1 of N replicas) so one failure doesn't freeze writes. Naive single-sync-replica setups can take the whole system down when that replica dies."
+      },
+      {
+        "q": "What's the difference between physical (WAL) and logical replication?",
+        "a": "Physical replication ships raw WAL/byte-level page changes, so replicas are exact binary copies, fast and simple but tied to the same version and whole cluster. Logical replication decodes WAL into row-level change events (insert/update/delete) keyed by a publication, enabling selective tables, cross-version upgrades, and replication into a different schema or system, at higher CPU cost."
+      },
+      {
+        "q": "How do you quantify the data-loss risk of async replication?",
+        "a": "By replication lag, the gap between the primary's WAL position and the replica's apply position, measured in bytes or seconds. On failover you lose everything in that gap. You monitor it (`pg_stat_replication`), alarm on thresholds, and for stricter guarantees switch to semi-sync so the window is bounded to in-flight transactions rather than however far behind a slow replica drifted."
+      }
+    ]
   },
   {
     "q": "How do read replicas help scaling, and what is their main pitfall?",
     "a": "Read replicas are copies that serve read queries, letting you spread read load across many servers and offload reporting from the primary. They scale reads and storage redundancy, but they do not increase write throughput, since all writes still go to the single primary. The main pitfall is replication lag with asynchronous replication: a client that writes then immediately reads from a replica may not see its own write (read-after-write inconsistency). You mitigate with read-your-writes routing to the primary or bounded-staleness checks.",
     "fs": "Read replicas scale reads but not writes, and asynchronous lag breaks read-your-writes unless you route fresh reads to the primary.",
     "fj": "Expecting read replicas to also speed up writes, and being surprised when a just-written row is missing on a replica.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Concretely, how do you implement read-your-writes against lagging replicas?",
+        "a": "Pin reads to the primary for a short window after a user's write (sticky routing keyed by user/session), or capture the WAL LSN at write time and only read from a replica that has applied up to that LSN, otherwise fall back to the primary. The first is simpler; the LSN approach is precise and lets you keep using replicas as soon as they catch up."
+      },
+      {
+        "q": "Beyond read-your-writes, what's monotonic-reads and how can replicas violate it?",
+        "a": "Monotonic reads means you never see time go backward, once you've read a value, later reads don't return an older one. Routing a user's successive reads to different replicas with different lag can show a newer value then an older one. Fix by pinning a session to one replica (or by LSN tracking) so reads only move forward."
+      },
+      {
+        "q": "A reporting query on a replica runs fine then suddenly errors with 'canceling statement due to conflict with recovery'. Why?",
+        "a": "On a hot-standby replica, replaying the primary's WAL (e.g., a VACUUM that removes tuples a long-running read still needs) conflicts with the query, and the replica cancels the query to keep applying WAL. You mitigate with `hot_standby_feedback = on` (replica tells primary to delay cleanup) or by raising `max_standby_streaming_delay`, trading lag for query survival."
+      }
+    ]
   },
   {
     "q": "What is the difference between OLTP and OLAP workloads?",
     "a": "OLTP (Online Transaction Processing) handles many small, short, concurrent read/write transactions, like placing an order or updating a profile; it favors normalized schemas, row-oriented storage, and indexes for fast point lookups. OLAP (Online Analytical Processing) handles fewer, long-running analytical queries that scan and aggregate huge volumes, like dashboards and reports; it favors denormalized star schemas and columnar storage. You typically keep them on separate systems so heavy analytics do not starve transactional traffic.",
     "fs": "OLTP is many short point operations on normalized row stores; OLAP is few large scans/aggregations on denormalized columnar stores.",
     "fj": "Running heavy analytical aggregations directly against the production OLTP database and degrading transaction latency.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "How does data get from the OLTP system into the OLAP system?",
+        "a": "Through ETL/ELT pipelines or change-data-capture. Batch ETL periodically extracts and transforms into the warehouse; modern ELT loads raw then transforms in the warehouse (dbt). CDC streams the OLTP WAL/binlog in near real time into the analytics store for low-latency freshness. The pipeline is also where you reshape normalized OLTP tables into denormalized star schemas."
+      },
+      {
+        "q": "What is HTAP and why isn't it just the obvious answer to running both?",
+        "a": "HTAP (Hybrid Transactional/Analytical Processing) systems serve both workloads on one engine, often by keeping a row store for writes plus an in-memory or columnar copy for analytics. It avoids ETL latency, but reconciling row-optimized writes with column-optimized scans is hard, so you typically pay in cost, complexity, or weaker guarantees on one side. It's a genuine tradeoff, not a free lunch."
+      },
+      {
+        "q": "Why does running a big analytical query directly on the OLTP primary hurt more than just being slow?",
+        "a": "It competes for the buffer cache and CPU with latency-sensitive transactions, evicting hot OLTP pages and inflating p99. In MVCC systems a long scan also holds back an old snapshot, blocking VACUUM and causing bloat cluster-wide. So one report can degrade transactional latency and cleanup well beyond its own runtime, the reason analytics is offloaded."
+      }
+    ]
   },
   {
     "q": "Why is columnar storage so much faster than row storage for analytical queries?",
     "a": "OLAP queries usually read a few columns across millions of rows and aggregate them. Columnar storage keeps each column's values together on disk, so a query like SUM(amount) reads only the amount column instead of every byte of every row. That cuts I/O dramatically and, because a column holds similar values, it compresses far better (run-length, dictionary encoding) and is vectorization-friendly. Row storage is better for OLTP, where you read or write whole rows at a time.",
     "fs": "Columnar reads only the touched columns and compresses similar values together, slashing I/O for wide-scan aggregations.",
     "fj": "Assuming column vs row layout is just an implementation detail with no real performance impact for analytics.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why is columnar layout bad for OLTP point lookups and single-row inserts?",
+        "a": "Fetching one whole row means touching every column's separate storage block and stitching them back together, the opposite of a row store's single contiguous read. Inserting one row writes into many column files, and updates are costly because columnar formats favor large immutable batches. So OLTP's per-row read/write pattern is exactly what column stores handle worst."
+      },
+      {
+        "q": "How do columnar engines skip data without indexes via min/max metadata?",
+        "a": "They store per-block (e.g., per row-group/stripe) zone maps holding the min and max of each column. A `WHERE amount > 1000` filter lets the engine skip any block whose max is <= 1000 without reading it, a form of partition pruning at block granularity. Sorting/clustering data by the filter column makes these min/max ranges tight, maximizing skipping."
+      },
+      {
+        "q": "What is late materialization and why does it speed up columnar queries?",
+        "a": "The engine operates on compressed/encoded column vectors and delays reconstructing full rows until as late as possible, ideally after filters and aggregations have shrunk the data. It can run predicates on dictionary codes directly and only materialize the surviving rows' other columns. This keeps work on tight, cache-friendly, vectorizable column data instead of reassembling rows early."
+      }
+    ]
   },
   {
     "q": "What is a covering index, and how does it speed up a query?",
@@ -280,6 +602,20 @@
           "SELECT status FROM orders",
           "WHERE customer_id = 7;"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why might Postgres still hit the heap during a supposed index-only scan?",
+        "a": "Because the index doesn't store row visibility; it must confirm each tuple is visible to your snapshot via the visibility map. If the page isn't marked all-visible (recently modified, not yet vacuumed), it must visit the heap to check, defeating the index-only benefit. Keeping the table well-vacuumed (so pages are all-visible) is what makes index-only scans actually skip the heap."
+      },
+      {
+        "q": "What's the difference between adding a column as a key column versus in INCLUDE?",
+        "a": "Key columns participate in the B-tree's sort order, so they help searching, ordering, and uniqueness, but widen every internal node. `INCLUDE` columns are stored only in leaf nodes as payload, so they make the index covering without bloating the search structure or constraining sort order. Use a key column if you filter/sort on it; use `INCLUDE` if you only need to return it."
+      },
+      {
+        "q": "What's the cost of making a wide index covering, and when does it backfire?",
+        "a": "Every added column enlarges the index, slowing inserts/updates (more to maintain), consuming cache, and the index must be updated whenever any included column changes. If the included column churns frequently, you pay constant index writes for read speed you may not need. Covering indexes pay off on hot, read-heavy queries, not as a default."
       }
     ]
   },
@@ -305,6 +641,20 @@
           "ORDER BY created_at;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Your query is WHERE status = $1 with a parameter. Why won't the planner use the partial index?",
+        "a": "The planner must prove at plan time that the query predicate implies the index predicate. A literal `status = 'pending'` matches; a bound parameter `$1` could be anything, so it can't prove the implication and skips the partial index. You need the constant inlined (or a custom plan with the value known) for the implication check to succeed."
+      },
+      {
+        "q": "How can a partial unique index enforce a conditional uniqueness constraint?",
+        "a": "By making the index `UNIQUE ... WHERE predicate`, uniqueness applies only to the matching subset. The classic use is one active record per key: `CREATE UNIQUE INDEX ON subs(user_id) WHERE active`, allowing many inactive rows per user but only one active. A plain unique constraint can't express that conditional rule; a partial unique index can."
+      },
+      {
+        "q": "When does a partial index quietly become useless as data shifts?",
+        "a": "When the predicate stops being selective. If 'pending' was 1% but a backlog makes it 60% of rows, the index is no longer tiny and the planner may abandon it for a seq scan. Partial indexes assume the excluded value dominates; if that ratio inverts over time, the space and lookup wins evaporate, so the assumption needs monitoring."
+      }
     ]
   },
   {
@@ -325,6 +675,20 @@
           "SELECT * FROM events",
           "WHERE payload @> '{\"type\":\"login\"}';"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does the GIN fastupdate / pending list do, and what's the tradeoff?",
+        "a": "Because a single insert can touch many GIN entries (one per element), GIN buffers new entries in an unsorted pending list to make inserts cheap, then merges them into the main index during VACUUM or when the list fills. The tradeoff is that searches must also scan the pending list, so lookups slow down as it grows. Disabling `fastupdate` makes inserts costlier but reads steady."
+      },
+      {
+        "q": "GiST is described as 'lossy'. What does that mean for query execution?",
+        "a": "A GiST index can return candidate rows that might match (false positives), so the executor adds a recheck step that re-evaluates the predicate on each candidate's actual row. The index narrows the search; the recheck confirms it. This is why GiST suits approximate/spatial predicates, and why an unselective GiST scan can still do meaningful heap work."
+      },
+      {
+        "q": "Why prefer jsonb_path_ops over the default GIN opclass on JSONB?",
+        "a": "The default `jsonb_ops` indexes every key and value separately, supporting key-existence (`?`) and containment, but is larger. `jsonb_path_ops` hashes whole paths, producing a much smaller, faster index for the common `@>` containment queries, at the cost of dropping key-existence operators. If you only do containment lookups, it's the leaner choice."
       }
     ]
   },
@@ -350,6 +714,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "When is a separate IN(...) batch query better than a single JOIN to fix N+1?",
+        "a": "When the join would multiply parent rows by children and duplicate wide parent columns across every child row (cartesian-ish blowup), wasting bandwidth and forcing the app to de-dupe. Two queries, parents then children via `IN`, keep payloads small and let the ORM map them cleanly. ORMs often default to this 'select-in' loading for exactly that reason."
+      },
+      {
+        "q": "Eager-loading everything to avoid N+1 has its own failure mode. What is it?",
+        "a": "Over-fetching: joining or prefetching relations the request never uses pulls huge result sets, inflates memory, and can be slower than the N+1 you feared. The fix is to eager-load only the relations actually needed per use case, not globally. Blindly turning on eager loading trades one performance bug for another."
+      },
+      {
+        "q": "How does GraphQL make N+1 especially insidious, and what solves it?",
+        "a": "Each resolver runs independently per field per parent, so a nested query naturally fires one DB call per parent object, recreating N+1 across the resolver tree. The standard fix is the DataLoader pattern: resolvers register key requests within a tick, and a batch function coalesces them into a single `IN` query, with per-request caching to dedupe."
+      }
     ]
   },
   {
@@ -358,7 +736,21 @@
     "fs": "Log the change durably before touching data pages; on crash you replay the WAL from the last checkpoint to recover committed transactions.",
     "fj": "Assuming COMMIT means the table's data files were written to disk, rather than just the WAL record.",
     "level": "Mid",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "What is a checkpoint, and why not just keep replaying the entire WAL?",
+        "a": "A checkpoint flushes all dirty data pages up to a known WAL position and records it, so recovery only needs to replay WAL after the last checkpoint, not from the beginning. Without checkpoints the WAL would grow unbounded and recovery would take forever. The tradeoff: frequent checkpoints shorten recovery but cause I/O spikes; spreading them out smooths I/O but lengthens recovery."
+      },
+      {
+        "q": "How does synchronous_commit = off change the durability guarantee?",
+        "a": "It lets COMMIT return before the WAL record is fsync'd, so commits get much faster but a crash can lose the last few hundred milliseconds of committed transactions (the unflushed WAL). Crucially, it does not risk corruption or partial transactions, only a small loss window, since WAL ordering still holds. It's a per-transaction durability-for-throughput knob."
+      },
+      {
+        "q": "What is full_page_writes protecting against, and why does it bloat the WAL?",
+        "a": "It guards against torn pages: an OS/disk crash mid-write can leave an 8KB data page half-old, half-new, which WAL deltas can't repair. So after each checkpoint the first modification of a page logs the entire page image. That hardens recovery but significantly inflates WAL volume, which is why aligning the DB page size with storage atomicity or compressing FPIs matters at scale."
+      }
+    ]
   },
   {
     "q": "In PostgreSQL, where does table bloat come from and what does autovacuum do about it?",
@@ -379,6 +771,20 @@
           "    = 100);",
           "-- vacuums after 100 + 5% dead rows"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does VACUUM not shrink the table file, and when do you actually need VACUUM FULL?",
+        "a": "Plain VACUUM marks dead-tuple space reusable in place, so the file stays the same size but new rows fill the gaps, no exclusive lock needed. It only returns space to the OS by truncating trailing empty pages. To physically shrink a badly bloated table you need `VACUUM FULL` (or `pg_repack`), which rewrites it, but `VACUUM FULL` takes an `ACCESS EXCLUSIVE` lock, so it's an outage on a hot table."
+      },
+      {
+        "q": "Autovacuum is running but a high-churn table keeps bloating. What's likely throttling it?",
+        "a": "Either it can't keep up (cost-based delay throttling it, or too few autovacuum workers), or, more often, a long-running transaction/idle-in-transaction or unused replication slot is holding back the oldest snapshot (xmin horizon), so VACUUM is forbidden from removing tuples newer than it. Check `pg_stat_activity` for old `xact_start` and slots; the cleanup is blocked, not slow."
+      },
+      {
+        "q": "What does VACUUM's freezing accomplish beyond reclaiming space?",
+        "a": "Freezing rewrites old tuples' xmin as 'frozen/always-visible' so their transaction ids no longer matter for visibility, preventing transaction-id wraparound. As the cluster approaches the wraparound limit, an aggressive anti-wraparound autovacuum runs even on append-only tables with no dead tuples, purely to freeze. It's a correctness/availability mechanism, not just garbage collection."
       }
     ]
   },
@@ -403,6 +809,20 @@
           "  TO ('2026-07-01');"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is dropping a range partition so much cheaper than DELETE for retention?",
+        "a": "`DROP TABLE`/`DETACH` on a partition is a near-instant catalog/metadata operation that unlinks the whole file, generating no per-row work, no dead tuples, and no subsequent vacuum. A bulk `DELETE` of the same rows must scan, write a dead tuple per row, log it all to WAL, then vacuum the bloat. For time-series retention that difference is enormous."
+      },
+      {
+        "q": "What's the downside of hash partitioning when it comes to range queries?",
+        "a": "Hash scatters consecutive key values across all partitions, so a range query (`ts BETWEEN ...`) can't be pruned, it must scan every partition, defeating the point of partitioning for that access pattern. Hash only prunes on equality of the exact partition key. That's why time-series, which is queried by time ranges, wants range partitioning, not hash."
+      },
+      {
+        "q": "What goes wrong if an inserted row matches no defined partition?",
+        "a": "Without a DEFAULT partition the insert errors with 'no partition found for row', a common production failure when nobody created next month's partition ahead of time. The fixes are a DEFAULT partition to catch strays, or automated partition pre-creation (pg_partman/cron). But a DEFAULT partition can itself bloat and complicates attaching new partitions, so pre-creation is usually preferred."
+      }
     ]
   },
   {
@@ -425,6 +845,20 @@
           "  CONCURRENTLY daily_rev;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does REFRESH ... CONCURRENTLY require a unique index, and what does it cost?",
+        "a": "Concurrent refresh computes the new result into a temp set and diffs it against the existing materialized view to apply only changed rows, which requires a unique key to match rows. The benefit is reads aren't blocked. The cost: it's slower and more I/O-heavy than a plain rebuild because it does a row-by-row merge instead of a bulk swap, and it still takes a brief lock at the end."
+      },
+      {
+        "q": "Postgres matviews don't auto-refresh. How do people get near-real-time materialization?",
+        "a": "They schedule refreshes (cron/pg_cron) at an acceptable staleness, or trigger a refresh from application events. For true incremental real-time materialization you step outside core Postgres, to an extension or a streaming system (e.g., Materialize, or trigger-maintained summary tables that update in the same transaction as the base write). Core matviews are snapshot-and-refresh only."
+      },
+      {
+        "q": "When is a trigger-maintained summary table better than a materialized view?",
+        "a": "When you need always-fresh aggregates and writes are frequent but each touches few groups. A trigger updates the running total in the same transaction as the base change, so reads are instant and never stale, no refresh job. The tradeoffs are write-path overhead, added contention on the summary rows, and more code to keep correct versus a declarative matview."
+      }
     ]
   },
   {
@@ -433,7 +867,21 @@
     "fs": "Expand (add new, additive), migrate (batched backfill + dual-write), then contract (drop old) as separate safe deploys; never rename-in-place with old code live.",
     "fj": "Doing ALTER TABLE RENAME COLUMN in one migration and breaking every app instance still running the old code.",
     "level": "Sr",
-    "asked": 12
+    "asked": 12,
+    "followups": [
+      {
+        "q": "Why must the backfill be done in small batches rather than one big UPDATE?",
+        "a": "A single `UPDATE` over millions of rows takes one giant transaction that locks rows for its whole duration, generates massive WAL, holds back the xmin horizon (blocking VACUUM), and bloats the table, potentially saturating I/O and stalling production. Batching (e.g., a few thousand rows per transaction with a pause) bounds lock time, WAL, and bloat, keeping the system responsive."
+      },
+      {
+        "q": "Adding a NOT NULL column with a default used to lock the table for a long time. Why, and what changed?",
+        "a": "Historically `ADD COLUMN ... DEFAULT x` rewrote every row to store the default, holding an exclusive lock proportional to table size. Postgres 11+ stores a constant default as catalog metadata and materializes it lazily on read, so adding it is instant metadata-only. A volatile default still forces a rewrite, so add the column nullable, backfill in batches, then set the default/NOT NULL."
+      },
+      {
+        "q": "How do you add an index or a NOT-VALID constraint without blocking writes?",
+        "a": "`CREATE INDEX CONCURRENTLY` builds the index without an `ACCESS EXCLUSIVE` lock, scanning the table in passes so writes continue (it's slower and can't run in a transaction block). For constraints, add them `NOT VALID` so new rows are checked but existing ones aren't, then `VALIDATE CONSTRAINT` separately, which takes only a `SHARE UPDATE EXCLUSIVE` lock instead of blocking writes."
+      }
+    ]
   },
   {
     "q": "Why do you need a connection pooler like PgBouncer in front of PostgreSQL?",
@@ -441,7 +889,21 @@
     "fs": "A pooler multiplexes thousands of clients onto a few reused backends; transaction mode maximizes reuse but disallows session state like prepared statements.",
     "fj": "Letting every app instance and lambda open its own direct connection until Postgres hits its connection limit and rejects new clients.",
     "level": "Mid",
-    "asked": 8
+    "asked": 8,
+    "followups": [
+      {
+        "q": "Exactly why do protocol-level prepared statements break in transaction-pooling mode?",
+        "a": "A prepared statement is session state living on one server backend, but transaction mode reassigns you to a different backend each transaction, so a prepare from one transaction won't exist on the next backend you land on. PgBouncer added support by tracking and re-preparing them, but classically you set the driver to simple query mode or disable server-side prepares."
+      },
+      {
+        "q": "A pooler fixes connection count. Why might it still not fix an overloaded database?",
+        "a": "The pooler caps concurrent server connections, but the real limit is CPU/IO and lock contention. Funnel 5000 clients onto 20 backends and if queries are slow, clients just queue at the pooler instead of overwhelming Postgres, latency rises and the pool saturates. A pooler protects against connection exhaustion, not against fundamentally too much work or slow queries."
+      },
+      {
+        "q": "Why does serverless (Lambda/edge functions) make a transaction-mode pooler almost mandatory?",
+        "a": "Each concurrent function instance opens its own short-lived connection, and bursty invocation counts can spike to thousands instantly, far past Postgres's process limit, while connections sit idle between requests. Transaction-mode pooling multiplexes those ephemeral clients onto a few backends and skips per-invocation connect cost. Without it, a traffic spike exhausts connections and errors out."
+      }
+    ]
   },
   {
     "q": "Walk me through the four NoSQL data models and when each one fits.",
@@ -449,7 +911,21 @@
     "fs": "Key-value for caches/sessions, document for whole-entity flexible schemas, wide-column for write-heavy known-pattern scale, graph for multi-hop relationship traversals.",
     "fj": "Treating 'NoSQL' as one thing and picking a document store for a problem that is really a graph traversal or a simple cache.",
     "level": "Jr",
-    "asked": 13
+    "asked": 13,
+    "followups": [
+      {
+        "q": "Why is a graph database faster for multi-hop traversals than a relational DB with join tables?",
+        "a": "Native graph engines use index-free adjacency: each node stores direct pointers to its neighbors, so traversing an edge is a pointer hop, roughly O(1) per step regardless of total graph size. A relational `friends-of-friends` query re-joins and index-scans the edge table at each hop, so cost grows with table size and depth. The graph wins precisely as hop count climbs."
+      },
+      {
+        "q": "Why does wide-column modeling start from queries instead of entities?",
+        "a": "Stores like Cassandra read efficiently only by partition key and clustering order and have no joins, so you can't reshape data at query time. You must know your access patterns first and build one denormalized table per query, duplicating data as needed. Designing by normalized entities, as in relational, produces tables that can't answer your queries without forbidden scatter-gather scans."
+      },
+      {
+        "q": "Document stores tempt you to embed everything. When should you reference instead?",
+        "a": "Embed when the sub-data is owned by and fetched with the parent and is bounded in size (order line items). Reference (store an id and look up separately) when the related data is shared across many parents, grows unbounded, or updates independently, otherwise you get huge documents, duplicate-update anomalies, and hit size limits. It's the embed-vs-join tradeoff reframed for documents."
+      }
+    ]
   },
   {
     "q": "How does the CAP theorem apply when choosing or operating a distributed database?",
@@ -457,7 +933,21 @@
     "fs": "CAP only bites during a partition: pick CP (reject/block to stay consistent) or AP (stay available, reconcile later); PACELC adds the latency tradeoff when there's no partition.",
     "fj": "Calling a database 'CA' as if you could permanently opt out of network partitions.",
     "level": "Sr",
-    "asked": 14
+    "asked": 14,
+    "followups": [
+      {
+        "q": "What does the PACELC extension add that plain CAP misses?",
+        "a": "CAP only describes behavior during a partition. PACELC says: if Partitioned, choose Availability or Consistency; Else (normal operation), choose Latency or Consistency. It captures that even with no partition, replicating synchronously for strong consistency costs latency, while async replication is faster but weaker. It forces you to state the everyday tradeoff CAP ignores."
+      },
+      {
+        "q": "Why is labeling a single-node SQL database 'CA' considered meaningless?",
+        "a": "Because CAP's choice only exists in a distributed system that can be partitioned. A single node has no network partition to survive, so 'sacrificing P' just means 'not distributed', it's not a third option. The moment you add replicas you're back to choosing C or A under partition. 'CA' describes a non-distributed system, not a design point."
+      },
+      {
+        "q": "How does a CP system using quorums decide who stays available during a partition?",
+        "a": "With majority quorum (e.g., Raft/Paxos): only the side holding more than half the nodes can elect a leader and accept writes, guaranteeing the latest data; the minority side rejects writes (and often stale reads) to preserve consistency. So a 5-node cluster split 3/2 keeps the 3-node side serving and the 2-node side unavailable, deliberately sacrificing availability on the minority."
+      }
+    ]
   },
   {
     "q": "What does eventual consistency actually mean, and what bugs does it introduce?",
@@ -465,7 +955,21 @@
     "fs": "Replicas converge eventually but reads can be stale or reordered until then; mitigate with read-your-writes/monotonic-read session guarantees and idempotent writes.",
     "fj": "Assuming a write is instantly visible everywhere and being surprised when a just-saved value reads back as the old one.",
     "level": "Mid",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "Why is last-write-wins a dangerous default conflict resolution strategy?",
+        "a": "LWW picks a winner by timestamp and silently discards the loser's write, so concurrent updates cause data loss, and it depends on clock synchronization that's unreliable across nodes (clock skew can let an older write 'win'). It's simple but lossy. When losing a write is unacceptable you need version vectors, application merge logic, or CRDTs instead."
+      },
+      {
+        "q": "How do CRDTs resolve concurrent writes without a coordinator?",
+        "a": "Conflict-free Replicated Data Types are designed so their merge operation is commutative, associative, and idempotent, meaning any order of applying updates converges to the same result. A grow-only counter or an add-wins set can merge replicas mathematically without picking a loser or coordinating. They trade richer semantics and metadata overhead for coordination-free, lossless convergence."
+      },
+      {
+        "q": "What's the difference between eventual consistency and causal consistency?",
+        "a": "Eventual consistency only promises convergence with no ordering, so you can see effects before their causes (a reply before its message). Causal consistency adds happens-before order: causally related ops are seen in order, while concurrent ones may differ. It rules out the most confusing reorderings while staying available, stronger than eventual but weaker than linearizable."
+      }
+    ]
   },
   {
     "q": "What is two-phase commit, and what is its fundamental weakness?",
@@ -473,7 +977,21 @@
     "fs": "2PC's prepare/commit gives cross-database atomicity but blocks: a coordinator crash after the yes votes leaves participants holding locks in the prepared state.",
     "fj": "Reaching for distributed 2PC across microservices without accounting for the coordinator-failure blocking and lock-holding it causes.",
     "level": "Sr",
-    "asked": 9
+    "asked": 9,
+    "followups": [
+      {
+        "q": "How does a saga differ from 2PC, and what does it give up?",
+        "a": "A saga is a sequence of local transactions, each committed immediately, with a compensating transaction to undo each step if a later one fails. No locks are held across services and no coordinator blocks. What it gives up is isolation: intermediate states are visible, and 'undo' is a semantic compensation (refund), not a true rollback, so design for partial-visibility and idempotency."
+      },
+      {
+        "q": "Does adding a 'three-phase commit' actually solve 2PC's blocking problem?",
+        "a": "Only partially, and at a cost. 3PC inserts a pre-commit phase so participants can reach a decision without the coordinator after a crash, making it non-blocking under simple crash-stop failures. But it adds a network round trip and still fails under network partitions/asynchrony (it can violate agreement), so in practice consensus protocols like Paxos/Raft are used instead of 3PC."
+      },
+      {
+        "q": "How do consensus protocols like Raft avoid 2PC's single-coordinator blocking?",
+        "a": "They replace the single coordinator with a quorum: a decision commits once a majority durably acknowledges it, and if the leader crashes the remaining majority elects a new leader and recovers the committed state from the log. No single point's death strands everyone, the cluster progresses as long as a majority is alive, unlike 2PC where a coordinator crash blocks all participants."
+      }
+    ]
   },
   {
     "q": "Compare hash-based, range-based, and directory-based sharding strategies.",
@@ -481,7 +999,21 @@
     "fs": "Hash = even spread but scatter-gather range scans; range = locality but hotspots on monotonic keys; directory = flexible placement at the cost of a lookup table you must keep available.",
     "fj": "Picking range sharding on a timestamp key for write-heavy data, then funneling all new writes into one hot shard.",
     "level": "Sr",
-    "asked": 8
+    "asked": 8,
+    "followups": [
+      {
+        "q": "Why is the directory's availability the Achilles' heel of directory sharding?",
+        "a": "Every read and write must first consult the directory to locate the shard, so it's on the critical path, if it's down or slow, the whole system is. It becomes a single point of failure and bottleneck unless replicated and cached aggressively. Arbitrary key placement is bought with this extra hop and keeping the directory itself highly available."
+      },
+      {
+        "q": "Range sharding gives query locality. Why might that locality itself become a problem?",
+        "a": "Because locality concentrates load: keys queried or written together live on the same shard, so a hot key range (recent timestamps, a popular tenant) overloads one shard while others idle. The same property that makes range scans cheap creates hotspots. You end up manually splitting hot ranges, the rebalancing toil that hash sharding avoids by spreading load."
+      },
+      {
+        "q": "How does directory sharding make rebalancing easier than hash or range?",
+        "a": "Since placement is an explicit mapping, you can move any individual key or bucket to a less-loaded shard by updating the directory entry and migrating just that data, no global reshuffle, no key-order constraint. Hash requires re-hashing (mitigated by consistent hashing), and range requires splitting/merging ordered ranges. Directory turns rebalancing into targeted entry updates."
+      }
+    ]
   },
   {
     "q": "What is a foreign key, and what does a database do to enforce referential integrity?",
@@ -504,6 +1036,20 @@
           "-- orders; insert of bad user_id fails"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does an unindexed foreign key column hurt you specifically on parent deletes?",
+        "a": "Postgres doesn't auto-create an index on the referencing (child) column. When you delete or update a parent row, the engine must find all referencing children to enforce the action, and with no index that's a full child-table scan per parent delete. On a large child table this makes deletes pathologically slow, the classic missing-FK-index bug. Index the FK column to make those checks fast."
+      },
+      {
+        "q": "What's the difference between ON DELETE CASCADE, RESTRICT, and SET NULL in practice?",
+        "a": "CASCADE deletes the child rows too, convenient but dangerous since one delete can silently remove huge subtrees. RESTRICT (and NO ACTION) blocks the parent delete while children exist, forcing you to handle them explicitly, safer against accidents. SET NULL keeps children but nulls the reference, for when a child can validly exist orphaned. The choice encodes your domain's deletion semantics."
+      },
+      {
+        "q": "Why do many sharded or microservice systems deliberately drop foreign keys?",
+        "a": "FK enforcement requires the parent and child to live in the same database, but sharding/service boundaries split them across nodes where the engine can't check. Cross-node FKs are unsupported or need expensive coordination. So those systems move integrity to the application (validate on write, reconcile async), trading the guarantee for horizontal scalability and service autonomy."
+      }
     ]
   },
   {
@@ -525,6 +1071,20 @@
           "-- can't use index efficiently:",
           "WHERE b = 2;"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why specifically does a range predicate on a leading column 'stop' the index from using later columns?",
+        "a": "Within a range like `a > 5`, the rows span many different `a` values, and `b` is only sorted within each fixed `a`, not across the range. So the index can seek to the range start but can't then use `b` to narrow or order without re-sorting. That's why the equality columns go first and the single range/sort column goes last, after the range, ordering by `b` is no longer free."
+      },
+      {
+        "q": "How does the index's stored sort direction interact with ORDER BY a, b DESC?",
+        "a": "A B-tree can be scanned forward or backward, so an index on `(a, b)` ascending serves `ORDER BY a, b` (forward) and `ORDER BY a DESC, b DESC` (backward) without a sort. But mixed directions like `ORDER BY a ASC, b DESC` match neither scan direction and force a sort, unless you build the index with explicit per-column direction (`CREATE INDEX ... (a ASC, b DESC)`)."
+      },
+      {
+        "q": "When does column order between two equality predicates still matter for index size and reuse?",
+        "a": "For a pure two-equality query either order works, but order affects index reuse and size. Put the column that's also queried alone (as a leading prefix) first, since `(a, b)` also serves `WHERE a = ?` but not `WHERE b = ?`. Leading with the higher-cardinality/more-selective column also tightens the initial seek. So you optimize for which prefixes other queries need, not just this one."
       }
     ]
   }

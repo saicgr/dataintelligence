@@ -4,7 +4,21 @@
     "a": "Hex is a collaborative, cloud data workspace where you blend SQL and Python cells in one polyglot notebook (called a project), then publish the result as an interactive data app. Unlike a classic notebook, cells form a reactive dependency graph: Hex tracks how cells reference each other and re-runs only what's affected, so state stays consistent rather than depending on the order you happened to click Run.",
     "fs": "It's a reactive, polyglot SQL+Python workspace where the same project doubles as a publishable data app.",
     "fj": "It's just Jupyter in the browser with a nicer theme.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Where does the project's compute actually run, and what is the warehouse for?",
+        "a": "Python/no-code cells run in a Hex-managed kernel on a compute profile you size; data-connection SQL runs in your warehouse (Snowflake, BigQuery, Databricks, etc.). Hex is the orchestration and presentation layer, not a query engine for connected sources. That split is why pushing work down to the warehouse keeps kernel memory and Hex compute cost low."
+      },
+      {
+        "q": "If it's reactive, why does Hex still keep a long-lived kernel?",
+        "a": "Reactivity only governs which cells re-run; the kernel still holds live Python state (dataframes, imported modules) between runs so downstream cells can reference upstream variables by name. The DAG decides execution order over that shared kernel state. A kernel restart clears everything and forces a full re-run of the graph."
+      },
+      {
+        "q": "When is Hex's project model a worse fit than a plain Jupyter notebook?",
+        "a": "For deep local iteration with custom system dependencies, GPU work, or heavyweight ML training, a self-managed Jupyter/IDE gives more control than Hex's managed kernel and profiles. Hex shines at collaborative analytics and publishing, not as a general ML training rig. Teams often prototype models elsewhere and use Hex for the analytical app layer."
+      }
+    ]
   },
   {
     "q": "How do you mix SQL and Python in a single Hex project?",
@@ -33,6 +47,20 @@
           "  .reset_index())"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What is the gotcha when a SQL cell returns millions of rows into the Python kernel?",
+        "a": "In dataframe (return) mode the full result streams into the kernel as a pandas dataframe, which can be slow or OOM for big pulls. Use query mode so the result stays in-warehouse with only a ~1k-row preview, and aggregate before materializing. Pulling a wide raw table just to `groupby` in pandas is the classic anti-pattern."
+      },
+      {
+        "q": "Can Python write back to a SQL cell, or only SQL feed Python?",
+        "a": "It's bidirectional: a dataframe SQL cell can query any in-kernel dataframe by name via DuckDB, so a pandas-built dataframe becomes a SQL source. You can ping-pong SQL->Python->SQL freely. The direction of an edge is set by which variable a cell reads, not by language."
+      },
+      {
+        "q": "How do you change a SQL cell's output variable name without breaking downstream cells?",
+        "a": "The output variable is editable in the cell header, but renaming it breaks every downstream cell that references the old name, since edges are name-based. Update all dependents, or use the graph/usages view to find references first. Hex won't silently rewire them for you."
+      }
     ]
   },
   {
@@ -40,21 +68,63 @@
     "a": "Implicitly, by variable name. A cell that produces a dataframe assigns it to an output variable; any other cell that references that name becomes a downstream dependent in the graph. There's no explicit wiring or import. Because passing is by reference in shared kernel state, naming and ordering of dependencies are what define the flow, not the cell's position on the canvas.",
     "fs": "Cells pass dataframes by referencing each other's output variable names; Hex infers the edge automatically.",
     "fj": "You drag a wire between cells to connect them.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Since passing is by reference, what happens if a downstream cell mutates the dataframe in place?",
+        "a": "It can corrupt shared kernel state: another cell reading the same variable sees the mutated object, and the graph can't model that hidden side effect, so results depend on run order again. Treat upstream dataframes as immutable and assign a new distinctly-named output instead of `inplace=True`. This is the single biggest reactive-model footgun."
+      },
+      {
+        "q": "How does Hex know which variables a cell reads versus only writes?",
+        "a": "Hex statically parses each cell's code to detect referenced (read) and assigned (written) names, then builds edges from writers to readers. A name read but never written upstream is treated as a free/global reference, not an edge. Dynamic access like `globals()['x']` can defeat this analysis and hide a real dependency."
+      },
+      {
+        "q": "What if two cells both assign the same output variable name?",
+        "a": "That creates an ambiguous or cyclic dependency the DAG can't order cleanly, and Hex will flag it rather than guess. Single-assignment style, one distinct output name per cell, is the fix. Reusing names is a Jupyter habit that the reactive graph explicitly disallows."
+      }
+    ]
   },
   {
     "q": "Explain Hex's reactive execution and dependency graph.",
     "a": "Hex parses each cell to find which variables it reads and writes, then builds a DAG of cells. When you run or edit a cell, Hex computes its upstream dependencies (to ensure inputs are fresh) and its downstream dependents, and executes the affected subgraph. This keeps notebook state internally consistent and reproducible, avoiding the classic out-of-order hidden-state problem. You can open a Graph view to visualize these edges.",
     "fs": "Hex builds a DAG from variable references and re-runs the affected upstream/downstream subgraph, keeping state consistent.",
     "fj": "Reactive just means it auto-saves your work.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Can the dependency graph contain a cycle, and what happens if it does?",
+        "a": "No, the DAG must be acyclic. If cell A reads B's output and B reads A's, Hex detects the cycle and refuses to order/run it, surfacing an error. Cycles usually come from reusing an output name or mutating a shared dataframe; break them by giving each transformation a distinct output name."
+      },
+      {
+        "q": "Does Hex re-run cells in parallel or strictly one at a time?",
+        "a": "Within a single kernel, Python cells execute sequentially in dependency order because they share interpreter state. Independent branches still run in a valid topological order rather than truly parallel, and SQL pushed to the warehouse runs there. So the DAG defines order and what's skipped, not multi-core parallelism of Python cells."
+      },
+      {
+        "q": "How does the graph handle a cell that has side effects but no output variable, like an API write?",
+        "a": "With no written variable, nothing downstream depends on it, so Hex may not re-run it when you'd expect, and ordering relative to other cells is undefined. For order-sensitive side effects, force a dependency by having it read an upstream variable or return a value others reference. Pure side-effect cells are an anti-pattern in a reactive graph."
+      }
+    ]
   },
   {
     "q": "When you edit one cell, which other cells re-run, and why?",
     "a": "When a cell changes, Hex re-runs its downstream dependents, the cells whose inputs derive (directly or transitively) from the changed cell's outputs. Cells that don't depend on it are untouched. Upstream cells run only if their outputs are stale. This is the core efficiency win: long chains re-execute only the necessary slice, not the whole notebook top-to-bottom.",
     "fs": "Editing a cell re-runs only its transitive downstream dependents, not the entire notebook.",
     "fj": "Editing any cell re-runs the whole notebook from the top.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "If you edit only a comment or whitespace in a cell, does the subgraph still re-run?",
+        "a": "Editing the cell marks it stale, so running it propagates to dependents even if the logic is unchanged, the graph reacts to that the cell ran, not to a semantic diff. To avoid needless warehouse cost on cosmetic edits, rely on SQL caching, which reuses an identical query's result. Be deliberate about running cosmetic edits in expensive chains."
+      },
+      {
+        "q": "What if a downstream cell's result didn't actually change, do its own dependents still re-run?",
+        "a": "Yes, the model propagates 'this cell ran' to its dependents regardless of whether the output value differs; there's no value-level memoization across cells. This can cascade re-runs even when numbers are identical. SQL-result caching mitigates the warehouse-cost portion, but the kernel cells still execute."
+      },
+      {
+        "q": "How do you stop an unrelated expensive cell from re-running when you tweak inputs?",
+        "a": "Structure the graph so the expensive cell isn't downstream of the input you're changing, i.e. don't make it reference that variable. If it genuinely needn't react, move it to a separate branch or precompute it once. Reactivity only re-runs true dependents, so the fix is decoupling the dependency, not a setting."
+      }
+    ]
   },
   {
     "q": "What is an input parameter in Hex and how does it trigger re-runs?",
@@ -72,6 +142,20 @@
           "WHERE region = {{ region_filter }}",
           "GROUP BY region"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How is a button input different from a dropdown in the reactive model?",
+        "a": "A dropdown re-runs dependents the instant its value changes; a button input is for deferred execution, you stage several input changes and trigger the dependent run only on click. Use a button when each input change would fire an expensive warehouse query and you want one run after all selections. It trades immediacy for cost control."
+      },
+      {
+        "q": "How do you populate a dropdown's options dynamically from a query?",
+        "a": "Bind the dropdown's options to a dataframe column instead of a static list, so the choices come from a live SQL/Python result. That makes the dropdown itself downstream of that query, and its options refresh when the source data changes. Useful for showing only regions that actually exist in the current data."
+      },
+      {
+        "q": "What happens to a dependent query if an input is empty or cleared?",
+        "a": "The variable holds an empty/None value and your SQL still runs, which can return zero rows or error if the Jinja binding expects a value. Guard with a default, a Jinja conditional, or validation so an empty multi-select doesn't produce `IN ()`. Don't assume an input is always populated."
       }
     ]
   },
@@ -91,6 +175,20 @@
           "WHERE status IN {{ status_list | array }}",
           "  AND day >= {{ start_date }}"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is Jinja parameter binding safer than building the SQL string in Python?",
+        "a": "Hex parameter-binds the value with correct quoting and typing, mirroring a prepared statement, so it resists SQL injection and quoting bugs. F-string concatenation lets a malicious or odd input alter the query structure. Binding also lets Hex hash the query consistently for caching."
+      },
+      {
+        "q": "How do you inject a dynamic identifier like a table or column name, which can't be a bound value?",
+        "a": "Bound parameters are for values, not identifiers, so a `{{ col }}` in the column position won't bind cleanly. Use Jinja control flow or build the SQL text in a Python cell and reference it, accepting you must validate the identifier against an allowlist yourself. Templating identifiers reopens injection risk, so whitelist them."
+      },
+      {
+        "q": "What does {{ list | array }} expand to, and what breaks if the list is empty?",
+        "a": "It expands to a parenthesized, properly-typed value list for an `IN (...)` clause. An empty list yields `IN ()`, which is invalid in most warehouses and errors. Guard with a Jinja `{% if list %}` branch or a sentinel so an empty multi-select doesn't break the query."
       }
     ]
   },
@@ -112,6 +210,20 @@
           "ORDER BY amount DESC"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Which SQL dialect does dataframe SQL use, and why does that bite people?",
+        "a": "Dataframe SQL uses the DuckDB dialect, not your warehouse's (Snowflake/BigQuery) dialect. So functions, date handling, and `QUALIFY`/regex syntax may differ from the connection SQL you wrote one cell up. Switching a cell between connection and dataframe mode can break syntax that was valid in the other dialect."
+      },
+      {
+        "q": "When should you prefer dataframe SQL over just pulling everything into the warehouse?",
+        "a": "Use dataframe SQL when joining or aggregating across results that already live in the kernel, from different connections, an API, or an uploaded file, so you avoid round-tripping into the warehouse. DuckDB is fast over those in-memory Arrow/pandas frames. For raw heavy pulls from one warehouse, stay in connection/query mode instead."
+      },
+      {
+        "q": "Does dataframe SQL inherit query mode's memory savings?",
+        "a": "No, dataframe SQL operates on data already materialized in the kernel, so the rows are in memory by definition. Query mode's in-warehouse benefit only applies to connection SQL; the moment you feed a result into DuckDB dataframe SQL or Python, it's materialized. Filter in the warehouse first if memory is a concern."
+      }
     ]
   },
   {
@@ -119,35 +231,105 @@
     "a": "Chart cells are no-code visualization cells: you pick a dataframe as the source and map columns to axes, color, and aggregation in a UI, no plotting code required. The chart depends on its source dataframe, so when an upstream input or query changes, the chart re-renders reactively. Selecting points in a chart can also emit a filtered dataframe that downstream cells can consume, making charts both outputs and interactive inputs.",
     "fs": "Chart cells are no-code, bind to a source dataframe, re-render reactively, and can emit a filtered selection downstream.",
     "fj": "You always have to write Matplotlib/Plotly code to chart in Hex.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "When would you still drop to code (Plotly/Altair) instead of a no-code chart cell?",
+        "a": "Use a code chart for visualizations the no-code builder doesn't support, custom annotations, niche chart types, bespoke interactivity, or programmatic styling driven by data. The trade-off is that code charts aren't editable by non-coders and don't emit the built-in cross-filter selection. Reach for code only when the no-code cell genuinely can't express it."
+      },
+      {
+        "q": "How does a chart's selection-as-input avoid creating a dependency cycle with its own source?",
+        "a": "The selection is a separate output variable; downstream cells consume the filtered selection, not the chart's source query, so the edge points forward, not back into the source. As long as the source query doesn't read the selection variable, there's no cycle. Wiring the selection back upstream into its own source is what would break it."
+      },
+      {
+        "q": "What's the performance concern with charting a very large source dataframe?",
+        "a": "Rendering hundreds of thousands of points strains the browser and bloats the app payload. Pre-aggregate or sample in SQL/query mode so the chart binds to a reduced dataframe, plotting daily rollups instead of every raw row. The chart should consume summarized data, not the full fact table."
+      }
+    ]
   },
   {
     "q": "Besides chart cells, what other no-code cells exist and why do they matter for the graph?",
     "a": "Hex has no-code cells like chart, map, table (with filters/sorts), and pivot that sit alongside SQL/Python cells and return dataframes. Because they output dataframes like any code cell, they participate in the dependency graph; for example a no-code filter table can feed a downstream Python model. This lets non-coders contribute steps that remain composable with code.",
     "fs": "No-code cells (chart, map, pivot, filter table) output dataframes, so they're first-class nodes in the same DAG.",
     "fj": "No-code cells are dead ends, you can't use their output anywhere else.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Does a no-code table's interactive filter actually change the dataframe downstream cells receive?",
+        "a": "A display-only sort/filter on a table cell affects the view, but the cell can also expose a filtered output dataframe that dependents consume, or expose the user's selection. Know which you're using: a purely visual filter won't propagate to a downstream Python cell. Wire the explicit filtered/selected output when you need it to flow."
+      },
+      {
+        "q": "Why might a team prefer a no-code pivot cell over equivalent pandas code?",
+        "a": "A pivot cell is editable by analysts who don't write pandas, renders consistently, and stays a first-class graph node, so the step is auditable and composable without code review of `pivot_table` calls. The trade-off is less control over edge cases than code. It lowers the barrier for non-coders to own a transformation."
+      },
+      {
+        "q": "What's lost in version diffs when logic lives in no-code cells instead of code?",
+        "a": "No-code cells serialize as configuration in the project YAML, so a diff shows config changes rather than readable line-by-line code, which can be harder to review than a SQL/Python diff. Hex's Reviews mitigate this by showing the rendered output alongside the change. For complex logic, code can be more reviewable than a tangle of no-code config."
+      }
+    ]
   },
   {
     "q": "What is a Hex app and how does publishing relate to the notebook?",
     "a": "An app is a curated, stakeholder-facing layout built from a subset of the project's cells, inputs, text, and visualizations, while the underlying code stays hidden. Publishing snapshots the current project version as the live app. You keep editing the notebook freely without changing what viewers see, then re-publish when ready. So the notebook is the source of truth and the app is a published view of a chosen version.",
     "fs": "An app is a published, curated view of a project version; editing the notebook doesn't change the live app until you re-publish.",
     "fj": "Every save to the notebook instantly changes what app viewers see.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "If editing doesn't affect the live app, how do viewers ever get fresh data?",
+        "a": "Logic changes need a re-publish, but data freshness is separate: a published app re-queries on viewer load or via scheduled runs, and 'update published results' refreshes cached data without changing logic. So viewers see new numbers from runs while the curated layout stays pinned to the published version. Code edits and data refresh are decoupled."
+      },
+      {
+        "q": "Can you roll back a bad app publish to a prior version?",
+        "a": "Yes, every saved version is in the version timeline, and you can re-publish an earlier one to instantly restore the previous app for viewers. Because publishing is just pinning a version, rollback is publishing the known-good version, no Git revert needed. This is why version labels matter."
+      },
+      {
+        "q": "What's the difference between saving a version and publishing the app?",
+        "a": "Saving records a version in history (and, with Git sync, a commit); publishing pins one of those versions as what app viewers see. You can save many versions while editing without any of them reaching stakeholders. Only an explicit publish changes the live app."
+      }
+    ]
   },
   {
     "q": "How are input parameter values shared and reproduced when distributing an app link?",
     "a": "Hex can generate a shareable app URL that encodes the current input values as URL parameters. A recipient opening that link sees the app pre-filtered to exactly those inputs, and because execution is reactive, the dependent cells recompute for those values. This makes specific filtered views reproducible and linkable without cloning the project.",
     "fs": "App input values serialize into the URL, so a link reproduces a specific filtered, recomputed view.",
     "fj": "There's no way to share a specific filtered state; everyone always sees the default.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Does opening a parameterized link trigger a fresh warehouse query for that recipient?",
+        "a": "It depends on run settings: with app caching on, the dependent cells may serve cached SQL results within the staleness window rather than re-billing the warehouse; a viewer-triggered run on a Can-View permission always uses cache. So a shared link recomputes the view but not necessarily with a fresh warehouse hit. Tune caching for the cost/freshness you want."
+      },
+      {
+        "q": "What's the security risk of encoding input values in a URL?",
+        "a": "Sensitive filter values (a customer ID, a region) become visible in the link and any logs or browser history that capture it, and the recipient still needs Can View App permission to load anything. URL params are convenience, not access control; the share permission is what actually gates data. Don't treat an obscure URL as a secret."
+      },
+      {
+        "q": "Can every input type be serialized into the URL?",
+        "a": "Simple scalar inputs (dropdowns, dates, text, sliders) serialize cleanly; complex states like a large multi-select or a table selection may not round-trip fully and can fall back to defaults. Test the link for the exact inputs you care about. Don't assume an arbitrarily complex filtered state is always link-reproducible."
+      }
+    ]
   },
   {
     "q": "How does version history work in Hex?",
     "a": "Projects have built-in versioning: a chronological timeline of versions, edits, and comments. You can browse what changed over time, label or name versions, restore an earlier version, and you publish a specific version to an app. This gives you reproducibility and a rollback path without an external Git workflow, though it's project-level history rather than line-level diffs of a file.",
     "fs": "Hex keeps a built-in version timeline you can browse, label, restore, and publish from, no external Git needed.",
     "fj": "There's no version history; if you overwrite a cell the old logic is gone.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Does restoring an old version also restore the data its cells produced?",
+        "a": "It restores the logic, layout, and cell definitions, not a frozen snapshot of the data, re-running a restored version re-queries the warehouse against current data. So a restored project can yield different numbers than when that version was first saved. Versions capture code, not a data time-machine."
+      },
+      {
+        "q": "How does built-in versioning handle concurrent editors on the same project?",
+        "a": "Hex projects are real-time collaborative like a Google Doc, so multiple editors see live changes rather than committing in parallel branches. Versions are points you save along that shared timeline. The branching/PR model only appears when you enable Git sync; native history is linear."
+      },
+      {
+        "q": "When is built-in version history insufficient and you need Git sync?",
+        "a": "When you need line-level diffs, branch-and-PR review, audit in an external repo, or to keep notebook logic alongside other code, the project-level timeline isn't enough. Git sync serializes the project to diff-friendly YAML and maps saved versions to commits. Reach for it when compliance or code-review workflows demand real Git."
+      }
+    ]
   },
   {
     "q": "How do scheduled runs work in Hex and what can they trigger?",
@@ -162,6 +344,20 @@
         "lines": [
           "0 7 * * 1-5"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the difference between a subscription and a conditional notification?",
+        "a": "A subscription fires every time a scheduled run completes (or errors), optionally attaching the output, it's a heartbeat. A conditional notification only fires when a data condition you define is met by the run, e.g. revenue dropped below a threshold. Use conditional alerts to avoid notification fatigue from routine runs."
+      },
+      {
+        "q": "Does a scheduled run that updates published results use cached SQL?",
+        "a": "No, when 'update published results' is enabled the background run ignores cached SQL to fetch the freshest data before re-publishing. By contrast, runs triggered by Can-View users always reuse cache to spare the warehouse. So freshness vs cost depends on who/what triggers the run."
+      },
+      {
+        "q": "What's the maximum schedule frequency, and how do you go faster?",
+        "a": "Scheduled runs cap at hourly; you can't natively schedule sub-hourly. For near-real-time needs you'd trigger runs via the API/automation on a tighter loop or rethink whether an app re-run is the right tool. Don't expect Hex schedules to drive minute-level pipelines."
       }
     ]
   },
@@ -181,6 +377,20 @@
           "client = ApiClient(token=token)"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why are secrets safer than inlining a key, given the code is still in version history?",
+        "a": "Because the secret value never enters cell source or the serialized project, only a reference like `os.environ['TOKEN']` is stored, so version history and any Git sync contain no credential. Rotating the secret updates every reference at once. Inlined keys leak into history forever and require rewriting commits to purge."
+      },
+      {
+        "q": "How do you give an app warehouse access without each viewer having their own credentials?",
+        "a": "The data connection's stored credentials (or a service account) execute queries on behalf of viewers, so a Can-View-App user runs the app without holding the warehouse password. For per-user data control you'd combine that with row-level security or OAuth-based connections. The connection is the shared identity to the warehouse."
+      },
+      {
+        "q": "What's the risk of a single broad service-account connection shared across many projects?",
+        "a": "It's convenient but over-privileged: every project and app using that connection inherits its full warehouse access, so a leaked or misused project can read anything the account can. Prefer least-privilege roles per use case and lean on workspace roles plus project shares to limit blast radius. Don't make one god connection for everything."
+      }
     ]
   },
   {
@@ -188,7 +398,21 @@
     "a": "In Jupyter, execution order is manual and hidden state can accumulate: a cell may reference a variable defined in a cell you later deleted or ran out of order, so a top-to-bottom rerun can produce different results. Hex enforces a dependency-driven order from the graph, so a given change yields a predictable, consistent set of re-computes. State reflects the code as written, not your click history.",
     "fs": "The DAG enforces a deterministic recompute order, eliminating Jupyter's hidden out-of-order state.",
     "fj": "Reproducibility is the same; both just run cells top to bottom.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Even with the DAG, what can still make a Hex run non-reproducible?",
+        "a": "External nondeterminism the graph can't control: live warehouse data changing between runs, `current_timestamp`/`random()`, unpinned package versions, or API calls with side effects. The DAG fixes ordering, not the inputs. Pin dependencies and snapshot or parameterize time to get true reproducibility."
+      },
+      {
+        "q": "How does in-place mutation still break reproducibility despite the reactive model?",
+        "a": "If a cell mutates a shared dataframe in place, another cell reading that object sees state that depends on which ran first, reintroducing the hidden-order problem the DAG was meant to remove, because the mutation isn't modeled as an edge. Single-assignment, no-mutation style is what makes the guarantee hold. The graph only orders what it can see."
+      },
+      {
+        "q": "Does the reactive model guarantee a fresh viewer gets identical numbers to the author?",
+        "a": "Only if data and caching align: the same code runs, but a viewer may hit cached SQL results or query data that has since changed, so numbers can differ from when the author published. Reproducibility of logic is guaranteed; reproducibility of values needs frozen data or a published snapshot. Distinguish code determinism from data freshness."
+      }
+    ]
   },
   {
     "q": "What is a gotcha when moving from Jupyter habits to Hex's reactive graph?",
@@ -217,6 +441,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Is it fine to reassign the same variable multiple times within one cell?",
+        "a": "Yes, within a single cell normal Python sequencing applies, the graph only models edges between cells, not lines inside one. So `df = ...; df = df[...]` in one cell is fine; the cell exposes one final output. The rule is one distinct output per cell, not one assignment per line."
+      },
+      {
+        "q": "How do you detect these ambiguous-dependency problems before they bite?",
+        "a": "Open the Graph/DAG view to spot duplicate output names, unexpected edges, or cells with no dependents, and watch for Hex's cyclic-dependency warnings. The usages panel shows where a variable is read. Reviewing the graph is the equivalent of a lint pass for reactive structure."
+      },
+      {
+        "q": "If a library only offers an in-place API, how do you stay safe?",
+        "a": "Copy first, then mutate the copy and assign it to a new output, e.g. `clean = df.copy(); clean.dropna(inplace=True)`, so the upstream dataframe other cells read is never altered. The cost is an extra copy in memory. Never mutate a shared upstream object that another node depends on."
+      }
     ]
   },
   {
@@ -238,6 +476,20 @@
           "GROUP BY day, region"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If every dropdown change fires an expensive warehouse query, how do you control cost?",
+        "a": "Gate execution behind a button input so several filter changes batch into one run, lean on SQL caching for repeated identical queries, and enable app caching so viewers reuse results within the staleness window. You can also pre-aggregate into a smaller summary table. The goal is fewer, cheaper warehouse hits per interaction."
+      },
+      {
+        "q": "How do you let the app stay responsive while filtering billions of rows?",
+        "a": "Query mode keeps the result in-warehouse with a 1k preview and pushes downstream SQL as a CTE, so you never stream the full set into the kernel; pair that with warehouse-side aggregation so charts bind to small rollups. Add appropriate clustering/partition pruning on the warehouse side. The kernel should only ever see reduced data."
+      },
+      {
+        "q": "Where do semantic models help in this design?",
+        "a": "If your warehouse data is exposed via Hex's semantic models, inputs can drive governed metrics/dimensions instead of hand-written SQL, giving consistent definitions and letting the Agent and end users pick endorsed fields. That reduces metric drift across apps. It's the governed alternative to every app re-deriving 'revenue' in raw SQL."
+      }
     ]
   },
   {
@@ -245,7 +497,21 @@
     "a": "Apps can be configured to run on load, on a schedule, or use cached results, and viewer-triggered runs often reuse cached SQL to avoid hammering the warehouse. This matters for cost and freshness: an always-live app re-queries per viewer, while a scheduled-refresh app serves cached results between runs. You tune this per project depending on data volatility and warehouse spend.",
     "fs": "Run-on-load vs scheduled-refresh vs cached trades freshness against warehouse cost; viewer runs often reuse cache.",
     "fj": "Apps always run completely fresh for every viewer with no caching.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "For a daily-refreshed exec dashboard with hundreds of viewers, what settings minimize cost?",
+        "a": "Use a scheduled run with 'update published results' to refresh once each morning, and serve all viewers cached results between runs rather than running on load. That turns hundreds of potential per-viewer queries into one daily warehouse hit. Reserve fresh-on-load for low-traffic, high-volatility apps."
+      },
+      {
+        "q": "How can you guarantee viewers always see at least the latest scheduled snapshot?",
+        "a": "Configure cache validation against the most recent scheduled-run timestamp rather than a fixed timeout, so a viewer's cached result is only used if it's no older than the last refresh. That couples freshness to the schedule instead of an arbitrary window. Viewers then never see data older than the most recent run."
+      },
+      {
+        "q": "What's the downside of caching a Python cell's heavy computation result?",
+        "a": "SQL result caching is built in, but expensive pure-Python work isn't cached the same way and re-executes when its subgraph runs, so a viewer interaction can re-pay that cost even if the SQL was cached. Push reducible work into cacheable SQL, or precompute and persist heavy outputs upstream. Don't assume the whole graph is cached just because SQL is."
+      }
+    ]
   },
   {
     "q": "Give a concrete end-to-end flow: warehouse pull to published interactive app in Hex.",
@@ -272,6 +538,20 @@
           "summary = sales.groupby('day').sum()"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "In step 1, why select specific columns instead of SELECT *?",
+        "a": "`SELECT *` streams every column into the kernel, inflating memory and the app payload, and breaks downstream cells if the schema changes. Projecting only `day, region, amount` narrows the pull and makes the dependency explicit. In a warehouse you're also billing for scanning columns you never use."
+      },
+      {
+        "q": "Where would you add a Review step before this app reaches stakeholders?",
+        "a": "Mark the project as requiring an approved Review (or a merged PR via Git sync) before publishing, so a reviewer sees the code-and-rendered-output diff and approves it. Then the schedule and subscription only ever distribute vetted logic. The gate sits between saving a version and publishing."
+      },
+      {
+        "q": "How do you guarantee the morning Slack link reflects fresh data, not yesterday's cache?",
+        "a": "Enable 'update published results' on the scheduled run so it bypasses SQL cache, re-queries the warehouse, re-publishes, and only then fires the subscription with the link. That sequencing ensures the link's snapshot is the fresh one. A plain cached run would send a stale view."
+      }
     ]
   },
   {
@@ -280,7 +560,21 @@
     "fs": "The Notebook Agent edits real cells grounded in project context and warehouse schema, favoring endorsed/semantic data.",
     "fj": "Magic is just a generic chatbot pasted in that has no idea what your tables are.",
     "level": "Jr",
-    "asked": 9
+    "asked": 9,
+    "followups": [
+      {
+        "q": "Why does endorsing data and building semantic models improve the Agent's answers?",
+        "a": "Endorsed status marks data as trusted, and Hex prioritizes endorsed and semantically modeled tables/metrics for all AI features, so the Agent steers toward governed definitions instead of guessing among raw lookalike tables. That reduces the classic LLM failure of joining the wrong staging table. Curation is the highest-leverage way to make the Agent reliable."
+      },
+      {
+        "q": "What stops the Notebook Agent from running a destructive or wrong query unsupervised?",
+        "a": "It generates and edits cells you can review before running, executes within the connection's permissions (so a read-only role can't write), and changes still flow through versions and optional Reviews. It proposes; a human approves. Least-privilege connections plus the review gate are the real guardrails, not blind trust."
+      },
+      {
+        "q": "What does the zero-retention agreement actually guarantee about your data?",
+        "a": "It means the LLM provider doesn't retain or train on the prompts/data Hex sends, so your schema and query context aren't absorbed into a model. It governs the provider's handling, not whether the Agent can read your warehouse, which it does via your connection. Verify the specific provider terms for regulated data."
+      }
+    ]
   },
   {
     "q": "How does SQL query caching work in Hex by default?",
@@ -288,7 +582,21 @@
     "fs": "Identical warehouse SQL within ~60 min reuses a cached result; non-SELECT, >16 GB, or volatile queries bypass it.",
     "fj": "Every time a cell runs it always hits the warehouse fresh; Hex never caches SQL.",
     "level": "Mid",
-    "asked": 6
+    "asked": 6,
+    "followups": [
+      {
+        "q": "What counts as 'identical' for a cache hit, given Jinja parameters?",
+        "a": "The cache keys on the fully-rendered query after Jinja binding, so the same SQL with different input values is a different query and misses the cache. Changing a whitespace or comment also changes the hash. That's why parameterized apps re-query when filters change but reuse results when a viewer revisits the same selection."
+      },
+      {
+        "q": "Why does a query using current_timestamp or random bypass caching?",
+        "a": "Its result is inherently nondeterministic, so a cached value would be wrong for the next run; Hex treats such volatile queries as non-cacheable to avoid serving stale or incorrect results. If you want repeatable behavior, parameterize the time as an input value instead of calling `current_timestamp()`. Determinism is the precondition for caching."
+      },
+      {
+        "q": "When should you deliberately turn caching off for a cell?",
+        "a": "When freshness within the hour is critical, monitoring a live pipeline, or validating a fix, use 'Run without cached results' so you hit the warehouse fresh. Scheduled runs that update published results already bypass cache for this reason. Otherwise leave caching on to control warehouse spend."
+      }
+    ]
   },
   {
     "q": "What is SQL query mode in Hex and why does it matter for memory?",
@@ -315,6 +623,20 @@
           "GROUP BY region"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If query mode only previews 1k rows, how does a downstream aggregate see all the data?",
+        "a": "Hex injects the query object's SQL as a CTE into the downstream query, so the aggregate runs in the warehouse over the full result, not the 1k preview. The preview is just for display in the kernel. The chained query is re-executed warehouse-side, so the full data is honored without ever materializing it locally."
+      },
+      {
+        "q": "Which single downstream action silently negates query mode's memory benefit?",
+        "a": "Referencing the query object from a Python cell (or dataframe-mode SQL, or a writeback) forces Hex to materialize the full result into the kernel as a dataframe. After that you're back to OOM risk. Keep the chain in connection/query-mode SQL until you've aggregated down to something small enough for Python."
+      },
+      {
+        "q": "Does chaining query-mode cells mean the warehouse re-runs the upstream query each time?",
+        "a": "Yes, because the upstream SQL is inlined as a CTE, the warehouse re-executes that logic whenever a downstream query runs, which can repeat expensive scans. SQL caching can absorb identical re-runs, but deep chains may still re-bill. If the upstream is reused heavily, consider materializing a reduced result once."
+      }
     ]
   },
   {
@@ -323,7 +645,21 @@
     "fs": "App run settings choose cache vs fresh; schedules can bust cache and viewers validate against the last refresh timestamp.",
     "fj": "Caching is global and viewers can never get fresher data than the 60-minute window.",
     "level": "Sr",
-    "asked": 4
+    "asked": 4,
+    "followups": [
+      {
+        "q": "How does validating against the last scheduled-run timestamp differ from the default 60-minute window?",
+        "a": "The default reuses any cached SQL within ~60 minutes regardless of when the app last refreshed; timestamp validation instead invalidates cache that predates the most recent scheduled run, tying freshness to the schedule. So a viewer can't see data older than the last refresh even if it's under an hour old. It couples cache to your data SLA, not a clock."
+      },
+      {
+        "q": "Why do Can-View viewers' runs always use cache while editors can force fresh?",
+        "a": "Viewer-triggered runs always reuse cached SQL to protect the warehouse from many low-privilege users each spawning queries. Editors and scheduled refreshes can bypass cache to update results. It's a deliberate cost guardrail: the people who should refresh data can, casual viewers can't stampede the warehouse."
+      },
+      {
+        "q": "What's the failure mode of an always-fresh, run-on-load app at scale?",
+        "a": "Every viewer load triggers warehouse queries, so concurrency spikes drive cost and can queue/throttle the warehouse, hurting latency for everyone. Reserve run-on-load for low-traffic or highly volatile apps; otherwise schedule-refresh and serve cache. Fresh-per-viewer doesn't scale to a popular dashboard."
+      }
+    ]
   },
   {
     "q": "Walk me through building the App view from a Hex project.",
@@ -331,7 +667,21 @@
     "fs": "App builder is a drag-layout over the same reactive cells; you curate, hide code, and publish a version.",
     "fj": "The app is just the notebook shown top-to-bottom; there's no separate layout step.",
     "level": "Jr",
-    "asked": 5
+    "asked": 5,
+    "followups": [
+      {
+        "q": "Does hiding a code cell from the app remove it from the dependency graph?",
+        "a": "No, hiding only controls visibility in the app layout; the cell still runs and still feeds its dependents in the graph. So a hidden SQL cell can power a visible chart. Hiding is presentation, not deletion, the logic is fully intact, just not shown to viewers."
+      },
+      {
+        "q": "How do containers and tabs interact with reactive re-runs across the app?",
+        "a": "Layout grouping is purely visual organization; it doesn't sandbox execution, so an input in one tab still re-runs any dependent cells regardless of which tab they're displayed in. The DAG ignores layout. Don't assume a tab boundary isolates computation."
+      },
+      {
+        "q": "Why preview the app before publishing rather than just publishing?",
+        "a": "Preview renders the curated app with the viewer's permission and input defaults, catching layout breaks, accidentally exposed code, or inputs that error on empty values, before stakeholders see it. Publishing pins the version live, so mistakes reach everyone. Preview is the cheap dry run before that commit."
+      }
+    ]
   },
   {
     "q": "What are workspace roles in Hex and how do they differ from project permissions?",
@@ -339,7 +689,21 @@
     "fs": "Roles are workspace-wide capability (Admin..Guest); project shares (Full/Edit/Explore/View App) scope access per project.",
     "fj": "If you're an Editor in the workspace you can automatically edit every project.",
     "level": "Mid",
-    "asked": 6
+    "asked": 6,
+    "followups": [
+      {
+        "q": "If role and project share disagree, which wins?",
+        "a": "They compose as an intersection-of-capability: the role sets the ceiling of what someone can ever do, and the project share grants access to that specific project. A workspace Viewer shared a project as Can Edit still can't exceed Viewer-level capabilities; a workspace Editor not shared a project gets nothing on it. You need both to align for access."
+      },
+      {
+        "q": "Why use a Guest or Explorer role instead of just Viewer?",
+        "a": "Guest is the most restricted, typically external users limited to explicitly shared apps; Explorer can view and explore shared projects without broad editing. Choosing the tightest role that still permits the user's task is least privilege. Don't hand everyone Editor 'to be safe', it widens blast radius."
+      },
+      {
+        "q": "How do collections/categories fit alongside roles and shares for governance?",
+        "a": "Collections group projects and let admins manage access at the group level, so you grant a team access to a collection rather than re-sharing each project. It scales least-privilege as project count grows. Roles set capability, shares/collections set reach; together they keep access auditable."
+      }
+    ]
   },
   {
     "q": "A stakeholder should run an app and change filters but never see the SQL. Which permission?",
@@ -347,7 +711,21 @@
     "fs": "Can View App exposes only the app + inputs; Can Explore and above reveal the underlying notebook SQL.",
     "fj": "Give them Can Edit so they can use the filters.",
     "level": "Sr",
-    "asked": 5
+    "asked": 5,
+    "followups": [
+      {
+        "q": "Can a Can-View-App user trigger warehouse queries by changing filters?",
+        "a": "Yes, changing inputs re-runs dependent cells, but their runs always reuse cached SQL results to limit warehouse load, so they can't stampede fresh queries. They interact fully without seeing logic or driving cost. That's the cost guardrail baked into the viewer tier."
+      },
+      {
+        "q": "What is Chat-with-App and does it leak the underlying SQL to viewers?",
+        "a": "Chat-with-App lets viewers ask natural-language questions of the published app's data within their Can-View-App scope, answering from the app's results rather than exposing the notebook source. It surfaces insights, not the SQL behind them. The logic stays hidden, consistent with the permission."
+      },
+      {
+        "q": "How do you also prevent the viewer from screenshotting and re-sharing sensitive numbers?",
+        "a": "Permissions stop access to logic and unshared projects, but they can't stop a screenshot, governance there relies on row-level security or filtered connections so the viewer only ever sees data they're entitled to. Combine Can View App with RLS for true data minimization. Don't rely on the app layer alone for confidentiality."
+      }
+    ]
   },
   {
     "q": "How does Hex's GitHub sync relate to its built-in versions?",
@@ -366,6 +744,20 @@
           "history_tab   == branch log"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What file format do Hex projects serialize to in the repo, and why does it matter?",
+        "a": "Projects serialize to YAML describing each cell's logic, config, and app layout, plus the code, which diffs cleanly in a PR so reviewers see line-level changes. That's what enables Git-based code review and audit. A binary or opaque blob wouldn't diff, so the YAML representation is the whole point."
+      },
+      {
+        "q": "If you require PRs, how does that change the publish flow?",
+        "a": "Requiring Pull Requests adds a gate: a new Hex version can't be published until a PR is approved and merged into the main branch on GitHub. Publishing in Hex then reflects merged main. This enforces external review and keeps the live app pinned to vetted, merged code."
+      },
+      {
+        "q": "Can you edit the YAML directly in Git and have it appear in Hex?",
+        "a": "Git sync is primarily an export/mirror so changes flow Hex->repo for review and recovery; you still author in the Hex product, not by hand-editing YAML. Treating the YAML as the editing surface invites malformed projects. Use Git for review/audit/PR gating, not as your IDE for the notebook."
+      }
     ]
   },
   {
@@ -374,7 +766,21 @@
     "fs": "Reviews diff code and its rendered output side by side, with cell comments and required-approval gating.",
     "fj": "Reviewing a Hex change is identical to reading a GitHub text diff of the code.",
     "level": "Jr",
-    "asked": 4
+    "asked": 4,
+    "followups": [
+      {
+        "q": "Why is diffing rendered output, not just code, the key advantage of Reviews?",
+        "a": "A change can be small in source yet shift a number, a flipped join, a changed filter, that a text diff alone wouldn't reveal as wrong. Reviews show the resulting output beside the code so the reviewer verifies the analytical effect, not just syntax. It catches silent correctness regressions a GitHub diff would pass."
+      },
+      {
+        "q": "How does 'require approved reviews' relate to Git sync's 'require PRs'?",
+        "a": "Both gate publishing, but Reviews is the in-product, output-aware approval flow (Team/Enterprise), while require-PRs delegates the gate to a merged, approved GitHub pull request. You can use either or both; teams standardized on GitHub may prefer PR gating, while analyst-heavy teams prefer Reviews for the rendered diff. They're alternative enforcement points on the same publish boundary."
+      },
+      {
+        "q": "What can a Review still miss that you'd want a test for?",
+        "a": "It verifies the output for the data and inputs present at review time, but not behavior across other input combinations, future data drift, or edge cases like empty filters. A reviewer eyeballs one rendered state, not an exhaustive matrix. For invariant guarantees, add assertions/validation cells rather than relying solely on visual review."
+      }
+    ]
   },
   {
     "q": "Your Python cell hits an out-of-memory error on a large warehouse pull. How do you fix it in Hex?",
@@ -402,6 +808,20 @@
           "GROUP BY region"
         ],
         "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is scaling up the compute profile the last resort, not the first?",
+        "a": "A bigger profile just delays the wall and costs more, while the real issue is pulling a wide raw table the warehouse could have reduced for free. Pushing work down is cheaper and scales further than any single kernel. Resize only when the data is genuinely irreducible and must live in pandas."
+      },
+      {
+        "q": "If you must land data in pandas, what reduces footprint before it OOMs?",
+        "a": "Project only needed columns, filter rows in SQL first, and downcast dtypes (`int64`->`int32`, object->`category`) once loaded; consider chunked processing if you can't reduce upstream. Reading 5 columns instead of 50 alone can cut memory an order of magnitude. Shrink before you load, then shrink the dtypes."
+      },
+      {
+        "q": "How does query mode prevent the OOM without losing access to the full dataset?",
+        "a": "It returns a lightweight handle with a 1k preview while the full result stays in-warehouse; downstream SQL is pushed as a CTE so aggregation runs over everything without streaming it into the kernel. You only materialize the small final result. The full data is queried, never resident in pandas, so there's nothing to OOM."
       }
     ]
   }

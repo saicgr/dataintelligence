@@ -17,6 +17,20 @@
           "f.count()   # replays whole DAG again"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If actions replay the whole DAG, why not just cache everything to be safe?",
+        "a": "Caching costs memory and an eager materialization pass, so caching a single-use DataFrame is pure overhead that can evict genuinely reused blocks. Only `cache`/`persist` a DataFrame that feeds two or more actions, and `unpersist` once done. For a linear job with one terminal `write`, caching adds nothing."
+      },
+      {
+        "q": "Is take(5) an action, and does it run the entire DAG like count()?",
+        "a": "`take(n)` and `show(n)` are actions but short-circuit: Spark runs one partition at a time and stops once it has `n` rows, often touching just a few partitions. `count()` must scan everything. So `take` is cheap for previewing but its result order is not deterministic across runs."
+      },
+      {
+        "q": "Does explain() count as an action that reads data?",
+        "a": "No. `explain()` only compiles and prints the logical/physical plan from Catalyst without executing it, so it reads zero data. It is the safe way to inspect pushdown, join type, and shuffle count before paying for any I/O."
+      }
     ]
   },
   {
@@ -37,6 +51,20 @@
           "# big table never shuffles",
           "# explain -> BroadcastHashJoin"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "union is narrow, yet why does df.union(df2).distinct() still trigger a shuffle?",
+        "a": "`union` itself just concatenates partitions with no network movement, so it is narrow. But `distinct` (like `groupBy`) must compare rows across the whole dataset, which forces a hash shuffle. The shuffle comes from the dedup, not the `union` that precedes it."
+      },
+      {
+        "q": "Why is a wide shuffle 10-100x slower than a narrow op beyond just network cost?",
+        "a": "A shuffle writes every partition's output to local disk as shuffle files, fetches them over the network, then deserializes and re-sorts on the receiving side. That is disk I/O plus serialization plus network plus a stage boundary that blocks pipelining, so even a fast network leaves the disk and serde costs dominating."
+      },
+      {
+        "q": "When would broadcasting the small side actually be the wrong choice?",
+        "a": "When the small side is not small in memory: the broadcast estimate is on deserialized in-memory size, so a 50MB compressed Parquet can balloon past executor heap. It is also wrong if the lookup grows over time near the threshold, since silent flips to sort-merge join hurt predictability. Verify with `explain`."
       }
     ]
   },
@@ -65,6 +93,20 @@
           "  .write.parquet('out')"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "A surprising gotcha: how can coalesce(10) actually slow down the upstream computation?",
+        "a": "`coalesce` pushes its narrow nature up the lineage: collapsing to 10 output partitions can force the preceding stage (e.g. a heavy map) to run with only 10 tasks, throttling parallelism for the whole computation. When you need both upstream parallelism and few output files, use `repartition` instead, accepting its shuffle."
+      },
+      {
+        "q": "How do you write fewer large files without coalesce(1) forcing one executor to hold everything?",
+        "a": "Pick a coalesce/repartition target that yields ~128-256MB files rather than 1, e.g. `coalesce(8)` for a 1GB result. Or set `spark.sql.files.maxRecordsPerFile` so each task caps file size. Forcing a single file is rarely worth the OOM risk and lost write parallelism."
+      },
+      {
+        "q": "Does coalesce(1) guarantee a single output file?",
+        "a": "Yes for the data part, but the directory still gets `_SUCCESS` and possibly `_committed`/`_started` metadata files. If you partitionBy as well, you get one file per partition directory, not one overall. `coalesce(1)` controls task count, not the commit-protocol sidecar files."
+      }
     ]
   },
   {
@@ -85,6 +127,20 @@
           "j.explain(mode='formatted')",
           "# look for BroadcastHashJoin"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "The 400 MB side is too big to broadcast but a sort-merge join is too slow; what is your next option?",
+        "a": "Use a shuffle-hash join or pre-bucket both tables on `product_id` with matching bucket counts so the join needs no shuffle. Alternatively pre-shuffle once and `cache` the partitioned big side if it is reused. If 400MB exceeds heap, broadcasting is simply off the table and bucketing is the durable fix."
+      },
+      {
+        "q": "Why does the driver become a bottleneck in a broadcast hash join?",
+        "a": "The small side is collected to the driver first, then shipped to every executor via the broadcast variable. So driver heap must hold the full deserialized table, and the broadcast serialization happens once on the driver. A too-large broadcast OOMs the driver before any executor even sees it."
+      },
+      {
+        "q": "How does AQE decide at runtime to flip a sort-merge join to a broadcast?",
+        "a": "After the shuffle stage materializes, AQE reads the actual shuffle-write bytes of each side. If one side's real size falls under `spark.sql.adaptive.autoBroadcastJoinThreshold`, it rewrites the join to BHJ for the remaining plan, fixing cases where compile-time row estimates were too pessimistic."
       }
     ]
   },
@@ -108,6 +164,20 @@
           "       lag('amount',1).over(w))"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What is the difference between a ROWS frame and a RANGE frame, and why can it change your running total?",
+        "a": "`ROWS` counts physical rows around the current row; `RANGE` groups by the ordering value, so all rows sharing the same `date` get the same cumulative sum. An ordered window with an aggregate defaults to RANGE UNBOUNDED PRECEDING, which can surprise you on tie values. Use an explicit `rowsBetween` frame for true row-by-row totals."
+      },
+      {
+        "q": "What happens to performance if you partitionBy nothing, e.g. Window.orderBy('date') alone?",
+        "a": "With no `partitionBy`, Spark must put every row into a single partition to compute the global order, so one task processes the entire dataset and almost certainly OOMs or spills hard. A warning is even logged. Global-order windows are an anti-pattern at scale; always partition."
+      },
+      {
+        "q": "Can you reuse one WindowSpec for both running total and lag if their frames differ?",
+        "a": "Yes for the partition/order, but the frame matters: `lag`/`rank`/`row_number` ignore the frame clause, while aggregate functions like `sum` honor it. So one `Window.partitionBy(...).orderBy(...)` is fine for `lag`, but if you want a bounded running sum, add an explicit `rowsBetween` only on the aggregate's `over`."
+      }
     ]
   },
   {
@@ -129,6 +199,20 @@
           "  col('session_id').isNull(), sid)",
           "  .otherwise(col('session_id')))"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "dropDuplicates keeps an arbitrary row among duplicates; how do you keep the LATEST one deterministically?",
+        "a": "`dropDuplicates` picks a nondeterministic survivor, which breaks reruns. Instead use `row_number()` over `partitionBy(key).orderBy(desc('event_ts'))` and filter `rn == 1`. That deterministically keeps the newest record per key and is reproducible across runs and node failures."
+      },
+      {
+        "q": "Why fill session_id BEFORE the row_number window rather than after?",
+        "a": "The window partitions by `session_id`; if you number first, all the NULL-session rows collapse into one giant partition and get numbered together, mixing unrelated users. Filling synthetic session ids first ensures each real session gets its own correct sequence."
+      },
+      {
+        "q": "Will dropDuplicates on event_ts catch true duplicate clicks if timestamps have millisecond jitter?",
+        "a": "No. If the same logical click arrives with slightly different `event_ts`, an exact-match key misses it. You would need to truncate the timestamp to a coarser bucket or dedupe on a stable event id. Exact-key dedup only works when the key is genuinely identical across duplicates."
       }
     ]
   },
@@ -152,6 +236,20 @@
           "big.join(small, ['key','s'])"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "AQE skewJoin is on, yet the straggler persists; what could prevent AQE from splitting it?",
+        "a": "AQE only splits a partition exceeding both `skewedPartitionFactor` x median AND `skewedPartitionThresholdInBytes`; a single mega-key may be too small in bytes to trip the threshold yet still slow. AQE also cannot split when the skewed side feeds certain join types or when there is no shuffle (e.g. already-broadcast). Then manual salting is required."
+      },
+      {
+        "q": "If the hot key is NULL, what is a cheaper fix than salting?",
+        "a": "NULL keys never match in an inner join, so filter them out before the join and union them back if needed. For outer joins, split the NULL rows into a separate branch handled without a join. This sidesteps salting entirely because NULLs carry no join semantics."
+      },
+      {
+        "q": "What is the downside of choosing a very large salt N like 256?",
+        "a": "The small side is replicated N times via `explode`, so N=256 multiplies its shuffle and join cost 256-fold, which can dwarf the savings on the big side. Pick N just large enough to spread the hottest key below the partition target, often 8-32, not arbitrarily high."
+      }
     ]
   },
   {
@@ -159,7 +257,21 @@
     "a": "Start at the Jobs tab sorted by duration, drill into the slow job's Stages tab sorted by duration, then open the worst stage's Summary Metrics to compare median versus max task duration. Max far exceeding median signals data skew; non-zero Shuffle Spill (Disk) signals executors out of memory; tiny per-task input sizes signal too many small partitions. Fix skew with AQE skewJoin or broadcast() of the small side, fix spill by raising spark.sql.shuffle.partitions or executor memory so partitions fit in memory, and fix small partitions with AQE coalescePartitions or a manual coalesce. The guiding target is 128-256 MB per partition, which AQE handles dynamically when adaptive execution is enabled.",
     "fs": "Compare max versus median task duration in Summary Metrics to confirm skew, and check Shuffle Spill (Disk) for memory pressure.",
     "fj": "Guessing at fixes without navigating Jobs to Stages to Summary Metrics, and ignoring the per-task input size that reveals small partitions.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Spill (Memory) is huge but Spill (Disk) is small; should you worry?",
+        "a": "Spill (Memory) is the in-memory size of data that spilled; Spill (Disk) is its compressed on-disk footprint. A large memory-spill with small disk-spill still means tasks could not fit working data in heap and paid serialization plus disk I/O. Both indicate memory pressure; raise partitions or executor memory."
+      },
+      {
+        "q": "Tasks are fast but the job still drags between stages; where do you look?",
+        "a": "Check the Event Timeline and the gap between stage completion and the next stage start, plus the driver. Long gaps often mean driver-side work: huge plan compilation, listing millions of files, or a `collect`/broadcast on the driver. Per-task metrics look fine because the bottleneck is not in the executors."
+      },
+      {
+        "q": "GC time shows as a large fraction of task time; what does that tell you?",
+        "a": "Heavy GC means executors are thrashing the heap, usually from too-few large partitions, caching too much, or skew packing one task. Reduce data per task by raising `shuffle.partitions`, lower cache footprint with a `_SER` storage level, or fix skew. It is a symptom of memory pressure, not a tuning knob itself."
+      }
+    ]
   },
   {
     "q": "How do you design an end-to-end partition strategy to bring an 800 GB daily PySpark pipeline from 90 minutes under a 20-minute SLA?",
@@ -179,6 +291,20 @@
           "df.repartition('region').write \\",
           "  .partitionBy('region').parquet(p)"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "If AQE coalescePartitions is on, why bother setting shuffle.partitions to 3200 at all?",
+        "a": "AQE can only coalesce DOWN from the configured partition count; it never adds partitions. If you leave it at 200, each task still starts with 4GB and spills before AQE can act. Set a high static count so the initial split is small enough, then let AQE merge undersized ones back up to ~256MB."
+      },
+      {
+        "q": "You hit the 20-minute SLA but the output has thousands of tiny region files; what went wrong?",
+        "a": "`partitionBy('region')` with many shuffle tasks means each task writes one file per region, so N tasks x M regions = huge file count. The `repartition('region')` before write fixes it by collocating each region in one task. Without it, you trade SLA for a small-file problem downstream."
+      },
+      {
+        "q": "Why measure after each change instead of applying all tunings at once?",
+        "a": "Tunings interact and can mask each other: fixing the shuffle might eliminate the spill that you would otherwise mis-attribute to memory, and over-raising partitions can add scheduling overhead. Changing one knob and reading stage durations isolates which change actually moved the needle, avoiding cargo-cult config."
       }
     ]
   },
@@ -200,6 +326,20 @@
           "  .orderBy(F.desc('total_revenue'),",
           "           'seller_id'))"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "If some amounts are NULL, how does F.sum treat them and could that skew the ranking?",
+        "a": "`F.sum` ignores NULLs, so a seller with all-NULL amounts returns NULL (not 0), and a NULL total sorts unpredictably. Wrap with `F.coalesce(F.sum('amount'), F.lit(0))` if you need zero-revenue sellers ranked at the bottom deterministically rather than dropping or floating."
+      },
+      {
+        "q": "The grader diffs row order; does a final orderBy guarantee that order survives the write?",
+        "a": "`orderBy` before `collect` holds, but writing to multiple files and re-reading does NOT preserve global order, and any later wide op re-shuffles. Keep the `orderBy` as the last step before the action the grader runs, and avoid a trailing `repartition`."
+      },
+      {
+        "q": "Would a window sum be wrong here instead of groupBy?",
+        "a": "Not wrong, just wasteful: `sum().over(partitionBy('seller_id'))` keeps one row per order with the total repeated, so you would still need a `dropDuplicates`. `groupBy().agg()` collapses directly to one row per seller, which is exactly the required shape with a single shuffle."
       }
     ]
   },
@@ -229,6 +369,20 @@
           "# stays in JVM, full codegen"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Concretely, how does a Python UDF block predicate pushdown?",
+        "a": "Catalyst cannot see inside the Python function, so it cannot prove a filter on the UDF's output is safe to push to the scan, and it will not reorder a filter past it. A `df.filter(myUdf(col)>0)` therefore reads all rows and evaluates the UDF before filtering, instead of skipping row groups at the Parquet scan."
+      },
+      {
+        "q": "Beyond raw speed, what reliability risk does a Python UDF add that a native expression does not?",
+        "a": "It spins up Python worker processes whose memory lives outside the JVM heap, counted against `spark.executor.pyspark.memory`/overhead. A heavy UDF can OOM the container via off-heap growth that executor heap tuning will not catch, and a Python exception kills the task. Native expressions have neither failure mode."
+      },
+      {
+        "q": "If logic truly needs Python, what makes a pandas_udf faster than even an Arrow-optimized row UDF?",
+        "a": "A `pandas_udf` operates on a whole `pd.Series`/batch, so the per-row Python interpreter overhead is amortized and vectorized numpy ops run in C. An Arrow row UDF still calls Python once per row; it only speeds up the serialization layer. Vectorization, not serde, is the bigger win when the op is naturally columnar."
+      }
     ]
   },
   {
@@ -250,6 +404,20 @@
           "               z double')"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Does maxRecordsPerBatch help with an applyInPandas OOM on a hot group?",
+        "a": "No. `maxRecordsPerBatch` only chunks scalar `pandas_udf` and Arrow transfer batches; `applyInPandas` must hand the function the ENTIRE group at once because the logic is per-group. The only fixes for a hot group are pre-aggregation, splitting the group, or more executor memory."
+      },
+      {
+        "q": "What goes wrong if the pandas DataFrame you return doesn't match the declared schema?",
+        "a": "Spark coerces columns positionally/by name to the declared schema; a missing column, wrong dtype, or extra column raises at runtime or silently nulls/casts. Float-vs-int and timezone-naive timestamps are classic mismatches. Always build the return frame with exactly the declared column names, order, and dtypes."
+      },
+      {
+        "q": "When would mapInPandas be a better fit than applyInPandas?",
+        "a": "`mapInPandas` streams arbitrary-sized batches of the DataFrame without grouping, so it avoids holding a whole group in memory and is ideal for per-row enrichment or batched model inference. Choose `applyInPandas` only when the logic genuinely needs all rows of a key together (e.g. per-group model fit)."
+      }
     ]
   },
   {
@@ -270,6 +438,20 @@
           "df.join(...)  # reuses cached blocks",
           "df.unpersist()"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Note that the DataFrame cache() default differs from the RDD default; why does that matter?",
+        "a": "For RDDs `cache()` is `MEMORY_ONLY`, but for DataFrames/Datasets it is `MEMORY_AND_DISK`. So a DataFrame silently spills to disk instead of recomputing on eviction, which is usually what you want but means cached DataFrames can consume disk you did not expect. Knowing the level avoids surprise disk pressure."
+      },
+      {
+        "q": "If a cached DataFrame's source files change underneath, what happens on the next action?",
+        "a": "The cache is a point-in-time materialization, so subsequent actions serve stale data even after the underlying files change; Spark will not detect the change. You must `unpersist` (or recreate) to pick up new data. This is a common source of 'why is my output stale' bugs."
+      },
+      {
+        "q": "Why might MEMORY_ONLY actually be slower than MEMORY_AND_DISK for a barely-too-big dataset?",
+        "a": "With `MEMORY_ONLY`, partitions that do not fit are dropped and RECOMPUTED from lineage on every access, so a dataset slightly over heap thrashes recomputation. `MEMORY_AND_DISK` spills the overflow once and reads it back, which is far cheaper than re-running the whole upstream DAG repeatedly."
       }
     ]
   },
@@ -293,6 +475,20 @@
           "  '256m')"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does AQE only re-optimize at shuffle (stage) boundaries and not continuously?",
+        "a": "Exact statistics (per-partition byte sizes, row counts) only become known after a shuffle stage fully materializes its map output. AQE uses those concrete stats to re-plan the remaining stages. Between boundaries there is no new ground truth, so re-planning mid-stage would just re-guess. Shuffle-less queries get no AQE benefit."
+      },
+      {
+        "q": "Can AQE ever make a query slower, and how would you tell?",
+        "a": "Rarely, but coalescing too aggressively can under-parallelize a CPU-bound stage, and the re-planning adds tiny overhead. The Spark UI marks AQE-changed nodes (`AdaptiveSparkPlan isFinalPlan=true`); compare with AQE off. If a stage now runs with too few large tasks, raise `advisoryPartitionSizeInBytes` down or `minPartitionSize`."
+      },
+      {
+        "q": "Does AQE remove the need to broadcast() explicitly?",
+        "a": "Not entirely. AQE only flips to broadcast when the side's MATERIALIZED shuffle size falls under the adaptive threshold, which means it already paid for one shuffle to find out. An explicit `broadcast()` hint avoids that shuffle from the start, so for a known-small side the hint is still better."
+      }
     ]
   },
   {
@@ -312,6 +508,20 @@
           "# SortMergeJoin vs BroadcastHashJoin",
           "# AdaptiveSparkPlan -> AQE active"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "With AQE on, the printed plan shows placeholders; how do you see the FINAL plan?",
+        "a": "Before execution, AQE nodes show as `AdaptiveSparkPlan isFinalPlan=false` with unresolved sub-plans. Run an action first, then call `explain` (or read the SQL tab in the UI), which prints `isFinalPlan=true` with the actually-chosen joins and coalesced partition counts. The pre-execution plan is only a guess."
+      },
+      {
+        "q": "PushedFilters appears but the filter still seems slow; what is the difference between pushed and partition filters?",
+        "a": "`PushedFilters` are pushed into the file reader for row-group skipping via stats; `PartitionFilters` prune whole directories before reading any file and are far more effective. A predicate on a non-partition, low-selectivity column shows as a pushed filter but still scans most row groups. Check that your hot predicate hits a partition column."
+      },
+      {
+        "q": "What does a ReusedExchange node tell you in the plan?",
+        "a": "`ReusedExchange` means Spark recognized two subtrees produce the same shuffle and computed it once, reusing the output, e.g. self-joins or a DataFrame used twice. Seeing it is good (saved a shuffle); its absence where you expected reuse hints the subtrees differ subtly and you are paying for the shuffle twice."
       }
     ]
   },
@@ -334,6 +544,20 @@
           "# same N both sides -> no shuffle"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Two tables are bucketed on the same key but one has 64 and the other 32 buckets; does the shuffle-free join still work?",
+        "a": "Not fully. A shuffle-free join needs identical bucket counts. With 64 vs 32, Spark can sometimes coalesce the 64-bucket side to 32 (if `bucketed scan` coalescing is enabled and one is a multiple of the other), but mismatched non-multiple counts force a re-shuffle. Plan matching N on both tables from the start."
+      },
+      {
+        "q": "Why does adding new data to a bucketed table risk breaking the no-shuffle property?",
+        "a": "Each insert writes its own set of N bucket files, so a table can accumulate multiple files per bucket. Spark still reads them per bucket, but too many small bucket files hurt, and any operation that re-distributes (like a non-bucket-aware overwrite) can violate the layout. Bucketing favors stable, append-controlled tables."
+      },
+      {
+        "q": "What does the sortBy add on top of bucketBy?",
+        "a": "`sortBy` orders rows within each bucket file, enabling a sort-merge join to skip the sort step entirely (a `bucketed + sorted` scan), and it improves predicate/min-max skipping inside the bucket. Without it you still avoid the shuffle but pay to sort each bucket at join time."
+      }
     ]
   },
   {
@@ -354,6 +578,20 @@
           "   .outputMode('append')",
           "   .start('/out/orders'))"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Exactly-once requires more than the checkpoint; what must the source and sink each provide?",
+        "a": "The source must be replayable so Spark can re-read uncommitted offsets (Kafka, file source), and the sink must be idempotent or transactional so a reprocessed batch does not double-write (Delta, foreachBatch with upsert). A non-replayable source or a plain append sink degrades the guarantee to at-least-once despite the checkpoint."
+      },
+      {
+        "q": "Which code changes between restarts are safe versus state-breaking with the same checkpoint?",
+        "a": "Safe: changing filters, projections, sink options, output path. State-breaking: changing aggregation keys, the number/type of stateful operators, output mode, or watermark in incompatible ways, because the stored state no longer maps to the new plan. Those require a new checkpoint and a backfill."
+      },
+      {
+        "q": "Why does each streaming query need its OWN checkpoint location?",
+        "a": "The offset and commit logs are keyed to one query's source/sink topology. Two queries sharing a directory would clobber each other's offsets and state, corrupting progress tracking and producing duplicates or silent data loss. Always give every `writeStream` a distinct `checkpointLocation`."
       }
     ]
   },
@@ -377,6 +615,20 @@
           "  .count())"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does append output mode specifically require a watermark on a windowed aggregation?",
+        "a": "Append mode emits a row only once it is final and will never change. Without a watermark, Spark cannot know when a window stops receiving late updates, so it can never declare a result final and would emit nothing. The watermark defines the cutoff after which the window is closed and safe to append."
+      },
+      {
+        "q": "How does the watermark behave across multiple stateful operators in one query?",
+        "a": "Spark tracks a single global watermark and, by default, uses the MINIMUM event-time across all input streams/operators so no operator drops data another still needs. You can switch to max policy via `spark.sql.streaming.multipleWatermarkPolicy`, but min is the safe default to avoid prematurely expiring state."
+      },
+      {
+        "q": "In a stream-stream join, what does the watermark bound that it does not in a single aggregation?",
+        "a": "It bounds how long each side's unmatched rows are retained waiting for a match on the other stream, plus a join-time-range condition. Without watermarks (and a time constraint) the join state grows forever because Spark must keep every row in case a future match arrives. The watermark lets it evict rows past the allowed lateness."
+      }
     ]
   },
   {
@@ -399,6 +651,20 @@
           "WHEN NOT MATCHED THEN INSERT *"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If the CDC batch has multiple updates for the same key, why does the MERGE fail?",
+        "a": "Delta raises an error when a single target row matches more than one source row, because the update result would be ambiguous. Pre-dedupe the source to one row per key (keep the latest by sequence/timestamp via `row_number`) before the MERGE so each target matches at most one source row."
+      },
+      {
+        "q": "How does Delta's MERGE achieve atomicity if it rewrites files in place?",
+        "a": "It does not edit files in place: MERGE writes new data files, then atomically commits a new version in the `_delta_log` transaction log that swaps which files are active. Readers see either the old or new snapshot, never a partial state. Failed merges leave orphan files that VACUUM later cleans up."
+      },
+      {
+        "q": "What is the difference between adding t.dt = s.dt to the ON clause versus a WHERE on the source?",
+        "a": "A predicate in the ON clause lets Delta perform file/partition pruning on the TARGET, skipping files it need not rewrite. Filtering only the source narrows what you scan but Delta may still scan/rewrite all target partitions to find non-matches. The target-side predicate is what cuts the write amplification."
+      }
     ]
   },
   {
@@ -419,6 +685,20 @@
           "# new cols added; old rows -> null"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "An upstream column changes from int to string; will mergeSchema handle it?",
+        "a": "No. `mergeSchema` only allows additive changes and safe widening (e.g. int to long), never an incompatible narrowing or type swap like int to string. That write still fails. You must cast explicitly to a compatible type or do an `overwriteSchema` rewrite, which rewrites the whole table's metadata and data for that column."
+      },
+      {
+        "q": "Why is dropping or renaming a column harder than adding one in Delta?",
+        "a": "Adds are append-only metadata. Drop/rename without column mapping would invalidate the physical Parquet column names that existing files reference. You must enable `delta.columnMapping.mode = name` first, which decouples logical names from physical ones, then `ALTER TABLE ... RENAME/DROP COLUMN` becomes a cheap metadata operation."
+      },
+      {
+        "q": "What is the operational risk of leaving global autoMerge on permanently?",
+        "a": "Every job that writes the table can silently introduce columns, so a typo (`amountt`), a mis-mapped field, or a bad upstream change pollutes the schema permanently and bloats files with sparse columns. Scoping `mergeSchema` per intentional write keeps evolution a deliberate, reviewed act rather than an accident."
+      }
     ]
   },
   {
@@ -438,6 +718,20 @@
           "-- auto: delta.autoOptimize",
           "--       .optimizeWrite = true"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does VACUUM with a short retention break time travel and concurrent reads?",
+        "a": "VACUUM physically deletes data files no longer referenced by the current version but still needed by older versions and by in-flight reads. A retention below the default 7 days can delete files a long-running query or a time-travel `versionAsOf` still references, causing `FileNotFound`. Keep retention above your longest reader plus desired history."
+      },
+      {
+        "q": "How does ZORDER differ from partitionBy for speeding up filtered queries?",
+        "a": "`partitionBy` physically separates data into directories prunable before reads but only works for low-cardinality columns. `ZORDER` co-locates related rows of high-cardinality columns within files using a space-filling curve so min/max stats skip more row groups. They are complementary: partition by date, ZORDER by user_id."
+      },
+      {
+        "q": "Does optimizeWrite/autoCompact remove the need for periodic OPTIMIZE?",
+        "a": "Largely for steady streaming, since they compact at write time, but they target a smaller file size and only handle data written in that commit. Periodic `OPTIMIZE` with ZORDER is still worthwhile to reach the larger ~1GB targets and to cluster across many commits. Auto-features reduce, not eliminate, scheduled compaction."
       }
     ]
   },
@@ -461,6 +755,20 @@
           "# only dt's in df are replaced"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Dynamic overwrite replaces only present partitions; what failure mode does that introduce on its own?",
+        "a": "It silently leaves stale data in partitions NOT present in the incoming batch. If a backfill should have emptied a partition (all rows deleted upstream), dynamic mode keeps the old rows because that `dt` is absent from the DataFrame. For true deletes you need an explicit overwrite of that partition or Delta `replaceWhere`."
+      },
+      {
+        "q": "Why is Delta replaceWhere safer than dynamic partition overwrite for correctness?",
+        "a": "`replaceWhere('dt = ...')` is a single atomic transaction validated against the predicate: Spark errors if any incoming row falls outside the predicate, preventing accidental cross-partition writes. Dynamic mode infers scope from the data with no guardrail, so a stray partition value in the DataFrame silently overwrites an unintended partition."
+      },
+      {
+        "q": "What happens if the partition column is missing from the DataFrame under dynamic mode?",
+        "a": "Dynamic mode scopes the overwrite by the distinct partition values present in the data; with no partition column there are no partition values to scope to, so it falls back to behaving like a static full overwrite or errors. Always confirm the `partitionBy` column is actually in the DataFrame before the write."
+      }
     ]
   },
   {
@@ -480,6 +788,20 @@
           "  if i % 10 == 0:",
           "    df = df.checkpoint()  # cut lineage"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Should you cache() a DataFrame before checkpoint()ing it, and why?",
+        "a": "Yes. `checkpoint` is an action that recomputes the DataFrame to write it, and if downstream code uses the DataFrame again it recomputes once more. Calling `cache()` first means the checkpoint write reads from cache and later uses hit cache too, avoiding a double computation of the whole lineage."
+      },
+      {
+        "q": "When is localCheckpoint() acceptable despite not being fault-tolerant?",
+        "a": "`localCheckpoint` truncates lineage by writing to executor local disk/cache, which is much faster than reliable storage but lost if the executor dies. It is fine when you only need to break a runaway lineage for planner performance within a job and can tolerate recomputation on the rare node failure, e.g. exploratory or short iterative loops."
+      },
+      {
+        "q": "Why doesn't cache() solve the stack-overflow-in-planner problem on deep lineages?",
+        "a": "Cache stores materialized partitions but leaves the logical/physical lineage intact, so Catalyst still has to build and analyze the full multi-hundred-node plan tree, which is what overflows the recursion or slows planning. Only `checkpoint` cuts the lineage so the plan tree restarts from the materialized node."
       }
     ]
   },
@@ -509,6 +831,20 @@
           "  expr('...').alias('c'))"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Does the deep withColumn plan actually run slower, or only analyze slower?",
+        "a": "Mostly it ANALYZES slower: each `withColumn` wraps a new Project node, so Catalyst builds and re-resolves a tower of projections, sometimes seconds of driver-side planning before any task runs. The optimized physical plan usually collapses adjacent projects, so runtime is often fine; the pain is plan compilation, not execution."
+      },
+      {
+        "q": "When is selectExpr genuinely better than select with column objects?",
+        "a": "`selectExpr` shines for terse SQL-string logic, dynamic column lists built from strings, or porting SQL CASE expressions, e.g. `selectExpr('id', 'amt*1.07 as t', 'CASE WHEN ...')`. It avoids importing functions and is concise, but loses Python-side type checking and IDE help, so prefer column objects when the logic is built programmatically."
+      },
+      {
+        "q": "How does withColumns (plural) in newer Spark fix the chaining problem?",
+        "a": "`withColumns({'a': expr1, 'b': expr2})` (Spark 3.3+) adds multiple columns in a SINGLE Project node, giving the flat plan of a `select` while keeping the convenient add-column semantics. It is the direct replacement for a long `withColumn` chain when you want to keep all existing columns."
+      }
     ]
   },
   {
@@ -526,6 +862,20 @@
           "# only A rows with no B match",
           "# no columns from B added"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why can a left join + IS NULL filter give WRONG counts where left_anti does not?",
+        "a": "If the right side has duplicate keys, the left join fan-outs each left row into multiple matched rows; the `IS NULL` filter then only catches genuinely unmatched ones, but you have already changed the row multiplicity for matched keys upstream. `left_anti` returns each left row at most once with no fan-out, so it is correct and cheaper."
+      },
+      {
+        "q": "How does a NULL value in the join key behave across these join types?",
+        "a": "A NULL key never equals another NULL under standard equality, so NULL-keyed left rows are treated as unmatched: they survive `left_anti` and `left_outer` (with null right cols) but are dropped by inner and `left_semi`. If you need NULL=NULL matching, use `eqNullSafe` (`<=>`) in the join condition."
+      },
+      {
+        "q": "Does left_semi let you reference B's columns in a later select?",
+        "a": "No. `left_semi` only filters left rows by existence of a match and projects ONLY the left schema, so B's columns are not available afterward. If you need values from B, use an inner join instead and accept the potential fan-out (and dedupe B first if needed)."
       }
     ]
   },
@@ -547,6 +897,20 @@
           "  .when(F.col('amt') > 10, 'silver')",
           "  .otherwise('bronze'))"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does the ORDER of the when branches matter, and what bug does swapping them cause?",
+        "a": "`when` evaluates top-down and takes the FIRST true branch, so a broader condition placed before a narrower one shadows it. Putting `amt > 10` before `amt > 100` would label every high amount 'silver' because the first match wins. Order branches from most specific/highest threshold to least."
+      },
+      {
+        "q": "How do you handle NULL in the condition column so it doesn't silently fall to otherwise?",
+        "a": "A `when(F.col('amt') > 100, ...)` evaluates to NULL (not true) when `amt` is NULL, so the row drops through to `.otherwise()`, possibly mislabeling it. Add an explicit `F.when(F.col('amt').isNull(), 'unknown')` first so NULLs are handled deliberately rather than lumped into the default."
+      },
+      {
+        "q": "Is there a more concise native option than a long when chain for value-to-value mapping?",
+        "a": "For a fixed lookup, build a map literal with `F.create_map` and index it, or `F.coalesce` over equality checks; for ranges, `when/otherwise` stays clearest. A small broadcast lookup join also works for large mapping tables. All keep the logic in the JVM, unlike a UDF dictionary lookup."
       }
     ]
   },
@@ -575,6 +939,20 @@
           "  F.coalesce('sid', F.lit('NA')))"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Under three-valued logic, does NOT (x = 5) include rows where x is NULL?",
+        "a": "No. If `x` is NULL, `x = 5` is NULL, and `NOT NULL` is still NULL, which a filter treats as not-true, so NULL rows are dropped by both `x = 5` and `NOT (x = 5)`. To include NULLs you must add an explicit `OR x IS NULL`. This asymmetry surprises people expecting NULLs in the negation."
+      },
+      {
+        "q": "How does df.na.fill behave when you pass a single value versus a per-column dict?",
+        "a": "`df.na.fill(0)` fills ALL numeric columns (and `fill('')` all string columns) of the matching type, which can clobber columns you did not mean to touch. A dict `na.fill({'sid':'NA','amt':0})` scopes the fill per column. Prefer the dict form to avoid accidentally filling unintended columns."
+      },
+      {
+        "q": "When would eqNullSafe change the result of a join versus a normal equality join?",
+        "a": "A normal join on a key drops rows where the key is NULL on either side (NULL never equals NULL). `a.join(b, a.k.eqNullSafe(b.k))` treats NULL=NULL as a match, so NULL-keyed rows pair up. Use it when NULL is a meaningful, joinable category rather than missing data."
+      }
     ]
   },
   {
@@ -597,6 +975,20 @@
           "spark.read.schema(s).csv(path)"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "With an explicit schema, what happens to a row whose value doesn't fit the declared type?",
+        "a": "It depends on the read `mode`: `PERMISSIVE` (default) sets the bad field to NULL and can capture the raw row in `columnNameOfCorruptRecord`; `DROPMALFORMED` discards the row; `FAILFAST` aborts the job. So an explicit schema plus `FAILFAST` is how you reject malformed input predictably instead of silently nulling."
+      },
+      {
+        "q": "Does providing a schema for Parquet do anything, given Parquet stores its own?",
+        "a": "Parquet's footer already defines types, so a supplied schema is used mainly to SELECT/reorder columns and to enforce expected evolution; mismatched types can error or be coerced. The big win of explicit schemas is for schemaless formats (CSV/JSON); for Parquet it is about column selection and validation, not avoiding an inference scan."
+      },
+      {
+        "q": "Why is samplingRatio-based inference non-deterministic across runs?",
+        "a": "Inference samples a fraction of rows (or the first file) to guess types, so a column that is integer-looking in the sampled rows but has a decimal or string later can be typed differently on another run or partition order. An explicit schema removes that run-to-run variance entirely."
+      }
     ]
   },
   {
@@ -617,6 +1009,20 @@
           "# empty/null items rows dropped",
           "# use explode_outer to keep them"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What error do you hit if you put two explode() calls in the same select, and how do you fix it?",
+        "a": "Spark allows only one generator (explode) per `select`/projection and raises an `Only one generator allowed` analysis error for two. Chain them: explode the first array, then a second `select`/`withColumn` to explode the next, producing the cross-product of both arrays across separate steps."
+      },
+      {
+        "q": "How big can the row blow-up get, and why is that a performance hazard?",
+        "a": "`explode` multiplies rows by array length per row, so an average array of 50 turns 1M rows into 50M, exploding shuffle, join, and memory cost downstream. A few rows with pathologically large arrays also create skew. Filter or aggregate before exploding, or cap array sizes, to avoid a runaway fan-out."
+      },
+      {
+        "q": "When would you flatten a struct with explicit aliased fields instead of select('addr.*')?",
+        "a": "Use explicit `col('addr.city').alias('addr_city')` when `addr.*` would collide with existing top-level names, when you need a prefix to avoid ambiguity, or when you only want a subset of nested fields. `addr.*` is convenient but promotes every field with its bare name, which can clash or pull in unwanted columns."
       }
     ]
   },
@@ -639,6 +1045,20 @@
           "    .alias('users'))"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What accuracy does approx_count_distinct give, and how do you control it?",
+        "a": "It uses HyperLogLog with a default relative standard deviation around 5%; you pass a smaller `rsd` (e.g. 0.01 for ~1%) at the cost of more memory and CPU. It is ideal for dashboards and cardinality monitoring where a small error is fine; use exact `countDistinct` only when the precise number legally/financially matters."
+      },
+      {
+        "q": "Why doesn't Spark do a partial (map-side) pre-aggregation for collect_list like it does for sum?",
+        "a": "`sum`/`count` are algebraic, so Spark combines partial results per partition before the shuffle, shrinking data moved. `collect_list` must concatenate every value, so there is no reducing partial form: all values for a key travel to one reducer and pile onto one task, which is exactly why a hot key OOMs."
+      },
+      {
+        "q": "How would you safely get the top-N values per group instead of collect_list of everything?",
+        "a": "Avoid materializing the whole list: use a `row_number()`/`rank()` window partitioned by the group and filter to N, or `slice(sort_array(collect_list(...)), 1, N)` only when groups are small. The windowed approach bounds per-task memory and is the standard skew-safe way to get top-N per key."
+      }
     ]
   },
   {
@@ -660,6 +1080,20 @@
           "  return s * 1.07  # whole Series"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Beyond speed, what type-handling problem does the Arrow-optimized UDF fix versus a pickled UDF?",
+        "a": "Pickled UDFs rely on Python's loose coercion, so a returned value can silently mis-cast or lose precision (e.g. int vs float, timestamp tz). The Arrow path enforces consistent, columnar type coercion matching the declared return type, catching mismatches more predictably. It is as much a correctness/consistency win as a perf win."
+      },
+      {
+        "q": "If a pandas_udf is faster, why ever use an Arrow-optimized row UDF?",
+        "a": "When the existing logic is inherently per-row and awkward to vectorize (complex branching, calling a row-oriented library), `useArrow=True` is a one-flag drop-in that speeds it ~1.6x with zero rewrite. Rewriting to a `pandas_udf` Series operation may be more effort or unnatural for that logic."
+      },
+      {
+        "q": "Does enabling Arrow have prerequisites or failure modes to watch?",
+        "a": "It needs a compatible `pyarrow` installed on driver and workers; on unsupported types or version mismatch Spark falls back to non-Arrow with a warning, silently losing the speedup. Some complex/nested types are not Arrow-serializable. Verify `pyarrow` is present and check logs for fallback warnings."
+      }
     ]
   },
   {
@@ -680,6 +1114,20 @@
           "# runs as Spark jobs, distributed",
           "# vs df.toPandas() -> all to driver"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is the default index in pandas-on-Spark a hidden performance trap?",
+        "a": "Pandas needs a global row order; the default `sequence` index requires collecting everything to one partition to assign monotonic ids, killing parallelism. Set `compute.default_index_type` to `distributed` or `distributed-sequence` so the index is computed without a single-partition bottleneck, at the cost of non-consecutive ids."
+      },
+      {
+        "q": "Which pandas operations should you expect to be slow or unsupported on pandas-on-Spark?",
+        "a": "Order-dependent and row-position ops (`iloc` by position, `shift` without ordering, cumulative ops needing a global order) are expensive because Spark is unordered, and some pandas methods are simply not implemented. Anything that implies materializing global order or per-row Python execution should be reviewed before relying on it at scale."
+      },
+      {
+        "q": "Is there overhead converting between a pandas-on-Spark frame and a regular Spark DataFrame?",
+        "a": "Conversion is cheap/metadata-level via `ps.DataFrame.to_spark()` and `df.pandas_api()` because both wrap the same underlying Spark plan; no data is collected. So you can drop into native Spark for a join, then back to the pandas API, mixing idioms without paying a collect."
       }
     ]
   },
@@ -708,6 +1156,20 @@
           "  handle(r)  # one partition at a time"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "toLocalIterator streams one partition at a time, but what can still OOM the driver?",
+        "a": "A single oversized partition: `toLocalIterator` brings one full partition into driver memory at a time, so if one partition is huge (skew, few large partitions), it still OOMs. Repartition to smaller, even partitions first so no single one exceeds driver heap."
+      },
+      {
+        "q": "Besides driver OOM, what other limit can collect() hit even on a moderate result?",
+        "a": "`spark.driver.maxResultSize` caps the total serialized size of results returned to the driver (default 1g); exceeding it aborts the job with an explicit error rather than silently OOMing. It is a guardrail you can raise, but hitting it is a sign you should aggregate or write to storage instead."
+      },
+      {
+        "q": "If you must get all rows out of Spark, what is the right pattern instead of collect?",
+        "a": "Write the DataFrame to distributed storage (Parquet/Delta) with executors writing in parallel, then read it where you need it. This keeps data off the driver entirely and parallelizes the I/O. Routing every row through `collect`/`toPandas` serializes the whole cluster's output through one machine."
+      }
     ]
   },
   {
@@ -729,6 +1191,20 @@
           "  yield s; s.stop()",
           "# assertDataFrameEqual(got, expected)"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Row order is nondeterministic; how does assertDataFrameEqual handle that and when does it not?",
+        "a": "`assertDataFrameEqual` has been updated to compare rows ignoring order by default in recent versions, but to be safe sort both sides (or pass the option) before comparing, since shuffles produce arbitrary order. Asserting on order only makes sense when the transformation itself includes a deterministic final `orderBy`."
+      },
+      {
+        "q": "Why use local[1] over local[*] in tests, and what is the tradeoff?",
+        "a": "`local[1]` makes execution single-threaded and deterministic, surfacing logic bugs without parallelism noise and avoiding flaky ordering. The tradeoff is it will not catch partition-boundary bugs (e.g. assuming all rows in one partition). Use `local[1]` for most logic tests and a small `local[2]` case when partition behavior matters."
+      },
+      {
+        "q": "How do you keep the slow SparkSession startup from dominating a large test suite?",
+        "a": "Scope the fixture to `session` (one JVM for the whole run) and configure `spark.sql.shuffle.partitions` low (e.g. 1-4) so tiny test data does not spawn 200 empty shuffle tasks. Disabling AQE and UI in tests also trims overhead. The goal is one Spark startup amortized across all tests."
       }
     ]
   },
@@ -752,6 +1228,20 @@
           "  .filter('rn = 1').drop('rn')"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Two records share the same key and identical max ts; how do you make row_number deterministic?",
+        "a": "With a tie, `row_number` picks an arbitrary survivor that can change across runs. Add a secondary tiebreaker to the `orderBy`, e.g. `desc('ts'), desc('version')` or a unique id, so the choice is stable and reproducible. Deterministic ordering is essential for idempotent reruns."
+      },
+      {
+        "q": "For very high-cardinality keys, is dropDuplicates(subset) cheaper than the row_number window?",
+        "a": "`dropDuplicates([key])` can be cheaper because it does a hash-based dedup without a full per-partition sort, but it gives a NONDETERMINISTIC survivor, so it is only safe when any row per key is acceptable. When you need the latest specifically, the `row_number` window is required despite the sort cost."
+      },
+      {
+        "q": "How would this pattern extend to building a full SCD Type 2 history instead of just latest?",
+        "a": "Instead of filtering `rn == 1`, use `lead(ts).over(w)` to compute each record's `valid_to` from the next record's timestamp (NULL/high-date for the current row), and mark `is_current = rn == 1`. That turns the same window into effective-dated history rows rather than collapsing to the latest."
+      }
     ]
   },
   {
@@ -774,6 +1264,20 @@
           "# keeps DataFrame plan, Arrow batches"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What hidden cost does simply calling df.rdd incur even before your RDD logic runs?",
+        "a": "Accessing `.rdd` forces Spark to deserialize each Tungsten binary row into a JVM/Python `Row` object, abandoning the compact off-heap format and codegen. That conversion alone is expensive, and converting the result back to a DataFrame re-incurs it. So even a trivial `.rdd` round-trip can dominate runtime."
+      },
+      {
+        "q": "When is a custom partitioner via RDD genuinely worth it over DataFrame repartition?",
+        "a": "When you need a specific key-to-partition mapping the DataFrame API cannot express, e.g. range or custom-hash co-partitioning for a specialized join or to guarantee related keys share a partition for a `mapPartitions` algorithm. DataFrame `repartition(col)` only gives default hash partitioning, so a true custom `partitionBy` requires the RDD."
+      },
+      {
+        "q": "Why is mapInPandas usually preferable to mapPartitions on the RDD for per-partition Python logic?",
+        "a": "`mapInPandas` keeps the DataFrame plan, ships data as Arrow columnar batches (no per-row pickling), and stays visible to the scheduler/AQE, whereas RDD `mapPartitions` serializes row by row and is opaque to Catalyst. You get partition-level Python control without losing the optimized data path."
+      }
     ]
   },
   {
@@ -793,6 +1297,20 @@
           "# later reads: column pruning +",
           "# predicate pushdown via footer stats"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Predicate pushdown relies on min/max stats; when do those stats fail to skip anything?",
+        "a": "When the filter column is unsorted, so most row groups have wide min/max ranges that overlap the predicate and none can be skipped. Sorting (or `ZORDER`) the data on the filter column tightens per-row-group ranges so skipping becomes effective. Unsorted data turns pushdown into a near-full scan despite the stats."
+      },
+      {
+        "q": "Why is Avro a better fit than Parquet for a streaming CDC or Kafka payload?",
+        "a": "CDC/streaming reads and writes whole records, not column slices, so a row format avoids Parquet's columnar overhead and write amplification per small batch. Avro's compact binary form plus its strong schema-evolution rules (with a schema registry) make it ideal for message-shaped, write-heavy, full-row data."
+      },
+      {
+        "q": "What does a table format like Delta or Iceberg add on top of plain Parquet?",
+        "a": "They add a transaction log over the Parquet files giving ACID commits, snapshot isolation/time travel, schema evolution, and file-level stats for faster skipping plus `OPTIMIZE`/compaction. Plain Parquet has none of that: concurrent writers can corrupt it and there is no atomic overwrite. Delta/Iceberg make a lake behave like a table."
       }
     ]
   },
@@ -817,6 +1335,20 @@
           "p.groupBy('key').agg(F.sum('v'))"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does this two-stage trick work for sum/count but not for exact median?",
+        "a": "`sum`/`count`/`max` are algebraic: the final answer is a simple combination of per-salt partials (sum of sums, sum of counts). Median is holistic: you cannot derive the global median from per-salt medians without all the underlying values. For median, use `approx_percentile` or a different distribution-aware approach."
+      },
+      {
+        "q": "How do you compute an AVERAGE correctly with a salted pre-aggregation?",
+        "a": "Do not average the per-salt averages, which is wrong when salt buckets have different counts. Instead carry `sum(v)` and `count(v)` per (key, salt), re-aggregate both by key, then divide total sum by total count. Average is algebraic only when decomposed into its sum and count components."
+      },
+      {
+        "q": "Why doesn't AQE skewJoin help a skewed groupBy the way it helps a skewed join?",
+        "a": "AQE skew handling targets the join's shuffle partitions, splitting an oversized join partition. A `groupBy` reduces all rows of a key into one group on one reducer by definition, so splitting the partition would split the group and break the aggregate. AQE coalesce can right-size partitions but cannot un-skew a single hot group; manual salting still does."
+      }
     ]
   },
   {
@@ -837,6 +1369,20 @@
           "j = big.join(F.broadcast(small),'id')",
           "j.explain()  # expect BroadcastHashJoin"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why can a 5 MB Parquet file blow past a 10 MB broadcast threshold once read?",
+        "a": "Parquet is compressed and columnar on disk; in memory Spark deserializes it into row objects with per-value overhead, so a 5MB file can expand many-fold (often 5-10x) in heap. The threshold and the broadcast itself act on the in-memory size, which is why a small file still OOMs the broadcast."
+      },
+      {
+        "q": "How does a broadcast() hint interact with an explicit threshold of -1?",
+        "a": "Setting `autoBroadcastJoinThreshold = -1` only disables AUTOMATIC broadcasting based on size estimates; an explicit `broadcast()` hint still forces the broadcast. So -1 is a clean way to turn off accidental broadcasts while keeping deliberate, hinted ones, useful for diagnosing a runaway auto-broadcast."
+      },
+      {
+        "q": "Which join types can't broadcast a given side, forcing a fallback?",
+        "a": "You cannot broadcast the side that must be fully preserved/streamed for that outer join: e.g. a left outer join cannot broadcast the left side, a right outer cannot broadcast the right, and full outer joins cannot use a broadcast hash join at all. Spark silently falls back to sort-merge, which `explain` will reveal."
       }
     ]
   },
@@ -859,6 +1405,20 @@
           "df.repartition('dt').write \\",
           "  .partitionBy('dt').parquet(path)"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does raising shuffle.partitions do nothing for a job that is slow at the READ stage?",
+        "a": "`shuffle.partitions` only governs post-shuffle width; the read stage's parallelism comes from `maxPartitionBytes` and the file/split count. If reads are slow because of a few huge files or many tiny ones, no shuffle setting helps. They are independent knobs at different stages, which is the core point."
+      },
+      {
+        "q": "How does maxPartitionBytes interact with files that are smaller than its value?",
+        "a": "`maxPartitionBytes` caps how large an input partition can get but does not merge small files by default; Spark also uses `openCostInBytes` to decide packing. Many sub-128MB files still tend to map to many small input partitions, under-parallelizing or wasting task overhead, so you coalesce or compact upstream."
+      },
+      {
+        "q": "Why repartition('dt') before partitionBy('dt') instead of letting the write handle it?",
+        "a": "Without the `repartition`, each of the many in-flight tasks writes its own file into every `dt` directory, producing tasks x dt files (a tiny-file explosion). `repartition('dt')` collocates all rows of a date into one partition, so each `dt` gets one (or few) properly sized file. It aligns the in-memory partitioning with the on-disk layout."
       }
     ]
   }

@@ -14,6 +14,20 @@
           "    SUM([Sales]) }"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If you put a FIXED customer-total measure on the view and then aggregate it, why might SUM double-count it?",
+        "a": "A `FIXED [Customer ID]` value repeats on every row for that customer, so summing it across an order-level view adds the same per-customer total once per order. Wrap it in `MIN`, `MAX`, or `ATTR` to collapse the duplicates, or set the view's grain to the customer so each value appears once. The repetition is the whole point of FIXED, but it makes naive re-aggregation wrong."
+      },
+      {
+        "q": "Does an empty FIXED like `{ FIXED : SUM([Sales]) }` mean something different from `{ FIXED [Region] : ... }`?",
+        "a": "Yes. An empty dimension list computes a single grand total across the whole table, ignoring every dimension, which is exactly the stable denominator you want for percent-of-grand-total. `{ FIXED [Region] : ... }` instead produces one value per region. The empty form is the cleanest way to get a filter-resistant total that does not move as you add dimensions to the sheet."
+      },
+      {
+        "q": "When would you NOT reach for a FIXED LOD even though it could compute the right number?",
+        "a": "Avoid it when the denominator must follow the user's slicers, since FIXED ignores dimension filters unless you promote them to context; an `INCLUDE`/`EXCLUDE` or table calc is cleaner there. Also skip FIXED on very high-cardinality keys over huge live sources, where the pre-aggregation step can be slow. FIXED is for stable, view-independent grain, not for view-reactive shares."
+      }
     ]
   },
   {
@@ -39,6 +53,20 @@
           "    SUM([Sales]) }"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why must an INCLUDE or EXCLUDE expression be wrapped in an outer aggregate when placed on the view?",
+        "a": "INCLUDE/EXCLUDE produce a value at a grain different from the sheet, so Tableau needs the outer aggregate to roll those values up to each mark, e.g. `AVG({ INCLUDE [Order ID] : SUM([Sales]) })`. Without it the grain mismatch is ambiguous. FIXED can sometimes display without one because its grain is self-contained, but INCLUDE/EXCLUDE inherit the view's dimensions and need reaggregation."
+      },
+      {
+        "q": "Can a context filter change an EXCLUDE result the way it changes a FIXED result?",
+        "a": "Not usefully. INCLUDE and EXCLUDE run after dimension filters, so they already respond to ordinary dimension filters directly. Context filters help FIXED precisely because FIXED runs earlier; for INCLUDE/EXCLUDE the context promotion is unnecessary. That timing difference is why you rewrite a FIXED as INCLUDE/EXCLUDE to make a calc honor a slicer without touching context."
+      },
+      {
+        "q": "EXCLUDE [Region] on a view that already lacks Region as a dimension — what happens?",
+        "a": "Excluding a dimension that is not in the view is a no-op for grain, so the expression just computes at the current view grain and effectively does nothing. EXCLUDE only matters when the named dimension is actually present on the sheet, where it pulls the calc up to a coarser total. This is a common 'my EXCLUDE isn't changing the number' confusion."
+      }
     ]
   },
   {
@@ -46,21 +74,63 @@
     "a": "FIXED LODs are computed BEFORE dimension filters, so a normal dimension filter does not shrink a FIXED result unless you promote that filter to a context filter (FIXED still respects extract, data source, and context filters). INCLUDE and EXCLUDE are computed AFTER dimension filters, so they react to dimension filters automatically. This is the single most-tested LOD gotcha: if you need a FIXED calc to honor a slicer, add the filter to context, otherwise rewrite the calc as INCLUDE/EXCLUDE.",
     "fs": "FIXED runs before dimension filters (respects only context/data-source/extract); INCLUDE and EXCLUDE run after.",
     "fj": "Believes all three LOD types respond to every filter the same way.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Exactly which filter types does a FIXED LOD still honor without promotion to context?",
+        "a": "FIXED is computed after extract filters, data source filters, and context filters but before dimension filters and measure filters. So it always respects those three earlier layers; it only ignores ordinary dimension/measure filters on the shelf. Promoting a slicer to context moves it into a layer FIXED can see, which is why that fix works."
+      },
+      {
+        "q": "Why is rewriting a FIXED as INCLUDE/EXCLUDE sometimes preferred over adding a context filter?",
+        "a": "Context filters add order-of-operations coupling and historically materialized a temp scope, and they affect every other filter and FIXED calc on the sheet, not just the one you care about. An `INCLUDE`/`EXCLUDE` reacts to dimension filters locally with no global side effects. When only one calc needs to follow the slicer, the rewrite is surgically cleaner."
+      },
+      {
+        "q": "How does a measure filter interact with these three LOD types?",
+        "a": "Measure filters run after all three LODs are computed, so they can hide marks whose FIXED, INCLUDE, or EXCLUDE values fall outside a range without changing the LOD math itself. You can therefore filter on the LOD result (e.g., keep customers whose `{ FIXED [Customer ID] : SUM([Sales]) }` exceeds 10k) and that filter behaves as a late-stage measure filter."
+      }
+    ]
   },
   {
     "q": "When would you choose an extract over a live connection?",
     "a": "Use an extract when the underlying source is slow, far away on the network, query-throttled, or charged per query; when you need offline access; or when you want columnar, in-memory speed for aggregation. Extracts (the .hyper format) store data column-wise so aggregations scan far less I/O, and they can be pre-aggregated and filtered to shrink size. Use live when freshness is critical (near real-time), when the warehouse is already fast and tuned (Snowflake, BigQuery), or when data volume exceeds what the local engine can hold in memory.",
     "fs": "Extract for speed/offline/throttled sources; live for freshness and when the warehouse outperforms the local engine.",
     "fj": "Says extracts are always faster, so you should never use a live connection.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "How do you keep an extract reasonably fresh without going fully live?",
+        "a": "Schedule incremental refreshes on Tableau Server/Cloud keyed to a monotonically increasing column (a timestamp or ID) so only new rows are appended, with periodic full refreshes to catch updates and deletes. For sub-hourly needs you can pair extracts with a live source on a small real-time sheet. Incremental refresh trades a little freshness for far cheaper refresh cost."
+      },
+      {
+        "q": "What is a failure mode of incremental extract refresh that surprises people?",
+        "a": "Incremental refresh only appends rows above the last refreshed key value; it does not see updates or deletes to existing rows. So a corrected or removed historical record silently stays wrong until a full refresh. Use incremental only for append-only event data, and schedule periodic full refreshes for mutable tables."
+      },
+      {
+        "q": "When does an extract actually perform worse than the live warehouse?",
+        "a": "When the data exceeds local memory and spills, or when the warehouse (Snowflake, BigQuery, Redshift) is massively parallel and already tuned, a single Hyper engine node can be slower than pushing the aggregate down live. Extracts win on small-to-mid, aggregation-heavy data; a petabyte-scale, columnar cloud warehouse with query pushdown often beats round-tripping through an extract."
+      }
+    ]
   },
   {
     "q": "What is the .hyper format and why did Tableau move to it?",
     "a": "Hyper is Tableau's in-memory data engine and the file format extracts use (replacing the legacy .tde). It is a columnar, compressed store designed for fast ingestion and analytical queries, giving roughly an order-of-magnitude faster query and extract-creation speed versus TDE. .tde is deprecated; 2024.2 was the last Desktop version that supported it, so all modern extracts are .hyper. Knowing this signals you understand why extracts accelerate aggregate-heavy dashboards.",
     "fs": "Hyper is the columnar in-memory engine behind .hyper extracts; .tde is deprecated since 2024.2.",
     "fj": "Thinks .hyper is just a renamed CSV with no engine differences.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How would you create or modify a .hyper file outside of Tableau Desktop?",
+        "a": "Use the Hyper API, a programmatic library (Python/Java/C++/.NET) that lets you insert, read, update, and delete rows in `.hyper` files and run SQL against them directly. It is how teams build automated extract pipelines that publish to Tableau Server/Cloud without opening Desktop. It replaced the older Extract API tied to `.tde`."
+      },
+      {
+        "q": "What does 'logical tables' vs 'physical tables' extract storage mean for a .hyper extract?",
+        "a": "Since the 2020.2 data model, an extract can store data as logical tables (one Hyper table per logical table, the default) or as a single flattened physical table. Logical storage preserves the relationship structure and avoids row duplication; physical storage flattens everything up front. Tableau recommends logical storage so relationships keep behaving contextually per sheet inside the extract."
+      },
+      {
+        "q": "Why is Hyper's columnar layout specifically good for dashboards versus a row store?",
+        "a": "Analytical queries typically touch a few columns over many rows (SUM a measure, GROUP BY a dimension). A columnar store reads only those columns and compresses each one well because values are homogeneous, so it scans far less I/O than a row store that must read whole rows. That is the mechanical reason extracts speed up aggregate-heavy views."
+      }
+    ]
   },
   {
     "q": "What is the difference between a calculated field and a table calculation?",
@@ -83,6 +153,20 @@
           "RUNNING_SUM(SUM([Sales]))"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why can a table calc never reference rows that a dimension filter removed, while a FIXED LOD can?",
+        "a": "A table calc operates on the query result already returned to the view, so anything a dimension filter cut never reaches it. A `FIXED` LOD is computed in the engine before dimension filters, so it can still 'see' rows the filter later hides. That timing is why a percent-of-total against a filtered-out denominator needs a FIXED LOD, not a `WINDOW_SUM`."
+      },
+      {
+        "q": "Can you nest a table calc inside a regular calculated field, and what's the catch?",
+        "a": "Yes, you can reference a table calc from a calculated field, but the result is still a table calc and inherits all the partition/addressing and view-dependency rules. You cannot use it as a row-level dimension or as the input to a FIXED LOD, because it only exists after aggregation. The catch is that mixing them does not 'promote' the table calc to a row-level field."
+      },
+      {
+        "q": "Which is cheaper to compute over a 50M-row live source: a row-level calc or a table calc?",
+        "a": "A row-level calc usually pushes down into source SQL and runs alongside the query, so it's never materialized separately. A table calc runs locally on returned marks, so its cost scales with marks in the view, not source rows, but can't be pushed down. For full-dataset math prefer the row-level calc so the warehouse does the work; reserve table calcs for neighbor logic on the small result set."
+      }
     ]
   },
   {
@@ -90,21 +174,63 @@
     "a": "Tableau applies filters in a fixed sequence: extract filters, then data source filters, then context filters, then dimension filters, then measure filters, then table-calc filters, with FIXED LODs computed before dimension filters and INCLUDE/EXCLUDE after. It matters because the same set of filters can produce different numbers depending on which layer they live in. The classic trap is a Top N filter that 'sees' the wrong population because a category slicer is a sibling dimension filter rather than a context filter sitting above it.",
     "fs": "Filters execute extract to data-source to context to dimension to measure to table-calc, and LOD type decides which side of dimension filters a calc lands on.",
     "fj": "Assumes all filters apply at once in no particular order.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Where does a 'Top N' set or filter sit relative to a measure filter, and why can that matter?",
+        "a": "A Top N filter is a dimension-level filter (it ranks the dimension's members), so it runs before measure filters. If you also have a measure filter meant to drop low-value marks, the Top N has already ranked over the unfiltered measure population, so the two can disagree. You sequence them deliberately by promoting one to context or pre-aggregating the cutoff."
+      },
+      {
+        "q": "Do table-calc filters ('hide' via a table calc) remove data or just mask it?",
+        "a": "Table-calc filters run last and only hide marks; they do not remove the underlying data from earlier aggregations or LODs. So a `LOOKUP`/`INDEX`-based filter can blank out marks while totals and `WINDOW_SUM` denominators still include them. That late-stage masking is exactly why people use it to trim leading nulls without distorting running totals."
+      },
+      {
+        "q": "How do action filters (from dashboard interactions) fit into this order?",
+        "a": "A filter dashboard action injects a dimension filter into the target sheet, so it lands in the dimension-filter layer, after context but before measure filters and after FIXED LODs. That means a click action will not shrink a FIXED LOD denominator unless the source field is also a context filter on the target. Knowing this prevents 'my click isn't changing the percentage' bugs."
+      }
+    ]
   },
   {
     "q": "What does a context filter do and when should you use one?",
     "a": "A context filter creates a temporary, filtered subset of the data that all other (dimension/measure) filters then operate on. In the order of operations it runs before regular dimension filters, so it defines the population for Top N filters, FIXED LODs, and percent-of-total computations. Use it when you need 'Top 10 products within the currently selected region,' or to speed up a sheet by shrinking the data other filters scan. Historically each context filter materialized a temp table, so do not over-use them, but on modern engines the main reason is controlling order of operations.",
     "fs": "Context filters run before dimension filters, so they scope Top N, FIXED, and percent-of-total to a chosen subset.",
     "fj": "Adds many context filters thinking 'context' just means 'more important' with no order effect.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is the historical performance cost of a context filter, and is it still relevant?",
+        "a": "Older Tableau materialized each context filter into a temporary table that had to be built and refreshed whenever the context changed, which was expensive on big data. On the modern Hyper engine that cost is largely gone, so context is now chosen for order-of-operations control, not speed. The lingering advice to 'use few context filters' comes from that legacy behavior."
+      },
+      {
+        "q": "Does a context filter affect an INCLUDE LOD differently than a FIXED LOD?",
+        "a": "It can. A context filter scopes the data before both FIXED LODs and dimension filters, so it changes a FIXED result. An INCLUDE/EXCLUDE already runs after dimension filters, so it sees the post-dimension-filter data regardless; the context promotion is meaningful mainly for FIXED. So context buys you control over FIXED, less so over INCLUDE/EXCLUDE."
+      },
+      {
+        "q": "What's a sign you've over-used context filters on a sheet?",
+        "a": "If users complain that unrelated slicers feel sluggish or that filters interact in confusing ways, you may have promoted too many to context, forcing every downstream filter and FIXED calc to re-scope on each change. Keep context to the one or two fields that genuinely must scope Top N or FIXED, and leave the rest as ordinary dimension filters."
+      }
+    ]
   },
   {
     "q": "You have a Top 5 filter and a Region filter; the Top 5 ignores the region. How do you fix it?",
     "a": "Top N is a dimension filter and is applied simultaneously with the Region dimension filter, so Top N is computed over all regions, then the region selection just hides marks. Promote the Region filter to a context filter (right-click > Add to Context). Because context filters run earlier in the order of operations, the Top 5 is then evaluated within the selected region only. This is the canonical demonstration that context filters change which population downstream filters use.",
     "fs": "Add the Region filter to context so the Top N is computed after region scoping, not across all regions.",
     "fj": "Tries to fix it by reordering the pills on the Filters shelf, expecting that to change evaluation order.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Could you solve this without a context filter at all?",
+        "a": "Yes. Build the rank as a calculation that's region-aware, for example a `RANK` table calc partitioned by Region, or use a `{ INCLUDE }`/parameter-driven set that recomputes within the slicer scope. These avoid context's global side effects, though context is the fastest one-click answer most interviewers expect. The trade-off is more calc complexity for cleaner order-of-operations isolation."
+      },
+      {
+        "q": "What if Region is a parameter the user picks rather than a filter — does context still apply?",
+        "a": "No. A parameter is not data and never enters the filter pipeline, so there's nothing to promote to context. You'd instead use the parameter inside a filter calc (e.g., `[Region] = [p_Region]`) and then promote that resulting boolean filter to context, or build the rank to respect the parameter. The 'add to context' fix only works on actual field filters."
+      },
+      {
+        "q": "Why does dragging the Region pill above the Top 5 pill on the Filters shelf not fix it?",
+        "a": "Shelf order is purely cosmetic; Tableau's evaluation order is fixed by the order of operations, not by pill position. Both pills are dimension filters and execute in the same simultaneous layer regardless of arrangement. Only moving Region into the earlier context layer actually changes which population the Top N ranks over."
+      }
+    ]
   },
   {
     "q": "What is a parameter in Tableau and how does it differ from a filter?",
@@ -123,6 +249,20 @@
           "END"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "A static parameter's list of values gets stale when new data arrives — how do you keep it current?",
+        "a": "Use a dynamic parameter: in the parameter settings set 'List of values' to a workbook field and 'Current value' to a calculation, and Tableau refreshes the allowed values on workbook open or data source refresh. Before this feature you had to hand-edit the list or rebuild it. It bridges the gap between a fixed parameter and live data without making it a filter."
+      },
+      {
+        "q": "Why can't a parameter directly hold multiple selected values like a multi-select filter?",
+        "a": "A parameter is a single scalar by design, so it cannot represent a multi-select. To approximate multi-select you combine parameters with a delimiter-and-`CONTAINS` trick, use a set, or use parameter actions feeding a set. The single-value constraint is exactly why sets exist for multi-member selection scenarios."
+      },
+      {
+        "q": "How does a parameter action let a parameter feel 'bound' to the data after all?",
+        "a": "A parameter action writes a clicked field value into the parameter on Select, so the parameter updates from the data interactively even though it's not bound at refresh time. This powers click-to-drill, dynamic comparison baselines, and what-if toggles. It's the modern way to get data-driven behavior from a field that is otherwise data-independent."
+      }
     ]
   },
   {
@@ -130,21 +270,63 @@
     "a": "Create an integer parameter (say p_TopN), then on the dimension's filter use the Top tab, choose 'By field,' and set Top to 'p_TopN' by SUM(Sales). Now the user controls how many items show. To make Top N respect a slicer such as region, also promote that slicer to a context filter, because Top N is a dimension filter and otherwise ranks across the unfiltered population. This combines three tested concepts: parameters, Top N filters, and context/order of operations.",
     "fs": "Bind the Top N filter's count to an integer parameter, and add any scoping slicer to context so the rank is within scope.",
     "fj": "Hardcodes the number in the Top filter and exposes the parameter only as decoration.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How would you add a 'Top N plus an Other bucket' so the remaining items roll up?",
+        "a": "Don't use the Top filter; instead build a rank calc (`RANK` or an `INDEX` over sorted members) and a grouping calc that labels members with rank <= `p_TopN` individually and everything else as 'Other'. Place that grouping calc on the view so the long tail collapses into one mark. The Top filter alone just hides the tail; the calc preserves its total."
+      },
+      {
+        "q": "Why might the dynamic Top N show fewer than N items, and is that a bug?",
+        "a": "If ties at the cutoff or filtered-out members reduce the qualifying population, you simply get fewer than N marks — it's correct, not a bug. Tableau's Top filter returns the top members that exist, so a region with only three products can't show a Top 5. Add a context filter so the rank is computed within the right scope rather than 'losing' members unexpectedly."
+      },
+      {
+        "q": "Can you let the user toggle between Top and Bottom N with one parameter?",
+        "a": "Yes. Use a string/boolean parameter for direction and drive a `RANK` (descending) vs `RANK` (ascending) calc, or a single `RANK` whose `asc`/`desc` argument is chosen by the parameter, then filter where rank <= `p_N`. The built-in Top tab only does one direction, so a rank-calc approach is how you make direction itself user-controlled."
+      }
+    ]
   },
   {
     "q": "What is a dual-axis chart and how is it different from a blended (combined) axis?",
     "a": "A dual-axis chart places two measures on the same panel using two independent axes (left and right), each with its own Marks card, letting you mix mark types like bars plus a line. A blended/combined axis puts multiple measures onto a single shared axis using Measure Values/Names, with one scale for all of them. Choose dual axis when the measures have different scales or you want different mark types; choose blended axis when measures share units and you want them strictly comparable on one scale.",
     "fs": "Dual axis = two scales and two Marks cards (mix mark types); blended axis = one shared scale via Measure Values.",
     "fj": "Uses the words interchangeably and assumes both always share the same scale.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Beyond mixing mark types, what's a clever use of dual axis with the same measure twice?",
+        "a": "Placing the same measure on both axes lets you layer marks — e.g., a bar plus a circle for a 'lollipop' chart, or a filled area plus a line for emphasis, by giving each Marks card a different type and synchronizing the axes. The duplicate measure isn't redundant; it's a layering trick. Synchronize so both layers share one scale."
+      },
+      {
+        "q": "What accessibility or readability risk comes with dual-axis charts on different scales?",
+        "a": "Two independent scales let you imply a relationship that isn't there, since you choose where the lines visually cross by setting each axis range. Readers often miss the second axis entirely and misjudge magnitudes. Mitigate by clearly labeling both axes, color-coding marks to their axis, and only using independent scales when the units genuinely differ."
+      },
+      {
+        "q": "Why does a blended axis force you to use Measure Names/Values, and what's the limitation?",
+        "a": "A blended axis stacks multiple measures onto one continuous axis, and Tableau represents that multi-measure set through the `Measure Names`/`Measure Values` fields. The limitation is one shared scale and a single Marks card, so you can't give measures different mark types or independent ranges. Use it only when the measures share units and you want strict comparability."
+      }
+    ]
   },
   {
     "q": "Why must you synchronize axes on a dual-axis chart, and when does it not apply?",
     "a": "By default the two axes scale independently, so a bar at value 100 on the left can visually line up with 5 on the right, which is misleading. Right-click the secondary axis and choose Synchronize Axis to force both axes onto the same scale; this requires both measures to share the same data type. You intentionally do NOT synchronize when the two measures genuinely live on different scales (e.g., revenue in dollars and conversion rate in percent), where the whole point is two independent axes.",
     "fs": "Synchronize aligns both axes to one scale (needs matching data types); skip it when measures legitimately differ in units.",
     "fj": "Always synchronizes, even when one axis is dollars and the other is a percentage.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why is 'Synchronize Axis' sometimes greyed out, and how do you fix it?",
+        "a": "It's disabled when the two measures have incompatible data types — for instance an integer against a float, or a currency against a percentage — because Tableau can't map them onto one numeric scale. Cast or recompute one measure so the types match (e.g., wrap one in `FLOAT()`), then the option enables. Mismatched types are the most common cause of the greyed-out menu item."
+      },
+      {
+        "q": "After synchronizing, why might the two axes still show different tick ranges?",
+        "a": "Synchronize aligns the scale mapping, but if you've manually fixed one axis's range or have a non-zero start, the displayed ticks can still differ. Reset both axes to automatic, or set identical fixed ranges, so the synchronization is visually faithful. Synchronizing scale and fixing range are separate settings that can conflict."
+      },
+      {
+        "q": "When you deliberately don't synchronize, how do you keep the chart honest?",
+        "a": "Label each axis with its unit, color the marks to match their axis, and avoid implying causation from where the lines happen to cross. Consider annotations or a clear legend so readers know the two series live on different scales. Independent axes are legitimate for dual-unit comparisons but require explicit signposting to not mislead."
+      }
+    ]
   },
   {
     "q": "What are addressing and partitioning fields in a table calculation?",
@@ -162,6 +344,20 @@
           "RANK(SUM([Sales]))"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is 'Compute Using > Table (Across)' fragile compared to 'Specific Dimensions'?",
+        "a": "Table (Across)/(Down) are relative to the current physical layout, so swapping rows and columns or adding a dimension silently changes which field is addressing and breaks the calc. Choosing 'Specific Dimensions' and naming the exact field (e.g., Order Date) pins the behavior regardless of layout. Senior authors prefer Specific Dimensions for stability."
+      },
+      {
+        "q": "What does the 'at the level' and 'restarting every' option do beyond addressing/partitioning?",
+        "a": "Within Specific Dimensions, 'at the level' controls the grain a calc like `RANK` is evaluated at, and 'restarting every' inserts an extra reset boundary along the addressing path. They let you, say, rank by month but restart numbering each quarter without making quarter a full partition. They're finer controls than just choosing addressing fields."
+      },
+      {
+        "q": "How does sort order interact with addressing for a calc like RANK or RUNNING_SUM?",
+        "a": "Addressing defines direction, but the order marks are traversed follows the view's sort, so a `RUNNING_SUM` or `RANK` accumulates in whatever order the addressing dimension is sorted. Change a nested sort and the running total changes. That's why date addressing fields should be sorted chronologically, not by measure, for time-series calcs."
+      }
     ]
   },
   {
@@ -178,6 +374,20 @@
           "SUM([Sales])",
           "/ WINDOW_SUM(SUM([Sales]))"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you turn WINDOW_SUM into a trailing 3-period moving sum?",
+        "a": "Pass an offset range: `WINDOW_SUM(SUM([Sales]), -2, 0)` totals the current mark plus the two before it along the addressing direction. The `-2, 0` arguments bound the window relative to the current position. Omit the bounds and it sums the whole partition, which is the percent-of-total form."
+      },
+      {
+        "q": "What's the difference between INDEX() and RANK() when there are ties?",
+        "a": "`INDEX()` is purely positional — it counts marks 1,2,3 regardless of value, so it never ties. `RANK()` is value-based and assigns equal ranks to ties (with configurable dense/modified behavior), so two equal sales values share a rank. Use INDEX for stable row numbering and RANK when ties should genuinely share position."
+      },
+      {
+        "q": "Why might RUNNING_SUM and WINDOW_SUM disagree on the partition total?",
+        "a": "They agree only at the last mark of the partition; mid-partition, `RUNNING_SUM` shows the cumulative-so-far while `WINDOW_SUM` (unbounded) shows the full partition total on every mark. People expecting a constant denominator sometimes wire up RUNNING_SUM by mistake. For percent-of-total you want the constant WINDOW_SUM, not the growing RUNNING_SUM."
       }
     ]
   },
@@ -206,6 +416,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "You want the running total to accumulate across years but restart each year — how?",
+        "a": "Use Specific Dimensions with Order Date (continuous month) as the addressing field and set 'restarting every' to Year, or make Year a partitioning field while Month addresses within it. That gives a per-year cumulative that resets each January. The 'restarting every' control is the precise tool for an intentional reset boundary."
+      },
+      {
+        "q": "After fixing the addressing, the totals row shows a wrong cumulative value — why?",
+        "a": "Grand totals compute table calcs over the totals row's own grain, which often differs from the detail marks, so a `RUNNING_SUM` at the total can look nonsensical. Use 'Edit Table Calculation' or two-pass totals (`Total using > Automatic`) settings, or hide the total. The total row is a separate partition the calc treats independently."
+      },
+      {
+        "q": "Why prefer fixing addressing over rewriting RUNNING_SUM as a self-referencing LOOKUP?",
+        "a": "A `LOOKUP`-based hand-rolled cumulative is more brittle, harder to read, and still subject to the same partition/addressing rules, so it doesn't escape the root cause. The reset is an addressing problem, not a formula problem, so the correct fix is in Compute Using. Rewriting the formula just hides the misconfiguration and usually reproduces the bug."
+      }
     ]
   },
   {
@@ -213,42 +437,126 @@
     "a": "A join combines tables at the row level before aggregation: it matches rows, produces a single combined table, then Tableau aggregates. Blending queries each data source separately, aggregates each to the level of the linking fields, then merges the aggregated results in the view (a left join from the primary to the secondary, at the sheet level only). Use joins/relationships when data is in the same source or can be physically combined and you need row-level detail; use blending when sources differ (e.g., warehouse plus an Excel file) or are at different granularities.",
     "fs": "Join matches rows then aggregates; blend aggregates each source then left-joins the results per sheet.",
     "fj": "Calls blending 'just a join' and assumes it produces a single physical table.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why does a join risk duplicating measures while a blend usually doesn't?",
+        "a": "A one-to-many join repeats the 'one' side's rows for every match on the 'many' side, so summing its measure double-counts unless you de-dup with an LOD. A blend aggregates each source to the link grain first, so the secondary contributes a single aggregated value per link key. That pre-aggregation is precisely why blending avoids the fan-out trap."
+      },
+      {
+        "q": "How does a relationship (logical layer) differ from both join and blend on duplication?",
+        "a": "A relationship keeps tables separate and lets Tableau choose the join type and grain per sheet at query time, so measures aren't duplicated until a sheet actually needs the combined grain. It's neither an up-front flatten (join) nor a per-sheet aggregate merge (blend). That contextual, lazy joining is the headline benefit of relationships over physical joins."
+      },
+      {
+        "q": "What's a scenario where you'd still pick a physical join over a relationship or blend?",
+        "a": "When you need a specific flattened shape — for example a deliberate row explosion for a Cartesian-style calendar scaffold, or a self-join, or to control the exact join type and unmatched-row handling. Relationships hide those decisions, and blends can't produce row-level detail. The physical layer is the right tool when you want explicit, fixed join semantics."
+      }
+    ]
   },
   {
     "q": "In a data blend, what do an asterisk (*) and a Null in the secondary source mean?",
     "a": "Blending is a left join from primary to secondary on the linking fields and aggregates the secondary up to that grain. An asterisk appears when multiple secondary values map to one primary row for a non-additive (string/text) field, meaning 'many different values, cannot show one.' A Null appears when a primary value has no matching row in the secondary source. Recognizing this tells the interviewer you understand blend granularity: to remove asterisks you usually need a coarser link or an aggregate the blend can compute.",
     "fs": "Asterisk = many secondary values collapsing into one primary row; Null = no secondary match (it is a left join).",
     "fj": "Reads the asterisk as a Tableau error rather than a many-to-one collapse.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why does swapping which source is primary sometimes make the Nulls disappear?",
+        "a": "Because a blend is a left join from primary to secondary, only primary members are guaranteed to show; primary rows with no secondary match yield Null. Making the other source primary changes which members anchor the view, so previously unmatched-and-null rows may now match. The asymmetry of the left join is the lever."
+      },
+      {
+        "q": "How can you resolve an asterisk while keeping the text field meaningful?",
+        "a": "Add the differentiating dimension to the view (or to the link) so each primary row maps to a single secondary value, or apply `MIN`/`MAX`/`ATTR` to deliberately pick one. The asterisk is `ATTR` telling you the grain is too coarse for one answer; refining the link grain or choosing an aggregate resolves it. You can't sum text, so you must reduce the many-to-one."
+      },
+      {
+        "q": "What blend behavior catches people when they filter on a secondary dimension?",
+        "a": "Filtering on a secondary-source dimension is limited and behaves differently from a primary filter — it often filters the secondary's aggregation rather than removing primary marks, and it can introduce Nulls instead of dropping rows. For full filter control you usually filter on the primary or restructure as a relationship. Secondary-side filtering is a classic blend gotcha."
+      }
+    ]
   },
   {
     "q": "When should you use blending instead of a relationship/join, and what are blending's limits?",
     "a": "Prefer blending when the data lives in separate connections that cannot be physically joined (different servers, a published source plus a local file) or when sources sit at different levels of detail and you only need linked aggregates. Limits: a blend is sheet-scoped (not reusable across the workbook like a relationship), the secondary source can only contribute aggregated/measure values once it is the secondary side, you cannot freely use secondary dimensions in all shelves, and dimension filters on the secondary behave differently. For same-source, row-level needs, relationships or joins are the better default.",
     "fs": "Blend across separate or mismatched-grain sources; accept that it is sheet-scoped and secondary fields are limited to aggregates.",
     "fj": "Reaches for blending first even when both tables are in one source and a join would be cleaner.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Since you can blend two published data sources, when is that better than republishing a joined source?",
+        "a": "Blending two published sources keeps each governed and independently refreshed, which suits cross-team data where you can't or shouldn't merge sources or where they refresh on different schedules. Republishing a joined source centralizes the model but couples the teams and grain. Blend when ownership/refresh independence matters more than a reusable physical model."
+      },
+      {
+        "q": "Why can't you always use a secondary source's dimension on the Rows shelf?",
+        "a": "Once a source is secondary, it's aggregated to the linking grain, so its non-linking dimensions don't have a defined row-level identity in the view and Tableau restricts where they can go. You can use them as aggregated attributes (`ATTR`) but not freely as primary structural dimensions. This is the core 'secondary fields are second-class' limitation of blending."
+      },
+      {
+        "q": "Multi-fact relationships arrived in 2024.2 — when do they replace a blend?",
+        "a": "Multi-fact relationships let you relate several fact tables to shared dimensions in one logical model, covering many 'two fact tables at different grains' cases that previously forced a blend, while keeping fields first-class and reusable across the workbook. Reach for them when the sources are joinable in one connection. Blending remains for genuinely separate connections."
+      }
+    ]
   },
   {
     "q": "What are dashboard actions and what types exist?",
     "a": "Dashboard actions make a dashboard interactive by letting one sheet drive others. The main types are Filter actions (a selection filters other sheets), Highlight actions (emphasize matching marks without filtering), Go to URL actions (open an external link with field values passed in), Go to Sheet/Navigation actions (jump to another dashboard or sheet), Parameter actions (a click sets a parameter value), and Set actions (a click adds/removes members from a set). They trigger on Hover, Select, or Menu. Parameter and Set actions are the modern way to build drill-downs, dynamic comparisons, and proportional-brushing interactions.",
     "fs": "Filter, Highlight, URL, Navigation, Parameter, and Set actions, triggered on hover/select/menu, wire sheets together.",
     "fj": "Thinks the only dashboard action is a basic filter on click.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "What's the trade-off between Hover and Select as the triggering event?",
+        "a": "Hover feels instant and good for quick highlights but fires constantly, can thrash queries on heavy filter actions, and is unreliable on touch devices. Select requires an intentional click, is friendlier on mobile, and supports a clearing behavior on deselect. Use Hover only for cheap highlights; Select for filter, parameter, and set actions that re-query."
+      },
+      {
+        "q": "How does 'Run on' behavior (clearing the selection) change a filter action's result?",
+        "a": "The 'Clearing the selection will' setting decides what the target shows when the user deselects: keep all values, show all values, or exclude all values (a blank target). Choosing 'show all' restores the unfiltered view, while 'exclude all' forces the user to click before seeing data — useful for guided drill-downs. Picking the wrong option is a common 'my dashboard is blank' bug."
+      },
+      {
+        "q": "When would Dynamic Zone Visibility be a better choice than a navigation action?",
+        "a": "Dynamic Zone Visibility (since 2022.3) shows or hides layout containers based on a parameter or field, so you can reveal a detail panel in place without leaving the dashboard, unlike a navigation action that jumps to a separate sheet. Use it for progressive disclosure and conditional panels within one canvas. It pairs naturally with parameter actions to toggle the controlling value."
+      }
+    ]
   },
   {
     "q": "How would you build a click-to-drill-down using a parameter action?",
     "a": "Create a parameter (e.g., p_SelectedCategory), then add a Parameter Action on the source sheet: on Select, set p_SelectedCategory to the clicked Category field. Reference that parameter in the detail sheet's calc or filter so clicking a bar on the overview updates the detail view to that category. Parameter actions are preferred over chained filter actions when you also need the selected value inside calculations, titles, or reference lines, not just for filtering. Add a 'clearing the selection' option so users can reset.",
     "fs": "A Parameter Action on Select writes the clicked value into a parameter the detail sheet reads in its filter or calc.",
     "fj": "Builds it with a filter action only, then cannot reuse the clicked value in titles or calculations.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why combine Dynamic Zone Visibility with the parameter action in this drill-down?",
+        "a": "Tie the detail zone's visibility to whether `p_SelectedCategory` holds a real value, so the detail panel only appears after the user clicks and disappears on reset. That keeps the dashboard clean until a selection exists. The parameter action sets the value; DZV reacts to it — a tidy progressive-disclosure pattern."
+      },
+      {
+        "q": "What happens to the parameter value if the user clicks empty space, and how do you reset it?",
+        "a": "By default a parameter action only writes on a mark click and won't reset on deselect, so a stale value lingers. Set the action's 'Clearing the selection will' to set the parameter to a sentinel value (like 'All' or an empty string), and handle that sentinel in your filter/calc. Without an explicit reset, the drill-down feels stuck on the last click."
+      },
+      {
+        "q": "Where would a set action beat a parameter action for drill-down?",
+        "a": "When you want multi-member selection or proportional brushing — keeping the other marks visible and showing the selection's share — a set action is better because a parameter holds only one scalar value. Parameter actions shine for single-value drivers used in titles and calcs; set actions shine for multi-select, in/out comparisons against the whole."
+      }
+    ]
   },
   {
     "q": "A dashboard is slow. Walk through how you would tune its performance.",
     "a": "Start with the Performance Recorder to find the expensive events. Common fixes: switch heavy live connections to an extract (.hyper) and pre-aggregate/filter it; reduce the number of marks and sheets per dashboard; replace many quick filters with fewer or context filters and avoid 'only relevant values' on big domains; push row-level calculations into the source or extract and minimize nested LODs and table calcs over huge partitions; use data source filters and aggregate extracts to shrink data; avoid blends where a join/relationship is cheaper; and remove unused fields. Fewer marks, less data scanned, and computation closer to the source are the recurring themes.",
     "fs": "Profile with Performance Recorder, then cut marks, extract/pre-aggregate, simplify filters, and push calcs toward the source.",
     "fj": "Blames the network and adds more quick filters, increasing the query load instead of reducing it.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why can 'Show only relevant values' on a quick filter hurt performance?",
+        "a": "'Only relevant values' makes each filter re-query the data to recompute its valid domain whenever any other filter changes, so a dashboard of such filters triggers a cascade of extra queries. On high-cardinality fields this is expensive. Switch to 'All values in database', or use fewer filters, when the domain is large."
+      },
+      {
+        "q": "How does the number of marks specifically drive render time?",
+        "a": "Tableau must lay out and draw every mark client-side, and 'Computing Layout' time scales with mark count, so a 50k-mark scatterplot or dense crosstab is slow regardless of query speed. Aggregate to a coarser grain, filter to a Top N, or split into smaller views. Cutting marks often beats any query tuning for layout-bound dashboards."
+      },
+      {
+        "q": "What's the risk of fixing slowness by extracting everything, and when does it backfire?",
+        "a": "An over-broad extract can exceed memory and spill, or duplicate work the warehouse already does better, and it adds refresh cost plus staleness. For huge, well-tuned cloud warehouses a live connection with query pushdown can beat a bloated extract. Extract selectively — filter and pre-aggregate it — rather than mirroring the entire source."
+      }
+    ]
   },
   {
     "q": "What does 'level of detail' actually mean in a Tableau view, and what controls it?",
@@ -256,7 +564,21 @@
     "fs": "The view's grain is the set of dimensions on the sheet; one mark per unique combination, measures aggregate up to it.",
     "fj": "Thinks the measure or its aggregation sets the level of detail rather than the dimensions in the view.",
     "level": "Jr",
-    "asked": 14
+    "asked": 14,
+    "followups": [
+      {
+        "q": "Does a dimension on the Detail shelf change the grain even though it's not visible?",
+        "a": "Yes. Any dimension on Detail (or Tooltip via a dimension) still adds to the set of dimensions defining the grain, so it splits marks finer even though it draws nothing new. This is a frequent surprise: a measure 'changes value' just because someone dropped a dimension onto Detail. Grain is about which dimensions are present, not where they sit."
+      },
+      {
+        "q": "How does a continuous date on Columns affect the level of detail versus a discrete one?",
+        "a": "A discrete date part (e.g., MONTH as a blue pill) acts as a dimension and sets one mark per distinct part, while a continuous date (green pill) produces a continuous axis but still bins at the chosen date level, defining grain by that truncation. Both shape the grain; the difference is axis vs header, not whether they affect detail. Choosing the date level is choosing the time grain."
+      },
+      {
+        "q": "When the view grain disagrees with what you need, why is an LOD better than just adding/removing dimensions?",
+        "a": "Adding or removing a dimension changes the whole view, which you often can't do without altering the chart. An LOD computes a value at a different grain than the view while leaving the visualization intact — e.g., a customer-level total displayed on a region chart. That decoupling of computed grain from displayed grain is exactly the problem LODs solve."
+      }
+    ]
   },
   {
     "q": "What is the difference between a relationship and a join in Tableau's 2020.2+ data model?",
@@ -264,7 +586,21 @@
     "fs": "Relationships (logical layer) stay separate and Tableau joins contextually per sheet; physical joins flatten one fixed table up front.",
     "fj": "Treats a relationship as just a left join that always merges tables the same way every sheet.",
     "level": "Mid",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "How does a relationship avoid the measure-duplication fan-out that a join causes?",
+        "a": "Because tables stay separate, Tableau aggregates each measure at its own table's grain and only joins the aggregated results for the sheet, so a 'one' side measure isn't repeated across many matching rows. A physical join flattens first, repeating that measure per match and double-counting on SUM. Relationships defer the join until the grain is known, sidestepping fan-out."
+      },
+      {
+        "q": "What does the 'performance options' (cardinality and referential integrity) on a relationship do?",
+        "a": "They let you tell Tableau the relationship's cardinality (many-to-one, etc.) and whether referential integrity holds (every record has a match). With that knowledge Tableau can skip unnecessary joins or use inner joins safely, speeding queries. Set them wrong, though, and you can drop rows or get incorrect counts — they're a promise Tableau trusts."
+      },
+      {
+        "q": "When does a relationship still behave like an inner join and drop rows?",
+        "a": "Per sheet, Tableau chooses the join type from which fields are used; if a sheet only references fields requiring matches on both sides, it effectively runs an inner join and unmatched rows won't appear. So 'relationships never drop rows' is an oversimplification — the contextual join can be inner when the view demands it. The behavior is per-sheet, not global."
+      }
+    ]
   },
   {
     "q": "What is a set in Tableau, and how does a dynamic set differ from a fixed one?",
@@ -272,7 +608,21 @@
     "fs": "A set splits members into In/Out; fixed sets are hand-picked, dynamic sets recompute from a condition or Top N.",
     "fj": "Thinks every set is a static hand-picked list that never updates with the data.",
     "level": "Mid",
-    "asked": 9
+    "asked": 9,
+    "followups": [
+      {
+        "q": "How does a combined set let you do cohort-style comparisons?",
+        "a": "A combined set merges two sets with set logic — In both (intersection), in either (union), or in one but not the other (difference) — so you can express 'customers who bought in 2024 but not 2025' as a single dimension. That difference cohort is exactly the churn/retention question interviewers love. Combined sets turn two membership tests into one reusable group."
+      },
+      {
+        "q": "Why does a dynamic set defined on a condition sometimes not respond to a dashboard filter?",
+        "a": "Like FIXED LODs, a computed set's condition is evaluated relatively early and may be defined over a population that dimension filters don't shrink unless promoted to context. So a set of 'top customers' can rank over the unfiltered data. To scope it to a slicer, add that slicer to context or build the set on a filtered calc."
+      },
+      {
+        "q": "When would you use a set as a filter versus an IN/OUT calculation?",
+        "a": "Use the set directly as a filter to physically remove out-of-set marks; use `IF [Set] THEN ... ELSE ...` or an IN/OUT pill when you want to keep both groups visible and compare them (e.g., color in-set vs out-of-set, or show their share). Filtering hides the contrast; the IN/OUT calc preserves it. Set actions plus IN/OUT is the basis of proportional brushing."
+      }
+    ]
   },
   {
     "q": "How do set actions enable proportional brushing on a dashboard?",
@@ -280,7 +630,21 @@
     "fs": "A Set Action rewrites set membership on click; the target sheet colors in-set vs out-of-set to show the selection's share of each total.",
     "fj": "Builds it as a filter action, which removes the other marks instead of showing their proportional share.",
     "level": "Sr",
-    "asked": 7
+    "asked": 7,
+    "followups": [
+      {
+        "q": "Why must the target sheet NOT filter on the set for proportional brushing to work?",
+        "a": "If you drop the set on the Filters shelf, out-of-set marks vanish and you lose the 'share of the whole' comparison the brushing is meant to show. Instead place the set on Color (or in an IN/OUT calc) so both portions stay visible and stacked. The whole effect depends on keeping the out-of-set remainder on screen."
+      },
+      {
+        "q": "What does 'Assign values' vs 'Add to set'/'Remove from set' on the set action control?",
+        "a": "The set action's running behavior decides whether each selection replaces the set's members ('assign'/run on select) or accumulates them. Replace-on-select gives single-brush behavior; accumulate lets users build up a multi-member selection across clicks. Pair the deselect option ('keep'/'clear/remove all') to define how the brush resets."
+      },
+      {
+        "q": "How would you show the selected members' percent of each category's total numerically, not just by color?",
+        "a": "Add a calc like `SUM(IF [State Set] THEN [Sales] END) / SUM([Sales])` to get the in-set share per category and put it on Label. The conditional numerator counts only in-set sales while the denominator is the full category total. That turns the visual brush into an explicit percentage readout."
+      }
+    ]
   },
   {
     "q": "How do filter, highlight, and URL dashboard actions differ in what they do to the target?",
@@ -288,7 +652,21 @@
     "fs": "Filter removes non-matching marks (re-aggregates), highlight only emphasizes (no data change), URL opens an external link with field values.",
     "fj": "Assumes highlight also filters the data, so totals would shrink like a filter action.",
     "level": "Jr",
-    "asked": 8
+    "asked": 8,
+    "followups": [
+      {
+        "q": "Why might a highlight action be better than a filter action for a time-series comparison?",
+        "a": "Highlight keeps every line/bar on screen and just emphasizes the selection, so the viewer retains the full distribution for context while their eye is drawn to the chosen member. A filter would drop the others and rescale the axes, destroying the comparison baseline. For 'how does this one compare to the rest', highlight preserves the reference frame."
+      },
+      {
+        "q": "What do you have to handle when injecting field values into a Go to URL action?",
+        "a": "Values must be URL-encoded (use the action's encoding option) so spaces and special characters don't break the link, and you must account for multi-select producing a delimited list the target app may not expect. Test with members containing `&`, spaces, or unicode. Unencoded field values are the usual cause of broken deep links."
+      },
+      {
+        "q": "Can highlight and filter actions coexist on the same dashboard without conflict?",
+        "a": "Yes, and it's a common pattern — a highlight action on hover for quick orientation plus a filter action on select for drill-down. They operate independently because highlight only restyles marks while filter re-queries. Just watch that hover-highlight on heavy sheets doesn't thrash, and that the two triggers (hover vs select) don't fight."
+      }
+    ]
   },
   {
     "q": "What is a nested LOD, and which level of detail wins when you nest expressions?",
@@ -308,6 +686,20 @@
           "        SUM([Sales]) }",
           "  ) }"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does the inner FIXED override the outer's dimensions instead of adding to them?",
+        "a": "`FIXED` is absolute: it declares its grain explicitly and ignores inherited context, so an inner `{ FIXED [Customer ID] : ... }` pins to customer regardless of the outer Region. Use `INCLUDE` inside if you instead want the inner to extend the outer's dimensions. The FIXED-resets-grain behavior is the tool for stopping unwanted dimensions from propagating inward."
+      },
+      {
+        "q": "What's a correctness pitfall when the outer aggregate over inner LOD values is SUM rather than AVG?",
+        "a": "If the inner LOD repeats a value across rows (e.g., a per-customer total) and the outer wraps it in `SUM` instead of `AVG`/`MIN`, you double-count just as with displaying a FIXED directly. Choose the outer aggregate to match how the inner values should roll up. Averaging per-customer totals needs AVG; summing them would inflate the result."
+      },
+      {
+        "q": "When does a nested LOD become a performance concern?",
+        "a": "Deeply nested LODs over high-cardinality keys force the engine to materialize multiple intermediate grains, which can be slow on big live sources and hard to push down. Profile with the Performance Recorder, and consider pre-aggregating in the source or extract. Nesting is correct but not free; flatten the logic when the cardinality is large."
       }
     ]
   },
@@ -337,6 +729,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Why wrap the FIXED denominator in ATTR(), and what breaks without it?",
+        "a": "The numerator `SUM([Sales])` is aggregated, so the denominator must also present a single aggregated value per mark; `ATTR()` collapses the repeated FIXED value into one and avoids an aggregate/row-level mismatch error. Without ATTR, Tableau complains it can't mix aggregate and non-aggregate arguments. ATTR is the standard glue when combining a FIXED with view-level aggregates."
+      },
+      {
+        "q": "If the user filters out some categories, how do the table-calc and FIXED-LOD percentages differ?",
+        "a": "The table-calc share re-normalizes so the visible categories sum to 100%, because `WINDOW_SUM` only sees marks in the view. The FIXED-LOD share keeps the original company-wide denominator (unless promoted to context), so the visible slices sum to less than 100%. Which you want depends on whether 'percent of what's shown' or 'percent of everything' is the question."
+      },
+      {
+        "q": "Can you do percent of a partition total (e.g., within each region) with a table calc?",
+        "a": "Yes — set the table calc's partition to Region and addressing to the inner dimension, so `WINDOW_SUM(SUM([Sales]))` totals only within each region and each region's marks sum to 100%. Partitioning is what scopes the denominator. The same formula gives within-view, within-partition, or grand-total shares purely by changing Compute Using."
+      }
     ]
   },
   {
@@ -345,6 +751,20 @@
     "fs": "Record, sort events by duration, and read the event type (query vs layout vs geocoding) to target the single worst offender first.",
     "fj": "Glances at the total dashboard load time without drilling into which event type is actually dominating it.",
     "level": "Mid",
-    "asked": 9
+    "asked": 9,
+    "followups": [
+      {
+        "q": "If 'Executing Query' dominates, how do you find and fix the offending SQL?",
+        "a": "Click the long query event to reveal the actual SQL Tableau generated, then check for missing source indexes, an expensive join/blend, or a row-level calc that didn't push down. Fix by extracting and pre-aggregating, simplifying the calc, or tuning the source (indexes, partitions). The recorder hands you the literal query, so optimization becomes a normal database tuning problem."
+      },
+      {
+        "q": "What does a large 'Computing Layout' time tell you, and what's the fix?",
+        "a": "It means rendering, not querying, is the bottleneck — usually too many marks or overly complex dashboard layout. The fix is on the viz side: aggregate to a coarser grain, apply a Top N, reduce sheets per dashboard, or simplify containers. No amount of extract/query tuning helps a layout-bound dashboard."
+      },
+      {
+        "q": "Why record on Tableau Server in addition to Desktop?",
+        "a": "Server adds VizQL/cache, concurrency, and network factors that Desktop can't reproduce, so a dashboard fast locally may stall under multi-user load or cold caches. Server performance recording (enabled per workbook via a URL parameter) captures those real-world events. Always validate on the platform users actually hit, not just on the author's machine."
+      }
+    ]
   }
 ]

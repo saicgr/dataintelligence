@@ -5,7 +5,21 @@
     "fj": "Cortex is just a wrapper that forwards my rows to OpenAI.",
     "fs": "Inference runs inside Snowflake's boundary with no data egress, governed by the same RBAC and masking. Snowflake also doesn't train models on your data — that's the whole governance pitch.",
     "level": "Jr",
-    "asked": 17
+    "asked": 17,
+    "followups": [
+      {
+        "q": "If inference 'runs inside Snowflake', does that mean a model like Claude or GPT physically runs on Snowflake hardware?",
+        "a": "Not necessarily on your warehouse compute, but it runs within Snowflake's security and governance perimeter, not by shipping rows to a public vendor endpoint. Some models are hosted by Snowflake directly; for partner models, Snowflake operates the inference inside its boundary so data isn't sent to the vendor's own API. The key promise is no egress to a third-party account and no training on your data."
+      },
+      {
+        "q": "What's the downside of being limited to Snowflake's model menu?",
+        "a": "You can't instantly adopt a brand-new model the day it launches, and you may lack a niche or self-hosted fine-tune you'd run elsewhere. Region availability also varies, so a model you want may not exist in your region without enabling cross-region inference. For most governed enterprise workloads the curated, vetted menu is a feature, not a bug — but it's a real constraint if you need bleeding-edge or exotic models."
+      },
+      {
+        "q": "How would you prove to an auditor that prompts aren't being used to train the models?",
+        "a": "Point to Snowflake's contractual and documentation commitments that customer data and prompts are not retained for or used in foundation-model training, plus the fact that inference runs in-account under your existing RBAC, masking, and row-access policies. You can also restrict the `SNOWFLAKE.CORTEX_USER` role and show ACCOUNT_USAGE query/usage history as an audit trail of exactly which functions touched which data."
+      }
+    ]
   },
   {
     "q": "Name the AISQL functions you'd reach for and what each one does.",
@@ -27,6 +41,20 @@
           "FROM tickets;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "The older functions were under SNOWFLAKE.CORTEX. How do the AI_ functions relate to those?",
+        "a": "The `AI_`-prefixed family is the newer, consolidated AISQL surface that supersedes much of the older `SNOWFLAKE.CORTEX.*` set — e.g. `AI_SENTIMENT` over `SNOWFLAKE.CORTEX.SENTIMENT`, `AI_COMPLETE` over `COMPLETE`. The AI_ versions are top-level, often add multimodal and structured-output support, and are the ones to standardize on. The legacy names still work but are the older generation."
+      },
+      {
+        "q": "Why does calling these inline in SQL matter versus a Python loop — what do you actually gain?",
+        "a": "Inline AISQL participates in the query plan, so you get predicate pushdown, set-based parallelism across the warehouse, and composition with normal SQL (filter cheap first, then call the LLM). A Python UDF loop serializes row-by-row, bypasses the optimizer, and loses the governance/billing visibility you get from native functions. You also keep everything in one transactional SQL statement."
+      },
+      {
+        "q": "What does AI_TRANSCRIBE actually take as input and where does the audio live?",
+        "a": "`AI_TRANSCRIBE` operates on file references — typically audio/video staged in Snowflake and passed via `TO_FILE`/a FILE value from a stage — and returns the transcript text. Because it's a SQL function over staged files, you can transcribe a whole directory of recordings set-based and then chain `AI_SENTIMENT` or `AI_CLASSIFY` on the output, all without a separate speech-to-text service."
+      }
     ]
   },
   {
@@ -35,7 +63,21 @@
     "fj": "I just use AI_COMPLETE with a clever prompt for everything.",
     "fs": "If the task is exactly summarize/translate/sentiment, the dedicated function is cheaper, needs no prompt tuning, and is more stable. I only reach for AI_COMPLETE when I need a custom prompt or output shape.",
     "level": "Jr",
-    "asked": 13
+    "asked": 13,
+    "followups": [
+      {
+        "q": "AI_SENTIMENT differs from the old SENTIMENT function how — what's the practical upgrade?",
+        "a": "`AI_SENTIMENT` adds entity-aware/aspect-based sentiment: instead of one overall score per text, it can return sentiment per specified category or entity (e.g. food vs service in a review). The legacy `SENTIMENT` returns a single −1..1 overall score. So when you need to know sentiment about a specific aspect, `AI_SENTIMENT` is the upgrade; for a single overall tone the difference is mostly the newer surface."
+      },
+      {
+        "q": "Cost-wise, why is SUMMARIZE typically cheaper than AI_COMPLETE doing the same thing?",
+        "a": "The dedicated function maps to a specifically chosen, often smaller model and a fixed internal prompt tuned for the task, so you're not paying frontier-model rates or sending extra prompt tokens. With `AI_COMPLETE` you choose the model and write the prompt, so it's easy to over-spend on a bigger model and longer instructions to replicate what the narrow function already does cheaply and predictably."
+      },
+      {
+        "q": "EXTRACT_ANSWER versus AI_COMPLETE with a structured output schema — which for pulling fields from text?",
+        "a": "`EXTRACT_ANSWER` (and `AI_EXTRACT`) is the quick path for 'find the answer to this question in this text' with no prompt engineering. But when you need multiple typed fields returned as guaranteed-valid JSON, `AI_COMPLETE` with a `response_format` schema is stronger because it constrains every field's shape and type. So: single quick lookups → `EXTRACT_ANSWER`/`AI_EXTRACT`; a strict multi-field record → structured-output `AI_COMPLETE`."
+      }
+    ]
   },
   {
     "q": "Show me how AI_FILTER changes a query, and why it's better than wrapping AI_COMPLETE.",
@@ -56,6 +98,20 @@
           "    'Is this an outage report? {0}',",
           "    body));               -- LLM last"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Can the optimizer reorder predicates so the cheap WHERE actually runs before AI_FILTER, or do you have to force it?",
+        "a": "You shouldn't rely on it implicitly. SQL is declarative and the planner may not guarantee evaluation order across a conjunction, so the safe pattern is to structure the query so the narrow set is materialized first — a CTE/subquery that applies the cheap deterministic filters, then `AI_FILTER` on that result. That makes the 'filter cheap, then LLM' discipline explicit instead of hoping the optimizer short-circuits."
+      },
+      {
+        "q": "How is AI_FILTER in a JOIN condition different from a regular join, and what's the risk?",
+        "a": "Used in a JOIN, `AI_FILTER` evaluates a natural-language predicate across paired rows — useful for fuzzy/semantic matching that exact keys can't express. The risk is combinatorial blow-up: an LLM call per candidate row pair means a near-Cartesian join can explode into millions of LLM invocations. You constrain the join with cheap equality/range predicates first so `AI_FILTER` only judges a small candidate set."
+      },
+      {
+        "q": "Why use PROMPT() instead of string concatenation to build the predicate?",
+        "a": "`PROMPT()` is a typed templating helper that safely interpolates column values into a placeholder (`{0}`, `{1}`) rather than concatenating raw text, which keeps the prompt well-formed and avoids quoting/escaping bugs and prompt-injection-style breakage from messy data. It's also clearer and reusable. Plain `||` concatenation is fragile the moment a value contains quotes, braces, or instruction-like text."
       }
     ]
   },
@@ -79,6 +135,20 @@
           "GROUP BY product_id;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "How does AI_AGG get past the context window if a group has more text than the model can hold?",
+        "a": "It does the fan-in internally with a hierarchical/map-reduce-style strategy: it partitions the group's rows, summarizes chunks, then combines those partial results, so no single call has to fit every row in one context window. You don't manage the batching. The practical implication is that ordering across rows isn't guaranteed to be globally preserved, so it's best for theme/aggregate questions rather than tasks needing strict sequence."
+      },
+      {
+        "q": "When is AI_AGG the wrong tool even though you're aggregating many rows?",
+        "a": "When you need exact, deterministic numbers — counts, sums, top-N by a metric. That's a job for normal SQL aggregates, which are precise and free of LLM cost and variance. `AI_AGG` is for qualitative synthesis ('what are the recurring complaints'), not for computing figures, where an LLM can miscount or hallucinate. Route quantitative aggregation to GROUP BY/SUM, qualitative to `AI_AGG`."
+      },
+      {
+        "q": "What's the difference between AI_AGG and AI_SUMMARIZE_AGG?",
+        "a": "`AI_SUMMARIZE_AGG` is the specialized aggregate for the common 'summarize all these rows' case — no prompt needed, tuned for summarization across a group. `AI_AGG` is the general cross-row reasoning aggregate where you supply your own instruction (e.g. 'list the top 3 objections and who raised them'). Use `AI_SUMMARIZE_AGG` when you literally just want a group summary; reach for `AI_AGG` when the cross-row task is bespoke."
+      }
     ]
   },
   {
@@ -87,7 +157,21 @@
     "fj": "I always pick the biggest, smartest model to be safe.",
     "fs": "Match the model to the job — a cheap small model for bulk classification, a frontier model only for hard reasoning. And cross-region inference has a residency implication: ANY_REGION can route your request out of region, which may not be acceptable.",
     "level": "Jr",
-    "asked": 15
+    "asked": 15,
+    "followups": [
+      {
+        "q": "How do you constrain cross-region inference to satisfy data residency instead of just turning it off?",
+        "a": "Set `CORTEX_ENABLED_CROSS_REGION` to a specific allowed region group rather than `ANY_REGION` — for example a value scoped to your continent/cloud so requests can only route to approved regions where the model exists. Setting it to `DISABLED` blocks cross-region entirely (and you only get models native to your region). The middle setting lets you keep model availability without violating residency."
+      },
+      {
+        "q": "How do you decide empirically which model is 'good enough' for a bulk classification job?",
+        "a": "Run a small labeled eval set through candidate models and compare accuracy/agreement against the cheapest one, using AI Observability or a simple SQL comparison. Pick the smallest model that clears your accuracy bar, since at high row counts the cost gap between a small and frontier model is often 10x+. You only escalate to a bigger model for the hard subset of rows the small one gets wrong."
+      },
+      {
+        "q": "What happens if you pass a model name that isn't available in your region and cross-region is off?",
+        "a": "The function errors — the model simply isn't reachable, rather than silently falling back. That's why you either enable (scoped) cross-region inference to reach it or choose a model that's GA in your region. It's worth checking the regional availability matrix when productionizing, because a model in your dev region may not exist in the region you deploy to."
+      }
+    ]
   },
   {
     "q": "What is the semantic model behind Cortex Analyst, and why does it beat raw text-to-SQL?",
@@ -110,6 +194,20 @@
           "    synonyms: [sales, gmv]"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What specifically goes wrong if you omit relationship/join definitions from the semantic model?",
+        "a": "Analyst has to guess how tables connect, and that's exactly where text-to-SQL fails — wrong join keys, fan-out from one-to-many joins double-counting a metric, or picking the wrong path between tables. Declaring relationships pins the join graph so a question that spans tables uses the intended keys and grain, preventing inflated sums. The metric definitions and relationships together are what make aggregates trustworthy."
+      },
+      {
+        "q": "Why define metrics in the semantic model instead of letting Analyst write the SUM itself?",
+        "a": "A named metric like `revenue = SUM(amount)` with the right filters (e.g. excluding refunds) encodes the one correct business definition, so every question resolves to the same number. If Analyst derives the aggregate ad hoc, two phrasings of 'revenue' can produce two different SQLs and two different totals. Centralizing the metric is what makes results consistent and auditable."
+      },
+      {
+        "q": "How do synonyms actually change Analyst's behavior at query time?",
+        "a": "Synonyms map business vocabulary to model entities, so when a user says 'GMV' or 'sales' Analyst resolves it to the `revenue` metric instead of failing or guessing a raw column. Without them, colloquial terms either don't match anything or match the wrong column by name similarity. They widen the set of natural phrasings the model answers correctly without changing the underlying SQL."
+      }
     ]
   },
   {
@@ -118,7 +216,21 @@
     "fj": "I'd just switch it to a bigger LLM and hope the SQL improves.",
     "fs": "Accuracy comes from the semantic layer, not the model. I add verified queries so common questions reuse trusted SQL, fix ambiguous metric/synonym definitions, and make it ask for clarification instead of guessing.",
     "level": "Sr",
-    "asked": 14
+    "asked": 14,
+    "followups": [
+      {
+        "q": "How does a verified query get matched to a new user question — is it exact-match only?",
+        "a": "No — the Verified Query Repository (VQR) is used by similarity, not exact string match. When a new question is semantically close to a verified one, Analyst leans on that trusted SQL (using the model's logical table/column names) rather than generating from scratch. That's why a modest set of well-chosen verified queries can cover a large cluster of phrasings, and why the queries must reference the semantic model's names to be reusable."
+      },
+      {
+        "q": "What's the newer optimization feature that uses verified queries beyond direct reuse?",
+        "a": "Snowflake can analyze your verified queries to automatically enrich the rest of the semantic layer — extracting useful definitions, filters, and relationships and folding them in (a Preview feature from late 2025). So verified queries help even for questions that don't match one directly, because the lessons from them improve the semantic model that all questions are grounded on."
+      },
+      {
+        "q": "Why is 'ask a clarifying question' better than letting Analyst pick a reasonable interpretation?",
+        "a": "A confident wrong answer is worse than a clarifying prompt because the stakeholder can't tell it's wrong — it erodes trust in the whole tool. When a question is ambiguous ('top customers' by revenue or by order count?), having Analyst ask resolves the intent instead of silently choosing, so the returned number is the one the user actually meant. Guessing optimizes for looking smart over being correct."
+      }
+    ]
   },
   {
     "q": "Explain how Cortex Search works under the hood and what TARGET_LAG controls.",
@@ -139,6 +251,20 @@
           "AS SELECT doc_id, content",
           "   FROM support_docs;"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Which embedding model powers Cortex Search, and can you bring your own?",
+        "a": "The vector component is powered by Snowflake's Arctic Embed family (e.g. Arctic Embed M) by default. More recently Cortex Search added Preview support for custom/precomputed vector embeddings, so you can supply vectors from your own or a third-party model when the default doesn't fit your domain — but the managed Arctic default is the zero-config path most teams use."
+      },
+      {
+        "q": "What does setting TARGET_LAG too tight versus too loose cost you?",
+        "a": "Too tight (e.g. a few minutes) means frequent refreshes and higher serverless compute cost to keep the index near-real-time. Too loose means cheaper refresh but stale results — a user could search for a doc added an hour ago and not find it. You set it to the freshness the use case actually needs: minutes for live support content, hours for a slowly-changing knowledge base."
+      },
+      {
+        "q": "Why does hybrid plus a reranker beat vector-only retrieval — give the mechanism.",
+        "a": "Vector search captures semantic similarity but can miss exact terms (product codes, error strings, names) that lexical/keyword search nails; combining them recovers both. The reranker then takes the merged candidate set and scores each against the query with a stronger cross-encoder-style model, fixing the ordering. Snowflake's own benchmarks show NDCG@10 climbing from lexical to vector to hybrid to hybrid+reranker — each layer adds relevance."
       }
     ]
   },
@@ -162,6 +288,20 @@
           "FROM kb ORDER BY s DESC LIMIT 5;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "In the DIY path, how do you keep the stored embeddings in sync as source documents change?",
+        "a": "You own the refresh — typically a Stream on the source table feeding a Task that re-embeds changed rows and updates the VECTOR column. That's exactly the maintenance burden Cortex Search removes via `TARGET_LAG`. If you skip it, your index silently drifts stale and retrieval returns outdated chunks. The operational cost of building and monitoring that refresh pipeline is the main reason to prefer the managed service."
+      },
+      {
+        "q": "Why must the query and the documents use the same embedding model in the DIY path?",
+        "a": "Cosine similarity is only meaningful when both vectors live in the same embedding space. If you embed documents with `e5-base-v2` (768-dim) and the query with a different model, the dimensions and geometry don't correspond, so similarity scores are garbage. You also can't compare across different dimension sizes at all. Same model, same dimension, for both sides — always."
+      },
+      {
+        "q": "What does chunking strategy affect in retrieval quality, and why might you hand-roll it?",
+        "a": "Chunk size and boundaries control whether a retrieved passage is self-contained and on-topic: too large dilutes the embedding with mixed topics and wastes context; too small loses the surrounding meaning. Domain docs (legal clauses, code, tables) often need custom splitting that respects structure, which is a reason to DIY when the managed default chunking doesn't fit. Good chunking frequently matters more than the model choice."
+      }
     ]
   },
   {
@@ -170,7 +310,21 @@
     "fj": "An agent is just Cortex Analyst with a chat box on top.",
     "fs": "An agent orchestrates multiple tools and steps — it routes structured sub-questions to Analyst and document sub-questions to Search, then composes them. Analyst alone can't retrieve from PDFs, and Search alone can't aggregate a metric.",
     "level": "Sr",
-    "asked": 13
+    "asked": 13,
+    "followups": [
+      {
+        "q": "How do you add a custom capability to an agent that Analyst and Search can't provide?",
+        "a": "You register a custom tool backed by a stored procedure or UDF (or an external function for an outside API), with a description the agent uses to decide when to call it. So if a task needs a pricing-calculation procedure or a call to an internal service, the agent can invoke it as just another tool alongside Analyst and Search. The tool description quality drives whether the agent picks it at the right time."
+      },
+      {
+        "q": "What governs the data an agent can touch — does orchestration bypass RBAC?",
+        "a": "No. Each tool call still runs under the caller's privileges, so Analyst only sees tables the role can access, Search only the services it's granted, and custom procs run with their own grants. The agent orchestrates, but it can't read anything the underlying role couldn't read directly — governance is enforced at the tool/query layer, not waived by the agent."
+      },
+      {
+        "q": "How does an agent decide it's done versus needs another tool call?",
+        "a": "It runs a plan-act-observe loop: after each tool result it evaluates whether the accumulated evidence answers the question or whether a gap remains (e.g. it has the contract text but still needs the spend figure), then either calls another tool or composes the final answer. This iterative reasoning over intermediate results is exactly what a single Analyst or Search call can't do — they answer one shot with no follow-up step."
+      }
+    ]
   },
   {
     "q": "You need to pull structured fields out of thousands of scanned PDFs. How do you do it in Cortex?",
@@ -191,6 +345,20 @@
           "  ['invoice_no','total','due_date'])",
           "FROM invoices;"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Concretely, when is LAYOUT mode worth its higher cost over OCR mode?",
+        "a": "LAYOUT preserves tables, multi-column flow, headings, and reading order, and is required to extract images — so it's worth it for invoices, forms, financial statements, or anything where a value's meaning depends on its position in a table. For flat, single-column text-heavy scans where you just need the words, OCR mode is faster and cheaper. Using LAYOUT on plain text wastes money; using OCR on a table garbles the structure you needed."
+      },
+      {
+        "q": "How do you process only specific pages of a huge PDF to save cost?",
+        "a": "Use `page_split`/`page_filter` so `AI_PARSE_DOCUMENT` only parses the pages you care about (e.g. just the summary page of a 200-page report) instead of the whole file. Combined with pre-filtering which documents even need parsing, this keeps token and compute cost down. Parsing everything when you only need page 1 is the same 'don't process more than you must' discipline as filtering rows before an LLM call."
+      },
+      {
+        "q": "Why parse first and then extract, rather than feeding the raw PDF straight to AI_EXTRACT?",
+        "a": "`AI_PARSE_DOCUMENT` does the heavy OCR/layout work to produce clean, structured text or markdown; feeding that to `AI_EXTRACT` (or `AI_COMPLETE` with a schema) gives the extractor reliable input so fields land in the right place. Skipping the parse and hoping a model reads a raw scan directly is less reliable for tables and multi-column docs. Separating the stages also lets you cache parsed text and re-extract different field sets without re-OCRing."
       }
     ]
   },
@@ -215,6 +383,20 @@
           "  FORECASTING_PERIODS => 30);"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "How does FORECAST handle multiple series, like demand per store, in one model?",
+        "a": "You provide a series identifier column so a single `FORECAST` model fits and predicts each series (store, SKU) separately within one call, rather than training a model per store by hand. You can also pass exogenous/future regressors (e.g. promotions, holidays) to improve accuracy. So one model object covers a whole panel of time series, and the prediction returns per-series forecasts."
+      },
+      {
+        "q": "Why is 'deterministic and explainable' a real advantage of the ML functions over an LLM here?",
+        "a": "The ML functions return prediction intervals and, for anomaly/insights, attributions you can defend to a stakeholder ('this point is outside the 99% interval'). They give the same output for the same input, which matters for finance and audit. An LLM eyeballing numbers gives a plausible-sounding figure that varies run to run and can't show its statistical work — unacceptable when a number drives a decision."
+      },
+      {
+        "q": "Where would you still combine the ML functions with GenAI in one pipeline?",
+        "a": "Use `FORECAST`/`ANOMALY_DETECTION`/`TOP_INSIGHTS` to compute the numbers and surface drivers, then use `AI_COMPLETE` to narrate them — turn 'metric X dropped, driven by region Y' into a readable executive summary. The ML side owns correctness of the figures; the LLM owns the language layer. That division of labor plays to each tool's strength instead of asking the LLM to do arithmetic."
+      }
     ]
   },
   {
@@ -223,7 +405,21 @@
     "fj": "If the model isn't accurate enough, fine-tune it on my documents.",
     "fs": "Fine-tuning teaches style and behavior, not facts — facts belong in RAG. I exhaust prompting and retrieval first, and only fine-tune to lock in a format or to make a small cheap model match a big one on a narrow task.",
     "level": "Sr",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "Why doesn't fine-tuning reliably inject new facts the way people assume?",
+        "a": "PEFT fine-tuning adjusts a small adaptor to shift behavior/style, not to memorize a knowledge base, and any facts it does absorb become frozen, hard to update, and prone to confident hallucination when asked beyond the training set. RAG keeps facts in an external, governed, refreshable store the model reads at query time, so you update a document instead of retraining. That's why facts go in via retrieval and fine-tuning shapes form."
+      },
+      {
+        "q": "How do you justify fine-tuning cost over just using a bigger base model?",
+        "a": "Fine-tuning pays off when a small, cheap model fine-tuned for a narrow high-volume task can match a frontier model's quality there — the per-inference savings at scale outweigh the one-time training token cost. If volume is low, the bigger base model with good prompting is simpler and likely cheaper overall. So the math is: training cost + cheaper inference × volume vs frontier inference × volume."
+      },
+      {
+        "q": "What does the training data for Cortex Fine-tuning look like, and what's a common failure?",
+        "a": "You supply labeled prompt/completion pairs (typically a Snowflake table/column of inputs and desired outputs) demonstrating the target style or format. The common failure is a small, inconsistent, or unrepresentative dataset — the adaptor overfits to quirks and the model regresses on anything outside it. Quality and consistency of the examples drive the result far more than quantity beyond a threshold."
+      }
+    ]
   },
   {
     "q": "How do you keep Cortex LLM outputs safe and machine-parseable in production?",
@@ -244,6 +440,20 @@
           "     'schema':{'type':'object',",
           "       'properties':{...}}}});"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What exactly does Cortex Guard do when it catches an unsafe response, and what powers it?",
+        "a": "Cortex Guard (enabled via the `guardrails: true` option on the completion) screens the model's generated response and, if it falls into harmful categories — violent crime, hate, sexual content, self-harm, and similar — replaces it with a 'Response filtered by Cortex Guard' message instead of returning the unsafe text. It's powered by Meta's Llama Guard. Note it evaluates the model output, so it's an output filter, not a prompt-rewrite."
+      },
+      {
+        "q": "How does response_format guarantee valid JSON rather than just nudging the model?",
+        "a": "It's constrained/grammar-based decoding: `AI_COMPLETE` validates each generated token against your JSON schema during generation, so the output is forced to conform to the structure and types you declared rather than the model freely emitting text you hope is JSON. That GA mechanism (with `$ref` support for reusable sub-schemas) removes the parse-and-pray step — downstream code can rely on the shape."
+      },
+      {
+        "q": "If both Guard and structured output are on, what happens when Guard filters a response that was supposed to be JSON?",
+        "a": "Guard takes precedence on safety: a filtered response returns the safety message, not your schema-shaped JSON, so downstream code must handle the 'filtered' case rather than assuming every row yields a valid object. In practice you check for the filtered sentinel before treating the output as parseable JSON. The two controls are independent — structure conformance doesn't override the safety filter."
       }
     ]
   },
@@ -266,6 +476,20 @@
           "  .cortex_functions_usage_history",
           "GROUP BY 1,2 ORDER BY credits DESC;"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How is Cortex Search billed differently from the per-token AI functions?",
+        "a": "Cortex Search has its own serverless cost components: compute to build and refresh the index (driven by data volume and your `TARGET_LAG`), plus storage for the index, plus serving cost for queries — not a simple per-token charge like `AI_COMPLETE`. So a tight `TARGET_LAG` on a large, frequently-changing corpus is a real cost lever distinct from inference tokens. Analyst likewise has its own serverless billing on top of any AI functions it invokes."
+      },
+      {
+        "q": "How do you put a hard ceiling on Cortex spend rather than just monitoring after the fact?",
+        "a": "Use Snowflake's budgets/cost controls now available for AI functions to cap or alert on Cortex consumption, and pair that with resource monitors on the warehouses involved. Operationally you also gate the runaway pattern at the query level — pre-filter rows and pick the cheapest adequate model — so you never depend solely on a budget catching it after credits are burned."
+      },
+      {
+        "q": "Why does prompt size matter as much as row count for cost?",
+        "a": "Billing is per input plus output token, so a verbose system prompt or stuffing huge context into every row multiplies input tokens by the row count — a 2x longer prompt on a million rows is a million extra prompt-token charges. Trimming instructions, retrieving only the top-k passages instead of dumping whole documents, and capping output length all directly cut the bill. It's not just how many rows, but how many tokens each row costs."
       }
     ]
   },
@@ -291,6 +515,20 @@
           "  TO ROLE ai_team;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If a column has a masking policy, does Cortex see the real value or the masked one?",
+        "a": "Because Cortex functions run as normal SQL under the calling role, they see whatever that role would see — so a role that gets the masked value feeds the masked value into the LLM, and a privileged role feeds the clear value. Masking and row-access policies apply at read time before the function, so governance isn't bypassed. The senior implication: control which roles can both unmask and call Cortex."
+      },
+      {
+        "q": "What's the point of CORTEX_ANALYST_USER if CORTEX_USER already exists?",
+        "a": "It's least privilege: `CORTEX_ANALYST_USER` grants access to Cortex Analyst specifically without handing out the broader `CORTEX_USER` ability to call every AI function. So a BI team that should only ask analytical questions gets Analyst access without the power to run arbitrary `AI_COMPLETE` over sensitive tables. Scoping to the narrowest role that does the job is the governance best practice."
+      },
+      {
+        "q": "How do you give an auditor a record of exactly what data Cortex processed?",
+        "a": "Use ACCOUNT_USAGE — the Cortex functions usage history shows which functions and models ran with token counts, and standard query history shows the actual SQL (including the tables referenced) per user and role. Together they form the audit trail of who invoked which AI function over which objects. That's a concrete answer beyond 'we're compliant' — it's queryable evidence."
+      }
     ]
   },
   {
@@ -299,7 +537,21 @@
     "fj": "I click through a handful of questions, and if they look right we ship.",
     "fs": "I run AI Observability / TruLens evals on a test set — groundedness and context relevance scored by an LLM judge — so I can tell whether failures come from retrieval or generation. Vibe-checking a few queries isn't evaluation.",
     "level": "Sr",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "A low groundedness but high context-relevance score tells you what?",
+        "a": "Retrieval is working — the right passages were pulled (high context relevance) — but generation is the problem: the model isn't sticking to the retrieved context and is adding unsupported claims (low groundedness). The fix is on the generation side: tighten the prompt to answer only from context, lower temperature, or switch the generation model — not the retriever. Splitting the metrics is exactly what lets you localize the fault."
+      },
+      {
+        "q": "Why use an LLM-as-judge instead of exact-match against reference answers?",
+        "a": "RAG answers are free-form, so a correct response can be phrased a hundred ways that exact string match would mark wrong. An LLM judge scores semantic properties — is this grounded in the context, is it relevant — and returns a 0–1 score with an explanation you can inspect. The tradeoff is judge variability, which you mitigate by fixing the judge model and reviewing its rationales rather than trusting the number blindly."
+      },
+      {
+        "q": "What does instrumenting with tracing buy you beyond the final score?",
+        "a": "Tracing captures the intermediate steps — the retrieved passages, the prompt sent, tool calls, latencies — so when a score is bad you can see exactly which stage failed instead of only the end answer. For a multi-step agent or RAG chain that's essential to debugging, because the failure could be retrieval, reranking, prompt assembly, or generation. The score tells you something's wrong; the trace tells you where."
+      }
+    ]
   },
   {
     "q": "Design a chatbot over Snowflake that answers both 'what's revenue this quarter' and 'what does the contract say'. How do you route?",
@@ -307,7 +559,21 @@
     "fj": "I'll send every question to Cortex Analyst and let it figure it out.",
     "fs": "Analyst only does structured SQL — it can't read a contract PDF. I route metric questions to Analyst and document questions to Search, and let a Cortex Agent decide per question. Streamlit-in-Snowflake keeps it all in-boundary.",
     "level": "Sr",
-    "asked": 13
+    "asked": 13,
+    "followups": [
+      {
+        "q": "For the compound question 'tie contract terms to spend', how does the agent actually combine the two tools?",
+        "a": "The agent decomposes it: it calls Cortex Search to retrieve the relevant contract clauses and Cortex Analyst to compute the spend figure, then in its reasoning loop joins the two intermediate results into one answer ('the renewal clause caps at $X; actual spend was $Y'). Neither tool alone can do both halves, and the agent's plan-act-observe loop is what stitches the document evidence to the numeric result."
+      },
+      {
+        "q": "Why Streamlit-in-Snowflake instead of an external web app calling Cortex via REST?",
+        "a": "Streamlit-in-Snowflake runs the app inside the account, so data and prompts never leave the governance boundary and the app inherits Snowflake auth/RBAC with no separate data egress to secure. An external app over the REST API works but reintroduces a perimeter to lock down — auth, network, and the question of data leaving the account. For a governed enterprise chatbot, keeping it in-boundary is the simpler, safer default."
+      },
+      {
+        "q": "How do you stop the agent from answering a 'revenue' question out of a stale document instead of live SQL?",
+        "a": "Tool descriptions and routing drive this: Analyst is described as the source of truth for metrics/numbers and Search for document text, so the agent routes a quantitative question to Analyst's live SQL rather than a possibly-outdated PDF. You reinforce it by scoping each tool's domain clearly and, for numbers, relying on the semantic model's verified metrics. Sloppy tool descriptions are what cause mis-routing."
+      }
+    ]
   },
   {
     "q": "Your AI_COMPLETE call over a 200M-row table failed partway and you got a partial, expensive result. What went wrong and how do you fix it?",
@@ -330,6 +596,20 @@
           "WHERE needs_review;     -- pre-filter"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Exactly how does TRY_COMPLETE behave on a row that COMPLETE would error on?",
+        "a": "`TRY_COMPLETE` returns `NULL` (rather than raising) when the underlying completion would error on that row, so one bad row no longer aborts the whole statement and you keep the good results. You then find the `NULL`s and retry or handle them separately. Plain `COMPLETE` raising on a single row is what wastes the tokens already processed by killing the run — the `TRY_` variant is the resilience knob."
+      },
+      {
+        "q": "Why does a Stream make the job resumable where a plain SELECT doesn't?",
+        "a": "A Stream tracks the unconsumed change rows; once a Task processes them within a transaction, the offset advances so already-handled rows aren't reprocessed. If a run fails, the next run picks up only the remaining rows instead of rescanning (and re-billing) the whole 200M-row table. A bare `INSERT ... SELECT` over the full table has no offset, so a failure means starting over from scratch."
+      },
+      {
+        "q": "How do you split work so the frontier model only sees the hard subset?",
+        "a": "Run a cheap small model (or a deterministic rule) over everything first to get a confidence signal or a coarse label, then route only the low-confidence/ambiguous rows to the frontier model in a second pass. Most rows resolve cheaply; the expensive model is reserved for the few that need it. This two-tier cascade controls cost while keeping accuracy on the hard cases — the same filter-cheap-then-AI discipline applied to model selection."
+      }
     ]
   },
   {
@@ -338,7 +618,21 @@
     "fj": "Both classify rows, so I'd just use whichever I've heard of.",
     "fs": "AI_CLASSIFY is zero-shot over text/images from plain-language labels; ML CLASSIFICATION is a supervised model trained on labeled tabular features. Text with no labels → AI_CLASSIFY. Labeled numeric features → ML CLASSIFICATION, which is cheaper and deterministic.",
     "level": "Sr",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "If you have a few thousand labeled text examples, which do you pick?",
+        "a": "It depends on the signal. If the labels hinge on semantic understanding of language, `AI_CLASSIFY` zero-shot (optionally with a few examples/clear category descriptions) may already nail it without training and stay robust to new phrasings. If the text reduces to extractable features or you want a cheap deterministic high-volume predictor, training ML `CLASSIFICATION` on those examples pays off at scale. Often you prototype with `AI_CLASSIFY`, then graduate to a trained model once volume justifies it."
+      },
+      {
+        "q": "How does AI_CLASSIFY handle multi-label and category descriptions?",
+        "a": "`AI_CLASSIFY` supports single- and multi-label classification, and you can pass not just label names but descriptions to disambiguate categories, plus task instructions. That lets you steer it ('billing = payment/refund issues, not feature requests') without training data, which is its core advantage over a supervised model that can only learn from labeled rows. Good category descriptions are the main accuracy lever for it."
+      },
+      {
+        "q": "Why is the ML CLASSIFICATION function 'deterministic' in a way AI_CLASSIFY isn't?",
+        "a": "ML `CLASSIFICATION` is a fixed trained model: the same feature vector produces the same class prediction every run, which matters for reproducibility and audit. `AI_CLASSIFY` is an LLM call whose output can vary slightly and depends on the model version and phrasing. For regulated or repeatability-critical pipelines that determinism plus lower per-inference cost is decisive for the supervised model."
+      }
+    ]
   },
   {
     "q": "What's the difference between a semantic model (YAML) and a semantic view for Cortex Analyst, and which do you pick?",
@@ -346,6 +640,20 @@
     "fj": "They're the same thing, just file versus object — pick either.",
     "fs": "Functionally similar, but the semantic view is a native object under RBAC and sharing, managed with DDL — better for production governance. YAML is fine for prototyping. The real work is the metric and synonym definitions either way.",
     "level": "Mid",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "What governance do you get from a semantic view that a staged YAML can't give you?",
+        "a": "A semantic view is a first-class object, so it's subject to RBAC grants (who can use it), Snowflake sharing, replication, and object-level access history — and changes go through DDL you can audit. A YAML on a stage is just a file: its access is governed by stage privileges, and version control is whatever external process you bolt on. For production lineage and least-privilege access, the native object is cleaner."
+      },
+      {
+        "q": "When is the YAML genuinely the better choice?",
+        "a": "For prototyping and tight iteration loops where you want to edit, diff, and review the semantic layer in Git alongside code, the YAML file is more convenient — you get external version control and PR review out of the box. It's also fine for quick experiments before you commit to a production object. The substance (metrics, synonyms, relationships) ports over, so starting in YAML and graduating to a semantic view is a reasonable path."
+      },
+      {
+        "q": "Does switching the storage container change Analyst's answer quality?",
+        "a": "No — accuracy comes from the definitions, not the container. A YAML and a semantic view with identical tables, relationships, metrics, and synonyms produce the same Analyst behavior. The container decides governance, sharing, and how you manage changes; the metric and synonym quality (and any verified queries) decides whether the answers are right. Don't expect a quality jump just from moving YAML into a view."
+      }
+    ]
   }
 ]

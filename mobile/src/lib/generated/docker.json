@@ -4,7 +4,21 @@
     "a": "An image is a stack of read-only layers, one per Dockerfile instruction (RUN, COPY, ADD). Each layer stores only the filesystem diff from the layer below, and layers are content-addressed so identical layers are shared across images and cached. At runtime Docker adds a thin writable layer on top via a union/overlay filesystem, leaving the image layers immutable and reusable.",
     "fs": "Layers are immutable content-addressed diffs unioned by overlayfs, which is why caching and cross-image dedup work.",
     "fj": "A layer is just a copy of the whole image you get after each command.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "If a file is created in one layer and deleted in a later layer, does that shrink the image?",
+        "a": "No. The earlier layer still contains the file's full bytes; the later layer only records a whiteout marker that hides it at runtime. The total image size still includes both, which is why secrets baked into an early layer leak via `docker history` and why cleanup must happen in the same RUN that created the data."
+      },
+      {
+        "q": "Do all Dockerfile instructions create a layer?",
+        "a": "No. Only RUN, COPY, and ADD produce filesystem layers. Metadata-only instructions like ENV, LABEL, EXPOSE, CMD, ENTRYPOINT, and WORKDIR just update the image config and create zero-size layers, so they don't add to image size."
+      },
+      {
+        "q": "How does the overlay filesystem present a single view from these stacked layers?",
+        "a": "`overlay2` mounts the read-only image layers as `lowerdir` and the container's writable layer as `upperdir`, merging them into one tree. Reads come from the topmost layer that has the file; a write to a lowerdir file triggers copy-up into the upperdir, where it's modified, leaving the underlying layer untouched."
+      }
+    ]
   },
   {
     "q": "How does the Docker build cache decide whether to reuse a layer?",
@@ -23,6 +37,20 @@
           "RUN npm run build"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Your CI runs on fresh runners every time, so the local cache is always cold. How do you still get cache hits?",
+        "a": "Use BuildKit's external cache backends: `--cache-to`/`--cache-from` (e.g. `type=registry` or `type=gha`) export layer cache to a registry or GitHub Actions cache, and the next runner imports it. With `mode=max` even intermediate stage layers are exported, so multi-stage builds get full cache reuse across ephemeral machines."
+      },
+      {
+        "q": "How do you force a cache bust at a specific point without editing the actual command?",
+        "a": "Pass an `ARG` that you change to invalidate from that line down, e.g. `ARG CACHEBUST` then reference it before the RUN, building with `--build-arg CACHEBUST=$(date +%s)`. Alternatively `docker build --no-cache` rebuilds everything, or `--no-cache-filter=<stage>` busts a single stage."
+      },
+      {
+        "q": "Why might a COPY layer miss the cache even when the file contents are identical?",
+        "a": "BuildKit's COPY checksum includes file metadata like mode and ownership, not just bytes, so a permission change busts it. Also, anything earlier in the stage missing cache cascades down. With the classic (non-BuildKit) builder, even unrelated mtime changes could invalidate COPY since it was less precise about what it hashed."
+      }
     ]
   },
   {
@@ -30,7 +58,21 @@
     "a": "The first cache miss invalidates all later layers, so you isolate the slow, rarely-changing step (installing dependencies) above the fast, frequently-changing step (your source). Copying only package.json/lockfile and running the install first means edits to application code do not bust the dependency layer. This can turn a multi-minute rebuild into a few seconds.",
     "fs": "Order layers by change frequency: a code edit should never invalidate the dependency-install layer.",
     "fj": "Just `COPY . .` first; it is simpler and the cache still works fine.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "In a monorepo with many package.json files, copying just the root manifest isn't enough. How do you preserve the dependency-layer cache?",
+        "a": "Copy every manifest and lockfile across all workspaces before the install, but nothing else — e.g. `COPY package.json pnpm-lock.yaml ./` plus each `packages/*/package.json`. The install layer then only busts when a dependency actually changes. BuildKit cache mounts on the package-manager store further speed warm installs."
+      },
+      {
+        "q": "What's the failure mode if you copy the lockfile but install with a command that ignores it?",
+        "a": "You lose reproducibility: `npm install` may resolve newer versions than the lockfile pins, so the built image drifts from what was tested even though the cache layer looks stable. Use `npm ci` (or `pnpm install --frozen-lockfile`), which installs exactly the lockfile and fails if it's out of sync."
+      },
+      {
+        "q": "Does this ordering still help if your dependencies themselves change on most commits?",
+        "a": "Less so — if the lockfile changes every build, the install layer busts every build regardless of ordering, and you gain little. In that case the win shifts to a cache mount that persists the download cache across builds, so even an invalidated install layer re-fetches little from the network."
+      }
+    ]
   },
   {
     "q": "What is a multi-stage build and what problem does it solve?",
@@ -53,6 +95,20 @@
           "ENTRYPOINT [\"/app\"]"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Can you build or stop at just one stage without producing the whole image?",
+        "a": "Yes. `docker build --target build .` stops at the named stage, which is handy for producing a test or lint image, or pulling artifacts out without the final stage. BuildKit also skips any stage whose output no target depends on, so unused stages cost nothing."
+      },
+      {
+        "q": "Beyond copying from a previous FROM stage, what else can COPY --from reference?",
+        "a": "It can copy directly from an external image, e.g. `COPY --from=ghcr.io/org/tools:1.2 /usr/bin/tool /usr/bin/tool`, with no need to declare it as a stage. This is a common way to grab a single static binary (like a CLI) from a published image into your runtime stage."
+      },
+      {
+        "q": "You're building a CGO-enabled Go binary and the distroless/static runtime crashes with a missing shared library. Why?",
+        "a": "`distroless/static` has no glibc, so a dynamically-linked (CGO) binary can't resolve `libc.so`. Either build a fully static binary (`CGO_ENABLED=0`) to keep using `static`, or switch the runtime to `gcr.io/distroless/base` (or `cc`), which ship the C runtime your binary links against."
+      }
     ]
   },
   {
@@ -72,6 +128,20 @@
           " && rm -rf /var/lib/apt/lists/*"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "A teammate suggests just switching the base to Alpine to fix size. What can go wrong?",
+        "a": "Alpine uses musl libc, not glibc, so glibc-linked binaries, some Python wheels (manylinux), and certain native modules break or fall back to slow source builds. You may chase DNS-resolution and locale quirks too. Distroless or `-slim` glibc bases often give most of the size win without the musl footguns."
+      },
+      {
+        "q": "You've already optimized the Dockerfile but one layer is still huge. How do you pinpoint exactly what's in it?",
+        "a": "`docker history --no-trunc <image>` shows per-layer size and the instruction that created it. For a file-level view, `dive` lets you walk each layer's filesystem and flags wasted space (files added then deleted in later layers), so you can see precisely which paths to move or clean in-layer."
+      },
+      {
+        "q": "Squashing layers is sometimes proposed to shrink images. Why is it usually a bad trade?",
+        "a": "Squashing (`--squash` or exporting flattened) collapses all layers into one, which can drop intermediate bloat but destroys layer sharing — every image now ships a unique blob, so pulls and registry storage balloon across many images. Prefer fixing the layers (in-layer cleanup, multi-stage) so the common base layers stay deduplicated."
+      }
     ]
   },
   {
@@ -79,14 +149,42 @@
     "a": "Distroless images contain only your app and its runtime dependencies, with no package manager and no shell. That shrinks attack surface and size and forces non-root by default with the :nonroot tag. The tradeoff is debuggability: you cannot `docker exec` a shell, so you rely on ephemeral debug containers, app-level logging, and exec-form healthchecks instead of shell scripts.",
     "fs": "No shell means no `exec sh` to debug; you attach an ephemeral debug container via `docker debug`/`kubectl debug` instead.",
     "fj": "Distroless is just Alpine with a smaller package list.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Your HEALTHCHECK uses `CMD curl -f ...` but the distroless image has no curl or shell. How do you health-check it?",
+        "a": "Ship a tiny static health-probe binary alongside your app and call it in exec form, e.g. `HEALTHCHECK CMD [\"/app/healthcheck\"]`. Go's `grpc_health_probe` or a few-line static binary is common. In Kubernetes, prefer the platform's `httpGet`/`grpc` probes, which don't need any in-image tooling at all."
+      },
+      {
+        "q": "What does the `:debug` variant of a distroless image give you, and why not use it everywhere?",
+        "a": "The `:debug` tag adds a BusyBox shell and basic tools so you can `exec` in to troubleshoot. You don't run it in production because it re-introduces a shell and utilities — extra attack surface — defeating the point. Use it as a temporary swap or via an ephemeral debug container, then revert."
+      },
+      {
+        "q": "How does an ephemeral debug container let you inspect a distroless container that has no tools?",
+        "a": "`kubectl debug` (or `docker debug`) starts a separate container with your chosen toolbox image and joins it to the target's namespaces (PID, network, sometimes filesystem via `--target`). You get your tools' processes seeing the target's process tree and network, without ever adding anything to the production image."
+      }
+    ]
   },
   {
     "q": "What does .dockerignore do and why does it matter for builds?",
     "a": "The .dockerignore file excludes paths from the build context that the CLI sends to the daemon before the build starts. Excluding things like .git, node_modules, and local secrets makes the context smaller (faster uploads), prevents busting COPY cache on irrelevant file changes, and avoids accidentally baking credentials into an image. It is evaluated against the context root, not against COPY destinations.",
     "fs": "It trims the context the daemon receives, so it both speeds uploads and stops secrets from leaking into layers.",
     "fj": "It is like .gitignore and only affects which files Docker tracks in version control.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "You .dockerignore'd `.env` but still need one specific file under an ignored directory. How do you do that?",
+        "a": "`.dockerignore` supports negation with `!`, so you ignore broadly then re-include: `secrets/*` followed by `!secrets/ca.pem`. Order matters — later patterns override earlier ones. Note you still shouldn't COPY real secrets in; use a BuildKit secret mount for those."
+      },
+      {
+        "q": "With BuildKit and named contexts, does .dockerignore still apply the same way?",
+        "a": "Each context has its own ignore file. For the default context it's `.dockerignore`; BuildKit also honors a per-Dockerfile `<dockerfile-name>.dockerignore` if present, which takes precedence. For additional named contexts (`--build-context`) the relevant ignore rules apply to that context's root, not the main one."
+      },
+      {
+        "q": "If a path is excluded by .dockerignore but a COPY tries to reference it, what happens?",
+        "a": "The build fails or the file is simply absent, because the excluded path was never sent to the builder — it's not in the context at all. This is a common source of \"file not found\" COPY errors after someone tightens the ignore file; the fix is a `!` negation to re-include the needed path."
+      }
+    ]
   },
   {
     "q": "Explain ENTRYPOINT vs CMD and when you would use each.",
@@ -105,6 +203,20 @@
           "#   -> python app.py --port 9000"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What happens if ENTRYPOINT is in exec form but CMD is in shell form (or vice versa)?",
+        "a": "When ENTRYPOINT is exec form and CMD is shell form, Docker appends `/bin/sh -c \"<cmd>\"` as the arguments — usually not what you want. The reliable pattern is to keep both in exec (JSON) form so CMD's tokens are appended cleanly as argv to the ENTRYPOINT binary."
+      },
+      {
+        "q": "How does an entrypoint script let you do setup before handing off to the real process correctly?",
+        "a": "Write `entrypoint.sh` that does init work, then `exec \"$@\"` to replace the shell with the command (CMD) as PID 1 so it receives signals. Without `exec`, the shell stays PID 1 and swallows SIGTERM. This is the standard pattern for running migrations or fixing permissions before the app starts."
+      },
+      {
+        "q": "A user wants to run a one-off shell in your image that has an ENTRYPOINT. What's the gotcha?",
+        "a": "Run args only replace CMD, not ENTRYPOINT, so `docker run img sh` becomes `entrypoint sh` — likely an error. You must override the entrypoint: `docker run -it --entrypoint sh img`. This is exactly why a hard-coded ENTRYPOINT can frustrate debugging if it's not designed to pass through."
+      }
     ]
   },
   {
@@ -112,7 +224,21 @@
     "a": "Shell form (ENTRYPOINT cmd arg) runs your command under /bin/sh -c, so the shell becomes PID 1 and your process is its child. That shell typically does not forward SIGTERM, so `docker stop` cannot gracefully shut your app down and you get a hard SIGKILL after the timeout. Exec form (ENTRYPOINT [\"cmd\",\"arg\"]) runs the binary directly as PID 1 so it receives signals, but loses shell features like variable expansion.",
     "fs": "Shell form makes /bin/sh PID 1, which swallows SIGTERM and breaks graceful shutdown on docker stop.",
     "fj": "Use shell form so you can use $ENV variables; the form does not affect shutdown.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How long does docker stop wait before the SIGKILL, and how do you change it?",
+        "a": "By default Docker sends SIGTERM (or the image's STOPSIGNAL) then waits a 10-second grace period before SIGKILL. Override per call with `docker stop -t 30`, or set a longer default; `-t -1` waits indefinitely. Long-draining services need a timeout above their worst-case shutdown so they aren't killed mid-flush."
+      },
+      {
+        "q": "You need shell features like env expansion but still want correct signal handling. How?",
+        "a": "Wrap with exec form invoking the shell explicitly and use `exec` to hand off: `ENTRYPOINT [\"sh\", \"-c\", \"exec myapp --port $PORT\"]`. The `exec` replaces the shell process with the app as PID 1, so you get variable expansion at start and proper SIGTERM delivery afterward."
+      },
+      {
+        "q": "Even with exec form, your app is PID 1 and leaves zombie processes. What's the fix?",
+        "a": "PID 1 has special duties — it must reap orphaned children — and many apps don't. Run a tiny init like `tini` (or `docker run --init`) as PID 1; it reaps zombies and forwards signals to your app. This is why `--init` exists as a one-flag fix for both reaping and signal forwarding."
+      }
+    ]
   },
   {
     "q": "A container exits immediately on `docker run`. How do you debug it?",
@@ -131,6 +257,20 @@
           "  --entrypoint sh <image>"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "The container exits 0 immediately, not with an error. What's typically happening?",
+        "a": "The main process finished and there's nothing to keep PID 1 alive — common when the app daemonizes/backgrounds itself, or the command is a one-shot. Containers live only as long as PID 1. Run the server in the foreground (e.g. `nginx -g 'daemon off;'`) so the process the container watches doesn't exit."
+      },
+      {
+        "q": "What does exit code 137 tell you specifically?",
+        "a": "137 = 128 + 9, meaning the process was killed by signal 9 (SIGKILL). Most often that's an OOM kill (the kernel reaped it for exceeding the memory cgroup limit) or a `docker stop` that timed out. Check `docker inspect`'s `OOMKilled` field and raise `--memory` or fix the leak accordingly."
+      },
+      {
+        "q": "Logs are empty and the exit is instant. How else can you see why it died?",
+        "a": "`docker inspect <id>` shows `State.ExitCode`, `Error`, and `OOMKilled`. If it's a missing-binary or bad-interpreter case you'll see an exec error like \"no such file or directory\" (often a wrong arch image or a CRLF in the entrypoint script). Re-running with `--entrypoint sh -it` lets you probe the filesystem and run the command manually."
+      }
     ]
   },
   {
@@ -138,7 +278,21 @@
     "a": "Use `docker exec -it <id> sh` to get a shell inside its namespaces and inspect processes, env, and files; `docker logs -f` to stream stdout/stderr; and `docker stats`/`docker top` for resource and process views. For images without a shell (distroless/scratch) use `docker debug` or `kubectl debug` to attach an ephemeral debug container that shares the target's namespaces. Use `docker inspect` for config, mounts, and network details.",
     "fs": "For shell-less images, attach an ephemeral debug container sharing the target's PID/network namespace instead of exec.",
     "fj": "SSH into the container like a VM and look around.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why does `docker exec` see a different process tree and environment than the container's main process?",
+        "a": "`exec` starts a brand-new process that joins the container's namespaces but does NOT inherit the entrypoint's environment — it gets the image's ENV plus any `--env` you pass, not variables the app set at runtime. It shares the PID namespace, so `ps` shows the app, but env vars exported inside the original process won't appear."
+      },
+      {
+        "q": "You suspect a network issue but the app's image has no networking tools. How do you inspect its traffic?",
+        "a": "Run a tool container in the target's network namespace: `docker run --net container:<id> nicolaka/netshoot` gives you `tcpdump`, `dig`, `ss`, and `curl` seeing exactly the target's interfaces and DNS. Nothing is added to the app image, and you can capture packets or test resolution as if you were inside it."
+      },
+      {
+        "q": "How do you grab a CPU or memory profile from a container without restarting it?",
+        "a": "Exec the language's profiler or expose a profiling endpoint (e.g. Go `pprof`, JVM async-profiler) and port-forward to it. For a quick view, `docker stats` shows live CPU/mem, and `docker exec` lets you run `top`/`perf` inside. The key is the app must already expose the hooks; you can't bolt on a profiler the binary doesn't support."
+      }
+    ]
   },
   {
     "q": "What is the difference between a Docker volume and a bind mount?",
@@ -154,6 +308,20 @@
           "docker run -v pgdata:/var/lib/pg img # vol",
           "docker run -v $PWD/src:/app img    # bind"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When you mount a named volume onto a path that already has files in the image, what happens to those files?",
+        "a": "An empty named volume mounted over a populated image directory gets pre-seeded with the image's contents on first use — Docker copies the existing files into the new volume. A bind mount does NOT do this; it shadows the directory entirely, so the image's files at that path become invisible behind the host directory."
+      },
+      {
+        "q": "Why might a bind-mounted node_modules cause native-module crashes across host and container?",
+        "a": "Bind mounts expose the host's exact bytes, so modules compiled against the host's OS/arch (e.g. macOS) get loaded by a Linux container and fail. The common fix is an anonymous volume on `/app/node_modules` that masks the host copy, letting the container install its own platform-correct binaries."
+      },
+      {
+        "q": "How do you safely back up the data in a named volume?",
+        "a": "Run a throwaway container that mounts both the volume and a host backup dir, then tar it out: `docker run --rm -v pgdata:/data -v $PWD:/backup alpine tar czf /backup/pgdata.tgz -C /data .`. For databases specifically, prefer a logical dump (`pg_dump`) over a raw volume copy to avoid an inconsistent on-disk snapshot."
       }
     ]
   },
@@ -175,6 +343,20 @@
           "  ping -c1 db   # resolves by name"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Two containers run the same service and you want one DNS name to load-balance across them. How?",
+        "a": "Give both the same `--network-alias` on a user-defined network; the embedded DNS returns multiple A records (round-robin) for that alias. In Swarm, a service VIP fronts the tasks instead. This is how Compose `scale`d replicas become reachable under one service name."
+      },
+      {
+        "q": "A container is attached to two networks. Which network's DNS and gateway does it use?",
+        "a": "It gets an interface and IP on each network and can resolve names on any network it's attached to via the embedded DNS. Outbound default-route traffic uses the gateway of the network with the lowest-priority/default interface (Docker picks one as default), so attaching to multiple networks is how you bridge, e.g., a frontend net and a backend net."
+      },
+      {
+        "q": "Why can't the container just edit /etc/resolv.conf to point elsewhere, and where does upstream DNS come from?",
+        "a": "On a user-defined network, `/etc/resolv.conf` points at `127.0.0.11`, the embedded DNS. For names it doesn't know (external domains), it forwards to the daemon's configured upstream resolvers (the host's resolvers by default, or `--dns` flags). Overwriting resolv.conf inside the container breaks Docker's service discovery, so you set DNS via run flags instead."
+      }
     ]
   },
   {
@@ -182,14 +364,42 @@
     "a": "bridge is the default single-host driver, giving containers a private subnet behind NAT; user-defined bridges add DNS service discovery. host shares the host's network namespace with no isolation or port mapping, used for max performance. none disables networking. overlay spans multiple hosts (Swarm/multi-host) and macvlan gives a container its own MAC/IP on the physical LAN.",
     "fs": "host removes the network namespace entirely, so there is no port publishing and the container binds host ports directly.",
     "fj": "You always use bridge; the other drivers are basically never needed.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What's the catch with host networking on Docker Desktop (Mac/Windows)?",
+        "a": "On Mac/Windows, Docker runs in a Linux VM, so `--network host` historically didn't map to the actual host — it bound inside the VM. Docker Desktop added opt-in host networking support, but it's not the seamless host-equals-laptop behavior Linux gives. On Linux native, host networking truly shares the host stack."
+      },
+      {
+        "q": "Why does macvlan often fail to let the container talk to its own host, and what's the workaround?",
+        "a": "macvlan attaches the container to the physical NIC at L2, but most NICs won't loop a frame from a macvlan child back to the parent host — so host↔container traffic is blocked by design. The workaround is creating a second macvlan/ipvlan sub-interface on the host for that path, or just using a bridge network for host-local comms."
+      },
+      {
+        "q": "When would you reach for an overlay network outside of Docker Swarm?",
+        "a": "Overlay needs a key-value store / control plane to coordinate the VXLAN tunnels and IP allocation across hosts; Swarm provides that out of the box. Outside Swarm you'd point the overlay driver at an external KV store (legacy) — but in practice multi-host networking today is handled by Kubernetes CNI plugins, not standalone Docker overlay."
+      }
+    ]
   },
   {
     "q": "What does publishing a port (-p 8080:80) actually do?",
     "a": "It tells Docker to map a host port to a container port by programming an iptables DNAT rule (via the userland proxy/NAT) so traffic to the host port is forwarded into the container's network namespace. Without publishing, a container on a bridge network is only reachable from other containers on that network, not from the host or outside. The left side is the host port, the right side is the in-container port.",
     "fs": "-p installs a DNAT/iptables rule; EXPOSE only documents intent and publishes nothing by itself.",
     "fj": "EXPOSE in the Dockerfile already opens the port to the host.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "You published a port but the container still isn't reachable from outside. What do you check?",
+        "a": "Confirm the app binds `0.0.0.0`, not `127.0.0.1` — a loopback bind inside the container is unreachable through the DNAT. Also check `docker port <id>` for the actual mapping, host firewall rules, and that you didn't bind to a specific host IP that differs from how you're connecting (`-p 127.0.0.1:8080:80` only listens on localhost)."
+      },
+      {
+        "q": "Why might Docker's published ports bypass your UFW/host firewall rules?",
+        "a": "Docker inserts its DNAT rules into iptables `nat`/`DOCKER` chains ahead of many user firewall rules, so a published port can be open to the world even though UFW \"denies\" it. The fix is to bind to a specific interface (`-p 127.0.0.1:...`) for local-only, or configure `DOCKER-USER` chain rules / `iptables=false` deliberately."
+      },
+      {
+        "q": "What is the userland proxy (docker-proxy) and when can you turn it off?",
+        "a": "`docker-proxy` is a small process that forwards published-port traffic for cases iptables DNAT alone can't cover (e.g. host-loopback to a published port, or hairpin). It adds a little overhead and a process per mapping. With `userland-proxy: false` in the daemon config, Docker relies purely on iptables/NAT, which is fine on modern kernels for most workloads."
+      }
+    ]
   },
   {
     "q": "What is Docker Compose and what does a service definition give you?",
@@ -214,6 +424,20 @@
           "  pgdata:"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "How do multiple Compose files or an override file combine, and why is that useful?",
+        "a": "Compose merges `compose.yaml` with `compose.override.yaml` (auto-loaded) or any files passed with `-f`, deep-merging maps and replacing scalars in later files. This lets a base file describe the app and an override add dev-only bind mounts or a prod file swap images, so you keep one source of truth per environment."
+      },
+      {
+        "q": "What's the difference between `docker compose up`, `down`, and `down -v` for your data?",
+        "a": "`up` creates/starts; `down` stops and removes containers and the project network but KEEPS named volumes by default; `down -v` also deletes named volumes — destroying your database. That `-v` is the classic foot-gun: people run it to \"clean up\" and wipe persistent data. `stop` just halts containers without removing anything."
+      },
+      {
+        "q": "How do you scale a service to multiple replicas in Compose, and what breaks?",
+        "a": "`docker compose up --scale web=3` runs three containers behind the service-name DNS alias (round-robined). It breaks if you statically published a host port (`8080:80`), since three containers can't bind the same host port — use a range or front them with a load-balancer/reverse proxy that targets the service name."
+      }
     ]
   },
   {
@@ -233,6 +457,20 @@
           "        condition: service_healthy"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Even with condition: service_healthy, why should the app still retry its DB connection?",
+        "a": "Health is a point-in-time signal and the DB can blip after startup — failover, a restart, or a transient network drop — long after the dependency was \"healthy\" at boot. Connection retry with backoff makes the app resilient to mid-life outages, not just the cold-start race that depends_on addresses."
+      },
+      {
+        "q": "What does `condition: service_completed_successfully` enable, and when is it used?",
+        "a": "It makes a service wait until another service's container exits 0 — ideal for a one-shot init/migration job: the `migrate` service runs to completion, then `web` starts. If the job fails (nonzero exit), the dependent service won't start, so a bad migration blocks the rollout cleanly."
+      },
+      {
+        "q": "On a Swarm deployment, does depends_on still apply?",
+        "a": "No — `depends_on` is ignored by `docker stack deploy` (Swarm) entirely. Swarm assumes services come up in any order and converge, so you must build retry/health logic into the apps themselves. depends_on ordering is a Compose-local-dev feature, not an orchestration guarantee."
+      }
     ]
   },
   {
@@ -251,6 +489,20 @@
           "  CMD curl -f localhost:8080/health \\",
           "  || exit 1"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "A container is marked unhealthy but keeps running. What actually acts on the health status?",
+        "a": "Plain Docker does nothing but set the status — it won't restart an unhealthy container on its own. An orchestrator does: Swarm reschedules unhealthy tasks, and `--restart` combined with tooling, or Compose `depends_on: service_healthy`, reacts to it. To auto-restart on health failure you need Swarm or an external watcher; HEALTHCHECK alone just reports."
+      },
+      {
+        "q": "Your healthcheck command does heavy work every interval and shows up as load. How do you keep it cheap?",
+        "a": "Make the probe a lightweight liveness endpoint that doesn't hit the database or do real work, lengthen `--interval`, and keep `--timeout` tight. A health probe that runs a full query every few seconds can itself cause load spikes or false unhealthies under pressure, so it should be near-free to evaluate."
+      },
+      {
+        "q": "How do liveness vs readiness differ, and does Docker's HEALTHCHECK cover both?",
+        "a": "Liveness = \"is the process alive, restart if not\"; readiness = \"can it serve traffic right now, route around it if not.\" Docker's HEALTHCHECK is a single signal that conflates them. Kubernetes splits them into separate `livenessProbe` and `readinessProbe`, which is why on K8s you generally use those instead of the image's HEALTHCHECK."
       }
     ]
   },
@@ -272,6 +524,20 @@
           "#   --cap-drop ALL ... image"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "After switching to USER app, the container can't write its log/cache directory. Why and how do you fix it?",
+        "a": "Files created by earlier root-owned layers are owned by root, so the non-root user can't write them. Fix it at build time by chowning the needed paths (`RUN chown -R app:app /data`) or `COPY --chown=app:app`, and mount writable dirs as volumes. With a read-only rootfs, give writable paths a `tmpfs` or named volume."
+      },
+      {
+        "q": "Your non-root app needs to bind port 80. How do you allow that without running as root?",
+        "a": "Either grant the binary the `CAP_NET_BIND_SERVICE` capability (`setcap` at build, or `--cap-add NET_BIND_SERVICE`), or just bind a high port (8080) inside and publish it as `-p 80:8080`. Since Docker 20.10 the daemon also lets you lower the unprivileged-port floor, but publishing a high in-container port is the simplest, safest route."
+      },
+      {
+        "q": "How does Docker's user namespace remapping differ from just setting USER in the Dockerfile?",
+        "a": "USER changes the in-container UID but, without remapping, container root still equals host root (UID 0). `userns-remap` maps the container's UID range to an unprivileged host range, so even container root is a powerless user on the host — defense if something runs as root inside. They're complementary: USER for least privilege in-app, userns-remap for host-side isolation."
+      }
     ]
   },
   {
@@ -290,6 +556,20 @@
           "  npm ci"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Where exactly does a BuildKit secret mount expose the value, and is it in the final image?",
+        "a": "By default the secret is mounted as a file at `/run/secrets/<id>` only for the duration of that single RUN, on a tmpfs. It's never written to a layer or the build cache key, so it doesn't appear in `docker history` or the final image. You pass it with `docker build --secret id=npm,src=./token`."
+      },
+      {
+        "q": "Passing a secret as a runtime env var is common but has a leak vector. What is it?",
+        "a": "Environment variables are visible to anyone who can `docker inspect` the container, are inherited by child processes, and often get dumped into logs or crash reports. They're better than baking into the image, but for sensitive material a mounted file (Docker/Swarm secret at `/run/secrets`) or a secrets-manager fetch at startup is safer than `-e`."
+      },
+      {
+        "q": "How do Docker Swarm secrets get delivered to a service, and why is that better than env?",
+        "a": "Swarm stores the secret encrypted in the Raft log and mounts it into the task as an in-memory tmpfs file at `/run/secrets/<name>`, only on nodes running that service. It's never written to disk on the worker and not exposed via inspect of the container, so it avoids the env-var and image-layer leak paths entirely."
+      }
     ]
   },
   {
@@ -297,7 +577,21 @@
     "a": "An image is an immutable, read-only template: a stack of layers plus metadata (entrypoint, env, exposed ports). A container is a running (or stopped) instance of an image with a thin writable layer on top and its own process, network, and mount namespaces. You can start many containers from one image, and changes inside a container stay in its writable layer unless you commit or persist them to a volume.",
     "fs": "Container = image layers + a writable layer + namespaces/cgroups; the image stays immutable and shareable across instances.",
     "fj": "A container is just the image after you start it; there's no real difference.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "What happens to a container's writable layer when you stop versus remove the container?",
+        "a": "Stopping keeps the writable layer, so you can `docker start` and your in-container changes are still there. `docker rm` deletes that writable layer permanently — any data not in a volume is gone. This is why ephemeral state survives a restart but not a recreate, and why durable data must live in a volume."
+      },
+      {
+        "q": "What does docker commit do, and why is it discouraged for building images?",
+        "a": "`docker commit` snapshots a container's writable layer into a new image. It's discouraged because the result is opaque and non-reproducible — there's no Dockerfile recording how it was made, so it can't be rebuilt, reviewed, or rebased on a patched base. Use it only for ad-hoc capture; build real images from a Dockerfile."
+      },
+      {
+        "q": "Multiple containers run from the same image. Do they share the underlying layer storage?",
+        "a": "Yes — the read-only image layers are shared on disk via the storage driver; each container only adds its own thin writable layer. So ten containers of the same image cost one copy of the image plus ten small writable layers, which is a big reason container density is cheap compared to full VMs."
+      }
+    ]
   },
   {
     "q": "Why does `apt-get update` in one RUN and `apt-get install` in a later RUN cause stale-package bugs?",
@@ -317,6 +611,20 @@
           " && rm -rf /var/lib/apt/lists/*"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is `--no-install-recommends` recommended alongside the install?",
+        "a": "apt pulls \"Recommends\" packages by default, which adds docs, optional tools, and extra libraries you rarely need, bloating the image and attack surface. `--no-install-recommends` installs only hard dependencies, often cutting tens to hundreds of MB. You add specific extras explicitly when actually required."
+      },
+      {
+        "q": "If you want a BuildKit cache mount for apt to speed rebuilds, what extra flag is essential and why?",
+        "a": "Use `sharing=locked` on the cache mount: `RUN --mount=type=cache,target=/var/cache/apt,sharing=locked`. apt isn't safe under concurrent writers, so two parallel builds sharing the cache can corrupt it; `locked` serializes them. You also stop deleting `/var/cache/apt` since the mount, not a layer, holds it. Disable apt's auto-clean docker config so files persist in the cache."
+      },
+      {
+        "q": "How do you pin package versions in apt so the build is reproducible?",
+        "a": "Use `apt-get install pkg=1.2.3-1` to lock exact versions, and pin the base image by digest so the apt repo snapshot is stable. The catch: distro repos garbage-collect old versions, so a pin can stop resolving over time — teams often run a frozen snapshot mirror (e.g. snapshot.debian.org) for truly long-lived reproducibility."
+      }
     ]
   },
   {
@@ -325,7 +633,21 @@
     "fs": "COPY/ADD can only read files inside the context that was sent to the builder, not arbitrary host paths.",
     "fj": "The build context is just the current folder, and Docker only reads the files you COPY.",
     "level": "Jr",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "Why does sending the context to a remote/daemon builder matter even when no COPY uses most files?",
+        "a": "The CLI transfers the whole context bundle to the builder before any instruction runs; with a remote daemon or a CI builder that's a network upload of every non-ignored byte. So a 2 GB context with node_modules adds upload latency to every build regardless of which files COPY references — which is exactly what .dockerignore prevents."
+      },
+      {
+        "q": "How does BuildKit reduce the cost of large contexts compared to the legacy builder?",
+        "a": "BuildKit transfers the context incrementally and lazily — it sends only the files an instruction actually needs and caches the transfer, rather than tarring and shipping the entire directory upfront like the classic builder. It still respects .dockerignore, but the per-build penalty for a big untouched context is much smaller."
+      },
+      {
+        "q": "Can you build with no local context at all, e.g. straight from a Git repo?",
+        "a": "Yes. `docker build https://github.com/org/repo.git#branch` makes the remote repo the context, and `docker build - < Dockerfile` builds with an empty context (no COPY of local files possible). BuildKit also supports `--build-context name=...` to add extra named contexts (dirs, images, or git URLs) referenced via `COPY --from=name`."
+      }
+    ]
   },
   {
     "q": "What is the difference between ADD and COPY, and which should you default to?",
@@ -345,6 +667,20 @@
           "RUN curl -fsSL $URL -o /tmp/x \\",
           " && echo \"$SHA  /tmp/x\" | sha256sum -c"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Modern BuildKit added flags that make ADD safer for remote fetches. What are they?",
+        "a": "`ADD --checksum=sha256:... <url> <dest>` verifies the download's hash so a changed/poisoned remote fails the build, and `ADD --keep-git-dir` controls git-context behavior. With `--checksum` you get an integrity guarantee similar to the explicit curl-and-verify pattern, removing the main reason to avoid ADD for URLs."
+      },
+      {
+        "q": "Why is `ADD <url>` for downloads still often discouraged even with checksums?",
+        "a": "ADD's URL fetch creates a layer that's re-evaluated on cache rules tied to the URL, doesn't let you decompress/clean in the same step, and you can't run intermediate verification logic. An explicit `RUN curl ... && verify && cleanup` keeps the download, check, and removal of temp files in one layer, which is leaner and more auditable."
+      },
+      {
+        "q": "Does COPY --chown work on all base images?",
+        "a": "`COPY --chown=user:group` needs the user/group to exist (by name) in the image, or you can pass numeric UID:GID which always works even on `scratch`/distroless that lack `/etc/passwd`. On Windows containers `--chown` is unsupported. So for shell-less bases, prefer numeric IDs to avoid a name-lookup failure."
       }
     ]
   },
@@ -366,6 +702,20 @@
           "# container sees APP_VERSION, not VERSION"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "How do you use an ARG to parameterize the base image in FROM, and what's the scoping catch?",
+        "a": "An ARG declared before the first FROM (e.g. `ARG TAG=3.12`, then `FROM python:${TAG}`) is in a special global scope usable only in FROM lines. Once you're inside a stage, you must re-declare `ARG TAG` to use its value in RUN/ENV, because each FROM resets the ARG scope. This trips people up constantly."
+      },
+      {
+        "q": "If ARG isn't present at runtime, how can a stale --build-arg still cause a surprise rebuild or value?",
+        "a": "An ARG's value is part of the cache key for instructions after its declaration, so changing `--build-arg` busts cache from that point down even though the value never reaches runtime. And if you forget to redeclare an ARG in a later stage, it silently falls back to its default — leading to a mismatch between what you passed and what the stage used."
+      },
+      {
+        "q": "Which ARGs does BuildKit predefine, and why does that matter for proxies?",
+        "a": "BuildKit predefines proxy ARGs like `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase): if you pass them as build args they're consumed by RUN commands but, by design, excluded from `docker history` and don't bust cache, so proxy settings don't leak into the image. That's why proxies \"just work\" in builds without polluting the final image config."
+      }
     ]
   },
   {
@@ -386,6 +736,20 @@
           "# reused next build, not in the image"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What are the three sharing modes for a cache mount and when do you pick each?",
+        "a": "`shared` (default) lets concurrent builds write the same cache simultaneously — fine for tools that handle concurrency. `locked` makes a second build wait for the first to release the mount — required for apt and other non-concurrency-safe caches. `private` gives each concurrent build its own cache copy. Pick `locked` for apt, `shared` for most language package managers."
+      },
+      {
+        "q": "How does a cache mount differ from layer caching, and can a cache mount be lost?",
+        "a": "Layer caching reuses whole built layers keyed on instruction inputs; a cache mount is a persistent scratch directory that survives even when the layer is rebuilt. It's a build-host artifact, not part of the image, so it's not exported with the image and can be pruned (`docker builder prune`) or absent on a fresh CI runner — making it a speedup, never a correctness dependency."
+      },
+      {
+        "q": "On ephemeral CI runners the cache mount is empty each run. How do you still benefit?",
+        "a": "Cache mounts are local to the builder, so on fresh runners they start cold. To persist across runs you combine them with exported layer cache (`--cache-to/--cache-from type=registry|gha`) for the install layers, or use a persistent/remote BuildKit builder. Some CI setups also restore the cache-mount directory from the CI's own cache store keyed on the lockfile."
+      }
     ]
   },
   {
@@ -394,7 +758,21 @@
     "fs": "Scanners match the image's SBOM against CVE feeds; gate CI on severity and re-scan stored images as new CVEs land.",
     "fj": "If the build succeeds the image is safe; scanning is only needed if something looks broken.",
     "level": "Mid",
-    "asked": 12
+    "asked": 12,
+    "followups": [
+      {
+        "q": "A scan reports a critical CVE in your base OS that has no fix yet. What are your options?",
+        "a": "Triage reachability — if your app never invokes the vulnerable code path the risk may be low; document an accepted-risk/ignore entry (e.g. a `.trivyignore` with justification and expiry). Otherwise switch to a slimmer base (distroless/-slim) that doesn't ship that package, pin to a patched upstream, or rebuild when a fix lands. Don't blanket-suppress; track and re-review."
+      },
+      {
+        "q": "Why is a distroless or minimal base often a faster fix for scan findings than patching?",
+        "a": "Most CVEs are in OS packages you don't actually use (shells, package managers, libc utilities). A distroless/scratch base ships almost none of them, so the vulnerability count drops to near-zero without you patching anything — fewer packages literally means fewer matchable CVEs and a smaller attack surface."
+      },
+      {
+        "q": "What is an SBOM and why generate one separately from scanning?",
+        "a": "An SBOM (e.g. SPDX or CycloneDX) is a machine-readable inventory of every component and version in the image. You attach it to the image (as an attestation) so consumers and future scanners can re-assess against new CVE feeds without rebuilding — supply-chain provenance. `docker buildx` can emit SBOM and provenance attestations at build time for exactly this."
+      }
+    ]
   },
   {
     "q": "Why pin an image by digest instead of a tag, and what is the tradeoff?",
@@ -414,6 +792,20 @@
           "# what you actually pull"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "You pin a multi-arch image by digest. Does the digest point at one architecture's bits?",
+        "a": "For a multi-arch image the digest usually points at the manifest list (image index), which itself references per-arch manifests by their own digests. So pinning the index digest still resolves to the right arch at pull time via platform matching — you're not locked to one architecture, you're locked to that exact set of arch images."
+      },
+      {
+        "q": "Does digest pinning alone prove the image came from who you think? If not, what does?",
+        "a": "No — a digest proves immutability and integrity (you got those exact bytes), but not authenticity of the publisher. For provenance you add signing: `cosign`/Sigstore signatures and attestations, verified at admission (e.g. policy controllers, Docker Content Trust historically). Digest + signature together give you tamper-evidence and trusted origin."
+      },
+      {
+        "q": "How do teams keep digest pins from going stale and missing security patches?",
+        "a": "Automate the bump: Dependabot/Renovate watch the readable tag, resolve its new digest, and open a PR updating `image:1.2@sha256:...`. CI re-tests the new bits before merge. This keeps the reproducibility benefit of pinning while still flowing patched bases in on a reviewed cadence rather than silently."
+      }
     ]
   },
   {
@@ -422,7 +814,21 @@
     "fs": "Pin bases by digest, pin package versions, and set SOURCE_DATE_EPOCH so floating versions and timestamps stop perturbing the digest.",
     "fj": "Builds from the same Dockerfile always produce the same digest, so reproducibility is automatic.",
     "level": "Sr",
-    "asked": 8
+    "asked": 8,
+    "followups": [
+      {
+        "q": "How exactly does SOURCE_DATE_EPOCH affect the build, and what doesn't it cover?",
+        "a": "BuildKit reads `SOURCE_DATE_EPOCH` (a Unix timestamp) and rewrites layer file mtimes and the image's created timestamp to that fixed value, removing the most common source of digest drift. It doesn't fix non-determinism inside your build (e.g. a compiler embedding a build path or random ordering); those need their own reproducibility flags."
+      },
+      {
+        "q": "Why can two builds still differ even after pinning bases and setting SOURCE_DATE_EPOCH?",
+        "a": "Build-internal nondeterminism: compilers embedding absolute paths or `__DATE__`, archives written in filesystem-iteration order, randomized symbol/hash ordering, or `pip`/`npm` resolving floating transitive deps. Fixes include path-remapping flags (`-ffile-prefix-map`), sorting tar entries, fixing `PYTHONHASHSEED`, and fully locked dependency trees."
+      },
+      {
+        "q": "How does reproducibility connect to SLSA / build provenance in practice?",
+        "a": "Provenance attestations (e.g. SLSA, emitted by `docker buildx --provenance`) record the source commit, builder, and inputs. Reproducibility lets an independent verifier rebuild from that commit and confirm they get the same digest the attestation claims — closing the loop so a signed provenance statement is actually checkable, not just asserted."
+      }
+    ]
   },
   {
     "q": "What is an OCI image and a registry, and what actually happens on docker push/pull?",
@@ -430,6 +836,20 @@
     "fs": "A registry stores content-addressed OCI blobs; push/pull move only the missing layers and a tag is just a pointer to a manifest digest.",
     "fj": "A registry stores whole images as single files, and each push uploads the entire image again.",
     "level": "Sr",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "How does a single tag serve both an ARM and an x86 host transparently?",
+        "a": "The tag points at an image index (manifest list) that references per-platform manifests, each tagged with `os/architecture`. On pull, the client sends its platform and the registry/runtime selects the matching manifest and its layers. So `docker pull app:1.0` on an M-series Mac and an x86 server resolve the same tag to different underlying images."
+      },
+      {
+        "q": "During a push, how does the registry know which layers it can skip uploading?",
+        "a": "The client first issues HEAD/mount requests for each layer blob by digest; if the registry already has that content-addressed blob (often from another image sharing the base) it returns exists and the client skips the upload, sometimes via cross-repo blob mount. Only genuinely new blobs and the manifest are transferred — that's the dedup that makes pushes of shared bases cheap."
+      },
+      {
+        "q": "Beyond images, what else can an OCI registry store these days?",
+        "a": "The OCI distribution spec now carries arbitrary artifacts via the referrers API: Helm charts, SBOMs, signatures (cosign), provenance attestations, and even AI models are pushed as OCI artifacts linked to an image by digest. So a registry is increasingly a general content-addressable artifact store, with attestations discoverable as referrers of the image they describe."
+      }
+    ]
   }
 ]

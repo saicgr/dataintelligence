@@ -4,7 +4,21 @@
     "a": "Online serving answers single or small requests synchronously behind an API with tight latency SLOs (e.g. p99 < 100ms), so it optimizes for tail latency and availability. Batch serving scores large datasets on a schedule (e.g. nightly) and optimizes for throughput and cost, writing results to a table or store that the app reads later. Pick online when the input is only known at request time or freshness matters per-request; pick batch when inputs are knowable ahead of time and slight staleness is acceptable, like daily churn scores.",
     "fs": "Frames it as a latency-vs-throughput and freshness tradeoff, not just 'real-time vs not'.",
     "fj": "Says online is always better, or assumes batch means slow/legacy rather than a deliberate cost/throughput choice.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "How would you serve a feature that needs real-time input but a too-expensive model to run online?",
+        "a": "Precompute the heavy part offline into a lookup (e.g. batch-score user embeddings nightly) and combine it with a cheap real-time signal at request time. This hybrid keeps the per-request path light while still reacting to fresh context. Many recsys do exactly this: batch candidate scores plus an online re-rank with live features."
+      },
+      {
+        "q": "What's the failure mode of caching batch predictions and reading them online?",
+        "a": "Predictions go stale between batch runs, so a user whose behavior changed sees yesterday's score until the next job. Worse, if an entity is new since the last batch you get a cache miss with no fallback. You need a freshness SLA, a default/online path for misses, and monitoring on cache age."
+      },
+      {
+        "q": "When would batch serving be the wrong choice even if inputs are knowable ahead of time?",
+        "a": "When the action window is short relative to the batch cadence: fraud or fast-moving pricing can't wait for a nightly job even if you technically have the inputs. Also when the entity set is huge but only a tiny fraction is ever queried, batch-scoring everything wastes compute versus scoring on demand."
+      }
+    ]
   },
   {
     "q": "Why does request batching speed up GPU inference, and what is the latency cost?",
@@ -24,6 +38,20 @@
           "# flush when EITHER is hit"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "At what point does increasing batch size stop helping throughput?",
+        "a": "Once the workload becomes compute-bound rather than memory-bound, you've saturated the GPU's FLOPs and bigger batches only add latency per step without more requests/sec. You also hit memory limits (activations/KV cache) that force smaller batches. The sweet spot is the knee where you're FLOPs-saturated but still under the p99 budget."
+      },
+      {
+        "q": "Why is a fixed max-queue-delay risky under bursty traffic?",
+        "a": "Under low load a request can wait the full delay window just to be batched alone, paying latency for zero throughput gain. Under bursts the batch fills instantly and the delay never matters. A smarter scheduler flushes early when the queue is empty after a request, so light traffic isn't penalized by a window sized for peak."
+      },
+      {
+        "q": "How does variable input length complicate batching the same way?",
+        "a": "Padding all sequences to the longest in the batch wastes compute on padding tokens, so one long outlier slows the whole batch. With static batching short requests also wait for the longest to finish. This is why length-aware bucketing or continuous batching matters: keep batched items similar in size or schedule per-token."
+      }
     ]
   },
   {
@@ -31,14 +59,42 @@
     "a": "Static batching groups requests once and runs them to completion together, so short requests are stuck waiting for the longest one to finish and freed slots sit idle. Continuous batching schedules at the token level: after every decode step the scheduler can evict finished sequences and admit new ones into the running batch, keeping the GPU saturated. Engines like vLLM, TensorRT-LLM (in-flight batching), and SGLang use this to deliver multiple-x higher throughput at lower p50 latency.",
     "fs": "Says it schedules per-decode-step and admits/evicts sequences mid-flight, citing a real engine (vLLM).",
     "fj": "Confuses it with just 'a bigger batch' or 'dynamic batching that waits a few ms', missing the token-level eviction.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How does continuous batching interact with the prefill of a newly admitted request?",
+        "a": "Admitting a new request injects a prefill (compute-heavy, processes the whole prompt) into a batch that's otherwise doing cheap decode steps, which can stall ongoing generations and spike inter-token latency. Engines mitigate this with chunked prefill, splitting a long prompt across steps so it interleaves with decode rather than blocking it."
+      },
+      {
+        "q": "What scheduling tension does continuous batching create between throughput and per-request fairness?",
+        "a": "Greedily admitting requests to keep the GPU full maximizes throughput but can starve or slow in-flight long generations, hurting their tail latency. Schedulers add priorities, max-running-sequence caps, or preemption (swapping a sequence's KV cache out) to bound any single request's slowdown rather than purely chasing occupancy."
+      },
+      {
+        "q": "Why can continuous batching still suffer when many requests share a long common prompt?",
+        "a": "Each sequence would redundantly store and attend over the same prefix KV, wasting memory and compute. The fix is prefix caching / shared KV blocks (vLLM's automatic prefix caching, SGLang's RadixAttention) so the common prefix is computed and stored once. Without it, throughput collapses under high prefix duplication despite continuous batching."
+      }
+    ]
   },
   {
     "q": "Walk me through the prefill vs decode phases of LLM inference. Why is decode memory-bandwidth bound?",
     "a": "Prefill processes the whole prompt in parallel in one pass, building the KV cache; it is compute-bound and uses the GPU's FLOPs well. Decode then generates one token at a time autoregressively, and each step must read the entire growing KV cache from HBM while doing very little compute, so it is memory-bandwidth bound and leaves the GPU's FLOPs underutilized. This is why single-request decode speed is capped by memory bandwidth (MBU), and batching is what restores high FLOPs utilization.",
     "fs": "Cleanly separates compute-bound prefill from bandwidth-bound decode and ties it to KV-cache reads.",
     "fj": "Treats inference as one uniform phase, or thinks decode is slow because of 'more math' rather than memory reads.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why do teams disaggregate prefill and decode onto separate GPU pools?",
+        "a": "Prefill is compute-bound and decode is bandwidth-bound, so mixing them on one pool means each interferes with the other's latency. Disaggregation (e.g. Splitwise, vLLM disaggregated serving) runs prefill on compute-optimized nodes and decode on bandwidth-optimized ones, transferring the KV cache between them, which lets you tune and scale each phase independently."
+      },
+      {
+        "q": "How does this phase split change which metric you optimize: TTFT vs TPOT?",
+        "a": "Prefill latency drives time-to-first-token (TTFT), so prompt length and prefill efficiency dominate it. Decode drives time-per-output-token (TPOT/inter-token latency), governed by memory bandwidth and batch size. A chatbot cares about low TTFT for snappiness; a long-generation task cares about TPOT. You can't reason about 'latency' as one number."
+      },
+      {
+        "q": "Why does decode being bandwidth-bound make speculative decoding attractive?",
+        "a": "Since decode underuses FLOPs, you have spare compute to verify multiple draft tokens per step nearly for free. Speculative decoding uses a small draft model to propose several tokens, then the big model verifies them in one parallel forward pass, accepting the prefix that matches. It trades idle FLOPs for fewer memory-bound steps, cutting latency."
+      }
+    ]
   },
   {
     "q": "What is the KV cache and why does it dominate GPU memory in LLM serving?",
@@ -57,6 +113,20 @@
           "# 2 = keys + values"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "How do GQA and MQA shrink the KV cache, and what's the tradeoff?",
+        "a": "Multi-query (MQA) shares one K/V head across all query heads; grouped-query (GQA) shares K/V across small groups of query heads. This cuts the `n_kv_heads` term by a large factor, shrinking the cache and raising decode throughput. The tradeoff is some quality loss versus full multi-head attention, which GQA balances by keeping a few groups rather than collapsing to one."
+      },
+      {
+        "q": "What can you do when a single request's KV cache for a very long context won't fit?",
+        "a": "Quantize the KV cache (FP8/INT8) to halve or quarter its bytes, offload older blocks to CPU/host memory, or use attention variants that bound the cache (sliding-window, like Mistral, only keeps the last N tokens). Each trades a bit of quality or PCIe-transfer latency for fitting the context. Pure recompute is usually too slow."
+      },
+      {
+        "q": "Why does KV-cache growth make throughput non-linear as context length increases?",
+        "a": "As sequences get longer the per-request cache grows, so fewer requests fit concurrently and the batch you can run shrinks, dropping throughput even though each token is cheap to compute. So a workload of long-context requests is memory-capacity-limited, not compute-limited, and adding context can cut concurrency faster than you'd expect."
+      }
     ]
   },
   {
@@ -64,28 +134,84 @@
     "a": "Naive serving pre-allocates a contiguous KV buffer for each request sized to the max sequence length, wasting 60-80% of it via internal and external fragmentation. PagedAttention (introduced by vLLM) borrows OS virtual-memory ideas: it splits the KV cache into fixed-size blocks allocated on demand and indexed by a block table, so memory waste drops under ~4% and freed blocks are reused. This lets far more requests fit in memory at once, giving roughly 2-4x higher throughput, and blocks can even be shared across requests for common prefixes.",
     "fs": "Maps it to OS paging, cites the fragmentation it kills and prefix-sharing as a bonus.",
     "fj": "Calls it a generic 'memory optimization' without the paged/block-table mechanism or the fragmentation problem.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How does copy-on-write enable safe KV-block sharing across requests?",
+        "a": "When multiple requests share a common prefix (same system prompt, or parallel samples from one prompt) they point at the same physical KV blocks via the block table. As soon as one diverges and must write new tokens, that block is copied so the others are unaffected, just like OS copy-on-write pages. This gives memory savings without correctness risk."
+      },
+      {
+        "q": "What overhead does the block-table indirection introduce?",
+        "a": "Attention kernels must now gather KV from non-contiguous blocks via the block table instead of reading one contiguous buffer, so you need a custom paged-attention kernel and pay a small indexing/gather cost. The throughput gain from fitting far more requests dwarfs it, but it means you can't just use a stock dense attention kernel."
+      },
+      {
+        "q": "How does block size choice affect the fragmentation-vs-overhead tradeoff?",
+        "a": "Small blocks minimize internal fragmentation (less wasted tail per sequence) but inflate block-table size and per-step scheduling/gather overhead. Large blocks cut overhead but waste more memory on partially filled final blocks. Engines pick a middle value (e.g. 16 tokens) that keeps waste low without too many blocks to manage."
+      }
+    ]
   },
   {
     "q": "Your model shows 100% GPU utilization but throughput is low. What metric tells the real story?",
     "a": "GPU utilization only means a kernel was running at all, not that the SMs or FLOPs were busy, so you can sit at 100% util while using ~20% of peak compute. The honest metrics are Model FLOPs Utilization (MFU) for compute-heavy work and Memory Bandwidth Utilization (MBU) for memory-bound decode. Low MFU at high util usually means small batches, memory-bandwidth stalls, or poor kernel efficiency; the fix is often larger/continuous batching or better kernels, not more GPUs.",
     "fs": "Calls GPU util a misleading metric and reaches for MFU/MBU plus a concrete cause like small batch.",
     "fj": "Trusts the 100% number and concludes the GPU is maxed out, recommending buying more hardware.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How would you actually measure MFU rather than eyeball it?",
+        "a": "Compute the model's theoretical FLOPs per forward (or fwd+bwd for training) times tokens/sec, then divide by the GPU's peak FLOPs for the dtype. A profiler (Nsight, torch profiler) gives kernel-level occupancy and achieved FLOPs. Realistic MFU is often 30-50% for training; well under that signals batching, kernel, or data-loading bottlenecks."
+      },
+      {
+        "q": "If MBU is high but MFU is low, what does that tell you?",
+        "a": "You're memory-bandwidth bound, the hallmark of single-request or small-batch decode where you stream weights/KV from HBM faster than you do math. More batching raises arithmetic intensity and shifts you toward compute-bound, lifting MFU. Buying faster-compute GPUs won't help; you need either bigger batches or higher-bandwidth memory."
+      },
+      {
+        "q": "Could 100% util with low throughput also be a non-GPU bottleneck?",
+        "a": "Yes, a busy kernel can be stalled waiting on data: slow tokenization, CPU-bound preprocessing, host-to-device copies, or a starved input pipeline keep the GPU spinning on small work. Profiling the timeline shows gaps or tiny kernels back-to-back. The fix is overlapping data loading, pinned memory, or prefetching, not more GPUs."
+      }
+    ]
   },
   {
     "q": "What is a feature store and what core problem does it solve?",
     "a": "A feature store is a centralized system that computes, stores, and serves features for both training and inference, typically with an offline store (warehouse/lake for training data) and a low-latency online store (e.g. Redis/DynamoDB) for serving. Its core value is computing a feature once and reusing it everywhere, which reduces duplicated pipelines, makes features discoverable via a registry, and is the primary tool for fighting train/serve skew. Examples include Feast, Tecton, and Hopsworks.",
     "fs": "Names the offline/online split, the registry, and reuse-to-kill-skew as the point.",
     "fj": "Describes it as 'just a table of features' or a cache, missing the dual offline/online stores and the consistency goal.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "When is a full feature store overkill?",
+        "a": "For a single team with one or two models and simple features computed in the same pipeline, a feature store's operational cost (extra infra, online store, materialization jobs) outweighs its benefits. If you don't have feature reuse across teams, real-time serving needs, or skew problems, a versioned table plus a shared transform library is enough."
+      },
+      {
+        "q": "Who computes the feature value: the store or an upstream job?",
+        "a": "It varies. Feast-style stores are mostly a serving/registry layer that materializes features computed by your own batch/stream jobs, so you own transformation correctness. Tecton-style stores also orchestrate the computation from feature definitions. Knowing which determines where skew can creep in: if the store doesn't own transforms, shared code discipline is on you."
+      },
+      {
+        "q": "What's the consistency risk between the offline and online stores?",
+        "a": "Materialization to the online store lags behind the offline write, so at any moment the online value can be staler than what training saw, or a backfill can update offline without re-materializing online. You need freshness monitoring on the online store and a guarantee that both are derived from the same source computation, not separate pipelines."
+      }
+    ]
   },
   {
     "q": "Explain train/serve skew. How does a feature store reduce it, and why doesn't it fully eliminate it?",
     "a": "Train/serve skew is when a feature is computed differently (or from different data) at training time vs serving time, so the model sees inputs in production that don't match what it learned, degrading accuracy. A feature store reduces it by serving the same definitions/transformations and materializing the same values to both offline and online stores. It doesn't fully eliminate skew because features still cross system boundaries: online aggregation windows, timezones, null handling, or freshness can diverge from the offline batch job unless transformations are genuinely shared code.",
     "fs": "Pinpoints divergence at system boundaries (windows, nulls, freshness), not just 'use a feature store'.",
     "fj": "Claims a feature store guarantees zero skew, treating it as a silver bullet.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Give a concrete skew bug that survives a feature store.",
+        "a": "A `last_7d_purchase_count` computed offline over calendar days but online over a rolling 7x24h window from request time: same name, different values. Or offline imputes missing income with the training-set median while the online service defaults to 0. The store served 'the same feature' but the math diverged at the boundary."
+      },
+      {
+        "q": "Why is freshness a form of skew, not just a latency issue?",
+        "a": "If the online store is materialized hourly but training joined values as of the exact event time, then at serving the model gets a value that's up to an hour stale relative to what it learned on. The distribution the model sees shifts purely from lag, even though the transform code is identical. Freshness mismatch is skew."
+      },
+      {
+        "q": "How does logging serving features help close the remaining gap?",
+        "a": "You log the exact feature vector served, then periodically recompute the offline value for those entity/timestamps and diff them. Any nonzero per-feature divergence is measured skew you can alert on and trace to a specific transform or freshness issue. This turns skew from an assumption into an instrumented metric the store alone can't guarantee away."
+      }
+    ]
   },
   {
     "q": "What is point-in-time correctness when building training data, and what bug does it prevent?",
@@ -109,6 +235,20 @@
           "  ORDER BY f.event_ts DESC) = 1"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "How does a feature-arrival delay (latency) break a naive as-of join?",
+        "a": "A feature event may have happened before the label time but only landed in the store afterward, so an `event_ts <= label_ts` join would use a value that wasn't actually available at prediction time. To be truly point-in-time you must also respect the value's ingestion/availability timestamp, not just its event timestamp. Otherwise you reintroduce subtle leakage."
+      },
+      {
+        "q": "Why is point-in-time correctness expensive to compute at scale?",
+        "a": "It's an as-of (temporal range) join: for every label row you find the latest feature row before its timestamp, which is a sort-merge over potentially huge feature histories rather than a cheap equality join. Engines optimize it (Spark as-of, Feast point-in-time joins), but it's still far costlier than grabbing the latest snapshot, which is why people cut the corner."
+      },
+      {
+        "q": "How do you sanity-check that your training set is point-in-time correct?",
+        "a": "Look for a feature whose offline AUC is implausibly high and verify it's knowable before the label time. Compare offline metrics to a shadow/online run: a large gap signals leakage. You can also deliberately recompute one feature with a strict cutoff and confirm the row-level values match what the as-of join produced."
+      }
     ]
   },
   {
@@ -116,14 +256,42 @@
     "a": "Data leakage is when information unavailable at prediction time leaks into training, so offline metrics look great but the model fails in production. It's dangerous precisely because it hides during evaluation: your cross-validation score is inflated, you ship with confidence, and the gap only shows once real traffic arrives without the leaked signal. Common forms are target leakage, temporal leakage, and preprocessing leakage.",
     "fs": "Stresses that leakage corrupts the very metric you'd use to catch it, so it's silent until prod.",
     "fj": "Defines leakage vaguely as 'overfitting' and assumes a good CV score means you're safe.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "How is leakage different from overfitting?",
+        "a": "Overfitting shows up as a train-vs-validation gap, so your honest validation score already warns you. Leakage inflates the validation score itself because the leaked signal is present in both folds, so it hides behind a great CV number. More data or regularization fixes overfitting; only removing the leaked information fixes leakage."
+      },
+      {
+        "q": "What's a cheap first check for leakage before a full audit?",
+        "a": "Pull feature importances/SHAP and look for a single feature that dominates implausibly, then ask whether its value is knowable strictly before the prediction timestamp. A near-perfect metric on a genuinely hard problem is itself a red flag. These two checks catch most obvious target leaks in minutes."
+      },
+      {
+        "q": "Can leakage ever be subtle enough to pass these checks?",
+        "a": "Yes, statistical leakage from target encoding fit across folds or a slightly overlapping aggregation window spreads signal across many features, so no single column looks suspicious and importances look normal. Catching it needs strict before-the-label computation and fitting all target-based transforms inside the CV fold, not a one-feature scan."
+      }
+    ]
   },
   {
     "q": "Give a concrete example of target leakage and how you'd catch it.",
     "a": "Target leakage is a feature that encodes the outcome itself, e.g. predicting loan default while including a 'collections_agency_assigned' flag that only gets set after default, or using 'days_until_cancel' to predict churn. You catch it by checking feature importances for a single suspiciously dominant feature, asking 'is this value knowable strictly before the prediction timestamp?', and auditing data lineage. A near-perfect offline metric on a hard problem is itself a red flag for leakage.",
     "fs": "Gives a post-outcome feature example and applies the 'knowable before prediction time' test.",
     "fj": "Just adds every available column to the model and trusts a 0.99 AUC as a win.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "What makes target leakage harder to spot in a warehouse where columns are mutated in place?",
+        "a": "If a row's `account_status` is updated to 'defaulted' after the event but you read the current value, the column silently encodes the future even though it existed before. Without an event-time history or audit log you can't tell when the value was set, so the leak is invisible. You need versioned/append-only feature history to compute as-of values."
+      },
+      {
+        "q": "How do you handle a feature that's predictive but only available for some rows post-outcome?",
+        "a": "Drop it, or reconstruct only the portion knowable at prediction time (e.g. the value as of the cutoff). Never impute the post-outcome version. If its pre-prediction form is too sparse to matter, it's not a usable feature. The test is strictly: would this exact value exist at serving time for a live request?"
+      },
+      {
+        "q": "Why isn't removing the obvious leaky column always sufficient?",
+        "a": "Other features can be proxies for it: a downstream system might stamp a queue assignment or a fee that's also only set after the outcome and correlates with the dropped column. You have to trace lineage for every dominant feature, not just the one you named, and re-audit importances after removal to catch the next proxy."
+      }
+    ]
   },
   {
     "q": "Why is standard K-fold cross-validation wrong for time-series, and what do you use instead?",
@@ -142,6 +310,20 @@
           "# trains only on past folds,",
           "# tests on the next time block"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is a purge/embargo gap and why add one between train and validation folds?",
+        "a": "When a label spans time (e.g. a 7-day-ahead outcome) the last training rows' label windows overlap the validation period, leaking across the boundary. You purge training samples whose label window touches the validation set and add an embargo gap after it. This is standard in financial ML (de Prado's purged K-fold)."
+      },
+      {
+        "q": "Expanding vs sliding window for forward-chaining: when pick which?",
+        "a": "Expanding (growing) windows use all history, good when older data stays relevant and you want maximum signal. Sliding (fixed-length) windows drop old data, better under concept drift or regime change where stale patterns hurt. Sliding also gives more comparable fold sizes; expanding can make later folds train on far more data than early ones."
+      },
+      {
+        "q": "How does grouped data combine with time-series splitting?",
+        "a": "You need both constraints at once: split by time so no future leaks, and group by entity so the same user/patient never spans train and test. A naive time split can still leak if an entity's rows straddle the cutoff and the model memorizes that entity. Use group-aware temporal splits, respecting both boundaries simultaneously."
       }
     ]
   },
@@ -173,6 +355,20 @@
         ],
         "accent": "fix"
       }
+    ],
+    "followups": [
+      {
+        "q": "Which preprocessing steps leak the most when fit on all data?",
+        "a": "Any step that learns statistics from the target or the global distribution: target/mean encoding (leaks the label directly), feature selection by correlation with y, oversampling like SMOTE, and PCA or scaling fit globally. Stateless transforms (log, fixed bucketing) don't leak. The riskiest are target-based ones, which can inflate scores dramatically."
+      },
+      {
+        "q": "How does this leak resurface at serving time even if you fit on train only?",
+        "a": "You must persist the fitted transform (the train means/stds, encoding maps) and apply the exact same parameters online. If serving re-fits a scaler on live data or uses different defaults, you reintroduce skew. The Pipeline that fixed CV must be the same artifact deployed, so train-time and serve-time preprocessing are identical code."
+      },
+      {
+        "q": "Why does wrapping in a Pipeline matter specifically for nested CV and hyperparameter search?",
+        "a": "During grid search each fold must refit preprocessing on only that fold's training data; if you scale once outside the search, every candidate is evaluated on leaked data and you pick optimistic hyperparameters. A Pipeline makes `cross_val_score`/`GridSearchCV` refit transforms per fold automatically, keeping the whole search honest."
+      }
     ]
   },
   {
@@ -180,7 +376,21 @@
     "a": "Data (covariate) drift is when the input distribution P(X) shifts but the input-output relationship holds; concept drift is when P(y|X) itself changes, so the same inputs now map to different outcomes. You detect data drift without labels using distribution tests on features and predictions; you detect concept drift by monitoring model performance against ground-truth (or delayed) labels, since input stats alone won't reveal it. A key rule: drift that doesn't degrade the monitored metric may not be worth acting on.",
     "fs": "Separates P(X) shift from P(y|X) shift and notes concept drift needs labels to see.",
     "fj": "Treats all drift as one thing and assumes feature-distribution tests can catch concept drift.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How do you monitor for concept drift when labels arrive weeks late?",
+        "a": "Use proxy signals that correlate with the outcome and are observable sooner (e.g. early-funnel engagement as a proxy for eventual conversion), and monitor prediction-distribution shifts as a leading indicator. When delayed labels land, run a backfilled performance check. You accept a detection lag and design alerts around proxies plus eventual ground-truth reconciliation."
+      },
+      {
+        "q": "Can input drift and concept drift cancel out?",
+        "a": "Yes, the input distribution can shift while P(y|X) shifts in a compensating way so accuracy looks stable, or vice versa, a benign-looking input shift hides a real concept change. This is why you watch both: data-drift tests catch the first kind silently, and label-based performance monitoring is the only thing that catches a pure concept shift."
+      },
+      {
+        "q": "Is sudden vs gradual concept drift handled differently?",
+        "a": "Sudden drift (a regime change, a new competitor) calls for fast detection and an immediate retrain or rollback. Gradual drift suits scheduled retraining on a rolling window so the model tracks the moving relationship. Recurring/seasonal drift is best handled by features that encode the cycle rather than constantly retraining against it."
+      }
+    ]
   },
   {
     "q": "How do PSI and the KS test work for drift detection, and what thresholds do you use?",
@@ -202,6 +412,20 @@
           "    return np.sum((a-e)*np.log(a/e))"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why does PSI's binning choice matter so much?",
+        "a": "PSI is computed over bins, so too few bins hide real shifts and too many make sparse bins dominate the sum and inflate the score. You should fix bins on the expected (reference) distribution, usually deciles, and reuse those edges on the actual data. Re-binning per window or using equal-width bins on skewed features gives unstable, misleading PSI values."
+      },
+      {
+        "q": "How do you monitor drift on high-cardinality or many features without alert overload?",
+        "a": "Univariate tests across hundreds of features produce constant false alarms, so you prioritize by feature importance, monitor the prediction-score distribution as a single aggregate signal, and use multivariate detectors (a domain classifier that tries to tell reference from current). You also require persistence (drift across several windows) before alerting."
+      },
+      {
+        "q": "Why prefer monitoring the prediction distribution over every input feature?",
+        "a": "Input drift only matters if it changes outputs; the model may be invariant to some shifts. The prediction-score distribution aggregates all features through the model's lens, so a shift there is far more likely to be actionable. It's also a single, cheap, label-free signal, whereas per-feature tests are noisy and many are irrelevant."
+      }
     ]
   },
   {
@@ -209,42 +433,126 @@
     "a": "First confirm it's real drift and not a pipeline bug (schema change, new null encoding, a broken upstream join), which is the most common cause of sudden 'drift'. If the inputs genuinely shifted but the monitored metric and business KPIs are healthy, you log it and don't retrain reflexively, since drift without performance loss often isn't actionable. You'd raise the bar to action when drift co-occurs with metric degradation or when labels are too delayed to trust performance alone.",
     "fs": "Checks for a pipeline/schema bug first and refuses to retrain on a benign drift signal.",
     "fj": "Immediately kicks off a retrain on any drift alert, chasing noise and risking churn.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What distinguishes a pipeline bug from genuine drift in the data?",
+        "a": "A bug usually shows as a discontinuous jump tied to a deploy: a feature goes all-null, a unit changes (cents vs dollars), a join starts dropping rows, or a new category code appears. Genuine drift tends to be gradual and correlated across related features for plausible reasons. Check deploy timestamps and per-feature null/cardinality counts first."
+      },
+      {
+        "q": "If accuracy is fine now but labels are delayed weeks, how cautious should you be?",
+        "a": "More cautious: 'accuracy is fine' may just be stale, computed on old labels predating the drift. With long label lag you lean on proxy metrics and prediction-distribution monitoring, and you treat significant input drift as a stronger warning than you would with fast labels. You might pre-stage a retrain candidate without promoting it yet."
+      },
+      {
+        "q": "When does benign-looking drift become a reason to act preemptively?",
+        "a": "When it signals an upcoming population you've never trained on (a new market, device, or season), or when the drifting feature is among the model's most important and you have no fresh labels to confirm performance. In those cases you'd refresh training data or add the new segment before degradation shows, rather than wait for harm."
+      }
+    ]
   },
   {
     "q": "What does a model registry give you that just versioning files in S3 does not?",
     "a": "A model registry (e.g. MLflow) tracks named models with versioned artifacts plus metadata, lineage, and the run/params/metrics that produced each version, and it lets you reference a version by an alias like 'champion' rather than a raw path. That indirection means you can promote, roll back, and audit deployments by reassigning aliases without redeploying or changing serving code. Raw S3 files give you bytes but no lineage, no governance, no stage transitions, and no single source of truth for 'what's in prod'.",
     "fs": "Highlights aliases/lineage/governance and alias-based promote-rollback over a raw artifact path.",
     "fj": "Thinks a registry is just file versioning with nicer names, missing lineage and alias indirection.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How does alias indirection enable instant rollback?",
+        "a": "Serving resolves the `champion` alias at request time (or on a refresh), so rolling back is just repointing the alias to the previous version, no redeploy, no image rebuild, no config push. The serving code never hard-codes a version. Contrast with an S3 path baked into the deployment, where rollback means a full redeploy."
+      },
+      {
+        "q": "What governance does a registry add that matters for regulated models?",
+        "a": "It records who promoted what and when, links each version to the run/data/code that produced it, and can gate stage transitions behind approvals. For audits you can answer 'what model decided this, trained on what, signed off by whom' from one system of record. Raw artifact files give you none of that provenance chain."
+      },
+      {
+        "q": "Does the registry replace your experiment tracker?",
+        "a": "No, they're complementary. The tracker logs the many throwaway runs and their metrics so you can pick a winner; the registry holds only the chosen, deployable artifacts with promotion governance. You promote a tracked run's model into the registry, preserving lineage from prod back to the exact run. One is exploration, one is system-of-record."
+      }
+    ]
   },
   {
     "q": "MLflow deprecated model stages in favor of aliases. What's the practical difference?",
     "a": "Stages were a fixed enum (None/Staging/Production/Archived) where a version could occupy exactly one stage, which was rigid for multi-env and multi-model-per-env setups. Aliases are free-form named pointers (e.g. 'champion', 'challenger') and a version can hold several, and one alias points to exactly one version, so serving targets the alias and you swap which version it resolves to. This makes champion/challenger and gradual rollout patterns natural; stages are deprecated since MLflow 2.9.",
     "fs": "Knows stages are deprecated (2.9+) and that aliases are flexible named pointers enabling champion/challenger.",
     "fj": "Still describes promotion as moving a model to the 'Production stage' as the current best practice.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why were fixed stages too rigid for multiple environments?",
+        "a": "A single 'Production' stage can't express 'the prod model in EU' vs 'the prod model in US' or two models serving different surfaces, since a version is in exactly one stage. Aliases let you define arbitrary pointers like `prod-eu`, `prod-us`, `canary` and resolve each independently, matching how real deployments fan out across regions and use-cases."
+      },
+      {
+        "q": "How do aliases plus tags express a champion/challenger setup?",
+        "a": "You point `champion` at the incumbent and `challenger` at the candidate; serving routes most traffic via `champion` and a slice via `challenger`. Tags carry metadata (eval scores, owner, validation status). Promoting the challenger is just moving the `champion` alias, and you keep history for instant rollback. Stages couldn't model two live competitors at once."
+      },
+      {
+        "q": "What's the migration risk if old code still references stages?",
+        "a": "Calls using stage transitions or `get_latest_versions(stages=...)` will break or warn against deprecated APIs, and any deployment logic that reads 'Production stage' silently stops finding the right version once you switch to aliases. You must migrate serving lookups to `get_model_version_by_alias` and update promotion scripts together, or you split your source of truth."
+      }
+    ]
   },
   {
     "q": "Compare canary and shadow deployments for a new model. When do you use each?",
     "a": "In a canary, the new model serves a small slice of real traffic (e.g. 1% -> 5% -> 25%) and its predictions reach users, so you can measure real business impact and roll back fast on regressions. In a shadow (mirror), the new model receives a copy of production traffic but its outputs are logged, not returned; users keep getting the old model's predictions. Use shadow to validate the serving pipeline and prediction parity risk-free; use canary when you must measure user/business response that only real exposure reveals. A common flow is shadow first, then canary.",
     "fs": "Says shadow logs but never serves outputs, canary serves a traffic slice; recommends shadow-then-canary.",
     "fj": "Conflates the two, or thinks shadow shows business impact (it can't, since users never see it).",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What can shadow mode never tell you, no matter how long you run it?",
+        "a": "Anything that depends on users reacting to the new predictions: actual CTR, conversion, revenue, or feedback-loop effects. Shadow only validates that the pipeline runs, latency is acceptable, and outputs are sane/parity-checked against the old model. To learn business impact you must expose users, which is what a canary or A/B does."
+      },
+      {
+        "q": "What side effects can make shadowing unsafe?",
+        "a": "If the model has side effects, sending emails, writing to a shared store, calling a paid downstream API, or consuming rate limits, running it on mirrored traffic causes real-world actions even though its 'response' is discarded. You must stub or sandbox those side effects, or shadow only the read-only inference path, before mirroring production traffic."
+      },
+      {
+        "q": "How do you decide canary ramp steps and the rollback trigger?",
+        "a": "Ramp slowly enough that each step exposes enough traffic to detect harm statistically but small enough to bound blast radius (1% -> 5% -> 25% -> 100%). Gate each step on guardrail metrics (errors, latency, prediction distribution, key business proxies) staying in bounds, and wire automatic rollback (repoint the alias/route) when any threshold trips."
+      }
+    ]
   },
   {
     "q": "What does a healthy canary rollout for an ML model monitor before increasing traffic?",
     "a": "Beyond HTTP error rate and latency p99, you watch model-specific signals: prediction-distribution shift vs the incumbent, key business/proxy metrics (CTR, conversion, false-positive rate), and guardrail metrics that must not regress. You gate each traffic step on these staying within bounds and wire an automatic rollback (revert the alias/route) if a threshold trips. The point is to detect harm at 1-5% exposure before it hits everyone.",
     "fs": "Lists model-specific guardrails plus auto-rollback gating each step, not just latency/errors.",
     "fj": "Only checks that the service returns 200s and stays up, ignoring prediction-quality regressions.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How do you monitor model quality at 1% traffic when ground-truth labels lag?",
+        "a": "Lean on label-free signals available immediately: prediction-distribution divergence from the incumbent, score calibration, and fast proxy metrics (click, dwell) that correlate with the true outcome. Compare canary vs control on these in real time. The eventual labels reconcile later, but the gate at ramp time runs on proxies and distribution checks."
+      },
+      {
+        "q": "Why compare canary against a concurrent control rather than yesterday's baseline?",
+        "a": "Time-of-day, day-of-week, and traffic-mix effects move metrics independently of the model, so comparing canary now to yesterday confounds model effect with temporal effect. A simultaneous control slice on the old model experiences the same conditions, so the canary-vs-control delta isolates the model change. Otherwise you'll blame or credit the model for seasonality."
+      },
+      {
+        "q": "What's a guardrail metric vs a primary metric in a canary?",
+        "a": "The primary metric is what you're trying to improve (say conversion). Guardrails are metrics that must not regress even if the primary improves, latency, error rate, fairness across segments, abuse/false-positive rate. A change that lifts the primary but trips a guardrail still fails the gate. Defining guardrails up front stops you from shipping a net-harmful 'win'."
+      }
+    ]
   },
   {
     "q": "How would you design a low-latency online feature pipeline that stays consistent with the offline training data?",
     "a": "Define each feature transformation as shared code/definition used by both paths, materialize it to an offline store for training and an online store (Redis/DynamoDB) for serving from the same source pipeline, and key reads by entity ID. Build training sets with point-in-time as-of joins so labels only see features available before their timestamp, and log the exact online feature values served at inference to compare against offline values for skew. Track freshness/staleness SLAs on the online store and alert when materialization lags.",
     "fs": "Ties shared transforms + dual materialization + point-in-time joins + serving-time logging together.",
     "fj": "Writes a separate hand-tuned online query for speed, quietly diverging from the offline definition.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you serve a streaming aggregation (e.g. last-5-min count) online without diverging from batch?",
+        "a": "Compute it once in a stream processor (Flink/Spark Structured Streaming) that writes the running aggregate to the online store, and use the same window definition when backfilling offline training values. The risk is window-edge semantics differing between stream and batch; pin one window spec and replay historical events through the same streaming logic to generate training data."
+      },
+      {
+        "q": "What's the latency budget breakdown for an online feature read?",
+        "a": "It's network round-trips to the online store plus deserialization plus any on-the-fly transform, often the dominant cost in the serving path before the model even runs. You batch entity reads, co-locate the store, cache hot entities, and push as much transformation as possible to materialization time so the online path is a near-pure lookup, not a compute."
+      },
+      {
+        "q": "How do you handle a feature that's missing in the online store at request time?",
+        "a": "Define an explicit, shared default/imputation that both training and serving use, never a silent serving-side fallback that training never saw. Log the miss so you can monitor miss rate (a sign of materialization lag or new entities). The cardinal rule: any null-handling logic must be identical code on both paths, or it becomes skew."
+      }
+    ]
   },
   {
     "q": "What is streaming (event-driven) model serving and how does it differ from online and batch?",
@@ -252,7 +560,21 @@
     "fs": "Frames the SLA as pipeline lag with replay/backpressure, distinct from synchronous online and scheduled batch.",
     "fj": "Calls streaming 'just online serving' or 'real-time batch', missing the unbounded-stream and lag-SLA framing.",
     "level": "Mid",
-    "asked": 6
+    "asked": 6,
+    "followups": [
+      {
+        "q": "What does at-least-once delivery imply for the model's side effects?",
+        "a": "An event may be processed more than once after a failure/replay, so any action the prediction triggers (alert, charge, notification) must be idempotent or deduplicated by event key. Exactly-once on the scoring itself is achievable with checkpointed state, but downstream side effects usually need their own idempotency keys. You design for replay, not against it."
+      },
+      {
+        "q": "How does backpressure protect a streaming inference pipeline?",
+        "a": "When the model can't keep up, backpressure propagates upstream so the source slows or buffers rather than dropping events or OOMing, and the lag SLA (consumer offset lag) becomes your alarm. Compare to synchronous serving, where overload manifests as timeouts and shed requests. You scale the model operator or partition the stream when lag grows."
+      },
+      {
+        "q": "When is per-event streaming the wrong tool versus micro-batch?",
+        "a": "If per-event overhead dominates (model load, GPU underutilization at batch size 1) or the model benefits heavily from batching, micro-batching events into small windows raises throughput at the cost of a little extra lag. Pure per-event makes sense only when end-to-end latency must be minimal and the model is cheap enough to run unbatched."
+      }
+    ]
   },
   {
     "q": "Walk me through the stages of a production training pipeline and why each is a separate, idempotent step.",
@@ -260,7 +582,21 @@
     "fs": "Names discrete stages (validate -> features -> train -> eval-vs-champion -> conditional register) and why each is cached/idempotent.",
     "fj": "Describes one monolithic train.py script with no validation, evaluation gate, or lineage between steps.",
     "level": "Jr",
-    "asked": 7
+    "asked": 7,
+    "followups": [
+      {
+        "q": "What does step-level caching key on, and how can it bite you?",
+        "a": "Caching keys on the step's inputs (data version, params, code hash); if unchanged, the orchestrator reuses the prior output and skips the step. It bites when the key is incomplete, an upstream data file mutated in place without a version bump, so the cache serves a stale output and you train on the wrong data. Sound caching requires immutable, content-addressed inputs."
+      },
+      {
+        "q": "Make 'idempotent' concrete: what breaks if the feature-materialization step isn't?",
+        "a": "A rerun (retry or backfill) that appends rather than overwrites double-counts rows, so a `count` feature inflates and a `sum` doubles, silently corrupting training data. Idempotent means writing to a versioned/partitioned target keyed by run so a rerun replaces rather than accumulates. Without it, every retry pollutes downstream state."
+      },
+      {
+        "q": "Why put the eval-vs-champion gate as a distinct conditional step?",
+        "a": "Separating it lets a failed eval block promotion without discarding the (expensive) trained artifact, and makes the gate auditable and reusable across pipelines. The conditional branch means a worse candidate simply doesn't register, so prod never silently regresses. Folding eval into training would force a full rerun to re-evaluate and couple two concerns that fail for different reasons."
+      }
+    ]
   },
   {
     "q": "What does CI/CD for ML add on top of normal software CI/CD?",
@@ -268,7 +604,21 @@
     "fs": "Adds data/model versioning, a quality gate, and the continuous-training (CT) pipeline as the ML-specific pieces.",
     "fj": "Thinks ML CI/CD is the same as app CI/CD once tests pass, ignoring data versioning and model-quality gates.",
     "level": "Mid",
-    "asked": 8
+    "asked": 8,
+    "followups": [
+      {
+        "q": "Why is the continuous-training (CT) pipeline a third leg beyond CI and CD?",
+        "a": "Unlike code, models go stale as data drifts even with zero code changes, so you need an automated path that retrains, evaluates against the champion, and promotes the winner, triggered by drift/performance/data-volume, not by a commit. CI/CD ship code; CT ships fresh models. Without it, your deployed model decays between human-initiated releases."
+      },
+      {
+        "q": "What does a model-quality gate look like, and why a frozen eval set?",
+        "a": "It runs the candidate on a fixed holdout and blocks merge/promotion unless it beats a threshold or the current champion on the primary metric and guardrails. The eval set must be frozen so improvements reflect the model, not an easier test set; a changing benchmark makes scores incomparable across versions and lets a regression sneak through on a softer split."
+      },
+      {
+        "q": "Why isn't a green unit-test suite enough to ship a model?",
+        "a": "Unit tests check that code runs and shapes/types are right, not that predictions are good; a perfectly 'passing' pipeline can train a useless model. You need quality gates (metrics vs champion), data-validation (schema, distributions), and operational checks (latency, prediction parity, shadow run). Software correctness and model quality are orthogonal axes."
+      }
+    ]
   },
   {
     "q": "What do you version to make a trained model reproducible, and why is the code commit not enough?",
@@ -276,7 +626,21 @@
     "fs": "Lists data+env+seeds+hparams alongside code and notes GPU non-determinism makes bitwise repro hard.",
     "fj": "Says pinning the git commit is enough, ignoring data version, environment, and seeds.",
     "level": "Mid",
-    "asked": 9
+    "asked": 9,
+    "followups": [
+      {
+        "q": "Why is bitwise reproducibility on GPUs so hard even with a fixed seed?",
+        "a": "Many CUDA kernels (atomics in reductions, non-deterministic cuDNN algorithms, multi-GPU all-reduce ordering) sum floats in non-deterministic order, and float addition isn't associative, so results differ run to run. You can force `torch.use_deterministic_algorithms(True)` and fixed cuDNN, but it's slower and not always available. Hence teams target statistical, not bitwise, reproducibility."
+      },
+      {
+        "q": "What's the difference between snapshotting data and versioning the pipeline that produced it?",
+        "a": "A data snapshot pins the bytes you trained on; versioning the pipeline pins the transforms that generated those bytes from raw sources. You want both: the snapshot reproduces this exact run, while the pipeline version lets you regenerate the data deterministically from source if the snapshot is lost or you change raw inputs. One is the output, one is the recipe."
+      },
+      {
+        "q": "How does logging the environment as an image differ from pinning a requirements file?",
+        "a": "A requirements file pins Python deps but not the CUDA/driver/OS/system libs, and pip can still resolve transitive versions differently over time. A container image freezes the entire userspace, giving far stronger reproducibility. For GPUs you still depend on the host driver, so even an image isn't fully hermetic, but it eliminates most environment drift."
+      }
+    ]
   },
   {
     "q": "What does an experiment tracker (MLflow/W&B) record, and how is it different from a model registry?",
@@ -284,7 +648,21 @@
     "fs": "Separates run comparison (tracker) from deployable system-of-record (registry) and notes they link via lineage.",
     "fj": "Treats tracker and registry as the same tool, or thinks logging metrics to a tracker is enough to govern deployments.",
     "level": "Jr",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "Why log metrics per step, not just final values?",
+        "a": "Per-step curves reveal training dynamics you can't see from a final number: divergence, overfitting onset (val loss turning up), learning-rate problems, and whether a longer run would still improve. Comparing curves across runs guides hyperparameter choices and early stopping. The final metric alone hides whether you stopped too early or too late."
+      },
+      {
+        "q": "What goes wrong if you skip the tracker and just promote artifacts to the registry?",
+        "a": "You lose the lineage back to the run, params, data, and environment that produced each model, so you can't reproduce it, can't explain why it was chosen over alternatives, and can't compare it to the rejected candidates. The registry knows what's deployed but not why or how it came to be. Audits and debugging then hit a dead end."
+      },
+      {
+        "q": "How do tracker and registry combine for a clean prod-to-source trail?",
+        "a": "The registry version links to its originating tracker run, which links to code SHA, data version, env, and metrics. So from 'what's serving in prod' you can trace the alias to a version, to a run, to the exact inputs that made it. That unbroken chain is what makes incident debugging and compliance audits tractable months later."
+      }
+    ]
   },
   {
     "q": "What triggers a retrain in production, and why is a fixed nightly cadence often the wrong default?",
@@ -292,7 +670,21 @@
     "fs": "Lists performance/drift/volume triggers and insists on an eval-vs-champion gate over blind scheduled retrains.",
     "fj": "Defaults to 'retrain every night' with no gate, assuming fresher is always better and can't regress.",
     "level": "Sr",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "How can frequent retraining itself cause harm via feedback loops?",
+        "a": "A model that shapes the data it's later trained on (recsys showing only its own picks, fraud blocking certain traffic) creates a feedback loop, so retraining on that biased data amplifies the bias each cycle. Faster retraining tightens the loop. You need exploration/randomized holdouts and off-policy correction so the new training data isn't purely the old model's reflection."
+      },
+      {
+        "q": "Why might a scheduled retrain still be worth keeping as a backstop?",
+        "a": "Trigger-driven retraining depends on monitoring that can itself break or have blind spots (delayed labels, an unmonitored segment), so a periodic floor ensures the model is at least refreshed on recent data even if no trigger fires. It's a safety net, not the primary mechanism, and it must still pass the eval-vs-champion gate before promotion."
+      },
+      {
+        "q": "What guards against a retrain shipping a regression automatically?",
+        "a": "A frozen-holdout eval-vs-champion gate that blocks promotion unless the candidate beats the incumbent on the primary metric and guardrails, followed by a shadow/canary stage and automatic rollback on regression. Without these, an automated nightly retrain can silently promote a worse model (e.g. trained on a corrupted recent batch) straight to prod."
+      }
+    ]
   },
   {
     "q": "How do you run a statistically sound A/B test for a model change? What pitfalls bite teams?",
@@ -300,7 +692,21 @@
     "fs": "Covers unit-of-randomization, pre-computed power, peeking/SRM, and interference, not just 'check p < 0.05'.",
     "fj": "Splits 50/50, watches the dashboard, and calls it the moment p dips below 0.05 (peeking, no power calc).",
     "level": "Sr",
-    "asked": 12
+    "asked": 12,
+    "followups": [
+      {
+        "q": "Why does randomizing at the request level instead of the user level bias results?",
+        "a": "A user bounces between treatment and control across requests, so their experience is a blend and the contrast between arms shrinks (dilution), plus within-user correlation violates the test's independence assumptions. User-level randomization gives each unit one consistent experience and the right unit of analysis. Request-level only works for truly stateless, independent decisions."
+      },
+      {
+        "q": "What does sample-ratio mismatch tell you and why never ignore it?",
+        "a": "If a 50/50 assignment delivers, say, 52/48 traffic beyond chance, something in assignment or logging is broken, bot filtering hitting one arm, a redirect failing, differential crashes, and that same bug likely biases your metric. SRM invalidates the whole experiment, so you treat a failed SRM check as a hard stop and debug before trusting any result, however significant."
+      },
+      {
+        "q": "How does marketplace interference violate A/B assumptions, and what fixes it?",
+        "a": "Treatment and control share finite supply (ad slots, inventory, drivers), so a better treatment can cannibalize control's outcomes, breaking the no-interference (SUTVA) assumption and biasing the measured lift. Fixes include cluster/geo-level randomization, switchback tests over time, or budget-split designs so the arms don't compete for the same scarce resource."
+      }
+    ]
   },
   {
     "q": "Explain data parallelism vs model parallelism in distributed training. When do you need each?",
@@ -308,7 +714,21 @@
     "fs": "Distinguishes batch-sharding (data) from weight-sharding (tensor/pipeline) and says model-parallel is memory-driven.",
     "fj": "Thinks model parallelism is just 'more GPUs for speed', conflating it with data parallelism.",
     "level": "Sr",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "How do ZeRO/FSDP differ from plain data parallelism?",
+        "a": "Plain data parallelism replicates the full model, gradients, and optimizer states on every GPU, wasting memory. ZeRO/FSDP shard those across workers and gather parameters just-in-time per layer, cutting per-GPU memory roughly by the worker count. You keep data-parallel simplicity but fit far bigger models, at the cost of extra communication to gather/scatter shards each step."
+      },
+      {
+        "q": "Why does pipeline parallelism create a 'bubble', and how is it reduced?",
+        "a": "Stages depend on each other, so while stage 1 processes the first micro-batch, later stages sit idle waiting, and the same drains at the end, this idle time is the bubble. Splitting the batch into more micro-batches keeps stages busier (bubble fraction shrinks with more micro-batches), and interleaved/1F1B schedules overlap forward and backward to further cut idle time."
+      },
+      {
+        "q": "What makes tensor parallelism communication-heavy and bandwidth-sensitive?",
+        "a": "Tensor parallelism splits individual matmuls across GPUs, so it needs an all-reduce within every layer's forward and backward, many times per step. That demands very high-bandwidth interconnect (NVLink within a node) and breaks down across slower inter-node links. So you typically keep tensor parallelism inside a node and use pipeline/data parallelism across nodes."
+      }
+    ]
   },
   {
     "q": "Your GPU training cluster is expensive. What levers actually cut cost without hurting wall-clock too much?",
@@ -316,7 +736,21 @@
     "fs": "Names spot+checkpointing, MFU improvements, right-sizing/MIG, and scale-to-zero rather than 'add GPUs'.",
     "fj": "Reduces cost only by asking for fewer or smaller GPUs, ignoring utilization, spot, and checkpointing.",
     "level": "Sr",
-    "asked": 9
+    "asked": 9,
+    "followups": [
+      {
+        "q": "What makes spot instances safe for training but risky for serving?",
+        "a": "Training is restartable: checkpoint periodically and a preemption just resumes from the last checkpoint, costing a little recompute. Serving must answer requests now, so an eviction is an outage; spot there needs a fast-failover on-demand fallback and capacity headroom. So spot is a near-free win for training but only a partial, hedged play for inference."
+      },
+      {
+        "q": "How does checkpoint frequency trade off against spot eviction cost?",
+        "a": "Too-frequent checkpointing wastes I/O and stalls training; too-rare risks losing lots of work on eviction. You tune frequency to roughly the expected eviction rate so the expected lost-work plus checkpoint-overhead is minimized. Asynchronous/sharded checkpointing reduces the stall so you can checkpoint more often cheaply, shrinking eviction loss."
+      },
+      {
+        "q": "When does scale-to-zero hurt rather than help serving cost?",
+        "a": "For latency-sensitive or steady traffic, cold starts (loading a multi-GB model into GPU memory) add seconds of first-request latency and can violate SLOs, so the savings aren't worth it. Scale-to-zero shines for spiky, tolerant, or internal workloads. For constant load, reserved/committed capacity is cheaper than on-demand churn, and you keep a warm minimum."
+      }
+    ]
   },
   {
     "q": "Compare quantization, pruning, and knowledge distillation for shrinking a model for serving.",
@@ -338,6 +772,20 @@
           "# ~4x smaller, faster CPU inference"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "When does quantization-aware training beat post-training quantization?",
+        "a": "PTQ is cheap (no retraining) and fine down to INT8 for many models, but at INT4 or for sensitive models accuracy drops sharply. QAT simulates quantization during training so the model learns weights robust to the rounding, recovering most of the lost accuracy at low bit-widths. The cost is a full retraining pass, so you reach for QAT only when PTQ's accuracy loss is unacceptable."
+      },
+      {
+        "q": "Why is unstructured pruning often a disappointment in practice?",
+        "a": "Zeroing scattered individual weights gives high sparsity on paper but standard dense GPU kernels still do the full matmul, so you see memory savings without real speedup unless you have hardware/kernels for sparse compute (e.g. 2:4 structured sparsity). Structured pruning (whole heads/channels) shrinks the actual dense dimensions and reliably speeds things up."
+      },
+      {
+        "q": "What's the catch with distillation that quantization and pruning avoid?",
+        "a": "Distillation needs a full training run with the teacher generating targets and often a representative (sometimes large) dataset, so it's the most expensive and longest of the three to apply. Quantization and pruning are post-hoc transforms of an existing model. Distillation's payoff is a genuinely smaller architecture, but you pay in compute, data, and tuning to get the student to match."
+      }
     ]
   },
   {
@@ -346,7 +794,21 @@
     "fs": "Says the speedup is kernel/hardware-dependent and dequant overhead can make naive INT4 slower than FP16.",
     "fj": "Assumes fewer bits always means proportionally faster inference, ignoring kernel support.",
     "level": "Sr",
-    "asked": 7
+    "asked": 7,
+    "followups": [
+      {
+        "q": "Why does INT4 still help even in the case where it's slower than FP16?",
+        "a": "Because the win is memory, not compute: 4-bit weights are a quarter the size of FP16, so you fit a bigger model on one GPU, hold more KV cache, or serve at a larger batch. In a memory-bound decode regime, reading fewer weight bytes from HBM can also raise throughput. The latency caveat is about naive kernels; the memory benefit is unconditional."
+      },
+      {
+        "q": "In which regime does low-bit weight quantization most reliably speed up decode?",
+        "a": "In single-request or small-batch decode, which is memory-bandwidth bound: you spend most time streaming weights from HBM, so reading 4-bit instead of 16-bit weights cuts that traffic and speeds the step, even with dequant. In large-batch compute-bound regimes the matmul dominates and dequant overhead can erase the benefit, so the win is workload-dependent."
+      },
+      {
+        "q": "Why do activations resist low-bit quantization more than weights?",
+        "a": "Activations have outliers and per-token dynamic range that vary at runtime, so quantizing them to INT4/INT8 loses accuracy unless you handle outliers (e.g. SmoothQuant, per-channel scaling) or keep them in higher precision. Weights are static and easier to calibrate offline. That's why many schemes quantize weights aggressively but keep activations at FP16/INT8."
+      }
+    ]
   },
   {
     "q": "Explain the latency vs throughput tradeoff in online inference and the main knobs to tune it.",
@@ -354,7 +816,21 @@
     "fs": "States the tension, lists batch/queue/replica/optimization knobs, and sets p99 budget before maximizing throughput.",
     "fj": "Treats latency and throughput as the same thing or maximizes batch size with no regard for the p99 SLO.",
     "level": "Jr",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "Why does p99 latency degrade faster than p50 as you push utilization up?",
+        "a": "By queuing theory, as utilization approaches capacity, queue length and wait time grow non-linearly and the tail blows up long before the median does, a small load increase can double p99 while p50 barely moves. So you size capacity to keep utilization well below saturation (often ~70%) precisely to protect the tail, not the average."
+      },
+      {
+        "q": "How does adding replicas help latency vs throughput differently?",
+        "a": "More replicas raise aggregate throughput linearly and reduce queuing (lower utilization per replica, so a better tail), but they do nothing for the single-request compute time, your floor latency on an idle system is unchanged. To cut that floor you need a faster/smaller model or better kernels, not more replicas. Replicas buy capacity and tail headroom, not base speed."
+      },
+      {
+        "q": "When does request caching meaningfully move the latency/throughput curve?",
+        "a": "When inputs repeat: identical embeddings, popular queries, or shared LLM prefixes. A cache hit skips compute entirely, slashing latency for those and freeing capacity for the rest, raising effective throughput. It's useless for high-cardinality unique inputs, and you must bound staleness. For LLMs, prefix/KV caching is the high-value form of this lever."
+      }
+    ]
   },
   {
     "q": "Sketch the architecture of a large-scale recommendation/ranking system. Why the multi-stage funnel?",
@@ -362,7 +838,21 @@
     "fs": "Describes retrieve(two-tower/ANN) -> rank -> re-rank and justifies it by latency/compute over the full catalog.",
     "fj": "Proposes scoring one big model over the entire catalog per request, ignoring the retrieval/ranking split.",
     "level": "Sr",
-    "asked": 13
+    "asked": 13,
+    "followups": [
+      {
+        "q": "Why optimize the retrieval stage for recall and the ranking stage for precision?",
+        "a": "If retrieval drops a relevant item, no downstream stage can recover it, so retrieval must cast a wide, high-recall net even at the cost of false positives. Ranking then sees only hundreds of candidates and can afford an expensive, precise model to order them well. Splitting objectives lets each stage use the right model and metric for its job rather than one compromise."
+      },
+      {
+        "q": "What does the re-ranking stage do that ranking can't, and why separate it?",
+        "a": "Re-ranking enforces cross-item constraints, diversity, de-duplication, freshness, business rules, fairness, that depend on the whole result set, not a single item's score. A pointwise ranker scores items independently and can't, say, avoid showing five near-identical items. Keeping it separate lets you tweak business logic without retraining the ranker."
+      },
+      {
+        "q": "How does cascade training-serving skew arise across the funnel?",
+        "a": "The ranker is trained on items the current retriever surfaced, so if you change retrieval, the ranker now sees a different candidate distribution than it trained on, degrading quality. Stages are coupled. You mitigate by jointly considering the cascade, logging candidates from the live retriever for ranker training, and re-validating downstream when any upstream stage changes."
+      }
+    ]
   },
   {
     "q": "How does a two-tower model serve embeddings for retrieval, and what makes it fast at query time?",
@@ -370,7 +860,21 @@
     "fs": "Notes item embeddings are precomputed into an ANN index and only the user tower runs online; flags the no-cross-feature limit.",
     "fj": "Thinks the model re-embeds every item per request or that two-tower retrieval alone gives final ranking quality.",
     "level": "Mid",
-    "asked": 11
+    "asked": 11,
+    "followups": [
+      {
+        "q": "Why can't the two towers share user-item cross features, and why does that matter?",
+        "a": "Each tower must encode independently so item vectors can be precomputed without knowing the user, which is what enables the ANN lookup. That forbids early interaction features like 'this user's affinity for this item's brand'. The model can only express relevance as a dot product of independent vectors, capping accuracy, hence a cross-feature ranker downstream."
+      },
+      {
+        "q": "What does ANN approximation trade away, and how do you tune it?",
+        "a": "ANN (HNSW/IVF) trades exact recall for speed: it may miss some true nearest neighbors. You tune knobs like `efSearch` or `nprobe` to move along the recall-vs-latency curve, more search effort means higher recall but slower lookups. You pick the operating point where recall loss is negligible for your funnel but latency stays in budget."
+      },
+      {
+        "q": "How do you keep the item index fresh as new items arrive?",
+        "a": "New items have no embedding until the item tower scores them, so you incrementally embed and upsert them into the ANN index (or rebuild periodically), and handle the cold-start gap with content-based features or a fallback. Stale item embeddings after retraining the tower also force a full re-embed; mismatched user/item tower versions silently break the shared space."
+      }
+    ]
   },
   {
     "q": "Why does an offline metric improvement often fail to show up as an online win, and how do you de-risk it?",
@@ -378,7 +882,21 @@
     "fs": "Names selection/position bias and metric mismatch, and uses counterfactual estimators + A/B as the arbiter.",
     "fj": "Assumes a higher offline AUC guarantees an online lift and ships straight to all users.",
     "level": "Sr",
-    "asked": 12
+    "asked": 12,
+    "followups": [
+      {
+        "q": "How does position bias corrupt offline evaluation specifically?",
+        "a": "Logged clicks reflect both relevance and where an item was shown, items in top positions get clicked more regardless of quality, so a model trained/evaluated on raw clicks learns position, not relevance. Inverse-propensity weighting or explicitly modeling position (a position feature dropped at serving) corrects it. Ignore it and your offline metric rewards reproducing the old layout."
+      },
+      {
+        "q": "What do off-policy / counterfactual estimators actually estimate, and what's their limitation?",
+        "a": "They estimate how a new policy would have performed on logged data by reweighting outcomes by the ratio of new-to-old action probabilities (inverse propensity scoring). They need logged propensities and suffer high variance when the new policy diverges far from the logging policy, items the old policy rarely showed have few or unreliable samples. So they pre-filter, not replace, a live test."
+      },
+      {
+        "q": "Why can a model improve a proxy metric but hurt the true business goal?",
+        "a": "Proxies are imperfect surrogates: optimizing CTR can boost clickbait that lowers long-term satisfaction and retention, or watch-time can crowd out diversity. The model exploits exactly the gap between proxy and goal (a form of Goodhart's law). You guard with long-horizon guardrails in the A/B and by choosing proxies validated to correlate with the real objective."
+      }
+    ]
   },
   {
     "q": "How do you detect training-serving skew in production rather than just hoping the feature store prevents it?",
@@ -399,6 +917,20 @@
           "# later: diff vs offline recompute"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why log the served feature vector rather than re-deriving it from raw inputs later?",
+        "a": "Re-deriving relies on the very transform you suspect of skew, so a bug would be reproduced in both and hide itself. Logging the exact bytes the model consumed captures ground truth of what served, letting you diff it against an independent offline recompute. The whole point is to compare two independently produced values, not one value against itself."
+      },
+      {
+        "q": "How do you separate row-level skew from distributional skew, and why care about both?",
+        "a": "Distributional checks (compare served vs offline feature distributions) catch systematic shifts cheaply but miss per-entity bugs that cancel out in aggregate. Row-level diffs on the same entity/timestamp catch a wrong value for individual requests even when the distribution looks fine. You want both: distribution for broad drift, row-level for precise correctness."
+      },
+      {
+        "q": "What's the cost/sampling tradeoff in logging every served feature vector?",
+        "a": "Logging full feature vectors for every request is expensive in storage and bandwidth at high QPS, so you sample (e.g. 1%) for the routine skew audit while keeping enough volume for statistical power per feature. For debugging a specific incident you can raise the rate temporarily. The recompute join is also costly, so you batch it rather than run it inline."
+      }
     ]
   },
   {
@@ -407,7 +939,21 @@
     "fs": "Identifies window-overlap and target-encoding-across-folds as silent leakage that no single column reveals.",
     "fj": "Thinks removing the obvious post-outcome columns is enough and target-encodes on the full dataset.",
     "level": "Sr",
-    "asked": 8
+    "asked": 8,
+    "followups": [
+      {
+        "q": "Why does target encoding fit on all data leak even with a correct as-of join?",
+        "a": "An as-of join controls when feature values are observed, but target encoding bakes the label statistic into the feature value itself: a category's mean target includes the very rows you're predicting. So even with perfect timestamps, the encoded value carries the answer. You must fit the encoding only on out-of-fold (or strictly prior) data, often with smoothing and per-fold refitting."
+      },
+      {
+        "q": "How can a rolling-window aggregate leak despite using only past timestamps?",
+        "a": "If the window's right edge isn't strictly before the label time, or the label outcome falls inside the lookback window (e.g. a '30-day spend' that includes spend after the prediction moment), future information bleeds in. The fix is anchoring every window to close strictly before the label timestamp and excluding the label's own period from the aggregate."
+      },
+      {
+        "q": "Why won't standard leakage detection (importance scan, single-column audit) catch this?",
+        "a": "Statistical leakage spreads signal thinly across many encoded categories or window aggregates, so no single feature dominates importances and no column reads as 'post-outcome'. The corruption is in how features were computed, not what they are. You catch it by auditing the computation, strict pre-label cutoffs and in-fold fitting, plus watching for an offline metric that's too good to be true."
+      }
+    ]
   },
   {
     "q": "How do you handle severe class imbalance in a production classifier without breaking calibration?",
@@ -415,6 +961,20 @@
     "fs": "Prefers threshold tuning/PR-AUC, warns resampling distorts probabilities and needs recalibration, fold-only.",
     "fj": "Blindly SMOTEs the whole dataset to 50/50 and trusts the resulting probabilities and accuracy.",
     "level": "Mid",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "Why exactly does oversampling distort predicted probabilities?",
+        "a": "Resampling to 50/50 changes the prior P(y), so outputs reflect that artificial base rate, not the real one, e.g. a true 1% positive rate gets predicted near 50%. Scores are then miscalibrated for downstream use (expected-value decisions, thresholds tied to real prevalence). Either recalibrate, correct the intercept for the prior shift, or use class weights and keep the natural rate."
+      },
+      {
+        "q": "Why must resampling happen inside the CV fold and never touch validation/test?",
+        "a": "Oversampling before splitting can place duplicates (or SMOTE-interpolated neighbors) of a training point into validation, leaking and inflating the score. And resampling validation/test changes the evaluation distribution away from reality, so your metrics no longer reflect production. You resample only the training fold and evaluate on the true, imbalanced distribution."
+      },
+      {
+        "q": "When is threshold tuning preferable to resampling or class weights altogether?",
+        "a": "When you need well-calibrated probabilities and only a good operating point. Training on the natural distribution keeps scores honest; you then pick the threshold that hits your precision/recall or cost target. This avoids the calibration damage of resampling entirely. Class weights or focal loss help only when the model genuinely underfits the minority class despite good metrics."
+      }
+    ]
   }
 ]

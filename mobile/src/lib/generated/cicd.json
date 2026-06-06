@@ -4,7 +4,21 @@
     "a": "A common pipeline runs lint/test, then build, then package into an image or artifact, then deploy to an environment. Each stage gates the next: tests must pass before you build, and the build must succeed before you deploy. Later stages often add security scanning, integration tests, and promotion across dev/staging/prod. The goal is to catch failures as early and cheaply as possible (shift left).",
     "fs": "I order stages by cost-to-fix: fast unit tests first, expensive integration/deploy last, so we fail cheap.",
     "fj": "You write code, then push to prod.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Should every stage run on every commit, or can some be skipped?",
+        "a": "Cheap stages like lint and unit tests should run on every push for fast feedback. Expensive stages such as full integration suites, image builds, and deploys are often gated on branch, path filters, or merge to `main` so PRs stay fast. The trade-off is coverage versus speed: skip too much and you push the failure later, where it's costlier to fix."
+      },
+      {
+        "q": "If unit tests are green but a later integration stage fails, what does that tell you about your pyramid?",
+        "a": "It signals a coverage gap at the unit/contract layer: the units pass in isolation but their interactions break. The fix is usually to add the missing seam as a faster test (contract or component test) rather than relying on the slow integration stage to catch it. Repeatedly catching bugs only at integration means feedback is too far right."
+      },
+      {
+        "q": "Why put security scanning late in the pipeline rather than first?",
+        "a": "Scans like image-vulnerability and SAST need the built artifact, so they naturally come after build. But cheap dependency-manifest scans can shift earlier. The principle is order-by-cost: run anything that fails fast and cheap first, and reserve slow, artifact-dependent gates for just before promotion to a higher environment."
+      }
+    ]
   },
   {
     "q": "What are the three core components of a GitHub Actions workflow?",
@@ -26,6 +40,20 @@
           "      - run: npm ci && npm test"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Do steps within a single job share state, and what is and isn't preserved between them?",
+        "a": "Steps in one job run sequentially on the same runner, so they share the working directory and filesystem. But each `run:` step is a fresh shell, so shell variables and `cd` don't persist across steps; to pass values you write to `$GITHUB_ENV` or `$GITHUB_OUTPUT`. Across jobs nothing on disk is shared since they're separate runners."
+      },
+      {
+        "q": "Why pin an action to a version like @v4 or a commit SHA rather than a branch?",
+        "a": "`uses:` against a mutable tag or branch means a third party can change the code your pipeline runs, a supply-chain risk. Pinning to a full commit SHA makes the action immutable and auditable; pinning to a major tag like `@v4` is a looser compromise that trusts the maintainer's release hygiene. For untrusted actions, SHA-pinning is the safe default."
+      },
+      {
+        "q": "If a job has no needs:, when does it start relative to other jobs?",
+        "a": "Jobs with no `needs:` are independent and start in parallel as soon as runners are available, subject to concurrency limits. The `needs:` graph is the only ordering mechanism; YAML position does not imply sequence. To force ordering you must declare the dependency explicitly."
+      }
     ]
   },
   {
@@ -46,6 +74,20 @@
           "  deploy:",
           "    needs: [test, build]"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "You want a cleanup job to run even when the deploy fails. How?",
+        "a": "Add `if: always()` to the cleanup job so it runs regardless of upstream status; without it, a failed `needs:` job skips downstream jobs. You can refine with `if: failure()` to run only on failure or `if: ${{ !cancelled() }}` to skip only on manual cancellation. `always()` also runs on cancellation, so choose the condition deliberately."
+      },
+      {
+        "q": "How do you read whether a needed job actually succeeded versus was skipped?",
+        "a": "Use `needs.<job>.result`, which is `success`, `failure`, `cancelled`, or `skipped`. When you use `if: always()` on a job, downstream logic must check `needs.build.result == 'success'` explicitly, because `always()` runs the job even if the dependency failed. This lets you branch deliberately instead of blindly proceeding."
+      },
+      {
+        "q": "Does needs: imply data passing between the jobs?",
+        "a": "No. `needs:` only orders execution; it does not move files. To consume a value from a needed job you read its declared `outputs` via `needs.<job>.outputs.x`, and for files you use upload/download-artifact. Separate runners share no disk, so ordering and data transfer are independent concerns."
       }
     ]
   },
@@ -69,6 +111,20 @@
           "      npm-"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "When restore-keys hits on a prefix instead of the exact key, is the cache re-saved at the end?",
+        "a": "Yes. A `restore-keys` partial match restores stale data but `cache-hit` is `false`, so at job end `actions/cache` saves a fresh entry under the exact primary key. That's how the cache rolls forward: the next run with the same lockfile gets an exact hit. Caches are immutable per key, so an existing exact key is never overwritten."
+      },
+      {
+        "q": "Why must you never include something user-controllable or PR-mutable in the cache key for security?",
+        "a": "Caches restored on `main` can be poisoned by a malicious PR if scopes overlap, since the attacker controls the cached contents. GitHub already isolates caches by branch scope (a base branch can read its own and the default branch's caches, not arbitrary PR caches), but you should key on trusted inputs like the committed lockfile and never restore an attacker-influenced cache into a privileged build."
+      },
+      {
+        "q": "What's the eviction behavior when a repo exceeds the cache size limit?",
+        "a": "GitHub enforces a per-repository cache limit (10 GB) and evicts least-recently-used entries once exceeded. So a rarely-hit cache key can silently disappear, meaning your pipeline must tolerate a cold start at any time. This reinforces that the cache is an optimization, never a correctness dependency."
+      }
     ]
   },
   {
@@ -76,14 +132,42 @@
     "a": "A cache is a performance optimization, not a source of truth, so a poisoned or stale cache must never change the result. You still run a deterministic install like npm ci against the lockfile; the cache only skips re-downloading already-resolved packages. Keying on the lockfile hash guarantees a dependency change invalidates the cache. If correctness ever depends on the cache existing, you have a bug.",
     "fs": "Cache is keyed on the lockfile and only speeds re-downloads; npm ci still resolves from the lock so a poisoned cache can't change output.",
     "fj": "I cache node_modules and skip install to save time.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why is caching ~/.npm safer than caching node_modules directly?",
+        "a": "`~/.npm` is the package download cache, so `npm ci` still runs and rebuilds `node_modules` deterministically from the lockfile, just skipping network fetches. Caching `node_modules` itself skips the install entirely, which can ship an OS- or arch-specific tree, miss native rebuilds, and let a stale tree drift from the lock. The first speeds a correct install; the second replaces it."
+      },
+      {
+        "q": "How would a poisoned cache actually fail to change your output if you cache node_modules?",
+        "a": "It wouldn't, and that's the danger: caching `node_modules` and skipping install means the cached bytes are exactly what runs, so a poisoned cache is your dependency tree. Caching only the download dir keeps `npm ci` as the arbiter, which re-verifies integrity hashes from the lockfile against the package tarballs, so corrupted cache entries are rejected, not executed."
+      },
+      {
+        "q": "Does npm ci verify package integrity, and how does that interact with the cache?",
+        "a": "Yes. `npm ci` checks each package against the `integrity` (SHA-512 SRI) hashes recorded in `package-lock.json`. Cached tarballs that don't match are discarded and re-fetched. So even a tampered download cache can't inject altered code, because the lockfile's integrity field is the trust anchor, not the cache."
+      }
+    ]
   },
   {
     "q": "How should secrets be handled in a CI/CD pipeline?",
     "a": "Store secrets in the platform's encrypted secret store (GitHub Actions secrets, environment secrets, or an external vault), never in the repo. Inject them as masked environment variables at runtime and scope them to the minimum jobs/environments that need them. Prefer short-lived, least-privilege credentials and rotate long-lived ones. Be aware secrets are not passed to workflows triggered by forks, and masked values can still leak if you echo them to logs.",
     "fs": "Secrets live in an encrypted store, are scoped to environments, masked in logs, and least-privilege; I avoid passing them to fork PRs.",
     "fj": "I put the API key in the YAML so the job can use it.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Log masking replaces a secret with ***. How can a secret still leak despite masking?",
+        "a": "Masking only matches the exact stored string. If you transform the secret (base64-encode, URL-encode, slice it, or print it inside an error structure), the derived form isn't masked and leaks. Multiline secrets and secrets embedded in larger output can also slip through. The defense is to never print or transform secrets, not to rely on masking."
+      },
+      {
+        "q": "Why doesn't GitHub pass repo secrets to workflows triggered by a fork's pull_request event?",
+        "a": "A fork PR runs untrusted code, so handing it your secrets would let any contributor exfiltrate them. The `pull_request` trigger from a fork runs with a read-only token and no secrets. If you genuinely need secrets for fork CI, you use `pull_request_target` (which runs in the base context) very carefully, or gate the privileged run behind a maintainer approval, because misusing `pull_request_target` is a known exfiltration vector."
+      },
+      {
+        "q": "When would you use an external vault over native GitHub secrets?",
+        "a": "Use an external vault (HashiCorp Vault, cloud secret managers) when you need dynamic short-lived credentials, centralized rotation across many systems, fine-grained audit, or secrets shared beyond CI. The pipeline authenticates to the vault, ideally via OIDC, and pulls a just-in-time credential. Native secrets are simpler but are static values you must rotate yourself."
+      }
+    ]
   },
   {
     "q": "Why is OIDC preferred over storing long-lived cloud credentials as secrets?",
@@ -107,6 +191,20 @@
           "      aws-region: us-east-1"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What's the most dangerous mistake when writing the cloud trust policy for GitHub OIDC?",
+        "a": "Scoping the `sub` claim too loosely, e.g. trusting `repo:org/*` or only `repo:org/repo:*` so any branch or any PR can assume the role. A compromised fork or a feature branch could then mint prod credentials. You constrain the `sub` to a specific branch or, better, a specific `environment`, and always verify the `aud` claim. Wildcard subjects defeat the whole point of OIDC."
+      },
+      {
+        "q": "Why does the workflow need permissions: id-token: write, and what does that grant?",
+        "a": "It authorizes the job to request an OIDC JWT from GitHub's token endpoint, which it then presents to the cloud provider. Without `id-token: write`, the token request fails. It does not grant cloud access by itself; the cloud role's trust policy decides whether to honor the token. It's least-privilege: only jobs that need federation get it."
+      },
+      {
+        "q": "How does OIDC compare to a self-hosted runner with an instance profile?",
+        "a": "An instance profile on a self-hosted runner gives every job on that machine the same standing credentials, with no per-workflow scoping and a larger blast radius if the runner is compromised. OIDC issues a fresh, job-scoped, short-lived token tied to the workflow's identity claims, so it's tighter and auditable. OIDC also works on ephemeral GitHub-hosted runners where there's no instance role at all."
+      }
     ]
   },
   {
@@ -128,6 +226,20 @@
           "    steps:",
           "      - run: ./deploy.sh"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Where exactly does the job pause relative to its steps when an environment requires approval?",
+        "a": "The whole job is held before any of its steps run; the runner isn't even allocated until approval. So nothing in the deploy job executes during the wait, which is why you put the actual deploy in the environment-gated job rather than gating a single step. Secrets scoped to that environment are only exposed after approval, too."
+      },
+      {
+        "q": "Why combine a branch-restriction rule with required reviewers on the production environment?",
+        "a": "Required reviewers stop an unapproved deploy, but branch restrictions ensure the environment can only be deployed from trusted refs (e.g. `main` or release tags), closing the gap where someone approves a deploy from an arbitrary feature branch. Defense in depth: the reviewer judges intent, the branch rule constrains source. Together they prevent both careless and malicious deploys."
+      },
+      {
+        "q": "What does a wait timer add that required reviewers don't?",
+        "a": "A wait timer enforces a fixed delay (e.g. 30 minutes) before the deploy proceeds, creating a cancellation window even when no human is watching, useful for staged rollouts or letting canary metrics accumulate. Reviewers require active human attention; the timer is a passive cooling-off period. They're complementary, not redundant."
       }
     ]
   },
@@ -151,6 +263,20 @@
           "        node: 18"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "What's the difference between include adding a combination versus extending an existing one?",
+        "a": "If an `include` entry's keys match an existing matrix combination, its extra keys are merged into that job rather than creating a new one. If it doesn't match any existing combination, it adds a brand-new job. This lets you attach a one-off variable (like an experimental flag) to a specific cell without exploding the whole matrix."
+      },
+      {
+        "q": "A matrix of 3 OSes x 4 versions x 2 archs is 24 jobs and eats your runner quota. How do you trim it sanely?",
+        "a": "Test the full cross-product only on a schedule (nightly), and on PRs run a representative subset, e.g. the latest version on all OSes plus all versions on Linux only, using `exclude` or separate workflows. You can also cap `max-parallel` to throttle concurrency. The goal is to keep PR signal fast while still getting full coverage less often."
+      },
+      {
+        "q": "How do you avoid one flaky matrix cell failing the whole required check?",
+        "a": "You can mark specific cells `continue-on-error: true` (often via an `include` flag) so they report but don't fail the job, or set `fail-fast: false` so other cells still complete. For a truly experimental combo, isolate it into a non-required job. But masking flakiness is debt; the real fix is stabilizing the test."
+      }
     ]
   },
   {
@@ -158,14 +284,42 @@
     "a": "fail-fast (default true) cancels all other in-flight matrix jobs as soon as one fails, saving runner minutes when you want a quick red signal. Setting it false lets every combination finish so you see the full failure matrix, useful for flaky cross-version debugging. max-parallel caps how many matrix jobs run concurrently, which throttles load on limited or self-hosted runners. Together they trade speed-of-signal against completeness and resource use.",
     "fs": "I keep fail-fast on for PRs to fail cheap, flip it off on nightly cross-version runs, and cap max-parallel for self-hosted runners.",
     "fj": "fail-fast just retries the failed job.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "fail-fast cancels in-flight jobs on first failure. What's the cost of that you might not want?",
+        "a": "You only learn that one cell broke, not whether the failure is isolated or systemic across versions/OSes. For a regression that hits, say, only Node 18, fail-fast hides whether 20 and 22 also break. That's why for debugging cross-version issues you flip it off and accept the extra runner minutes to see the complete failure pattern."
+      },
+      {
+        "q": "Does max-parallel reduce your total billed runner minutes?",
+        "a": "No. `max-parallel` only limits concurrency, so the same jobs still run and consume the same total minutes; they just queue rather than running simultaneously. It protects a limited pool (especially self-hosted runners or a license-capped fleet) from overload, and can lengthen wall-clock time. To cut minutes you reduce the number of combinations, not the parallelism."
+      },
+      {
+        "q": "How does fail-fast interact with a flaky test in one cell?",
+        "a": "With `fail-fast: true`, a single flaky cell can cancel all the healthy cells, producing a misleading all-red run and wasting the work already done. That's a strong reason to either fix the flake, isolate it with `continue-on-error`, or disable fail-fast on suites known to be flaky. Otherwise flakiness poisons the whole matrix's signal."
+      }
+    ]
   },
   {
     "q": "What does 'build once, deploy many' mean and why does it matter?",
     "a": "You produce a single immutable artifact (e.g. a container image) once in CI, then promote that exact artifact through dev, staging, and prod rather than rebuilding per environment. Rebuilding risks drift from changed dependencies, tool versions, or transient network state, so what you tested may not be what you ship. Promoting the same digest guarantees the tested artifact is the deployed one. Environment differences are injected via config, not by rebuilding.",
     "fs": "One immutable build flows through environments; config is injected at deploy so the digest tested equals the digest shipped.",
     "fj": "I just run the build step again in the prod pipeline.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "If config is injected at deploy, how do you keep environment-specific values out of the image?",
+        "a": "You parameterize purely at runtime: environment variables, mounted config maps/secrets, or a config service the app reads on boot, never baking an env name or endpoint into the build. The image must be environment-agnostic so the identical digest behaves correctly in dev and prod. Anything compiled in that differs per environment breaks the 'tested equals shipped' guarantee."
+      },
+      {
+        "q": "What about build-time values like a Git SHA or version that must be embedded?",
+        "a": "Those are fine because they're identity, not environment config: they're the same regardless of where the image is deployed and they make the artifact traceable. The rule is that nothing which differs between dev/staging/prod is baked in. Embedding the commit SHA actually strengthens 'build once' by tying the artifact to its source."
+      },
+      {
+        "q": "When might 'build once' break down, e.g. for compiled frontends with baked-in public env vars?",
+        "a": "Some toolchains inline public config at build time (e.g. a public API URL compiled into a JS bundle), so the same artifact can't serve all environments. The fixes are runtime config loading (fetch config at boot), or accepting per-environment builds for that layer while still pinning everything else. You name the leak explicitly rather than pretending the artifact is portable when it isn't."
+      }
+    ]
   },
   {
     "q": "What is artifact promotion and how is it usually implemented?",
@@ -186,6 +340,20 @@
           "  $REG/app@$DIG"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Tag-based promotion adds a :prod tag in the same registry. What's the security argument for copying to a separate prod registry instead?",
+        "a": "A separate higher-trust registry lets you apply stricter access controls, so only the promotion pipeline can write to prod and dev compromise can't push there. It also gives a clean trust boundary for signature/provenance verification at the gate, and isolates prod pulls from dev registry availability or tampering. Tag-based is simpler but keeps everything in one blast radius."
+      },
+      {
+        "q": "The code resolves the digest before re-tagging. Why not just point the :prod tag at the :staging tag directly?",
+        "a": "Re-tagging from a mutable tag could race or pick up a different image if `:staging` was re-pushed between resolution and promotion. Resolving to the immutable `sha256:` digest first pins exactly the artifact you validated, so the promotion is tamper-evident and reproducible. You promote the content, not a moving pointer."
+      },
+      {
+        "q": "Why is the audit log of who promoted what a hard requirement, not a nice-to-have?",
+        "a": "Promotion is the moment unvetted code can reach prod, so you need a non-repudiable record of actor, timestamp, digest, and which gates passed for incident forensics and compliance (SOC2, change management). Without it you can't answer 'who shipped this and was it approved' after an incident. The audit trail makes the gate accountable, not just present."
+      }
     ]
   },
   {
@@ -193,35 +361,105 @@
     "a": "Tags are mutable pointers: :latest or :prod can be re-pushed to point at a different image, so two deploys of the same tag may ship different code. A digest (sha256:...) is content-addressed and immutable, uniquely identifying one exact image. Pinning to the digest makes deploys reproducible, auditable, and rollback-safe. It also defends against a supply-chain swap of a tag you trusted.",
     "fs": "I deploy app@sha256:... because tags are mutable pointers; the digest is the only reproducible, tamper-evident reference.",
     "fj": "We always deploy :latest so we get the newest build.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "If you deploy by digest, are tags still useful at all?",
+        "a": "Yes, as human-friendly aliases and discovery handles: `:v2.3.1` or `:prod` tells people what an image is, and you resolve it to a digest at deploy time, then pin the digest. Tags are for humans and resolution; digests are for the actual deploy reference. You don't abandon tags, you just never trust them as the immutable identity."
+      },
+      {
+        "q": "How does digest-pinning specifically defend against a registry tag-swap attack?",
+        "a": "If an attacker re-pushes `:prod` to a malicious image, anyone deploying by tag pulls the malicious one, but a deploy pinned to the original `sha256:` digest still pulls the exact bytes you verified, since content-addressing means a different image has a different digest. Combined with signature verification on that digest, the swapped image is both ignored and rejected."
+      },
+      {
+        "q": "Can two different builds ever produce the same digest, and what does that imply for caching?",
+        "a": "Only if the image content is bit-for-bit identical, since the digest is a SHA-256 over the manifest and layers. Reproducible builds can intentionally produce matching digests, which lets registries and runtimes dedupe and skip re-pulls. Conversely, any change, even a timestamp, yields a new digest, which is exactly why digests are reliable identity."
+      }
+    ]
   },
   {
     "q": "Explain blue-green deployment and its rollback behavior.",
     "a": "Blue-green runs two identical production environments: blue serves live traffic while green gets the new version. After validating green, you flip the load balancer (or DNS) to send all traffic to it instantly. Rollback is just flipping back to blue, which is near-instant since the old environment is still warm. The cost is running double infrastructure during the cutover.",
     "fs": "Blue-green swaps all traffic via the LB to a parallel stack, so rollback is a one-switch flip back to the warm blue env.",
     "fj": "Blue-green means slowly sending more users to the new version.",
-    "level": "Jr"
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "You flip to green and it's bad. In-flight user sessions and connections, what happens on the flip back?",
+        "a": "An instant LB flip cuts new connections over but can drop or disrupt in-flight requests unless the LB drains connections gracefully. Sticky sessions tied to green can also break on flip-back. So you configure connection draining and keep sessions in shared state (not on the instance) so either environment can serve any user. The flip is fast, but session handling makes it safe."
+      },
+      {
+        "q": "Both environments share one production database. How does that constrain a blue-green release?",
+        "a": "Because blue and green hit the same DB, schema changes must be backward-compatible (expand/contract): green's new code and blue's old code both have to work against the live schema, or a flip-back corrupts or errors. You can't do a destructive migration coupled to the cutover. The shared data layer is what makes blue-green's 'instant rollback' actually safe or not."
+      },
+      {
+        "q": "When is canary preferable to blue-green despite blue-green's instant rollback?",
+        "a": "When you want to limit blast radius: blue-green sends 100% of traffic to the new version at once, so a bug nobody caught in validation hits everyone instantly. Canary exposes a small slice first and gates expansion on live metrics, so a latent issue affects 1% before you stop. Choose blue-green for fast cutover/rollback, canary when you can't fully trust pre-prod validation."
+      }
+    ]
   },
   {
     "q": "Explain canary deployment and how it differs from blue-green.",
     "a": "Canary routes a small percentage of traffic (e.g. 1% -> 5% -> 25% -> 100%) to the new version while watching error rates and latency, expanding only if metrics stay healthy. Unlike blue-green's instant all-or-nothing switch, canary exposes risk gradually so only a slice of users hit a bad release. It doesn't require a full duplicate environment, but it needs traffic-splitting and good observability. Rollback means shifting that slice back to the stable version.",
     "fs": "Canary shifts traffic in metric-gated increments, limiting blast radius; blue-green is an instant 100% cutover with a full duplicate stack.",
     "fj": "Canary and blue-green are basically the same thing.",
-    "level": "Mid"
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "What signals should gate canary promotion, and why is raw error count a poor one?",
+        "a": "Gate on rates and comparisons: error rate, p95/p99 latency, and saturation of the canary versus the baseline over the same window, ideally normalized for traffic. Raw error count is misleading because a 1% canary naturally sees few absolute errors; you compare the canary's rate against the stable group's rate. Automated analysis (e.g. Argo Rollouts/Flagger with Prometheus) does this comparison and aborts on regression."
+      },
+      {
+        "q": "At 1% traffic, a rare bug might not surface. How do you make a canary statistically meaningful?",
+        "a": "You need enough requests in the canary to detect the effect, so for low-frequency paths you either hold each step longer to accumulate volume, raise the initial percentage, or target the canary at the specific cohort that exercises the risky path. A canary that's too small or too brief gives false confidence. The dwell time and slice size must match the event rate you're trying to catch."
+      },
+      {
+        "q": "Why is canary harder than blue-green when the change includes a database migration?",
+        "a": "During a canary, old and new code run concurrently for an extended window, so the schema must satisfy both versions throughout, demanding strict expand/contract discipline. Blue-green's window is short and you can sometimes sequence the migration around the flip. Canary's prolonged mixed-version state means any non-backward-compatible change will error for one of the two code versions."
+      }
+    ]
   },
   {
     "q": "What makes a deployment rollback fast and safe?",
     "a": "Fast rollback comes from keeping the previous known-good immutable artifact available so you can re-point traffic or redeploy it without rebuilding. Stateless app changes roll back cleanly; the hard part is database migrations, which should be backward-compatible (expand/contract) so old and new code both work during the window. Automated health checks should trigger or at least prompt rollback. Avoid destructive, irreversible schema changes in the same release as code.",
     "fs": "I keep the prior artifact warm and use expand/contract migrations so rollback is a re-point, not a rebuild or a data-loss event.",
     "fj": "Rollback means git revert and redeploy from scratch.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "You shipped a DROP COLUMN with the new code and now must roll back. Why are you stuck?",
+        "a": "The data in that column is gone, so re-pointing to the old artifact restores the code but not the data it needs, and the rollback either errors or runs on a mutilated schema. That's why destructive changes are split out: you drop the column only in a later release, after the old code is fully retired. Coupling a `DROP` to a code deploy makes rollback impossible without a restore."
+      },
+      {
+        "q": "Why prefer rolling back by re-pointing to the prior artifact over git revert + redeploy?",
+        "a": "Re-pointing to the already-built known-good image is near-instant and ships exactly the bytes that previously worked. A `git revert` plus rebuild is slow (full pipeline) and risks drift, since the rebuild may resolve different dependencies than the original, so you might not get back the artifact you had. During an incident, MTTR matters, and re-pointing is the fast, deterministic path."
+      },
+      {
+        "q": "Should rollback always be fully automated on a failed health check?",
+        "a": "Automated rollback is great for clear, fast signals (crash loops, health-check failures) where speed beats deliberation. But auto-rollback on noisy or lagging metrics can thrash, and some failures (data corruption) shouldn't be 'rolled back' blindly. A common pattern is auto-rollback for hard health failures and human-prompted rollback for ambiguous metric regressions, with a feature flag as the even faster kill switch."
+      }
+    ]
   },
   {
     "q": "Why are forward-compatible database migrations important for zero-downtime deploys?",
     "a": "During a rolling or canary deploy, old and new code run simultaneously, so the schema must satisfy both. The expand/contract pattern splits a change: first expand (add the new nullable column/table) before code uses it, then migrate data, then contract (drop the old column) only after all code stops using it. This avoids the new code referencing a column the old code can't tolerate, or vice versa. It also makes rollback safe because the prior version still runs against the expanded schema.",
     "fs": "I use expand/contract: add-before-use, drop-after-unused, so mixed old/new versions and rollback both work against the schema.",
     "fj": "I just ALTER the table and deploy the new code together.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Walk through renaming a column with zero downtime using expand/contract.",
+        "a": "Don't rename in place. Expand: add the new column, deploy code that writes to both old and new (dual-write) and backfill existing rows. Then deploy code that reads from new only. Contract: once no code touches the old column, drop it in a later release. Each step keeps mixed code versions working, which an in-place `RENAME` would instantly break for the version that doesn't know the new name."
+      },
+      {
+        "q": "Why is adding a NOT NULL column with a default risky on a large table, even though it seems compatible?",
+        "a": "On some databases/versions, adding a `NOT NULL` column with a non-constant default rewrites the whole table and takes a long lock, causing a write outage on a big table, the opposite of zero-downtime. The safe path is add it nullable, backfill in batches, then add the constraint. Postgres has optimized constant-default adds, but you still verify the migration is non-blocking before shipping."
+      },
+      {
+        "q": "How does expand/contract make rollback safe, specifically?",
+        "a": "Because the expand step only adds, the schema is a superset that the prior code version already tolerates, it just ignores the new column. So if you roll back to the old artifact, it still runs correctly against the expanded schema. You never `contract` (drop) until the old version is permanently retired, so there's never a moment where rolling back hits a schema the old code can't handle."
+      }
+    ]
   },
   {
     "q": "How do you build a container image inside a GitHub Actions pipeline?",
@@ -243,6 +481,20 @@
           "    cache-from: type=gha",
           "    cache-to: type=gha,mode=max"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the difference between cache-to mode=max and mode=min, and when does max bite you?",
+        "a": "`mode=min` caches only layers for the final image stage; `mode=max` caches all intermediate stages too, including build-only stages, giving better reuse for multi-stage builds. The cost is a larger cache that can hit the GitHub Actions cache size limit and get evicted, sometimes making max slower than min for big builds. You pick based on how much your build benefits from intermediate-stage reuse."
+      },
+      {
+        "q": "Why tag by github.sha rather than the branch name or a build number?",
+        "a": "The commit SHA is immutable and uniquely traces the image back to exact source, so the artifact is reproducible and auditable. Branch names move and build numbers can reset or collide across reruns. You can add friendly tags too, but the SHA is the stable identity later promotion and provenance hang off of. It cements 'build once, deploy many'."
+      },
+      {
+        "q": "How would BuildKit layer caching defeat reproducibility if you're not careful?",
+        "a": "Cached layers can mask nondeterminism: a `RUN apt-get install` without pinned versions may have been cached months ago, so the image silently uses old packages while a fresh build would pull newer ones, two builds of the same Dockerfile diverge. For reproducibility you pin package versions and base images by digest, so the cache reflects deterministic inputs rather than hiding drift."
       }
     ]
   },
@@ -266,6 +518,20 @@
           "        >> $GITHUB_OUTPUT"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is it dangerous to pass a secret value through a job output?",
+        "a": "Job outputs are not masked the way `secrets` are and are visible in the run's logs and the workflow context, so passing a secret through `outputs` can leak it. Secrets should flow via the encrypted secret store and be read directly in each job that needs them, or via `secrets: inherit` for reusable workflows. Outputs are for non-sensitive values like tags and versions only."
+      },
+      {
+        "q": "Why use artifacts instead of the dependency cache to hand a built binary to the deploy job?",
+        "a": "The cache is keyed and best-effort: it can miss, be evicted, or be shared in ways that make it unreliable for a specific build's output, and it's scoped to dependency reuse, not handoff. Artifacts are an explicit, run-scoped store designed to pass build products between jobs deterministically. Relying on the cache for handoff creates a build that silently breaks on a cache miss."
+      },
+      {
+        "q": "Job outputs have a size limit. What do you do for a large JSON result that exceeds it?",
+        "a": "Outputs are capped (the total `GITHUB_OUTPUT` and per-output sizes are limited), so for a large payload you write it to a file and pass it via `upload-artifact`/`download-artifact`, then have the consuming job read the file. Outputs are for short scalars like a tag or version; anything large goes through the artifact path."
+      }
     ]
   },
   {
@@ -283,6 +549,20 @@
           "  cancel-in-progress: false"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Why is cancel-in-progress: true dangerous for a deploy but right for PR CI?",
+        "a": "Cancelling a deploy mid-flight can leave the environment half-updated, some instances new, some old, with no clean state, so deploys must finish or fail atomically, hence `false` (queue instead). PR CI has no such side effect: a newer push makes the old run's result irrelevant, so cancelling it saves runner minutes. The risk is state mutation, which deploys have and CI checks don't."
+      },
+      {
+        "q": "With cancel-in-progress: false and rapid pushes, what happens to the queued runs?",
+        "a": "Only one run is pending at a time per group: a new run queues behind the running one, and if another arrives, the older pending run is cancelled, keeping just the latest queued. So you don't pile up a backlog of deploys; you get the in-flight one plus the most recent request. You design the group key so this serialization happens per environment."
+      },
+      {
+        "q": "How do you choose the concurrency group key so staging and prod don't block each other?",
+        "a": "Include the environment in the key, e.g. `group: deploy-${{ github.event.inputs.env }}` or a static `deploy-prod` vs `deploy-staging`, so each environment serializes independently. A too-coarse key (one `deploy` group for all environments) would needlessly queue a staging deploy behind prod. The key defines the serialization boundary, so it should match the resource you're protecting."
+      }
     ]
   },
   {
@@ -290,7 +570,21 @@
     "a": "Adding SAST, dependency, and image-vulnerability scans (e.g. CodeQL, Trivy) to the pipeline shifts security left so issues are caught before deploy. To avoid drowning teams, you gate the build only on high/critical severity and on newly introduced findings, not the entire pre-existing backlog. Results feed dashboards and PR annotations, and you set SLAs to burn down lower-severity items. The scan acts as a gate before promotion to higher environments.",
     "fs": "I fail the build only on new high/critical findings and track the rest with SLAs, so scanning gates promotion without halting all work.",
     "fj": "Security scanning slows us down, so we run it manually once in a while.",
-    "level": "Sr"
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you distinguish a 'new' finding from the existing backlog so you only gate on new ones?",
+        "a": "You compare the PR's scan against a baseline of the target branch, so only findings the change introduces fail the build, often via the tool's diff/delta mode or a stored baseline. CodeQL on `pull_request` can annotate only new alerts; Trivy can ignore known IDs via an ignore file. Gating on the diff keeps the legacy backlog from blocking every unrelated PR."
+      },
+      {
+        "q": "What's the difference between SAST and SCA, and why do you usually need both?",
+        "a": "SAST (e.g. CodeQL) analyzes your own source for vulnerable patterns like injection. SCA / dependency scanning (e.g. Trivy, Dependabot) finds known CVEs in third-party libraries and base images. Most real risk lives in dependencies, but SAST catches bugs you write yourself, so they cover disjoint surfaces. Image-vulnerability scanning extends SCA to the OS packages baked into the container."
+      },
+      {
+        "q": "A critical CVE has no fix available yet and is blocking your release. What are your options?",
+        "a": "You triage exploitability: if the vulnerable code path isn't reachable in your usage, you can risk-accept with a documented, time-boxed exception (an ignore entry with an expiry) rather than block indefinitely. Otherwise you mitigate (compensating controls, WAF rule, disable the feature) or pin to a non-vulnerable version. The gate should allow auditable exceptions so a single unfixable CVE doesn't halt all delivery."
+      }
+    ]
   },
   {
     "q": "What's the difference between continuous integration, continuous delivery, and continuous deployment?",
@@ -298,7 +592,21 @@
     "fj": "CI/CD is one thing, it just means automated deploys.",
     "fs": "CI = integrate + test on every push; delivery = always releasable with a manual gate; deployment = the same with the gate removed, so prod ships automatically.",
     "level": "Jr",
-    "asked": 20
+    "asked": 20,
+    "followups": [
+      {
+        "q": "What has to be true about your test suite before continuous deployment is safe?",
+        "a": "The pipeline must be the sole trustworthy gate, so you need high-confidence automated coverage (unit + integration + critical E2E), reliable health checks, and an automatic rollback or feature-flag kill switch. Flaky tests or gaps mean a bad change ships unattended. Continuous deployment essentially says 'I trust my pipeline more than a human reviewer at deploy time,' which only holds with strong signals."
+      },
+      {
+        "q": "Can you do continuous deployment while still controlling when users see a feature?",
+        "a": "Yes, that's exactly where feature flags fit: every merge auto-deploys to prod (continuous deployment), but new functionality ships dark behind a flag and is released to users separately. So deploy is automatic and release is controlled. This decouples the engineering cadence from the product decision, which is what makes aggressive continuous deployment palatable."
+      },
+      {
+        "q": "Why is frequent merging (the 'integration' in CI) the prerequisite for both CDs?",
+        "a": "If branches live for weeks, you get big-bang merges and the trunk is rarely in a known-good state, so it can't be 'always releasable.' Frequent small merges keep the trunk green and integrated, which is the foundation continuous delivery and deployment build on. Without real CI, the CDs are just automated deploys of poorly-integrated code."
+      }
+    ]
   },
   {
     "q": "What is the test pyramid and why does it shape how you run tests in CI?",
@@ -306,7 +614,21 @@
     "fj": "I'll just write end-to-end tests since they cover everything.",
     "fs": "I put most coverage in fast unit tests and keep E2E thin, so CI fails in seconds and points precisely at the break instead of being slow and flaky.",
     "level": "Jr",
-    "asked": 14
+    "asked": 14,
+    "followups": [
+      {
+        "q": "Why does an E2E test point less precisely at a failure than a unit test?",
+        "a": "An E2E test exercises many layers at once (UI, services, DB), so a red E2E only tells you something in the whole chain broke, not which component. A failing unit test isolates one function, so the defect's location is obvious. That's why a top-heavy pyramid is slow to debug: failures are diffuse, and you spend time localizing rather than fixing."
+      },
+      {
+        "q": "Where do contract tests fit, and what problem do they solve that the pyramid layers don't?",
+        "a": "Contract tests sit between unit and integration: they verify a service honors the API contract its consumers expect, without spinning up the full system. They catch integration breakages (a provider changing a response shape) at near-unit speed and isolation, filling the gap where pure unit tests miss inter-service drift but full E2E is too slow. Tools like Pact codify these consumer-driven contracts."
+      },
+      {
+        "q": "E2E tests are flaky and people start re-running until green. What's the real fix?",
+        "a": "Blind reruns mask nondeterminism and erode trust in the suite. The fix is to attack the flake source: replace timing `sleep`s with explicit waits, control test data and isolation, stabilize the environment, and push assertions down to faster, deterministic layers so fewer flows need E2E at all. Quarantine persistently flaky tests rather than letting them poison the required check."
+      }
+    ]
   },
   {
     "q": "Explain rolling deployment and how it differs from blue-green and canary.",
@@ -314,7 +636,21 @@
     "fj": "Rolling, blue-green, and canary all just mean a gradual release.",
     "fs": "Rolling updates the fleet in batches with no duplicate stack; blue-green is an instant full cutover, canary is a metric-gated slice. Rolling needs mixed-version tolerance and rolls back batch by batch.",
     "level": "Mid",
-    "asked": 13
+    "asked": 13,
+    "followups": [
+      {
+        "q": "In Kubernetes, what do maxUnavailable and maxSurge control during a rolling update?",
+        "a": "`maxUnavailable` caps how many pods can be down at once during the roll, protecting capacity; `maxSurge` caps how many extra pods above the desired count can be spun up to add the new version before removing old ones. Together they trade rollout speed against available capacity: high surge updates faster but needs spare resources, low unavailable keeps more serving but rolls slower."
+      },
+      {
+        "q": "Why is rolling rollback slower than a blue-green flip, and what does that imply for risky releases?",
+        "a": "Rolling rollback re-deploys the old version batch by batch, so you crawl back through the same staged process while the bad version still serves part of the fleet. Blue-green keeps the old stack warm, so rollback is one LB flip. For a high-risk release where you need instant escape, blue-green or a feature-flag kill switch beats rolling's gradual reversal."
+      },
+      {
+        "q": "Why does a readiness probe matter so much during a rolling deploy?",
+        "a": "The rollout advances each batch only when new pods report ready, so a correct readiness probe prevents traffic from hitting a pod that's still warming up or wedged. A missing or too-lenient probe lets the roll march on while sending requests to broken pods, causing errors mid-deploy. The probe is the health gate that makes 'comes up healthy before the next batch' actually true."
+      }
+    ]
   },
   {
     "q": "Compare trunk-based development with GitFlow. Which suits CI/CD and why?",
@@ -322,7 +658,21 @@
     "fj": "GitFlow is the modern best practice with its release and develop branches.",
     "fs": "Trunk-based keeps main always releasable with tiny frequent merges, which is what 'continuous integration' actually means. GitFlow's long-lived branches delay integration and cause big-bang merge pain.",
     "level": "Mid",
-    "asked": 15
+    "asked": 15,
+    "followups": [
+      {
+        "q": "If you commit unfinished work to trunk daily, how do you keep main releasable?",
+        "a": "You hide incomplete features behind feature flags (off in prod) and use branch-by-abstraction for larger refactors, so the half-built code is merged but inert. Combined with a green pipeline gating every merge, the trunk stays deployable even while features are in progress. Trunk-based development relies on flags precisely because it forbids long-lived branches."
+      },
+      {
+        "q": "Trunk-based eliminates the big merge, but what's the cost of so many merges to main?",
+        "a": "You need fast, reliable CI on every push and strong test coverage, since the trunk is the integration point and a broken merge blocks everyone. Merge frequency also demands good branch protection (required checks, maybe merge queues) to avoid landing conflicting changes. The discipline shifts from merge mechanics to keeping the pipeline fast and the trunk green."
+      },
+      {
+        "q": "Is GitFlow ever the right choice?",
+        "a": "Yes, for software with discrete versioned releases and multiple supported versions in the field, like installed desktop apps, libraries with semver support branches, or firmware, where you genuinely maintain release branches and ship on a schedule. The long-lived branches map to real release lifecycles there. It's a poor fit for a continuously-deployed web service, where trunk-based wins."
+      }
+    ]
   },
   {
     "q": "What does 'pipeline as code' mean and why is it better than clicking through a CI UI?",
@@ -345,6 +695,20 @@
           "    secrets: inherit"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "The reusable workflow is pinned to @v1. What's the trade-off between pinning a tag versus a commit SHA?",
+        "a": "Pinning `@v1` lets the central team push fixes that all callers pick up automatically, but it also means a malicious or buggy change to that tag propagates everywhere instantly, a supply-chain risk. Pinning a full commit SHA makes the called workflow immutable and auditable but requires bumping each consumer to get updates. You choose based on how much you trust the source repo's controls."
+      },
+      {
+        "q": "What does secrets: inherit do, and why is it a thing to be careful with?",
+        "a": "`secrets: inherit` passes all the caller's secrets to the reusable workflow automatically, convenient but broad: the called workflow gets everything, even secrets it doesn't need, widening exposure if that workflow is compromised. The least-privilege alternative is to pass only specific named secrets. You use `inherit` only when you trust the called workflow and want to avoid plumbing each secret by hand."
+      },
+      {
+        "q": "Pipeline-as-code still drifts if your build depends on the runner image. How do you contain that?",
+        "a": "The YAML is versioned, but a GitHub-hosted runner image updates over time, so the same workflow can behave differently as tool versions shift. You contain it by explicitly setting up toolchains with `setup-*` actions pinned to versions, or by building in a pinned container image, so the environment is declared in code too. True reproducibility requires pinning the runtime, not just the pipeline steps."
+      }
     ]
   },
   {
@@ -365,6 +729,20 @@
           "      --defer \\",
           "      --state ./prod-manifest"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does --defer actually resolve a ref() to when a model is unchanged?",
+        "a": "With `--defer`, an unselected upstream `ref()` resolves to that model's relation in the deferred environment (production), per the `--state` manifest, instead of building it in the PR schema, so you read prod's existing table. By default deferral only kicks in if the object isn't already in your target; `--favor-state` forces using the state manifest's reference even when a local copy exists."
+      },
+      {
+        "q": "Why must the production manifest.json come from a real prod run, and what breaks if it's stale?",
+        "a": "`state:modified` is computed by diffing your project against that manifest, so it's only accurate if the manifest reflects current prod. A stale manifest mis-identifies what changed, either rebuilding unchanged models or, worse, skipping genuinely modified ones, undermining the test slice. So you persist `manifest.json` from each successful prod deploy (e.g. to S3) and fetch the latest for every CI comparison."
+      },
+      {
+        "q": "Slim CI tests only the changed slice. What kind of regression can it miss?",
+        "a": "It can miss a breaking change in a modified model that affects downstream models you didn't select, if your `+` selection or test coverage doesn't reach them, and it won't catch issues in unchanged models that depend on shifted data semantics rather than structure. The `+` operator (`state:modified+`) pulls downstream in to mitigate this, but a thin downstream test suite still leaves blind spots a full build would surface."
       }
     ]
   },
@@ -387,6 +765,20 @@
           "return legacyCheckout(ctx)"
         ]
       }
+    ],
+    "followups": [
+      {
+        "q": "Toggling a flag off is faster than a rollback. When is it actually NOT sufficient?",
+        "a": "A flag kill only reverts behavior the flag still guards. If the bad code ran with side effects (wrote corrupt data, sent emails, mutated shared state), or the change isn't behind the flag (a shared library, a migration, a startup path), flipping off doesn't undo the damage and you still need a real rollback or data fix. Flags reduce MTTR for gated, side-effect-free logic, not everything."
+      },
+      {
+        "q": "Why is flag debt a real cost, and how do you manage it?",
+        "a": "Each live flag is a runtime branch that multiplies code paths, complicates testing, and risks a stale flag being toggled wrong later. You manage it by treating flags as short-lived: tag them with an owner and expiry, remove the dead branch once a feature is fully rolled out or killed, and audit periodically. Permanent operational flags (kill switches) are kept deliberately; release flags should be retired."
+      },
+      {
+        "q": "How do flags interact with testing, since both code paths now ship to prod?",
+        "a": "Both branches are in the binary, so CI must exercise the flag on and off for the changed paths, not just the current default, or you ship an untested branch that activates the moment someone flips the flag. Teams test the new path in the on state (in CI and in a staging/canary cohort) before broad rollout. The flag doesn't remove the need to test new code; it changes when that code becomes user-visible."
+      }
     ]
   },
   {
@@ -395,7 +787,21 @@
     "fj": "As long as it builds green, reproducibility doesn't really matter.",
     "fs": "I pin deps by lockfile, base images by digest, and the toolchain, and run hermetically with no network, so the same commit yields a bit-identical artifact. That's what makes 'tested equals shipped' verifiable.",
     "level": "Sr",
-    "asked": 10
+    "asked": 10,
+    "followups": [
+      {
+        "q": "Name common sources of nondeterminism that break a bit-for-bit reproducible build.",
+        "a": "Embedded build timestamps, absolute build paths baked into binaries, non-deterministic file ordering in archives, randomized hash seeds, unpinned dependency or base-image versions, locale/timezone differences, and network-fetched 'latest' inputs. Reproducible-build tooling addresses these via `SOURCE_DATE_EPOCH`, path remapping, sorted archive entries, and full pinning. Each unpinned input is a place two builds can diverge."
+      },
+      {
+        "q": "How does hermeticity specifically improve security, beyond just determinism?",
+        "a": "No-network, declared-inputs builds prevent a compromised build step from exfiltrating secrets or pulling a malicious dependency mid-build, shrinking the attack surface and making provenance trustworthy. It's a core requirement climbing toward SLSA's higher build levels, where the build must be isolated so the provenance can't be forged. Determinism makes builds verifiable; hermeticity makes them tamper-resistant."
+      },
+      {
+        "q": "Why is reproducibility a prerequisite for verifying provenance, not just a nicety?",
+        "a": "Provenance claims 'this artifact came from this source via this builder.' A third party can only independently verify that claim by rebuilding from the same source and getting the same artifact, which requires reproducibility. Without it, you can't distinguish a legitimate artifact from a tampered one by re-running the build, so the provenance is harder to validate. Reproducibility turns provenance from a trusted assertion into a checkable fact."
+      }
+    ]
   },
   {
     "q": "What is SLSA, and how do signed build provenance and artifact signing defend the supply chain?",
@@ -416,6 +822,20 @@
           "    --certificate-identity $ID \\",
           "    $REG/app@$DIGEST"
         ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Cosign keyless signing avoids managing a private key. How does it prove who signed without one?",
+        "a": "Keyless signing uses Sigstore: cosign gets a short-lived certificate from Fulcio bound to your OIDC identity (e.g. the GitHub Actions workflow identity), signs, and records the signature in the Rekor transparency log. Verification checks the certificate's identity (`--certificate-identity` and issuer) and the Rekor entry. There's no long-lived key to leak; trust comes from the OIDC identity plus the public transparency log."
+      },
+      {
+        "q": "Why does cosign verify check --certificate-identity rather than just 'is it signed'?",
+        "a": "A valid signature alone only proves someone signed it; you also need to confirm who. `--certificate-identity` (plus `--certificate-oidc-issuer`) pins the signature to the expected builder identity, e.g. your specific GitHub workflow, so an attacker who signs with their own legitimate-but-different identity is rejected. Without identity binding, any Sigstore-issued signature would pass, defeating the point."
+      },
+      {
+        "q": "What's the difference between signing the image and attaching a provenance attestation?",
+        "a": "Signing proves the image's bytes are vouched for by a known identity; provenance is a structured attestation (SLSA format) describing how it was built, source repo, commit, builder, and inputs, signed the same way. Signing answers 'is this from someone I trust,' provenance answers 'was it built the way I expect from the source I expect.' Higher SLSA levels require the non-forgeable provenance, not just a signature."
       }
     ]
   }

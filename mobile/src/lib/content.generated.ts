@@ -68,6 +68,8 @@ export interface GeneratedCard {
     lines: string[];
     accent?: 'bug' | 'fix';
   }[];
+  /** Optional drill-down follow-up Q&As, revealed one tap deeper under the answer. */
+  followups?: { q: string; a: string }[];
 }
 
 export const GENERATED: Record<string, GeneratedCard[]> = {

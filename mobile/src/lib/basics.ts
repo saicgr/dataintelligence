@@ -75,6 +75,7 @@ function cardFromBasic(slug: string, c: GeneratedCard, i: number): SessionCard {
     fj: c.fj,
     fs: c.fs,
     code: c.code,
+    followups: c.followups,
   };
 }
 
