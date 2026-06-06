@@ -1,0 +1,792 @@
+[
+  {
+    "q": "Explain the difference between INNER JOIN, LEFT JOIN, RIGHT JOIN, and FULL OUTER JOIN. When would you use each?",
+    "a": "INNER JOIN returns only rows that match in both tables, dropping unmatched rows. LEFT JOIN keeps all rows from the left (anchor) table with NULLs where the right has no match, and RIGHT JOIN is its mirror that I usually rewrite as a LEFT JOIN by swapping table order for readability. FULL OUTER JOIN returns all rows from both sides with NULLs where either has no match, which is ideal for reconciliation and finding unmatched rows. My decision rule is to start with INNER unless I need to preserve unmatched rows, use LEFT when the master table should never lose rows, and reserve FULL OUTER for diff or audit queries.",
+    "fj": "INNER JOIN is the default, I use it for everything.",
+    "fs": "I check first whether I need to preserve unmatched rows — then LEFT JOIN is the right default when the left table is the anchor.",
+    "level": "Jr",
+    "asked": 29
+  },
+  {
+    "q": "How does SQL handle NULL? What are the gotchas with NULL in WHERE clauses, COUNT, and JOINs?",
+    "a": "SQL uses three-valued logic, so any comparison with NULL yields UNKNOWN, not FALSE, which is why you must write WHERE status IS NULL rather than = NULL. COUNT(column) skips NULLs while COUNT(*) counts every row, a common source of wrong totals, and aggregates like SUM and AVG ignore NULLs entirely. NULLs in join keys never match because NULL = NULL is UNKNOWN, so those rows silently drop or return NULLs depending on join type. The fixes are COALESCE for a default value and IS NULL / IS NOT NULL for membership checks.",
+    "fj": "WHERE col = NULL",
+    "fs": "WHERE col IS NULL — comparing to NULL with = always returns UNKNOWN, never TRUE.",
+    "level": "Jr",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- = NULL is UNKNOWN, never TRUE",
+          "WHERE status = NULL    -- 0 rows",
+          "WHERE status IS NULL   -- correct",
+          "",
+          "SELECT COUNT(*),        -- all rows",
+          "       COUNT(status)    -- skips NULLs",
+          "FROM orders;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Walk me through how GROUP BY and aggregate functions work. What can and can't you put in the SELECT list?",
+    "a": "GROUP BY collapses all rows sharing the same grouped values into one output row, then applies aggregates like SUM, COUNT, and AVG per group. Every non-aggregated column in the SELECT list must appear in the GROUP BY, otherwise the engine can't decide which value to show for the group. Use WHERE to filter before grouping and HAVING to filter after aggregation, following the logical order FROM, WHERE, GROUP BY, HAVING, SELECT, ORDER BY. COUNT(DISTINCT col) counts unique non-NULL values, which is what you want for distinct entities.",
+    "fj": "I can put any column in SELECT with GROUP BY.",
+    "fs": "Only columns in the GROUP BY or wrapped in an aggregate — otherwise it's undefined which value to return.",
+    "level": "Jr",
+    "asked": 19,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- region not grouped -> error",
+          "SELECT region, SUM(amt)",
+          "FROM sales GROUP BY dept;",
+          "",
+          "-- valid: grouped or aggregated",
+          "SELECT dept, SUM(amt)",
+          "FROM sales GROUP BY dept;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "DISTINCT vs GROUP BY — when would you choose one over the other for deduplication?",
+    "a": "DISTINCT removes duplicate rows from the full result set and is cleanest when you just need a unique list with no aggregation. GROUP BY collapses rows and lets you apply aggregates per group, so it's the right choice when you want uniqueness plus a count or sum. Neither lets you control which duplicate survives, so when you need the most recent row per entity you reach for a window function like ROW_NUMBER(). Performance is close on modern engines, so let intent and readability drive the choice rather than premature optimization.",
+    "fj": "DISTINCT is always the best way to deduplicate.",
+    "fs": "DISTINCT is great for simple dedup; when I need to control which duplicate survives, I use ROW_NUMBER() partitioned on the key.",
+    "level": "Mid",
+    "asked": 14
+  },
+  {
+    "q": "How do you choose between using a subquery and a JOIN for a filtering task?",
+    "a": "A JOIN reads best when you need columns from both tables or are doing a many-to-one lookup, while a subquery with IN or EXISTS is cleaner when you only need the outer table's columns for a membership test. Prefer EXISTS over IN when the inner query can be large or might contain NULLs, since NOT IN with a NULL silently returns no rows. On modern optimizers the performance difference is usually negligible, so readability is the primary driver. Avoid correlated subqueries in SELECT that run once per row, rewriting them as a JOIN or window function instead.",
+    "fj": "I always use IN for filtering.",
+    "fs": "I prefer EXISTS for large inner sets and especially when the inner query might have NULLs — NOT IN + NULL silently kills all rows.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "NOT IN + NULL kills all rows",
+        "accent": "bug",
+        "lines": [
+          "SELECT * FROM orders",
+          "WHERE cust_id NOT IN (",
+          "  SELECT cust_id FROM banned",
+          ");  -- any NULL -> 0 rows"
+        ]
+      },
+      {
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "SELECT * FROM orders o",
+          "WHERE NOT EXISTS (",
+          "  SELECT 1 FROM banned b",
+          "  WHERE b.cust_id = o.cust_id",
+          ");"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "WHERE vs HAVING — what's the difference, and why can't you filter an aggregate in WHERE?",
+    "a": "WHERE filters individual rows before grouping, so aggregate results don't exist yet and WHERE COUNT(*) > 5 is a syntax error. HAVING filters after GROUP BY and can reference aggregates because they've already been computed. This falls out of SQL's logical execution order: FROM, WHERE, GROUP BY, HAVING, SELECT, ORDER BY. For performance, push row-level filters into WHERE to shrink the input before grouping, and use both clauses together when you have both row-level and aggregate conditions.",
+    "fj": "They're basically the same.",
+    "fs": "WHERE is pre-aggregation, HAVING is post — the key is the logical execution order of SQL.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- WHERE can't see aggregates",
+          "WHERE COUNT(*) > 5   -- error",
+          "",
+          "SELECT dept, COUNT(*)",
+          "FROM emp WHERE active",
+          "GROUP BY dept",
+          "HAVING COUNT(*) > 5;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Find the second-highest salary per department. Walk me through your query and the edge cases.",
+    "a": "I'd use DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) in a CTE, then filter where the rank equals 2 in the outer query. DENSE_RANK is right because it gives tied top salaries rank 1 and the next distinct value rank 2, whereas RANK leaves a gap and ROW_NUMBER breaks ties arbitrarily. Before writing anything I'd clarify whether they mean the second distinct salary value or the second-ranked person, since that changes the function. I'd also name edge cases like departments with fewer than two distinct salaries returning no row and ties at rank 2 returning multiple rows.",
+    "fj": "I'd use LIMIT 1 OFFSET 1.",
+    "fs": "That breaks per-group and on ties — I'd use DENSE_RANK partitioned by department, after asking which tie behavior is expected.",
+    "level": "Sr",
+    "asked": 33,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "WITH r AS (",
+          "  SELECT dept, emp, salary,",
+          "    DENSE_RANK() OVER (",
+          "      PARTITION BY dept",
+          "      ORDER BY salary DESC) rk",
+          "  FROM emp)",
+          "SELECT * FROM r WHERE rk = 2;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Write a query to compute a 7-day rolling average of daily revenue. What window frame do you use and why?",
+    "a": "I'd use AVG(daily_revenue) OVER (ORDER BY date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW), which averages the current day plus the six prior rows for seven total. ROWS counts physical rows while RANGE counts rows sharing the same ORDER BY value, so on one-row-per-day data they behave the same, but ROWS BETWEEN 6 PRECEDING gives a wrong calendar window when days are missing. The production fix is a date spine: pre-generate every calendar date and LEFT JOIN revenue onto it so gaps fill with 0 or NULL before applying the window. Add a PARTITION BY when you want per-entity rolling averages.",
+    "fj": "I'd use a subquery with WHERE date >= current - 7.",
+    "fs": "A window function with ROWS BETWEEN 6 PRECEDING is cleaner and more composable — and I'd add a date spine to handle gaps.",
+    "level": "Sr",
+    "asked": 24,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "SELECT date, daily_revenue,",
+          "  AVG(daily_revenue) OVER (",
+          "    ORDER BY date",
+          "    ROWS BETWEEN 6 PRECEDING",
+          "    AND CURRENT ROW) AS avg7",
+          "FROM revenue;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you use LAG() and LEAD() to calculate period-over-period change, and what are the edge cases?",
+    "a": "LAG(col, N) returns the value N rows behind the current row within the window and LEAD(col, N) looks N rows ahead, letting you compare to a prior period in one pass instead of a self-join. For year-over-year change you'd write revenue - LAG(revenue, 1) OVER (PARTITION BY product ORDER BY year). The main edge case is the first N rows of each partition returning NULL because no prior period exists, which you handle by excluding or filling depending on the metric's meaning. For percentage change, guard division by zero with NULLIF on the prior value.",
+    "fj": "I'd self-join the table on row_number() - 1.",
+    "fs": "LAG() does this in one scan and is far more readable — self-joins on offsets are the pre-window-function workaround.",
+    "level": "Mid",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "SELECT year, revenue,",
+          "  revenue - LAG(revenue) OVER (",
+          "    PARTITION BY product",
+          "    ORDER BY year) AS yoy",
+          "-- pct change: divide by",
+          "-- NULLIF(prior,0) to dodge /0",
+          "FROM sales;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a CTE, how does it differ from a subquery, and when would you use a temp table instead?",
+    "a": "A CTE names a logical step with WITH so you can reference it by name, which mostly improves readability over a nested subquery on modern engines. The nuance is that on some databases, like older Postgres, a CTE was an optimization fence that materialized once and blocked predicate pushdown, so you should know your engine. A temp table is physically written and pays a write cost, earning its keep when the intermediate is large, reused across multiple statements, or needs an index. Use a CTE for readability within a single query and a temp table for large reused intermediates in multi-statement scripts.",
+    "fj": "CTEs are just slower subqueries wrapped in WITH.",
+    "fs": "They're mostly readability, but can be an optimization fence on some engines — worth checking behavior when tuning.",
+    "level": "Sr",
+    "asked": 15
+  },
+  {
+    "q": "When do you reach for a window function versus GROUP BY? Walk me through the decision.",
+    "a": "GROUP BY collapses rows into one output row per group, while a window function preserves every input row and computes the aggregate alongside it. The decision heuristic is whether you need the detail rows: if yes, use a window function; if you only need the aggregate, use GROUP BY. Window functions are how you get each employee's salary next to the department average in a single pass, instead of an expensive self-join or correlated subquery. You can also combine them, aggregating with GROUP BY first and then applying a window over the result.",
+    "fj": "I use GROUP BY whenever I need a per-group calculation.",
+    "fs": "If I need per-group results while keeping every row, I use a window function — GROUP BY collapses the rows and I lose the detail.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- each row keeps detail +",
+          "-- its dept average alongside",
+          "SELECT emp, dept, salary,",
+          "  AVG(salary) OVER (",
+          "    PARTITION BY dept) AS avg",
+          "FROM emp;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your query returns far more rows than expected. How do you systematically debug it?",
+    "a": "I count rows at each join step by isolating joins one at a time until the count explodes, which pinpoints the problematic join. Then I check join-key uniqueness with GROUP BY join_key HAVING COUNT(*) > 1 to confirm a fan-out, and verify the join condition isn't accidentally a cross join. The fix is to deduplicate the non-unique side before joining with ROW_NUMBER() = 1, aggregate it down to the right grain, or switch to an EXISTS membership check. Adding DISTINCT only masks the symptom rather than fixing the underlying grain mismatch.",
+    "fj": "I'd just add DISTINCT.",
+    "fs": "DISTINCT masks the symptom. I'd find which join is fanning out, check the join key for uniqueness, then fix the grain — deduplicate before joining or use EXISTS if I only need membership.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- is the join key unique?",
+          "SELECT join_key, COUNT(*)",
+          "FROM right_tbl",
+          "GROUP BY join_key",
+          "HAVING COUNT(*) > 1;",
+          "-- >1 means it fans out"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "RANK vs DENSE_RANK vs ROW_NUMBER — what is the difference, when does the choice matter, and give me an example where each gives a different answer?",
+    "a": "ROW_NUMBER assigns a unique sequential integer with ties broken arbitrarily, RANK gives tied rows the same rank but skips subsequent numbers leaving gaps, and DENSE_RANK shares the rank with no gaps. For tied salaries of 90, 90, 80 you get ROW_NUMBER 1, 2, 3; RANK 1, 1, 3; and DENSE_RANK 1, 1, 2. The choice matters whenever ties exist, which is almost always in real data. The rule of thumb is ROW_NUMBER for deduplication, DENSE_RANK for the Nth distinct value, and RANK for leaderboards where gaps are meaningful.",
+    "fj": "RANK and DENSE_RANK are basically the same.",
+    "fs": "RANK leaves gaps, DENSE_RANK doesn't — with salaries (90, 90, 80): RANK gives 1, 1, 3; DENSE_RANK gives 1, 1, 2. That difference changes the answer for 'second-highest salary.'",
+    "level": "Sr",
+    "asked": 21,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- salaries 90, 90, 80:",
+          "ROW_NUMBER -> 1, 2, 3",
+          "RANK       -> 1, 1, 3  (gap)",
+          "DENSE_RANK -> 1, 1, 2  (no gap)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A production query is slow. Walk me through how you'd diagnose and optimize it — from first principles.",
+    "a": "I read the execution plan first with EXPLAIN ANALYZE or the warehouse equivalent rather than guessing, looking for sequential scans on large tables, far-off row estimates from stale statistics, and expensive hash joins or unindexed sorts. Then I fix in priority order: add or push down filters to shrink the working set, index the right columns including covering indexes that avoid heap lookups, rewrite correlated subqueries into joins or window functions, pre-aggregate hot patterns, and ensure partition pruning. The instinct to resist is throwing more compute at it before understanding the bottleneck. Covering indexes help read-heavy queries but trade off write cost.",
+    "fj": "I'd add an index and see if that helps.",
+    "fs": "I'd open the execution plan first — the plan tells me whether the bottleneck is a missing index, a bad join strategy, or something else entirely.",
+    "level": "Sr",
+    "asked": 27
+  },
+  {
+    "q": "Given a table of user login dates, find all users who logged in on at least 3 consecutive calendar days, and return the start and end of each streak. Walk me through your approach.",
+    "a": "This is the gaps-and-islands pattern: subtract a per-user ROW_NUMBER from the login date, so consecutive dates share a constant difference that becomes the grouping key. First I deduplicate to one row per user-date, since multiple same-day logins get different row numbers and corrupt the key. Then I assign row numbers ordered by date, compute login_date minus row number as the group key, and aggregate per user and key with MIN as the streak start, MAX as the end, and COUNT, filtering HAVING COUNT(*) >= 3. I'd clarify whether same-day logins count once and whether any gap breaks the streak.",
+    "fj": "I'd self-join the table three times to check for three consecutive days.",
+    "fs": "Self-joins only work for exactly 3 days and don't scale. I'd use the row-number subtraction pattern to group consecutive dates as islands and filter on streak length.",
+    "level": "Sr",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "WITH r AS (",
+          "  SELECT user_id, login_date,",
+          "    login_date - ROW_NUMBER()",
+          "    OVER (PARTITION BY user_id",
+          "      ORDER BY login_date) grp",
+          "  FROM logins)",
+          "-- consecutive dates -> same grp"
+        ]
+      },
+      {
+        "lang": "sql",
+        "lines": [
+          "SELECT user_id,",
+          "  MIN(login_date) AS start,",
+          "  MAX(login_date) AS end_,",
+          "  COUNT(*) AS days",
+          "FROM r",
+          "GROUP BY user_id, grp",
+          "HAVING COUNT(*) >= 3;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "You have a large table with duplicate records and you need to deduplicate it, keeping only the most recent version of each entity. Walk me through your approach at scale.",
+    "a": "I use ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY updated_at DESC) in a CTE and filter where the rank equals 1, which deterministically keeps the most recent row per entity. At scale I avoid an in-place DELETE with NOT IN because it can lock the table for hours and overwhelm transaction logs, preferring a CTAS into a deduped table that I swap atomically. I'd ask what makes a record most recent and whether updated_at is reliable, since duplicate timestamps need a tiebreaker. In Snowflake or BigQuery, QUALIFY ROW_NUMBER() OVER (...) = 1 filters inline without a CTE.",
+    "fj": "I'd use DISTINCT.",
+    "fs": "DISTINCT deduplicates rows with identical columns — it can't pick the most recent version of an entity. ROW_NUMBER with an ORDER BY is the right tool.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- Snowflake/BigQuery: inline",
+          "SELECT * FROM events",
+          "QUALIFY ROW_NUMBER() OVER (",
+          "  PARTITION BY entity_id",
+          "  ORDER BY updated_at DESC",
+          ") = 1;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you pivot rows into columns in SQL without a PIVOT operator? Walk me through the pattern and tradeoffs.",
+    "a": "I use conditional aggregation: one MAX(CASE WHEN category = 'A' THEN value END) AS col_A expression per target column, grouped by the entity key. It works on every dialect because CASE returns the value for matching rows and NULL otherwise, and MAX ignores NULLs to pick the one real value per group. A static pivot is clear and version-controllable but breaks when new category values appear, while a dynamic pivot handles new values via runtime SQL generation at the cost of being hard to test and review. I'd clarify the output grain and which aggregate to use when an entity has multiple rows per category.",
+    "fj": "I'd export to Python and pivot there.",
+    "fs": "That's fine for ad-hoc, but in a pipeline I'd use conditional aggregation in SQL — it stays in the warehouse, is version-controlled, and handles the GROUP BY grain cleanly.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "SELECT entity_id,",
+          "  MAX(CASE WHEN cat='A'",
+          "      THEN value END) AS a,",
+          "  MAX(CASE WHEN cat='B'",
+          "      THEN value END) AS b",
+          "FROM t GROUP BY entity_id;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "An analyst gives you a vague spec: 'Show me active users over time.' What do you ask before writing a single line of SQL?",
+    "a": "I'd clarify what 'active' means, whether any login, a specific action, or a minimum session, since the definition drives the whole query. I'd pin down how a 'user' is identified and how to treat anonymous users, bots, and test accounts, plus the time granularity, rolling versus calendar window, and time zone. I'd confirm the metric type, like total active per period versus DAU/WAU/MAU or retention, and the grain so a user active five days counts once or five times. Finally I'd ask about downstream use, since a one-off exploration and a recurring dashboard warrant different investment.",
+    "fj": "Immediately writing `SELECT DATE, COUNT(DISTINCT user_id) FROM events GROUP BY 1`.",
+    "fs": "Asking 'what counts as active?', 'what time grain?', 'are bots filtered?', and 'how is this used?' before writing a character.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "How do you choose between indexing strategies in a relational database — B-tree, covering index, composite index — and how does that choice interact with query patterns?",
+    "a": "A B-tree is the default, good for equality, range, and sorting on filter and join columns. A composite index follows the leftmost prefix rule, so (a, b, c) supports filters on (a), (a, b), or (a, b, c) but not (b, c) alone, which means you put the equality or highest-selectivity column first. A covering index includes every column the query needs so the engine never touches the heap, eliminating the index-to-heap lookup. Every index speeds reads but slows writes, so I index aggressively on read-heavy OLAP tables and conservatively on write-heavy ones, profiling before deciding.",
+    "fj": "Just add an index on the slow column.",
+    "fs": "I check the query pattern first — column order for composite indexes matters (leftmost prefix), and I consider covering index columns to avoid heap lookups.",
+    "level": "Sr",
+    "asked": 16
+  },
+  {
+    "q": "How do you decide when to pre-aggregate data into a summary table versus computing on-the-fly at query time?",
+    "a": "On-the-fly is always fresh with zero storage and fits small data, infrequent queries, or tight freshness SLAs, while a pre-aggregated summary table pays an upfront compute cost for cheap reads on large or hot-path data. The decision weighs read frequency and compute cost against freshness tolerance and maintenance overhead. Materialized views automate refresh but restrict you to single-table, limited-function aggregations, so multi-table rollups need scheduled tasks with explicit orchestration. Pre-aggregating also shifts the grain, collapsing raw events to a daily-user level that makes downstream joins far cheaper.",
+    "fj": "Always pre-aggregate everything to make dashboards fast.",
+    "fs": "Pre-aggregation has a freshness cost and maintenance overhead — I compute the read-frequency × compute-cost trade-off before adding another scheduled refresh to manage.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "CTE vs subquery vs temp table — explain the differences in execution, optimization, and when you'd choose each.",
+    "a": "A subquery is inline and anonymous, fine for simple checks but unreadable when nested deeply. A CTE is named and reusable and, on modern engines like Postgres 12+, Snowflake, and BigQuery, is inlined by default so predicates push through, whereas older Postgres treated it as a materialized optimization fence. A temp table pays a write cost but materializes an expensive intermediate once, can be indexed, and gives the optimizer real row counts, making it right for multi-statement scripts. My judgment: CTE for readability in one query, MATERIALIZED CTE or temp table when a referenced-many-times intermediate is expensive, and a temp table across statements.",
+    "fj": "CTEs are always materialized.",
+    "fs": "Depends on the engine and version — modern Postgres (12+) and most cloud warehouses inline by default. You can force materialization explicitly when you want it.",
+    "level": "Sr",
+    "asked": 18
+  },
+  {
+    "q": "Write a recursive CTE to walk an org chart (employee -> manager) and return each employee's depth from the CEO. What are the parts, and how do you keep it from running forever?",
+    "a": "A recursive CTE has an anchor member that seeds the base rows (the CEO, where manager_id IS NULL) and a recursive member that joins the CTE back to the table, combined with UNION ALL; the engine iterates the recursive term until it produces no new rows. I track depth by selecting parent.depth + 1 in the recursive step. The real-world trap is a cycle — a bad row where A reports to B and B reports to A loops forever — so on Postgres 14+ I add a CYCLE clause (or carry a path array and check membership) to stop it; SQL Server caps with OPTION (MAXRECURSION). I'd also confirm whether they want every level or a bounded depth.",
+    "fj": "I'd just self-join the table a fixed number of times for each level.",
+    "fs": "A fixed chain of self-joins only handles a known max depth. I use WITH RECURSIVE with an anchor + recursive UNION ALL, and guard cycles with a CYCLE clause or a path array.",
+    "level": "Sr",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "WITH RECURSIVE org AS (",
+          "  SELECT id, mgr_id, 0 AS depth",
+          "  FROM emp WHERE mgr_id IS NULL",
+          "  UNION ALL",
+          "  SELECT e.id, e.mgr_id,",
+          "         o.depth + 1",
+          "  FROM emp e",
+          "  JOIN org o ON e.mgr_id = o.id",
+          ")"
+        ]
+      },
+      {
+        "lang": "sql",
+        "label": "Postgres 14+: stop cycles",
+        "accent": "fix",
+        "lines": [
+          "-- append to the CTE:",
+          "CYCLE id SET is_cyc",
+          "  USING path",
+          "SELECT * FROM org;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a LATERAL join (CROSS APPLY in SQL Server), and what does it let you do that a normal join can't? Give a top-N-per-group example.",
+    "a": "A LATERAL subquery in the FROM clause can reference columns from tables that appear before it, so it runs the right side once per left row — like a correlated subquery you can SELECT multiple columns and rows from. That makes it the clean way to do top-N per group: for each department, run an ORDER BY salary DESC LIMIT 3, which a plain join can't express because a join's right side can't see the left row's values. CROSS JOIN LATERAL drops left rows when the subquery returns nothing, while LEFT JOIN LATERAL keeps them with NULLs — the same MATCHED/unmatched semantics as inner vs left. In SQL Server the equivalents are CROSS APPLY and OUTER APPLY.",
+    "fj": "I'd use ROW_NUMBER() and filter rk <= 3 — LATERAL is just a fancier subquery.",
+    "fs": "ROW_NUMBER scans every row then filters; LATERAL with LIMIT can stop early per group and reads more naturally. The point of LATERAL is the right side can see the left row's columns.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "SELECT d.name, e.name, e.salary",
+          "FROM dept d",
+          "CROSS JOIN LATERAL (",
+          "  SELECT name, salary",
+          "  FROM emp",
+          "  WHERE emp.dept_id = d.id",
+          "  ORDER BY salary DESC",
+          "  LIMIT 3",
+          ") e;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "You need an idempotent upsert: insert new rows and update existing ones in one statement. How do you do it, and what breaks at scale?",
+    "a": "For a single-key upsert I reach for INSERT ... ON CONFLICT (key) DO UPDATE in Postgres (or INSERT ... ON DUPLICATE KEY UPDATE in MySQL), which is atomic per row and great for streaming writes. For batch sync where I also need to delete or apply different actions, I use MERGE (standard SQL, in Postgres 15+, Snowflake, BigQuery) with WHEN MATCHED / WHEN NOT MATCHED branches. The classic scale failure is a non-deduplicated source: if two source rows match the same target row, MERGE errors with 'must match at most one source row' on BigQuery/Snowflake (and is undefined-ish on others), so I pre-dedup the source with ROW_NUMBER = 1 on the merge key. ON CONFLICT needs a real unique constraint to fire.",
+    "fj": "I'd just DELETE the matching rows then INSERT — same result.",
+    "fs": "Delete-then-insert isn't atomic and churns the table; I use ON CONFLICT for key upserts or MERGE for batch sync, and always dedup the source on the merge key first.",
+    "level": "Mid",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Postgres: per-row upsert",
+        "lines": [
+          "INSERT INTO acct (id, bal)",
+          "VALUES (1, 100)",
+          "ON CONFLICT (id) DO UPDATE",
+          "  SET bal = EXCLUDED.bal;"
+        ]
+      },
+      {
+        "lang": "sql",
+        "label": "MERGE: batch sync",
+        "lines": [
+          "MERGE INTO tgt t",
+          "USING src s ON t.id = s.id",
+          "WHEN MATCHED THEN UPDATE",
+          "  SET t.bal = s.bal",
+          "WHEN NOT MATCHED THEN INSERT",
+          "  (id, bal) VALUES (s.id, s.bal);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Two engineers write a running total with SUM(amount) OVER (ORDER BY day) and get different numbers when there are duplicate days. What's the default window frame and how do you fix it?",
+    "a": "When you specify ORDER BY but no explicit frame, the SQL default is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW. RANGE treats all rows sharing the same ORDER BY value as peers, so two rows on the same day both get the full cumulative total through that day — they tie instead of stepping. To get a true row-by-row running total you switch to ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, and to make it deterministic across duplicate days add a tiebreaker like id to the ORDER BY. This RANGE-vs-ROWS default is one of the most common silent bugs in cumulative metrics.",
+    "fj": "ROWS and RANGE are the same thing, it doesn't matter which you write.",
+    "fs": "With ORDER BY the default frame is RANGE, which gives duplicate sort keys the same cumulative value. I use ROWS plus a tiebreaker column for a deterministic per-row running total.",
+    "level": "Mid",
+    "asked": 19,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "default RANGE ties duplicate days",
+        "accent": "bug",
+        "lines": [
+          "SUM(amt) OVER (ORDER BY day)",
+          "-- = RANGE UNBOUNDED PRECEDING",
+          "--   AND CURRENT ROW"
+        ]
+      },
+      {
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "SUM(amt) OVER (",
+          "  ORDER BY day, id",
+          "  ROWS BETWEEN UNBOUNDED",
+          "  PRECEDING AND CURRENT ROW)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "UNION vs UNION ALL — what's the difference, and why does it matter for performance?",
+    "a": "UNION concatenates two result sets and then removes duplicate rows, which forces a sort or hash-dedup pass over the combined output; UNION ALL just appends and does no dedup work. So UNION ALL is meaningfully cheaper, and I default to it whenever I know the inputs are already disjoint or duplicates are acceptable. Both require the same column count and compatible types across all SELECTs, with column names taken from the first query. Reaching for UNION 'to be safe' on large sets is a common silent performance tax — I only pay for the dedup when I actually need it.",
+    "fj": "I always use UNION so I don't get duplicates.",
+    "fs": "UNION pays for a dedup pass; if the inputs are disjoint I use UNION ALL and skip the sort entirely.",
+    "level": "Jr",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- dedups: sort/hash pass",
+          "SELECT id FROM a",
+          "UNION",
+          "SELECT id FROM b;",
+          "-- appends, no dedup (cheaper)",
+          "SELECT id FROM a",
+          "UNION ALL SELECT id FROM b;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does SELECT * cost you in production, and when is it actually fine?",
+    "a": "SELECT * reads and ships every column, so on a wide or columnar table it forces extra IO and can defeat a covering index that would otherwise satisfy the query from the index alone. It also makes the query fragile: a downstream ETL breaks or silently shifts columns when someone adds or reorders a column upstream, and it obscures intent in code review. I select explicit columns in any pipeline or application query so the contract is stable and the planner can prune. SELECT * is fine for ad-hoc exploration and EXISTS subqueries, where the column list is irrelevant.",
+    "fj": "SELECT * is fine, the database only returns what I need anyway.",
+    "fs": "It reads every column, can defeat a covering index, and breaks pipelines on schema change — I name columns explicitly in any persisted query.",
+    "level": "Jr",
+    "asked": 15
+  },
+  {
+    "q": "Explain three-valued logic in SQL. How do TRUE, FALSE, and UNKNOWN flow through WHERE, NOT, and CASE?",
+    "a": "SQL predicates evaluate to TRUE, FALSE, or UNKNOWN, where UNKNOWN arises any time NULL is compared. WHERE and JOIN keep only rows that evaluate to TRUE, so an UNKNOWN row is dropped exactly like a FALSE one — which is why NULLs silently disappear from filters. NOT UNKNOWN is still UNKNOWN, so wrapping a NULL comparison in NOT doesn't rescue the row, and that's the root of the NOT IN with NULL trap. A CASE with no matching WHEN and no ELSE returns NULL, so I add explicit IS NULL branches when NULLs are meaningful rather than letting them fall through.",
+    "fj": "NULL comparisons just return false, so the logic still works.",
+    "fs": "They return UNKNOWN, not FALSE — and WHERE drops UNKNOWN rows, while NOT UNKNOWN stays UNKNOWN, which is why NULLs vanish from filters.",
+    "level": "Jr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- TRUE / FALSE / UNKNOWN",
+          "1 = NULL      -> UNKNOWN",
+          "NOT (1 = NULL) -> UNKNOWN",
+          "-- WHERE keeps only TRUE rows",
+          "-- so NULL-key rows drop out"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you read an EXPLAIN ANALYZE plan? What's the first thing you look for?",
+    "a": "I read the plan bottom-up and inside-out, since leaf scans execute first and feed parent operators. The first thing I check is the gap between estimated and actual rows on each node: a planner that expects 10 rows but gets 100,000 has stale or missing statistics, and that bad cardinality is the usual root cause of a wrong join strategy or order. Then I look for the expensive operators — a Seq Scan on a large table, a sort or hash spilling to disk, or a nested loop whose inner side runs millions of times. EXPLAIN alone shows estimates; EXPLAIN ANALYZE actually runs the query and gives real timings and row counts, which is what I need to find the lie.",
+    "fj": "I look at the total cost number at the top and try to make it smaller.",
+    "fs": "I read bottom-up and compare estimated vs actual rows per node first — a big mismatch means stale stats, which is what misleads the planner into the wrong plan.",
+    "level": "Mid",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "EXPLAIN ANALYZE SELECT ...;",
+          "-- on each node compare:",
+          "--   rows=10 (estimate)",
+          "--   actual rows=98000",
+          "-- 4-order gap => stale stats,",
+          "-- run ANALYZE on the table"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Walk me through nested loop, hash join, and merge join. When does the optimizer pick each?",
+    "a": "Nested loop iterates the outer side and probes the inner once per row, so it wins when the outer side is tiny and the inner has an index on the join key — think a 50-row filter against a million-row table. Hash join builds an in-memory hash table on the smaller input then streams the larger past it, which is the optimizer's default for joining two large unsorted inputs on an equality key, as long as the hash fits in working memory. Merge join requires both inputs sorted on the join key and walks them in lockstep, so it's chosen when the rows already arrive sorted (e.g. from index scans) and it's the natural fit for range join conditions. The big failure mode is a bad row estimate picking a nested loop that then runs its inner side millions of times.",
+    "fj": "The database just picks the fastest join, I don't need to know how.",
+    "fs": "Nested loop for a tiny outer + indexed inner, hash for two big unsorted inputs on equality, merge when inputs are already sorted — and a bad cardinality estimate is what picks the wrong one.",
+    "level": "Mid",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- nested loop: small outer,",
+          "--   indexed inner (LIMIT-friendly)",
+          "-- hash: two large unsorted,",
+          "--   equality key, fits work_mem",
+          "-- merge: both sorted on key,",
+          "--   good for range joins"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "EXCEPT and INTERSECT — what do they do, and how do they differ from NOT IN and INNER JOIN with NULLs?",
+    "a": "INTERSECT returns rows present in both queries and EXCEPT returns rows in the first but not the second, both comparing entire rows and removing duplicates by default unless you add ALL. The key semantic difference from NOT IN is NULL handling: set operators treat two NULLs in the same position as equal, so EXCEPT correctly excludes a NULL-bearing row, whereas NOT IN with a NULL in the inner set collapses to UNKNOWN and returns nothing. Versus INNER JOIN, INTERSECT also matches on NULLs that a join would drop, and it dedups while a join can fan out. I use EXCEPT for clean set-difference and reconciliation, but note both queries must have matching column counts and compatible types.",
+    "fj": "EXCEPT is just a fancier NOT IN.",
+    "fs": "They differ on NULLs — set operators treat NULL=NULL as equal so EXCEPT excludes NULL rows, while NOT IN with a NULL returns nothing; EXCEPT also dedups whole rows.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- rows in A not in B,",
+          "-- NULL-safe and deduped",
+          "SELECT id, region FROM a",
+          "EXCEPT",
+          "SELECT id, region FROM b;",
+          "-- ALL keeps duplicates"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do GROUPING SETS, ROLLUP, and CUBE work, and how do you tell a subtotal NULL from a real NULL?",
+    "a": "GROUPING SETS lets you compute several independent groupings in one scan instead of UNION-ing separate GROUP BY queries; ROLLUP(a,b) is the hierarchical shorthand producing (a,b), (a), and the grand total, while CUBE generates every combination of the listed columns. The subtotal and total rows carry NULL in the columns that were rolled up, which is ambiguous if the data itself contains NULLs. The GROUPING(col) function disambiguates: it returns 1 when the NULL was generated by the rollup and 0 for a stored NULL, so I wrap output in CASE WHEN GROUPING(region)=1 THEN 'All' to label totals correctly. These are ANSI-standard and supported across Postgres, SQL Server, Oracle, and the cloud warehouses.",
+    "fj": "I'd just run separate GROUP BY queries and UNION the totals.",
+    "fs": "ROLLUP/CUBE do it in one pass, and I use GROUPING(col)=1 to distinguish a subtotal NULL from a real NULL in the data.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "SELECT region, product,",
+          "  SUM(amt),",
+          "  GROUPING(region) AS is_tot",
+          "FROM sales",
+          "GROUP BY ROLLUP(region, product);",
+          "-- is_tot=1 -> subtotal/total row"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A WHERE clause has a function on an indexed column and the query is slow. What's happening?",
+    "a": "Wrapping an indexed column in a function or expression — WHERE DATE(created_at) = '2026-01-01' or WHERE UPPER(email) = ... — makes the predicate non-SARGable, so the engine can't seek the B-tree and falls back to scanning every row and evaluating the function. The same thing happens with an implicit type cast when the column and literal types differ, forcing a per-row conversion that defeats the index. The fix is to keep the column bare and move the transformation to the literal side: WHERE created_at >= '2026-01-01' AND created_at < '2026-01-02'. If I genuinely need the function, I create an expression/functional index on UPPER(email) so the engine has something to seek.",
+    "fj": "It's slow because the table is big, I'd just add an index on the column.",
+    "fs": "The function on the column makes it non-SARGable so the index can't seek — I rewrite as a range on the bare column, or build an expression index.",
+    "level": "Mid",
+    "asked": 19,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "function blocks the index seek",
+        "accent": "bug",
+        "lines": [
+          "WHERE DATE(created_at)",
+          "  = '2026-01-01'  -- full scan"
+        ]
+      },
+      {
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "WHERE created_at >= '2026-01-01'",
+          "  AND created_at <  '2026-01-02'",
+          "-- bare column -> index seek"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Use NTILE and percentile functions to bucket customers into quartiles by spend. What are the edge cases?",
+    "a": "NTILE(4) OVER (ORDER BY spend) assigns each row a bucket from 1 to 4 by splitting the ordered rows into four as-equal-as-possible groups; when the row count isn't divisible, the earlier buckets each take one extra row. The subtlety is that NTILE splits by row count, not by value, so two customers with identical spend can land in different quartiles at a boundary — if I need value-based cut points I use PERCENTILE_CONT or PERCENTILE_DISC instead. PERCENTILE_CONT interpolates between values for a continuous estimate while PERCENTILE_DISC returns an actual data point. I'd also confirm tie-handling expectations and add a deterministic tiebreaker to the ORDER BY so the bucketing is reproducible.",
+    "fj": "NTILE splits customers by spend value into four ranges.",
+    "fs": "NTILE splits by row count, not value, so equal-spend rows can straddle a boundary — for value-based cutoffs I use PERCENTILE_CONT/DISC.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "SELECT cust_id, spend,",
+          "  NTILE(4) OVER (",
+          "    ORDER BY spend) AS quartile",
+          "FROM customers;",
+          "-- value cutoffs instead:",
+          "-- PERCENTILE_CONT(0.25) ..."
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A correlated subquery in the SELECT list runs once per row and is slow. How do you rewrite it?",
+    "a": "A correlated subquery references the outer row, so the engine re-executes it for every outer row — an O(N*M) pattern that crawls on large tables. When it's computing an aggregate like each order's count of customer orders, I rewrite it as a window function (COUNT(*) OVER (PARTITION BY customer_id)) that computes in a single pass, or as a GROUP BY derived table joined back once. For an EXISTS-style membership check the correlated form is usually fine because the optimizer can short-circuit and stop at the first match. The decision is whether I need an aggregate alongside detail rows — that's the window-function rewrite — versus a pure existence test, which I leave as EXISTS.",
+    "fj": "Correlated subqueries are fine, the optimizer handles them.",
+    "fs": "A correlated aggregate in SELECT reruns per row; I rewrite it as a window function or a joined GROUP BY for one pass — but I leave EXISTS membership checks alone.",
+    "level": "Sr",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "reruns per outer row",
+        "accent": "bug",
+        "lines": [
+          "SELECT o.id,",
+          "  (SELECT COUNT(*) FROM orders x",
+          "   WHERE x.cust=o.cust) AS n",
+          "FROM orders o;"
+        ]
+      },
+      {
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "SELECT o.id,",
+          "  COUNT(*) OVER (",
+          "    PARTITION BY o.cust) AS n",
+          "FROM orders o;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain transaction isolation levels and the anomalies each one prevents. Which would you pick?",
+    "a": "The four standard levels, from weakest to strongest, are READ UNCOMMITTED, READ COMMITTED, REPEATABLE READ, and SERIALIZABLE, and each removes one more concurrency anomaly. READ COMMITTED stops dirty reads but still allows non-repeatable reads and phantoms; REPEATABLE READ also stops non-repeatable reads but the standard still permits phantoms; SERIALIZABLE forbids all three and makes transactions behave as if run one at a time. Defaults differ by engine — Postgres and Oracle default to READ COMMITTED, MySQL InnoDB to REPEATABLE READ — and engine behavior varies: Postgres's REPEATABLE READ (snapshot isolation) actually blocks phantoms too. I default to READ COMMITTED and escalate to SERIALIZABLE only for money-movement or invariant-critical transactions, accepting more retries and contention.",
+    "fj": "I just use the default and don't worry about isolation.",
+    "fs": "READ COMMITTED stops dirty reads, REPEATABLE READ adds non-repeatable, SERIALIZABLE stops phantoms too — defaults differ (Postgres READ COMMITTED, MySQL REPEATABLE READ), and I escalate only for invariant-critical writes.",
+    "level": "Sr",
+    "asked": 21,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- anomalies by level:",
+          "-- READ COMMITTED: dirty read X",
+          "-- REPEATABLE READ: + non-repeat X",
+          "-- SERIALIZABLE: + phantom X",
+          "BEGIN ISOLATION LEVEL SERIALIZABLE;",
+          "-- ... ; COMMIT;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When is an index a bad idea? Give me cases where you'd deliberately not add one.",
+    "a": "Every index speeds reads but adds write amplification — each INSERT, UPDATE, or DELETE must also maintain the index — so on a write-heavy ingestion table I index conservatively and let analytics run on a downstream copy. I skip indexing low-cardinality columns like a boolean or status flag, where the optimizer often picks a scan anyway because the index doesn't filter enough to beat sequential IO. Small tables don't need indexes since a full scan is already cheap, and redundant indexes whose leading columns are covered by an existing composite just waste space and slow writes. Columnar warehouses like Snowflake and BigQuery don't even use traditional B-tree indexes; there you reach for clustering or partition pruning instead.",
+    "fj": "More indexes are always better, they only make things faster.",
+    "fs": "Indexes tax every write and barely help low-cardinality or tiny tables; I skip them on hot ingestion paths, and in columnar warehouses I use clustering/pruning, not B-trees.",
+    "level": "Sr",
+    "asked": 16
+  },
+  {
+    "q": "How do you handle dates, timestamps, and time zones in SQL without getting burned?",
+    "a": "I store timestamps in UTC using a timezone-aware type (TIMESTAMPTZ in Postgres) and convert to a local zone only at the presentation edge, because mixing local times in storage makes ranges and DST transitions ambiguous. I bucket by truncating with DATE_TRUNC('day', ts) rather than CAST to date when I need the grain to respect a session zone, and I filter with half-open ranges (ts >= start AND ts < end) to avoid the off-by-one and boundary issues of BETWEEN on timestamps. For age or duration I subtract timestamps or use date arithmetic functions, watching that adding a month is calendar-aware, not a fixed 30 days. The recurring bug is comparing a naive local timestamp against a UTC one and silently shifting every row by the offset.",
+    "fj": "I store local time and just compare the strings.",
+    "fs": "Store UTC with a tz-aware type, convert at the edge, and filter with half-open ranges — naive local-vs-UTC comparisons silently shift every row by the offset.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- store UTC, half-open range",
+          "WHERE ts >= '2026-01-01'",
+          "  AND ts <  '2026-02-01'",
+          "-- not BETWEEN (inclusive end)",
+          "SELECT DATE_TRUNC('day',",
+          "  ts AT TIME ZONE 'America/NY');"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Pivot rows to columns with a native PIVOT, then go the other way with UNPIVOT. What are the tradeoffs vs conditional aggregation?",
+    "a": "A native PIVOT (SQL Server, Oracle, Snowflake, BigQuery) rotates distinct values of one column into columns with an aggregate, which is more concise than the portable MAX(CASE WHEN ...) conditional-aggregation idiom but locks you to that dialect. Both share the same hard limit: the output columns must be known at parse time, so genuinely dynamic categories require generating the SQL at runtime, which is harder to test and review. UNPIVOT does the inverse, collapsing several columns back into label/value rows — useful for normalizing a wide denormalized table before it goes into a tidy model. I default to conditional aggregation for portability and readability, and use native PIVOT only when the dialect is fixed and the value set is stable.",
+    "fj": "PIVOT handles any number of categories automatically.",
+    "fs": "PIVOT and CASE both need the output columns known at parse time; truly dynamic categories need generated SQL. I prefer portable conditional aggregation unless the dialect is fixed.",
+    "level": "Sr",
+    "asked": 10,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "SELECT * FROM sales",
+          "PIVOT (SUM(amt)",
+          "  FOR region IN ('NA','EU'));",
+          "-- inverse: wide -> tall",
+          "... UNPIVOT (amt FOR region",
+          "  IN (na, eu));"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Design a composite index for a query that filters on two columns and sorts on a third. How do you order the columns?",
+    "a": "Composite indexes obey the leftmost-prefix rule, so an index on (a, b, c) can serve filters on (a), (a, b), or (a, b, c) but not (b) or (c) alone. I put equality-predicate columns first, then the column used for a range or sort, because once a range scan starts the index can no longer seek on columns to its right — only filter them. For an ORDER BY to be satisfied by the index without a separate sort, the index order (including ASC/DESC and NULLS ordering) has to match the requested sort. If the query also only needs a few columns, I append them to make it a covering index so the engine answers entirely from the index and skips the heap lookup. I verify the choice against the actual plan rather than guessing.",
+    "fj": "I'd just index all three columns separately.",
+    "fs": "Three single-column indexes can't serve the combined filter+sort; one composite ordered equality-cols, then range/sort col does, and appending the projected cols makes it covering.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "-- query: WHERE a=? AND b=?",
+          "--        ORDER BY c",
+          "CREATE INDEX ix ON t (a, b, c);",
+          "-- equality cols first, then sort",
+          "-- add INCLUDE (d) to cover SELECT d"
+        ]
+      }
+    ]
+  }
+]

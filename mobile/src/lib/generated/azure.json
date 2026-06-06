@@ -1,0 +1,553 @@
+[
+  {
+    "q": "In Azure Data Factory, what is the difference between a Copy activity and a Mapping Data Flow, and which integration runtime does each use?",
+    "a": "Copy activity moves data store-to-store with built-in connectors, format conversion, and column mapping; it can run on any IR (Azure, self-hosted, or via SHIR for on-prem). Mapping Data Flows do visual, no-code transformations (joins, aggregates, derived columns) and are compiled to Apache Spark, so they only run on an Azure IR (the data flow's compute spins up a managed Spark cluster). You cannot run a data flow on a self-hosted IR.",
+    "fs": "Copy = byte movement on any IR; Data Flow = Spark transforms, Azure IR only.",
+    "fj": "Saying 'just use Data Flow for everything' — ignoring that it spins a Spark cluster and costs/cold-starts far more than a Copy.",
+    "level": "Jr"
+  },
+  {
+    "q": "Your ADF pipeline must pull data from an on-prem SQL Server behind a corporate firewall. Which integration runtime do you use and why?",
+    "a": "A self-hosted integration runtime (SHIR), installed on a machine inside the corporate network. It makes outbound connections to ADF, so no inbound firewall ports are needed, and it bridges the on-prem source to the cloud. The Azure IR is fully managed but lives in Azure and cannot reach a private on-prem network; Azure-SSIS IR is only for lifting-and-shifting SSIS packages.",
+    "fs": "SHIR for on-prem; outbound-only, so no inbound firewall holes, and you patch/scale the host.",
+    "fj": "Reaching for Azure IR or 'open a firewall port' instead of SHIR's outbound model.",
+    "level": "Jr"
+  },
+  {
+    "q": "Compare Synapse dedicated SQL pool vs serverless SQL pool on billing and ideal workload.",
+    "a": "Dedicated SQL pool is provisioned compute measured in DWUs, billed per hour whether or not you query, with storage billed separately by TB; you pause it to stop compute charges. Serverless SQL pool has no provisioned compute — it's pay-per-TB-of-data-processed and is created with the workspace, so it costs nothing until a query runs. Dedicated fits consistent high-volume warehousing; serverless fits ad-hoc exploration over the data lake.",
+    "fs": "Dedicated = reserved DWUs billed by the clock (pause it!); serverless = $/TB scanned, $0 at idle.",
+    "fj": "Thinking serverless is always cheaper — a poorly-pruned query scanning the whole lake can cost more than a small dedicated pool.",
+    "level": "Mid"
+  },
+  {
+    "q": "A serverless SQL pool query over Parquet in the data lake is scanning far more data than expected and the per-TB bill is climbing. What do you check?",
+    "a": "Serverless bills by bytes processed, so the goal is to scan fewer bytes. Verify partition pruning via filepath()/filename() predicates and a partitioned folder layout, confirm columnar Parquet (not CSV) so only referenced columns are read, push predicates that the engine can prune, and use OPENROWSET with an explicit minimal schema and the right data types. CETAS to pre-aggregate hot result sets so repeated queries scan a small materialized table instead of the raw lake.",
+    "fs": "Drive down bytes-scanned: Parquet + partition pruning via filepath() + narrow column projection; CETAS the hot sets.",
+    "fj": "'Add an index' — serverless has no tables to index; you reduce cost by reducing bytes read.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "prune by partition folder",
+        "lang": "sql",
+        "lines": [
+          "SELECT cnt = COUNT_BIG(*)",
+          "FROM OPENROWSET(",
+          "  BULK 'logs/year=*/month=*/*.parquet',",
+          "  DATA_SOURCE='lake',",
+          "  FORMAT='PARQUET'",
+          ") WITH (id BIGINT) AS r",
+          "WHERE r.filepath(1) = '2026'",
+          "  AND r.filepath(2) = '05';"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "In a Synapse dedicated SQL pool, what is data distribution and how do you choose between HASH, ROUND_ROBIN, and REPLICATE?",
+    "a": "A dedicated pool is an MPP system that shards each table across 60 distributions. HASH distributes rows by a column's hash — use it for large fact tables, picking a high-cardinality, non-skewed join/group key so co-located joins avoid data movement. ROUND_ROBIN spreads rows evenly with no key — fine for staging/loads. REPLICATE copies the whole table to every compute node — use it for small dimension tables (<~2 GB) to eliminate shuffles in joins.",
+    "fs": "HASH big facts on the join key, REPLICATE small dims, ROUND_ROBIN staging — to kill data movement.",
+    "fj": "Leaving everything ROUND_ROBIN, then blaming the engine when every join shuffles across all 60 distributions.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "sql",
+        "lines": [
+          "CREATE TABLE dbo.Sales",
+          "WITH (",
+          "  DISTRIBUTION = HASH(CustomerKey),",
+          "  CLUSTERED COLUMNSTORE INDEX",
+          ")",
+          "AS SELECT * FROM staging.Sales;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why can a CLUSTERED COLUMNSTORE INDEX table in a dedicated SQL pool perform badly right after a trickle of small loads, and how do you fix it?",
+    "a": "Columnstore compresses rows into rowgroups of up to ~1,048,576 rows; many small inserts create undersized or open rowgroups and rows landing in the delta store, so scans read poorly-compressed segments. Load in large batches (ideally via COPY/PolyBase with enough rows per partition per distribution to fill rowgroups) and run ALTER INDEX ... REBUILD or REORGANIZE to merge small rowgroups. Ensure each of the 60 distributions gets enough rows (≈ millions) before expecting good segment quality.",
+    "fs": "Small drips = tiny/open rowgroups in the delta store; batch-load to fill ~1M-row rowgroups, then REBUILD.",
+    "fj": "Doing row-by-row INSERTs into a columnstore and expecting warehouse-grade scan speed.",
+    "level": "Sr"
+  },
+  {
+    "q": "What does the native Change Data Capture (CDC) top-level resource in Azure Data Factory give you that a normal pipeline does not?",
+    "a": "ADF pipelines are batch-only; the CDC resource is a separate top-level artifact that runs continuously in near real-time with a guided source-to-target mapping and configurable latency. It captures full-fidelity inserts/updates/deletes without you hand-coding watermark logic. Known limits: each source/target can be used once per mapping, complex types and the self-hosted IR are not supported, so on-prem sources needing SHIR aren't covered.",
+    "fs": "CDC resource = continuously-running, no-code change capture; pipelines are batch, so this is the streaming-ish path in ADF.",
+    "fj": "Confusing it with a tumbling-window pipeline that polls a watermark column on a schedule.",
+    "level": "Mid"
+  },
+  {
+    "q": "Without the native CDC resource, how would you implement incremental loads in ADF, and what's the failure mode of a naive high-watermark approach?",
+    "a": "Store a last-loaded watermark (max modified timestamp or a monotonic ID), and on each run read rows greater than it, then atomically update the watermark only after a successful load. Drive it with a Lookup + Copy inside a pipeline, ideally with a tumbling window trigger for ordered, retryable slices. The classic bug is using a timestamp watermark when source clocks skew or rows update with an older timestamp — you silently miss changes; prefer a reliable change column or true CDC/CT on the source.",
+    "fs": "Watermark + tumbling window with the watermark updated only on success; know that timestamp skew loses rows.",
+    "fj": "Using GETDATE() or 'rows from yesterday' with no idempotency, so a mid-run failure double-loads or skips a slice.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "incremental predicate",
+        "lang": "sql",
+        "lines": [
+          "SELECT * FROM dbo.Orders",
+          "WHERE ModifiedAt > @lastWatermark",
+          "  AND ModifiedAt <= @windowEnd;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "In Azure Event Hubs, what determines the maximum parallelism for consumers, and why can't you exceed it within one consumer group?",
+    "a": "Parallelism is bounded by the partition count: each partition is owned by exactly one active reader within a consumer group at a time (AMQP epoch, or group.id for the Kafka protocol). So with 8 partitions, one consumer group can run at most 8 concurrent processors; adding more instances just leaves some idle. Partition count is set at creation and (on most tiers) is fixed, so you size it up front for peak fan-out.",
+    "fs": "Partitions = max concurrent readers per consumer group; one owner per partition, so set partition count for peak.",
+    "fj": "Thinking adding more consumer instances scales throughput past the partition count.",
+    "level": "Jr"
+  },
+  {
+    "q": "What is checkpointing in Event Hubs, and what goes wrong if a consumer crashes before it checkpoints?",
+    "a": "Checkpointing persists the per-partition offset (usually to a Blob storage container) so a consumer can resume after a restart and a new instance can take ownership of a partition. Event Hubs has at-least-once delivery: if a consumer processes events but crashes before checkpointing, the replacement resumes from the last checkpoint and reprocesses that range — so downstream handling must be idempotent. Checkpointing too rarely widens replay; too often adds storage write overhead.",
+    "fs": "Checkpoint = durable per-partition offset; at-least-once means reprocessing on crash, so make handlers idempotent.",
+    "fj": "Assuming exactly-once and skipping idempotency, then getting duplicate rows after a consumer restart.",
+    "level": "Jr"
+  },
+  {
+    "q": "An Event Hubs namespace is throttling ingress. Walk through throughput units (or processing units) and how you'd raise capacity.",
+    "a": "On the standard tier, capacity is throughput units shared across the namespace: each TU gives ~1 MB/s or 1,000 events/s ingress and ~2 MB/s egress, up to 40 TUs; enabling Auto-Inflate raises TUs automatically up to a cap. Premium uses processing units and dedicated uses capacity units for isolated, higher scale. If you're TU-bound but also hot on one partition, repartitioning (or a better partition key) matters as much as adding TUs, since a single partition tops out around 1 MB/s.",
+    "fs": "TUs (or PU/CU) cap namespace throughput; Auto-Inflate for bursts, but a hot partition key bottlenecks one partition regardless.",
+    "fj": "Cranking throughput units while every event uses the same partition key, so one partition stays saturated.",
+    "level": "Sr"
+  },
+  {
+    "q": "Why might you choose Azure Functions with an Event Hubs trigger over a dedicated Stream Analytics or Spark Structured Streaming job, and what's the scaling model?",
+    "a": "The Functions Event Hubs trigger is ideal for lightweight, per-event or per-batch processing without managing a cluster; the runtime scales out instances and assigns partitions across them, so concurrency naturally tracks partition count. It's cheap and serverless for spiky workloads, but it's not a windowed-analytics engine — for stateful windowing/joins over streams, Stream Analytics or Structured Streaming on Databricks is the right tool. Consumption-plan Functions also have a default timeout (~5 min) that long aggregations can hit.",
+    "fs": "Functions = serverless per-batch glue, scales by partition; reach for ASA/Spark when you need stateful windowing.",
+    "fj": "Building stateful windowed aggregations inside a Consumption-plan Function and hitting the 5-min timeout.",
+    "level": "Sr"
+  },
+  {
+    "q": "What problem do Durable Functions solve, and describe the fan-out/fan-in pattern.",
+    "a": "Plain Functions are stateless and short-lived; Durable Functions add an orchestrator that durably checkpoints workflow state, enabling long-running, stateful coordination (chaining, fan-out/fan-in, human-interaction, monitors) on top of serverless. In fan-out/fan-in, the orchestrator kicks off many activity functions in parallel (fan-out), then awaits all of them (fan-in) to aggregate. The orchestrator code must be deterministic — it replays history on each resume, so no random values, DateTime.Now, or direct I/O inside it.",
+    "fs": "Durable orchestrator = checkpointed, deterministic workflow; fan-out runs activities in parallel and fan-in awaits them all.",
+    "fj": "Putting non-deterministic calls (DateTime.Now, Guid, direct HTTP) in the orchestrator, which breaks on replay.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "ts",
+        "lines": [
+          "const tasks = items.map(i =>",
+          "  ctx.df.callActivity('Process', i));",
+          "const results =",
+          "  yield ctx.df.Task.all(tasks);",
+          "return aggregate(results);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your Consumption-plan Azure Function processing a Blob/queue batch keeps timing out. What are the levers?",
+    "a": "Consumption plan caps function execution at ~5 minutes (configurable up to 10), so first reduce per-invocation work: lower the batch/host concurrency (e.g., maxBatchSize, batchSize) so each execution does less, or split the work across more invocations. If the workload is genuinely long-running, move to the Premium or Dedicated (App Service) plan where you can extend or remove the timeout, or restructure with Durable Functions sub-orchestrations. Right plan beats fighting the timeout.",
+    "fs": "Consumption ~5–10 min cap: shrink the batch or move to Premium/Dedicated; long jobs → Durable sub-orchestrations.",
+    "fj": "Trying to set an unlimited timeout on the Consumption plan, which the platform won't honor.",
+    "level": "Mid"
+  },
+  {
+    "q": "Why run Databricks on Azure instead of just using Synapse Spark, and how does Unity Catalog change governance?",
+    "a": "Azure Databricks gives the full Databricks runtime (Photon vectorized engine, Delta Lake, Delta Live Tables, MLflow) with deep Azure integration (AAD/Entra passthrough, ADLS, Key Vault), typically stronger Spark performance and a richer lakehouse ecosystem than Synapse Spark. Unity Catalog centralizes governance across workspaces with a three-level namespace (catalog.schema.table), fine-grained access control, lineage, and audit — replacing per-workspace Hive metastores. It also powers predictive optimization and system tables for cost attribution.",
+    "fs": "Databricks for the mature lakehouse runtime; Unity Catalog = one governance/lineage plane across workspaces (catalog.schema.table).",
+    "fj": "Treating Unity Catalog as 'just a metastore rename' and missing centralized lineage, ACLs, and cost system tables.",
+    "level": "Mid"
+  },
+  {
+    "q": "What is Photon in Azure Databricks and why does enabling it often lower total cost despite a higher DBU rate?",
+    "a": "Photon is a native, vectorized C++ query engine that replaces parts of the JVM execution path for SQL and DataFrame workloads, delivering roughly 2x–12x speedups on typical SQL. Although Photon-enabled compute carries a higher DBU multiplier, you pay by DBU-seconds consumed, so jobs finishing far faster usually cost less overall. It helps most on scan/aggregate/join-heavy SQL; it gives little benefit to UDF-heavy Python or tiny jobs where startup dominates.",
+    "fs": "Photon = vectorized engine; faster runtime cuts DBU-seconds, so the higher rate still nets cheaper on SQL-heavy work.",
+    "fj": "Refusing Photon because 'the DBU rate is higher,' ignoring that wall-clock time and total DBUs both drop.",
+    "level": "Sr"
+  },
+  {
+    "q": "Compare Databricks SQL warehouse types (Classic, Pro, Serverless) for cost and startup behavior.",
+    "a": "Classic and Pro warehouses run in your Azure subscription's compute (you pay Databricks DBUs plus the underlying VMs) and take minutes to start; Serverless runs in Databricks' managed account with infrastructure bundled into a higher DBU rate but starts in seconds and scales to zero when idle. Serverless is usually cheapest for spiky/intermittent BI because there are no idle VMs and fast cold start; Pro/Classic can win for steady, heavy workloads where you control instance types. All three support Photon and Predictive I/O.",
+    "fs": "Serverless = seconds to start, scales to zero, bundled infra — wins for spiky BI; Pro/Classic for steady, tuned compute.",
+    "fj": "Picking Classic for bursty dashboards and eating minutes of cold start plus idle VM cost.",
+    "level": "Jr"
+  },
+  {
+    "q": "How do you stop a Databricks all-purpose cluster from quietly burning money, and why prefer job clusters for scheduled work?",
+    "a": "Set aggressive auto-termination so idle interactive clusters shut down, right-size and enable autoscaling, and use spot/preemptible instances for fault-tolerant batch. For scheduled pipelines, use ephemeral job clusters that spin up for the run and terminate at the end — far cheaper than leaving a shared all-purpose cluster running and they isolate workloads. Use Unity Catalog system tables (billing/usage) for chargeback so cost is attributable per job and team.",
+    "fs": "Auto-terminate + autoscale + spot, and run scheduled jobs on ephemeral job clusters, not a parked all-purpose one.",
+    "fj": "Running nightly ETL on a 24/7 interactive cluster 'so it's always ready,' paying for idle compute all day.",
+    "level": "Mid"
+  },
+  {
+    "q": "In Azure OpenAI / AI Foundry, when do Provisioned Throughput Units (PTUs) beat pay-as-you-go (standard) deployments?",
+    "a": "Standard (pay-as-you-go) bills per token and is best for variable or low/spiky traffic. PTUs reserve dedicated model capacity billed hourly per PTU regardless of tokens, giving predictable latency and no per-request throttling — they win once sustained utilization is high enough that the hourly reservation undercuts token charges (often a break-even on the order of a week of steady high load), and you can lower cost further with Azure Reservations. So PTUs are for consistent, latency-sensitive production; standard for everything else.",
+    "fs": "PTUs = reserved hourly capacity, predictable latency; they pay off at sustained high utilization vs per-token standard.",
+    "fj": "Buying PTUs for a bursty, low-volume app and paying for reserved capacity that sits idle.",
+    "level": "Sr"
+  },
+  {
+    "q": "Explain Azure OpenAI content filtering and Prompt Shields, and how they relate to securing a RAG app (AI-102 territory).",
+    "a": "Content filtering runs an ensemble of classifiers on both prompt and completion across hate, sexual, violence, and self-harm at four severity levels, plus optional detectors. Prompt Shields specifically target jailbreak and prompt-injection attacks — including indirect injection where malicious instructions are hidden in retrieved documents — and Spotlighting helps the model distinguish trusted from untrusted input. For RAG, also enable groundedness detection so the service flags answers not supported by your provided source passages.",
+    "fs": "Content filter = 4 harm categories x 4 severities; Prompt Shields stop (indirect) injection; groundedness flags ungrounded RAG answers.",
+    "fj": "Assuming the default filter blocks prompt injection — injection defense is Prompt Shields, a separate control.",
+    "level": "Sr"
+  },
+  {
+    "q": "A teammate enables Azure OpenAI 'On Your Data' for RAG and expects zero hallucinations. What do you correct, and how do you ground it well?",
+    "a": "'On Your Data' wires retrieval (typically Azure AI Search) to the deployment so answers cite your indexed content, but it does not guarantee zero hallucination — quality depends on chunking, embeddings, the retrieval query, and limiting answers to retrieved context. Improve recall with semantic/hybrid (vector + keyword) search and good chunk sizes, set the model to answer only from sources and return citations, and turn on groundedness detection to catch unsupported claims. Measure with grounded eval data, not vibes.",
+    "fs": "RAG grounds, not guarantees: hybrid search + tight chunking + answer-from-sources-with-citations + groundedness check.",
+    "fj": "Believing 'On Your Data' makes hallucination impossible and skipping retrieval tuning and groundedness evaluation.",
+    "level": "Sr"
+  },
+  {
+    "q": "What is a Linked Service vs a Dataset vs an Integration Runtime in Azure Data Factory?",
+    "a": "A Linked Service is the connection definition (the 'where' and credentials — e.g., an ADLS account or SQL connection string, ideally via Key Vault/managed identity). A Dataset is a named view of data within that Linked Service (the 'what' — a folder, file format, or table). The Integration Runtime is the compute that actually runs the activity. Activities reference Datasets, which reference Linked Services, which run on an IR.",
+    "fs": "Linked Service = connection/creds, Dataset = the data shape, IR = the compute that executes.",
+    "fj": "Conflating Linked Service and Dataset, or hardcoding secrets in the Linked Service instead of Key Vault/MSI.",
+    "level": "Jr"
+  },
+  {
+    "q": "How do you trigger an ADF pipeline 'when a file lands' versus on a fixed schedule, and what's the difference between schedule and tumbling-window triggers?",
+    "a": "For 'on arrival,' use an event-based (storage event) trigger that fires on a Blob created/deleted event via Event Grid. For time-based runs, a schedule trigger fires on a wall-clock recurrence (fire-and-forget, no backfill), while a tumbling-window trigger creates contiguous, non-overlapping time slices with state — supporting backfill of past windows, dependencies between windows, and automatic retries. Choose tumbling windows when you need ordered, replayable, dependency-aware slices.",
+    "fs": "Event trigger for file-landing; tumbling window (stateful, backfillable, dependency-aware) over plain schedule for slice-based loads.",
+    "fj": "Using a schedule trigger for incremental slices, then having no way to backfill or enforce window ordering.",
+    "level": "Mid"
+  },
+  {
+    "q": "Your Azure data platform bill is dominated by an idle Synapse dedicated SQL pool and an always-on Databricks cluster. Outline a cost-control review.",
+    "a": "Tackle the always-on reserved compute first: pause the dedicated SQL pool outside business hours (compute charges stop while paused; storage persists) and automate pause/resume; offload ad-hoc lake queries to serverless SQL where you pay per TB. For Databricks, enforce auto-termination, autoscaling, and ephemeral job clusters with spot instances, and consider PTUs/Reservations only where utilization is genuinely steady. Attribute spend with Synapse cost views and Databricks system tables, then set Azure budgets/alerts so regressions surface fast.",
+    "fs": "Pause reserved DWUs, push ad-hoc to serverless, ephemeral+spot job clusters, attribute via system tables, and set budget alerts.",
+    "fj": "Chasing a few query optimizations while a 24/7 dedicated pool and parked cluster bleed reserved-compute cost all night.",
+    "level": "Sr"
+  },
+  {
+    "q": "Where does Microsoft Fabric and OneLake sit relative to Azure Synapse Analytics today, and how do you advise a team starting net-new analytics?",
+    "a": "Fabric is the SaaS successor to Synapse: a single tenant-wide platform where data engineering, warehousing, real-time, data science, and Power BI all share OneLake, one logical data lake built on ADLS Gen2 storing open Delta/Parquet so workloads read the same data with no copies (the 'one copy' idea, shortcuts mount external data in place). For net-new builds, default to Fabric for the integration and Microsoft's investment trajectory. But Synapse still owns dedicated SQL pools with custom columnstore and workload management, which Fabric's serverless warehouse doesn't fully replace yet, so heavy provisioned-DW workloads may stay on Synapse.",
+    "fs": "Fabric = SaaS successor, OneLake = one shared Delta lake with shortcuts; new builds default Fabric, but dedicated-pool workloads still favor Synapse.",
+    "fj": "Calling Fabric 'just Synapse renamed' and missing OneLake's single-copy, shortcut-driven, Power-BI-native SaaS model.",
+    "level": "Mid",
+    "asked": 9
+  },
+  {
+    "q": "What does enabling the hierarchical namespace turn a storage account into, and why does it matter for a data lake?",
+    "a": "It turns plain Blob Storage into ADLS Gen2: directories become first-class objects, so renaming or moving a folder is a single atomic metadata operation instead of copy-then-delete of every blob, and you get POSIX ACLs for fine-grained read/write/execute on files and folders. Standard blob is a flat namespace with only RBAC at container/account granularity, so a directory 'move' rewrites each object. ACLs work alongside RBAC, not instead of it: a principal needs an RBAC role on the account plus an ACL entry on the path. It costs the same as blob and is the right default for analytics.",
+    "fs": "HNS = real atomic directories + POSIX ACLs (ADLS Gen2); flat blob renames copy every object and only does coarse RBAC.",
+    "fj": "Building a lake on a flat blob account, then watching a 'rename folder' rewrite millions of objects.",
+    "level": "Mid",
+    "asked": 8
+  },
+  {
+    "q": "Explain Azure Event Hubs' Capture feature and why it's a differentiator versus running Kafka yourself.",
+    "a": "Capture automatically writes the incoming event stream to ADLS Gen2 or Blob as Avro files on a configurable size/time window, with no consumer code or extra throughput cost, giving you a cheap durable archive of the raw stream for replay, batch, or audit. Open-source Kafka has no built-in equivalent, you'd run a sink connector and operate it. Event Hubs also speaks the Kafka protocol, so existing Kafka clients can produce/consume by just changing the broker config, and Capture works underneath that too. So you get Kafka-compatible streaming plus managed archival without the operational burden.",
+    "fs": "Capture = managed Avro archive of the stream to ADLS/Blob, no code; Kafka needs a sink connector you operate.",
+    "fj": "Hand-rolling an archival consumer when Capture already lands raw events to the lake for free.",
+    "level": "Mid",
+    "asked": 7,
+    "code": [
+      {
+        "label": "az CLI enable capture",
+        "lang": "ts",
+        "lines": [
+          "az eventhubs eventhub update \\",
+          "  --resource-group rg \\",
+          "  --namespace-name ns \\",
+          "  --name hub \\",
+          "  --enable-capture true \\",
+          "  --capture-interval 300 \\",
+          "  --destination-name EventHubArchive"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What windowing functions does Azure Stream Analytics offer, and when do you pick a tumbling vs hopping vs session window?",
+    "a": "ASA is a managed SQL-based stream engine with tumbling (fixed, non-overlapping, every event in exactly one window), hopping (fixed size that advances by a smaller hop, so windows overlap and an event can land in several), sliding (emits only when an event enters or leaves, so every window has a change), session (groups bursts of activity separated by a timeout gap), and snapshot (same-timestamp events). Use tumbling for clean per-interval aggregates like 'count per 5 min', hopping for moving aggregates like 'last 10 min, refreshed every 1 min', and session for user-activity bursts. Tumbling is a hopping window whose hop equals its size.",
+    "fs": "Tumbling = non-overlapping buckets; hopping = overlapping moving windows; session = activity bursts split by a gap.",
+    "fj": "Reaching for a hopping window for a clean 'count per interval' and double-counting events across overlaps.",
+    "level": "Mid",
+    "asked": 8,
+    "code": [
+      {
+        "label": "tumbling aggregate",
+        "lang": "sql",
+        "lines": [
+          "SELECT DeviceId, COUNT(*) AS cnt",
+          "INTO output FROM input",
+          "TIMESTAMP BY EventTime",
+          "GROUP BY DeviceId,",
+          "  TumblingWindow(minute, 5)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Compare the DTU and vCore purchasing models for Azure SQL Database, and when do you reach for each?",
+    "a": "DTU bundles compute, memory, and IO into a single blended unit at preset tiers (Basic/Standard/Premium), simple but coarse and with included storage limits. vCore decouples compute (cores + memory) from storage so you can right-size independently, choose hardware, and it's the only model that supports Hyperscale, Business Critical, serverless auto-scaling, and Azure Hybrid Benefit and reserved-instance discounts. Reach for DTU only for tiny, simple, predictable workloads; default to vCore for anything needing scale, cost optimization via reservations, or higher limits. Microsoft positions vCore as the go-forward model, though DTU isn't deprecated.",
+    "fs": "DTU = blended preset bundles; vCore = decoupled compute/storage, the only path to Hyperscale, serverless, reservations, AHB.",
+    "fj": "Staying on DTU at scale and losing reserved-instance savings, Hyperscale, and Hybrid Benefit that only vCore offers.",
+    "level": "Mid",
+    "asked": 10
+  },
+  {
+    "q": "What problem do Azure SQL Database elastic pools solve, and when is a pool cheaper than per-database provisioning?",
+    "a": "An elastic pool shares a fixed budget of compute (eDTUs or vCores) across many databases in the same server, so databases that peak at different times draw from the common pool instead of each reserving its own capacity. It wins when you have many databases with low average but spiky, uncorrelated utilization (classic SaaS per-tenant DB pattern), where per-database provisioning would pay for idle headroom on each. It's the wrong choice if every database is consistently hot at once, since they'd contend for the shared cap. You set per-database min/max to stop one tenant starving the rest.",
+    "fs": "Elastic pool = shared compute across many spiky, uncorrelated DBs (SaaS per-tenant); set per-DB min/max to prevent noisy neighbors.",
+    "fj": "Pooling databases that all peak simultaneously, so they contend for the shared cap and everyone slows down.",
+    "level": "Sr",
+    "asked": 7
+  },
+  {
+    "q": "Azure SQL Database is growing past tens of TB and you need fast restores and read scale-out. Which service tier and why?",
+    "a": "Hyperscale, available only in the vCore model. It separates compute from a distributed storage layer of page servers, supporting databases up to ~128 TB with storage that auto-grows and is billed only for what's allocated. Because storage is snapshot-based, backups and restores are near-instant regardless of size, and you can add read-only replicas for read scale-out. General Purpose caps lower and restores scale with size; Business Critical gives the lowest latency with local SSD and built-in replicas but tops out smaller. So very large, fast-restore, read-heavy workloads point to Hyperscale.",
+    "fs": "Hyperscale (vCore-only): page-server storage to ~128 TB, near-instant snapshot restores, read-replica scale-out.",
+    "fj": "Picking General Purpose for a 50 TB DB and getting restore times that scale with data volume.",
+    "level": "Sr",
+    "asked": 6
+  },
+  {
+    "q": "Walk through Cosmos DB's five consistency levels and how you'd choose for a globally distributed app.",
+    "a": "From strongest to weakest: Strong (linearizable, reads see the latest committed write, but only with single-region writes and highest latency/RU), Bounded Staleness (lag bounded by K versions or T time), Session (read-your-own-writes per session token, the default and most common), Consistent Prefix (never see out-of-order writes), and Eventual (lowest latency/RU, no ordering). Strong and Bounded Staleness reads cost ~2x RUs because they read from two replicas. Most apps pick Session for the right freshness/cost balance; drop to Eventual for non-critical reads like counters or feeds, and reserve Strong for correctness-critical single-region data.",
+    "fs": "Strong>Bounded>Session>Consistent Prefix>Eventual; Session is the default sweet spot, Strong/Bounded cost ~2x RU and limit geo-writes.",
+    "fj": "Defaulting to Strong globally, paying double RUs and losing multi-region writes when Session would do.",
+    "level": "Sr",
+    "asked": 11
+  },
+  {
+    "q": "Your Cosmos DB container has hot partitions and 429 throttling despite high provisioned RU/s. What's wrong and how do you fix it?",
+    "a": "Provisioned RU/s is split evenly across physical partitions, and each logical partition maps to one physical partition with a hard 10,000 RU/s and 20 GB ceiling. A low-cardinality or skewed partition key concentrates traffic on one partition, so it throttles (429) while the account has spare RU/s elsewhere. Fix by choosing a high-cardinality key that spreads reads and writes evenly, or use hierarchical (sub)partition keys to split a hot tenant; synthetic composite keys help too. Adding RU/s without fixing the key just widens the gap. Also pass the partition key on point reads to avoid expensive cross-partition fan-out queries.",
+    "fs": "Hot partition = skewed/low-cardinality key; each logical partition caps at 10k RU/s & 20 GB. Repartition, don't just add RU/s.",
+    "fj": "Cranking RU/s to fight 429s while a single tenant's key keeps one physical partition saturated.",
+    "level": "Sr",
+    "asked": 10
+  },
+  {
+    "q": "When should a Cosmos DB container use autoscale throughput vs manual (standard) provisioned RU/s?",
+    "a": "Manual RU/s reserves a fixed level billed whether or not you use it, cheapest when load is steady and predictable. Autoscale scales instantly between 10% and 100% of a max you set and bills per hour for the highest RU/s reached that hour at a ~1.5x rate per RU, so it wins for spiky, unpredictable, or multi-tenant workloads where you'd otherwise over-provision for peak. Rule of thumb: if average utilization stays above ~66% of peak, manual is cheaper; below that, autoscale's elasticity beats paying for idle peak capacity. Serverless is a third option for intermittent dev/light traffic.",
+    "fs": "Manual for steady load; autoscale (10-100% of max, ~1.5x rate) for spiky/unpredictable; break-even ~66% avg utilization.",
+    "fj": "Putting bursty traffic on manual RU/s sized for peak, paying full rate on capacity that sits idle most of the day.",
+    "level": "Mid",
+    "asked": 7
+  },
+  {
+    "q": "Explain managed identities in Microsoft Entra ID and the difference between system-assigned and user-assigned.",
+    "a": "A managed identity is a special service principal Azure manages for you, letting a resource (VM, Function, App Service, AKS) authenticate to Entra-protected services with no secrets in code, you just grant it RBAC roles. System-assigned is tied 1:1 to a single resource's lifecycle and is deleted with it, good for a dedicated identity. User-assigned is a standalone resource you create once and attach to many resources, so it survives redeploys and is the recommended type for shared or repeatable infrastructure. Either way you get a token from the local IMDS endpoint, never a stored credential.",
+    "fs": "Managed identity = secretless SP Azure rotates; system-assigned dies with its one resource, user-assigned is reusable across many.",
+    "fj": "Storing a client secret in config for resource-to-resource auth when a managed identity removes the credential entirely.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "label": "DefaultAzureCredential (Python)",
+        "lang": "python",
+        "lines": [
+          "from azure.identity import \\",
+          "  DefaultAzureCredential",
+          "from azure.keyvault.secrets \\",
+          "  import SecretClient",
+          "cred = DefaultAzureCredential()",
+          "kv = SecretClient(url, cred)",
+          "pw = kv.get_secret('db-pw').value"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a service principal in Entra ID, and when do you use one instead of a managed identity?",
+    "a": "An app registration creates an application object and a service principal, the identity an app or automation uses to authenticate, holding either a client secret or (preferred) a certificate. Managed identities are themselves a managed kind of service principal but only work for resources running inside Azure with the IMDS endpoint. Use an explicit service principal when the workload runs outside Azure, an on-prem CI runner, a third-party SaaS, or GitHub Actions, where there's no managed identity, ideally with certificate auth or workload identity federation (OIDC) so no long-lived secret is stored.",
+    "fs": "Service principal = app identity with secret/cert; use it off-Azure where managed identities can't run, prefer cert or OIDC federation.",
+    "fj": "Treating SP and managed identity as interchangeable, then trying to use a managed identity from an off-Azure CI runner.",
+    "level": "Mid",
+    "asked": 9
+  },
+  {
+    "q": "Explain how Azure RBAC role assignments work: what are the three pieces, and how does scope inheritance behave?",
+    "a": "An assignment binds a security principal (user, group, SP, or managed identity) to a role definition (a set of allowed actions, e.g. Reader, Contributor, or a custom role) at a scope (management group, subscription, resource group, or resource). Assignments are inherited downward: a role granted at the subscription applies to every resource group and resource beneath it. Effective access is the union of all matching allow assignments minus any explicit deny assignments, which win over allows. Follow least privilege, prefer assigning to groups, and avoid handing Owner where Contributor suffices.",
+    "fs": "Assignment = principal + role definition + scope; inherits downward, deny beats allow, access is the union of allows.",
+    "fj": "Granting Owner at subscription scope 'to be safe', violating least privilege and cascading it to every child resource.",
+    "level": "Jr",
+    "asked": 11
+  },
+  {
+    "q": "What is Microsoft Entra Conditional Access, and give an example policy that hardens admin access.",
+    "a": "Conditional Access is Entra's Zero Trust policy engine: if-then rules that evaluate signals (user/group, sign-in and user risk from ID Protection, device compliance, app, network location/named locations) and then grant, block, or require controls like MFA or a compliant device. It's the enforcement layer where 'who you are' meets 'under what conditions'. A classic hardening policy: for users in the admin roles, require phishing-resistant MFA on every sign-in and block legacy authentication protocols. Combine with risk-based policies that force MFA or password reset when sign-in risk is elevated.",
+    "fs": "Conditional Access = if-then Zero Trust engine on signals (risk/device/location); e.g. admins require MFA + block legacy auth.",
+    "fj": "Relying on per-user MFA toggles instead of Conditional Access, so you can't condition on risk, device, or location.",
+    "level": "Sr",
+    "asked": 8
+  },
+  {
+    "q": "Compare Service Endpoints and Private Endpoints (Private Link) for securing access to an Azure PaaS service like Storage or SQL.",
+    "a": "A Service Endpoint extends your VNet identity to the service over the Microsoft backbone, but the service keeps its public IP and you lock it down with the service's firewall plus a VNet rule, traffic stays on Azure's network but the resource is still publicly addressable. A Private Endpoint (Private Link) puts a NIC with a private IP from your subnet in front of the specific resource, so it's reachable only privately and you can fully disable public access; it also extends to on-prem over VPN/ExpressRoute. Private Endpoint is the stronger, modern default but needs Private DNS zones to resolve the privatelink FQDN.",
+    "fs": "Service Endpoint = VNet rule, resource stays public-IP; Private Endpoint = private NIC/IP, kill public access, needs Private DNS.",
+    "fj": "Believing a Service Endpoint makes the resource private, it only restricts source VNets; the public endpoint still exists.",
+    "level": "Sr",
+    "asked": 9
+  },
+  {
+    "q": "What's the difference between a Network Security Group and Azure Firewall, and where does each sit?",
+    "a": "An NSG is a free, stateful L3/L4 allow/deny rule set attached to a subnet or NIC, filtering traffic by source/destination IP, port, protocol, and service tags, the baseline micro-segmentation control. Azure Firewall is a managed, stateful network virtual appliance with a public IP, doing centralized L3-L7 filtering, FQDN/application rules, threat intelligence, and NAT, typically deployed in a hub VNet so all spoke egress routes through it. Use NSGs everywhere for subnet-level segmentation and add Azure Firewall (or a WAF/App Gateway for HTTP) for centralized egress control, FQDN filtering, and logging.",
+    "fs": "NSG = free stateful L3/L4 subnet/NIC rules; Azure Firewall = managed hub appliance for L3-L7, FQDN, NAT, central egress.",
+    "fj": "Trying to do FQDN/application-layer filtering with NSGs, which only understand IP/port/protocol and service tags.",
+    "level": "Mid",
+    "asked": 8
+  },
+  {
+    "q": "When do you choose ExpressRoute over a site-to-site VPN to connect on-prem to Azure?",
+    "a": "A site-to-site VPN tunnels over the public internet with IPsec, quick and cheap to stand up but subject to internet latency, jitter, and a throughput ceiling. ExpressRoute is a private, dedicated circuit via a connectivity provider that bypasses the public internet, giving predictable low latency, higher and guaranteed bandwidth, and an SLA, used for heavy hybrid workloads, large data transfer, or compliance that forbids internet transit. It costs more and takes longer to provision. Common pattern: ExpressRoute as primary with a VPN as automatic failover.",
+    "fs": "VPN = IPsec over internet, cheap/variable; ExpressRoute = private dedicated circuit, predictable low latency + SLA, pricier.",
+    "fj": "Running latency-sensitive, high-volume hybrid traffic over an internet VPN and blaming Azure for jitter.",
+    "level": "Mid",
+    "asked": 7
+  },
+  {
+    "q": "How should access to Azure Key Vault be controlled today, and why prefer the RBAC permission model over vault access policies?",
+    "a": "Key Vault supports two permission models: legacy vault access policies (a flat per-vault list granting key/secret/cert operations) and Azure RBAC. RBAC is now the recommended model because it's consistent with the rest of Azure, supports scoping down to individual secrets, integrates with PIM, Conditional Access, and Defender, and gives unified auditing, fixing access-policy pitfalls like all-or-nothing grants and no resource-level scope. Pair it with managed identities so apps fetch secrets with no stored credential, enable soft-delete and purge protection, and restrict network access via Private Endpoint.",
+    "fs": "Prefer Key Vault Azure RBAC over access policies: per-secret scope, PIM/Conditional Access, unified audit; add MSI + Private Endpoint.",
+    "fj": "Granting broad access-policy permissions to a whole app team instead of RBAC scoped to the specific secrets they need.",
+    "level": "Sr",
+    "asked": 8
+  },
+  {
+    "q": "What does Microsoft Defender for Cloud give you, and what's the difference between its free CSPM and the paid plans?",
+    "a": "Defender for Cloud is Azure's cloud security posture management and workload protection platform. The free foundational CSPM is on by default and provides continuous assessment against the Microsoft Cloud Security Benchmark, prioritized recommendations, and a Secure Score that quantifies posture. The paid Defender plans (per resource type: servers, storage, SQL, containers, Key Vault, etc.) add threat detection/alerts, agentless scanning, attack-path analysis, and Defender CSPM's deeper posture features. Use Secure Score to drive remediation and turn on the paid plans for the workloads that need runtime threat protection.",
+    "fs": "Defender for Cloud = CSPM + workload protection; free tier = posture/Secure Score, paid plans add threat detection & attack paths.",
+    "fj": "Assuming the free Secure Score includes runtime threat alerts, those need the paid Defender plans per resource type.",
+    "level": "Mid",
+    "asked": 7
+  },
+  {
+    "q": "A team wants the cheapest durable Azure Storage but must survive a full datacenter loss. Walk through LRS, ZRS, GRS, and GZRS.",
+    "a": "LRS keeps three synchronous copies within one datacenter, cheapest but a datacenter-level disaster can lose all copies. ZRS spreads three synchronous copies across availability zones in the region, surviving a single datacenter/zone outage. GRS does LRS in the primary then async-replicates to a paired region (read access only after failover unless you use RA-GRS). GZRS combines ZRS in the primary with async geo-replication for the strongest durability and availability. For 'survive a datacenter loss', the minimum is ZRS; for regional disaster recovery, GRS/GZRS. Add the RA- variants for read access to the secondary.",
+    "fs": "LRS=1 datacenter, ZRS=zones in region, GRS=async to paired region, GZRS=zones+geo; datacenter-loss needs at least ZRS.",
+    "fj": "Picking LRS for resilience, it survives disk/rack failure but not a datacenter-wide disaster.",
+    "level": "Jr",
+    "asked": 9
+  },
+  {
+    "q": "Explain Blob Storage access tiers (hot, cool, cold, archive) and the gotchas with early deletion and archive retrieval.",
+    "a": "Tiers trade storage price against access price and latency: hot for frequent access (highest storage, lowest access cost), cool for infrequent data (cheaper storage, ~30-day minimum), cold for rarely accessed (~90-day minimum), and archive, an offline tier with the cheapest storage but highest retrieval cost and hours-long rehydration. Cool/cold/archive carry early-deletion penalties if removed before their minimum, and archive data can't be read until rehydrated to an online tier. Use lifecycle management policies to auto-tier or delete blobs by age. Archive supports LRS/GRS but not ZRS/GZRS.",
+    "fs": "Hot>cool>cold>archive trade storage vs access cost; archive is offline (rehydrate to read), and cool/cold/archive have min-stay penalties.",
+    "fj": "Dumping data into archive then needing it immediately, retrieval takes hours of rehydration and costs a lot.",
+    "level": "Jr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "lifecycle: tier then delete",
+        "lang": "ts",
+        "lines": [
+          "// rule: blobs in logs/",
+          "tierToCool:    after 30 days",
+          "tierToArchive: after 90 days",
+          "delete:        after 365 days",
+          "// set via mgmt policy on account"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do Azure Monitor, Log Analytics, and Application Insights fit together?",
+    "a": "Azure Monitor is the umbrella platform collecting two data types: metrics (lightweight numeric time series) and logs (rich structured records). Log Analytics is the workspace that stores logs and the place you run KQL queries; it's built on Azure Data Explorer. Application Insights is the APM layer for apps, capturing requests, dependencies, exceptions, and distributed traces, and modern workspace-based App Insights stores that telemetry in a Log Analytics workspace so you query app and infra data together with KQL. So: Monitor = platform, Log Analytics = log store/query engine, App Insights = app telemetry feeding into it.",
+    "fs": "Monitor = platform (metrics+logs); Log Analytics = KQL log store; App Insights = APM telemetry landing in that workspace.",
+    "fj": "Treating them as three separate products, App Insights telemetry now lives in a Log Analytics workspace you query with KQL.",
+    "level": "Jr",
+    "asked": 10
+  },
+  {
+    "q": "You need to find the top error-producing operations in the last hour from Application Insights. Sketch the KQL and explain the key operators.",
+    "a": "Query the requests (or exceptions) table, filter the time range, then summarize. KQL reads top-down piping a tabledata through operators: where filters, summarize aggregates with by for grouping (count(), percentile(duration,95)), and top/order by ranks. Use bin(timestamp, 5m) to bucket a time series, and join across requests/dependencies on operation_Id for distributed traces. KQL is the same language Log Analytics and Azure Data Explorer use, so the skill transfers across Azure observability.",
+    "fs": "requests | where time>ago(1h) | summarize count() by name | top — KQL pipes where/summarize/bin; join on operation_Id for traces.",
+    "fj": "Writing SQL-style GROUP BY syntax; KQL uses summarize ... by and pipes, not SELECT/GROUP BY.",
+    "level": "Mid",
+    "asked": 9,
+    "code": [
+      {
+        "label": "top failing operations",
+        "lang": "sql",
+        "lines": [
+          "requests",
+          "| where timestamp > ago(1h)",
+          "| where success == false",
+          "| summarize errors=count()",
+          "    by name",
+          "| top 10 by errors desc"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is distributed tracing in Application Insights and how does correlation work across services?",
+    "a": "Distributed tracing follows a single logical operation as it crosses process and service boundaries, so you can see the full call tree of a request through APIs, queues, and databases. App Insights (and the OpenTelemetry-based SDKs/auto-instrumentation) propagate a W3C Trace Context: each operation carries an operation_Id (the trace) and parent ids linking spans, stored in the requests and dependencies tables. You reconstruct the end-to-end transaction by joining on operation_Id, which is how you find which downstream dependency caused a slow or failed request in a microservices system.",
+    "fs": "Distributed tracing = one operation_Id (W3C Trace Context) propagated across services; join requests/dependencies on it to see the call tree.",
+    "fj": "Debugging a microservice latency spike service-by-service instead of following one operation_Id end-to-end.",
+    "level": "Sr",
+    "asked": 7
+  },
+  {
+    "q": "Compare Azure Reservations and Savings Plans for compute cost optimization, and how do you decide?",
+    "a": "Both are 1- or 3-year commitments in exchange for discounts. A Reservation commits to a specific instance family in a specific region (e.g. Dsv5 in East US), giving the deepest discount but the least flexibility, ideal for stable, known footprints. A Savings Plan commits to a fixed hourly spend across eligible compute in any region and family, a smaller discount but far more flexible as you resize or move workloads. Decide by stability: lock long-lived steady VMs with Reservations for max savings, cover dynamic or shifting compute with a Savings Plan, and leave bursty workloads on pay-as-you-go. Azure Advisor recommends both from your 30/60-day usage.",
+    "fs": "Reservation = lock instance family+region, deepest discount; Savings Plan = $/hr across any compute, flexible; Advisor sizes both.",
+    "fj": "Buying a region/family-locked Reservation for workloads you keep resizing, a Savings Plan's flexibility fits better.",
+    "level": "Mid",
+    "asked": 8
+  },
+  {
+    "q": "What does Azure Advisor do, and how do resource tags support cost governance?",
+    "a": "Azure Advisor is a free recommendation engine that analyzes your usage and config and surfaces actions across five pillars: Cost, Security, Reliability, Operational Excellence, and Performance, e.g. right-size or shut down idle VMs, buy reservations/savings plans, or delete unattached disks. Tags are key/value labels on resources (and groups) that don't enforce anything by themselves but power cost allocation: Cost Management groups and filters spend by tags like costCenter, env, or team for chargeback. Enforce consistent tagging with Azure Policy so untagged resources can't slip through and dashboards stay accurate.",
+    "fs": "Advisor = free 5-pillar recommendations (cost/sec/reliability/ops/perf); tags drive Cost Management chargeback, enforced via Policy.",
+    "fj": "Relying on ad-hoc tagging for chargeback without an Azure Policy to require tags, so spend can't be attributed.",
+    "level": "Jr",
+    "asked": 7
+  },
+  {
+    "q": "Explain Azure Policy and the difference between a policy definition, an initiative, and assignment effects like deny vs audit vs deployIfNotExists.",
+    "a": "Azure Policy enforces organizational rules on resources at create/update and continuously assesses compliance. A policy definition is one rule with an effect; an initiative (policySet) bundles many definitions so you assign a whole compliance baseline at once. Effects determine behavior: deny blocks non-compliant deployments, audit flags them as non-compliant without blocking, append/modify mutate properties, and deployIfNotExists/auditIfNotExists evaluate related resources and can auto-remediate (e.g. deploy a diagnostic setting). You assign at management group, subscription, or resource group scope, and remediation tasks fix existing non-compliant resources.",
+    "fs": "Definition = one rule+effect, initiative = bundle of rules; deny blocks, audit flags, DINE auto-deploys/remediates.",
+    "fj": "Expecting an audit-effect policy to stop bad deployments, only deny blocks; audit just records non-compliance.",
+    "level": "Sr",
+    "asked": 9,
+    "code": [
+      {
+        "label": "policy effect (deny)",
+        "lang": "ts",
+        "lines": [
+          "// require a tag or block create",
+          "\"if\": { \"field\":",
+          "  \"tags['costCenter']\",",
+          "  \"exists\": \"false\" },",
+          "\"then\": { \"effect\": \"deny\" }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do Management Groups structure an Azure tenant, and where do Azure Blueprints fit (given their current status)?",
+    "a": "Management groups sit above subscriptions in a hierarchy (up to the tenant root), so you assign RBAC and Azure Policy once at a management-group node and every subscription and resource beneath inherits it, the backbone of governance at scale and Cloud Adoption Framework landing zones. Blueprints packaged ARM templates, role assignments, policies, and resource groups into a versioned, repeatably deployable environment, but Blueprints is deprecated, Microsoft steers new work to Template Specs plus Deployment Stacks and Azure Verified Modules for environment provisioning, with policy/RBAC still applied via management groups.",
+    "fs": "Management groups = inheritance tree above subscriptions for RBAC/Policy at scale; Blueprints is deprecated → use Deployment Stacks/AVM.",
+    "fj": "Architecting new governance around Azure Blueprints, it's deprecated; use management-group inheritance plus Deployment Stacks.",
+    "level": "Sr",
+    "asked": 6
+  },
+  {
+    "q": "Why run Azure Databricks against ADLS Gen2 with Unity Catalog rather than mounting storage with account keys, and how does authentication work?",
+    "a": "Mounting storage with an account key or SAS hard-codes a powerful long-lived credential that every cluster user inherits, with no per-user governance. The modern pattern is Unity Catalog with an external location backed by an Azure managed identity (an access connector), so Databricks authenticates to ADLS via Entra with no stored keys, and Unity Catalog enforces table/volume-level grants, lineage, and audit centrally across workspaces. Legacy credential passthrough is being retired in favor of Unity Catalog. So you get secretless, per-principal access control instead of a shared key that bypasses governance.",
+    "fs": "Use Unity Catalog external locations via a managed-identity access connector (secretless Entra auth) over key/SAS mounts that share one credential.",
+    "fj": "dbutils.fs.mount with an account key, every user inherits full storage access and you lose per-principal governance and lineage.",
+    "level": "Sr",
+    "asked": 7
+  },
+  {
+    "q": "What is Azure Databricks Delta Live Tables (DLT / Lakeflow Declarative Pipelines), and why use it over hand-written notebook ETL?",
+    "a": "DLT (now Lakeflow Declarative Pipelines) lets you declare datasets as SQL/Python queries and the runtime builds and manages the dependency DAG, incremental/streaming refresh, retries, and compute lifecycle for you, instead of you orchestrating notebooks by hand. You get built-in data-quality expectations that drop, quarantine, or fail on bad rows, automatic lineage, and a medallion (bronze/silver/gold) structure with far less boilerplate. Use it when you want declarative, governed, observable pipelines with quality gates; hand-written notebooks still fit one-off or highly custom logic. It pairs with Unity Catalog for governance.",
+    "fs": "DLT/Lakeflow = declarative pipelines: auto DAG, incremental refresh, expectations (data-quality gates), lineage — over hand-orchestrated notebooks.",
+    "fj": "Hand-coding refresh order, retries, and quality checks across notebooks when DLT expectations and the managed DAG do it declaratively.",
+    "level": "Sr",
+    "asked": 6
+  },
+  {
+    "q": "Give a one-line view of Azure's AI services so I know which to reach for (the deep dive lives elsewhere). What's the current umbrella?",
+    "a": "Azure AI Foundry (formerly Azure AI Studio) is the unified platform for building and operating AI: it hosts Azure OpenAI models alongside a broad model catalog, plus the prebuilt Azure AI Services (Document Intelligence, AI Vision, AI Speech, Language, Content Safety) and Azure AI Search for RAG retrieval. Reach for a prebuilt AI Service when an off-the-shelf capability (OCR, transcription, translation) solves it, and for Azure OpenAI/Foundry models when you need generative or custom LLM work. Authenticate with managed identities and govern with RBAC and Content Safety, the same Azure primitives as everything else.",
+    "fs": "Azure AI Foundry = unified AI platform: Azure OpenAI + model catalog + prebuilt AI Services (Vision/Speech/Doc Intel) + AI Search for RAG.",
+    "fj": "Building OCR or transcription from scratch on raw LLMs when a prebuilt Azure AI Service already does it.",
+    "level": "Jr",
+    "asked": 6
+  }
+]

@@ -1,0 +1,549 @@
+[
+  {
+    "q": "What is Terraform state and why does Terraform need it?",
+    "a": "The state file (terraform.tfstate) is Terraform's record mapping resources in your configuration to real-world infrastructure objects via their IDs. Terraform uses it to know what it already manages, to compute diffs during plan, and to store resource metadata and dependencies. Without state, Terraform could not tell whether a resource exists or needs creating, updating, or destroying. It also caches attribute values so plans run without querying every provider for everything.",
+    "fs": "State is the source of truth mapping config to real resource IDs; it must be remote, locked, and never hand-edited.",
+    "fj": "State is just a backup of my config files that I can regenerate anytime by re-running apply.",
+    "level": "Jr"
+  },
+  {
+    "q": "Why is state locking important and how is it implemented with the S3 backend?",
+    "a": "State locking prevents two people or pipelines from running apply against the same state at once, which could corrupt it or cause lost writes. With the S3 backend, modern Terraform uses native S3 locking via use_lockfile = true, which writes a .tflock object next to the state using S3 conditional writes. The older approach used a DynamoDB table referenced by dynamodb_table, but DynamoDB-based locking is now deprecated. If a lock is stuck, terraform force-unlock with the lock ID releases it.",
+    "fs": "Use S3 native use_lockfile locking now; DynamoDB locking is deprecated, and force-unlock is a last resort with the lock ID.",
+    "fj": "Locking isn't really needed if I'm careful to only run Terraform from my own laptop.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "S3 backend with native locking",
+        "lang": "ts",
+        "lines": [
+          "terraform {",
+          "  backend \"s3\" {",
+          "    bucket       = \"my-tf-state\"",
+          "    key          = \"prod/app.tfstate\"",
+          "    region       = \"us-east-1\"",
+          "    use_lockfile = true",
+          "  }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between terraform plan and terraform apply?",
+    "a": "terraform plan is a dry run: it refreshes state, compares desired config to current state, and prints the create/update/destroy actions it would take without changing anything. terraform apply executes those changes against the providers and updates state. You can save a plan with terraform plan -out=tfplan and then apply that exact plan, guaranteeing apply does only what was reviewed. By default apply also generates and prompts on a plan unless you pass a saved plan file or -auto-approve.",
+    "fs": "Save the plan with -out and apply that file so CI applies exactly what was reviewed, with no drift between plan and apply.",
+    "fj": "plan and apply do the same thing, plan just shows it first, so I usually skip straight to apply.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Review-then-apply workflow",
+        "lang": "ts",
+        "lines": [
+          "terraform plan -out=tfplan",
+          "# review the saved plan",
+          "terraform apply tfplan"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is drift, and how do you detect it in Terraform?",
+    "a": "Drift is when real infrastructure no longer matches what Terraform recorded in state, usually because someone changed it manually in the console or another tool. Terraform detects drift during the refresh phase of plan by reading each resource's live attributes and comparing them to state. Running terraform plan (or terraform plan -refresh-only) surfaces the differences as proposed changes. To inspect without proposing config changes, -refresh-only shows only what changed in the real world.",
+    "fs": "Use plan -refresh-only to surface out-of-band changes, then decide whether to reconcile state or re-apply config.",
+    "fj": "Drift doesn't happen if everyone uses Terraform, so I never bother checking for it.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Detect drift only",
+        "lang": "ts",
+        "lines": [
+          "terraform plan -refresh-only",
+          "# or apply the refreshed state:",
+          "terraform apply -refresh-only"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a remote backend and why use one instead of local state?",
+    "a": "A backend determines where Terraform stores state and how operations run. A remote backend like S3, GCS, Azure Blob, or HCP Terraform stores state in shared, durable storage instead of a local file. This lets a team share one source of truth, supports locking so applies don't collide, and keeps secrets out of local disks and out of version control. Remote backends also enable encryption at rest and versioning so you can recover from a bad apply.",
+    "fs": "Remote backends give shared, versioned, encrypted, lockable state; committing local tfstate to Git is a classic anti-pattern.",
+    "fj": "I just commit terraform.tfstate to the repo so my teammates can pull the latest state.",
+    "level": "Jr"
+  },
+  {
+    "q": "What is a Terraform module and what makes a good module interface?",
+    "a": "A module is a reusable container of Terraform configuration: a directory with .tf files that can be called with input variables and return outputs. The root module is what runs in your working directory; child modules are called via module blocks with a source. A good module exposes a minimal set of well-typed input variables, returns useful outputs, and hides internal resources, so callers depend on the interface rather than internals. Pinning the module source version keeps callers from breaking on upstream changes.",
+    "fs": "Treat modules as versioned APIs: typed variables in, outputs out, internals hidden, source pinned to a version.",
+    "fj": "A module is just any folder of .tf files, so I copy-paste the same blocks into each environment.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Calling a pinned module",
+        "lang": "ts",
+        "lines": [
+          "module \"vpc\" {",
+          "  source  = \"terraform-aws/vpc/aws\"",
+          "  version = \"5.8.1\"",
+          "  name    = \"prod\"",
+          "  cidr    = \"10.0.0.0/16\"",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is terraform import and how has the workflow changed in Terraform 1.5+?",
+    "a": "import brings an existing real resource under Terraform management by recording it in state, so Terraform stops trying to recreate it. The legacy terraform import CLI command only writes to state and requires you to hand-write the matching resource block first. Since Terraform 1.5 the declarative import block lets you add an import to config and preview it in plan, and running terraform plan -generate-config-out=gen.tf can generate the resource HCL for you. Import blocks are reviewable in version control and CI-friendly, unlike the imperative command.",
+    "fs": "Prefer config-driven import blocks with -generate-config-out; they are previewable in plan and reviewable in PRs, unlike the CLI command.",
+    "fj": "I just run terraform import and Terraform writes the resource block in my .tf files for me.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Config-driven import (1.5+)",
+        "lang": "ts",
+        "lines": [
+          "import {",
+          "  to = aws_s3_bucket.logs",
+          "  id = \"my-existing-bucket\"",
+          "}",
+          "# generate matching HCL:",
+          "# terraform plan \\",
+          "#   -generate-config-out=gen.tf"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are Terraform workspaces and when are they the wrong tool?",
+    "a": "Workspaces let one configuration and backend hold multiple named state instances, so dev and staging each get isolated state under the same code. You switch with terraform workspace select and branch behavior using the terraform.workspace value. They suit short-lived or ephemeral copies of the same infrastructure. They are a poor fit for permanent environments needing separate credentials or access controls, because all workspaces share one backend and one set of permissions, and the environment is invisible in the code, making a wrong select a production risk.",
+    "fs": "Workspaces are fine for ephemeral copies, but use separate root configs/state for prod vs dev so credentials and blast radius are isolated.",
+    "fj": "Workspaces are the standard way to separate prod and dev because each gets its own state.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Workspace usage",
+        "lang": "ts",
+        "lines": [
+          "terraform workspace new staging",
+          "terraform workspace select staging",
+          "# in config:",
+          "# count = terraform.workspace ==",
+          "#   \"prod\" ? 3 : 1"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a Terraform provider and why should you pin provider versions?",
+    "a": "A provider is a plugin that lets Terraform manage a specific platform's API, like aws, google, azurerm, or kubernetes, exposing its resources and data sources. You declare providers in the required_providers block with a source and version constraint, and terraform init downloads them. Pinning versions (and committing the .terraform.lock.hcl lock file) ensures everyone and CI use the same provider build, so an upstream release can't silently change plan behavior. The lock file records exact versions and checksums for reproducibility.",
+    "fs": "Pin providers in required_providers and commit .terraform.lock.hcl so CI and teammates resolve identical, checksum-verified plugin versions.",
+    "fj": "I leave provider versions unset so I always get the newest features automatically on every init.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "required_providers",
+        "lang": "ts",
+        "lines": [
+          "terraform {",
+          "  required_providers {",
+          "    aws = {",
+          "      source  = \"hashicorp/aws\"",
+          "      version = \"~> 5.40\"",
+          "    }",
+          "  }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When should you use count vs for_each to create multiple resource instances?",
+    "a": "count creates instances indexed by integer position, while for_each creates instances keyed by a map key or set member. Prefer for_each when items have stable identities, because removing one entry leaves the others untouched. count is dangerous for lists since deleting a middle element shifts every later index, causing Terraform to destroy and recreate unrelated resources. Use count mainly for a simple on/off toggle (count = var.enabled ? 1 : 0) or truly interchangeable, identical copies.",
+    "fs": "Default to for_each for keyed identity and stable plans; reserve count for boolean enable toggles, never for growing lists.",
+    "fj": "I always use count with a list because it's simpler than dealing with maps in for_each.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "for_each keeps stable identity",
+        "lang": "ts",
+        "lines": [
+          "resource \"aws_iam_user\" \"u\" {",
+          "  for_each = toset([",
+          "    \"alice\", \"bob\", \"carol\"",
+          "  ])",
+          "  name = each.key",
+          "}"
+        ]
+      },
+      {
+        "label": "count for a simple toggle",
+        "lang": "ts",
+        "lines": [
+          "resource \"aws_eip\" \"nat\" {",
+          "  count = var.enable_nat ? 1 : 0",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does lifecycle ignore_changes do, and give a real use case?",
+    "a": "ignore_changes tells Terraform to disregard changes to listed attributes when planning updates, so out-of-band modifications to those fields don't trigger a diff. It applies only to updates, not the initial create. A common use is an attribute mutated outside Terraform, such as an autoscaling desired_count adjusted by a scaling policy, or a tag added by an external system. You can ignore specific attributes or use ignore_changes = all to freeze the whole resource after creation.",
+    "fs": "ignore_changes scopes out externally-managed attributes (like ASG desired_count) so they don't cause perpetual diffs, without abandoning the resource.",
+    "fj": "ignore_changes means Terraform stops managing the resource entirely, so it's the same as removing it.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Ignore externally-scaled count",
+        "lang": "ts",
+        "lines": [
+          "resource \"aws_autoscaling_group\" \"a\" {",
+          "  desired_capacity = 2",
+          "  # ...",
+          "  lifecycle {",
+          "    ignore_changes = [",
+          "      desired_capacity,",
+          "    ]",
+          "  }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a sensitive output and does marking it sensitive secure the value?",
+    "a": "Marking an output with sensitive = true tells Terraform to redact it from CLI plan and apply output, showing (sensitive value) instead. This prevents accidental display in logs, but it does not encrypt or hide the value in state: state still stores it in plaintext. So a sensitive output is about display hygiene, not real secret protection. To truly protect secrets, secure the backend (encryption, access control) and prefer a secrets manager over storing them in Terraform at all.",
+    "fs": "sensitive = true only redacts CLI display; the value is still plaintext in state, so protect the backend and use a real secrets store.",
+    "fj": "Marking the output sensitive encrypts it, so it's safe to keep secrets in Terraform outputs.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Sensitive output",
+        "lang": "ts",
+        "lines": [
+          "output \"db_password\" {",
+          "  value     = aws_db_instance.x.password",
+          "  sensitive = true",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you safely move or rename a resource in Terraform without destroying it?",
+    "a": "Renaming a resource block changes its address, and by default Terraform sees the old address as deleted and the new one as needing creation, causing a destroy-and-recreate. To avoid that, use a moved block in configuration to tell Terraform the resource simply changed address, so it updates state without touching real infrastructure. The moved block is declarative, reviewable in version control, and the modern replacement for the imperative terraform state mv command. It is especially useful when refactoring resources into or between modules.",
+    "fs": "Use declarative moved blocks for refactors so state addresses update with zero infra churn; they're PR-reviewable unlike state mv.",
+    "fj": "If I rename a resource Terraform just keeps it as-is, names are only labels so nothing happens.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "moved block",
+        "lang": "ts",
+        "lines": [
+          "moved {",
+          "  from = aws_instance.web",
+          "  to   = aws_instance.app",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does terraform init do and when must you re-run it?",
+    "a": "terraform init initializes a working directory: it downloads the providers declared in required_providers, installs modules referenced by module blocks, and configures the backend for state storage. It also writes or updates the dependency lock file. You must re-run it after adding or changing providers, changing module sources or versions, or changing backend configuration. It is safe to run repeatedly and is the required first step before plan or apply in a fresh checkout.",
+    "fs": "init wires up backend, providers, and modules and refreshes the lock file; re-run it whenever any of those change.",
+    "fj": "init only matters the very first time; after that I never need to run it again.",
+    "level": "Jr"
+  },
+  {
+    "q": "How would you migrate state from a local backend to a remote S3 backend?",
+    "a": "Add the backend \"s3\" block to your terraform configuration with the bucket, key, region, and use_lockfile settings, then run terraform init. Terraform detects the backend change and prompts to copy the existing local state into the new S3 backend; answer yes to migrate. After migration, the local terraform.tfstate is no longer authoritative and the remote bucket holds the state. Always back up the local state first and ensure the bucket has versioning and encryption enabled before migrating.",
+    "fs": "Define the new backend, run init, and let Terraform copy state with the migration prompt; back up local state and enable bucket versioning first.",
+    "fj": "I just upload my terraform.tfstate file to the S3 bucket manually and point the backend at it.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Migrate on init",
+        "lang": "ts",
+        "lines": [
+          "# add backend \"s3\" block, then:",
+          "terraform init -migrate-state",
+          "# Terraform: copy existing state",
+          "# to the new backend? yes"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is create_before_destroy and when do you need it?",
+    "a": "By default, when a change forces replacement of a resource that can't update in place, Terraform destroys the old object first, then creates the new one, causing downtime. Setting lifecycle { create_before_destroy = true } reverses the order: the replacement is created before the old one is destroyed, avoiding an outage. It is essential for resources behind load balancers or with strict availability needs. The new resource must be able to coexist with the old one, so watch out for unique-name or unique-port collisions.",
+    "fs": "create_before_destroy swaps replace ordering to avoid downtime, but requires the old and new resources to coexist (no unique-name clashes).",
+    "fj": "create_before_destroy just makes apply faster; it doesn't matter for availability.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Zero-downtime replacement",
+        "lang": "ts",
+        "lines": [
+          "resource \"aws_launch_template\" \"x\" {",
+          "  # ...",
+          "  lifecycle {",
+          "    create_before_destroy = true",
+          "  }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you pass values between modules using outputs?",
+    "a": "A child module exposes data through output blocks, and the calling module references them as module.<name>.<output>. To pass data into a module, you define input variables and set them in the module block. This is the only supported way for modules to share data; a child module cannot reach into a parent's resources directly. So you wire modules together by returning outputs from one and feeding them as variable inputs to another, keeping each module's internals encapsulated.",
+    "fs": "Modules compose through explicit outputs and input variables only; reaching across module internals directly is impossible by design.",
+    "fj": "Modules can just read each other's resources directly since it's all the same Terraform run.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Wire output to input",
+        "lang": "ts",
+        "lines": [
+          "module \"net\" { source = \"./net\" }",
+          "",
+          "module \"app\" {",
+          "  source    = \"./app\"",
+          "  subnet_id = module.net.subnet_id",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the .terraform.lock.hcl dependency lock file and should it be committed?",
+    "a": "The dependency lock file records the exact provider versions and their checksums that Terraform selected during init. Committing it to version control ensures every teammate and CI run installs identical provider builds, making plans reproducible and guarding against a tampered or unexpectedly upgraded plugin. terraform init -upgrade is how you intentionally bump versions and refresh the lock. Without committing it, two people could resolve different provider versions and see different plans for the same code.",
+    "fs": "Commit .terraform.lock.hcl for reproducible, checksum-verified provider resolution; bump deliberately with init -upgrade.",
+    "fj": "The lock file is a temporary cache like .terraform, so I add it to .gitignore.",
+    "level": "Mid"
+  },
+  {
+    "q": "How does Terraform build and use a dependency graph during apply?",
+    "a": "Terraform builds a directed acyclic graph from resource references and explicit depends_on, then walks it to order operations. Resources with no dependency between them are created or updated in parallel, while dependent resources wait for their prerequisites. Implicit dependencies come from interpolating one resource's attribute into another; depends_on adds an edge when there's no attribute reference but an ordering still matters. This graph is also what lets plan determine the correct create, update, and destroy order safely.",
+    "fs": "The DAG from references plus depends_on drives parallelism and ordering; reach for depends_on only when no attribute reference exists.",
+    "fj": "Terraform just runs resources top to bottom in the order I wrote them in the file.",
+    "level": "Sr"
+  },
+  {
+    "q": "What does terraform state rm do, and how is it different from terraform destroy?",
+    "a": "terraform state rm removes a resource from Terraform's state without touching the real infrastructure, so Terraform forgets about it and will no longer manage it. terraform destroy, by contrast, actually deletes the real resource and removes it from state. You use state rm when you want to hand a resource off to another configuration, stop managing it, or recover from a botched import, while keeping the live object alive. Because it edits state directly, do it carefully and ensure state is backed up and locked.",
+    "fs": "state rm forgets a resource but leaves it running; destroy deletes the real object. Use rm for handoffs, never to 'clean up' infra.",
+    "fj": "terraform state rm deletes the resource, it's just a shortcut for destroy on one resource.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Forget vs delete",
+        "lang": "ts",
+        "lines": [
+          "# stop managing, keep it alive:",
+          "terraform state rm aws_s3_bucket.old",
+          "",
+          "# delete the real resource:",
+          "terraform destroy \\",
+          "  -target=aws_s3_bucket.old"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between an input variable and a local value, and when do you use each?",
+    "a": "A variable is an external input to a module set by the caller, the CLI, a tfvars file, or an environment variable, so it parameterizes the module's interface. A local is an internal named expression computed once inside the module, used to avoid repeating a complex expression or to derive a value from variables and resource attributes. The rule of thumb: variables for things a caller should supply, locals for intermediate computations you don't want exposed. Overusing locals as pseudo-constants is fine, but never use a variable with a default just to fake a local, since that wrongly invites callers to override it.",
+    "fs": "Variables are the caller-facing interface; locals are internal derived expressions. Don't expose a tunable as a variable when it's really an internal constant.",
+    "fj": "Variables and locals are interchangeable, I just pick whichever and set a default.",
+    "level": "Jr",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Variable in, local derives",
+        "lang": "ts",
+        "lines": [
+          "variable \"env\" { type = string }",
+          "locals {",
+          "  name = \"app-${var.env}\"",
+          "  is_prod = var.env == \"prod\"",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a data source in Terraform and how does it differ from a resource?",
+    "a": "A data source reads information about existing infrastructure that Terraform does not manage, exposing it for use elsewhere in config. Unlike a resource block, it never creates, updates, or destroys anything, it only queries the provider during plan or apply. You use it to look up an AMI, an existing VPC, an account ID, or another team's outputs, then reference data.<type>.<name>.<attr>. Because data sources are read each run, they can introduce drift in your plan if the upstream value changes, so depend on stable lookups or pin filters tightly.",
+    "fs": "A data source reads existing infra read-only; it creates nothing. Pin its filters so an unstable lookup doesn't churn dependent resources every plan.",
+    "fj": "A data source creates the resource if it doesn't exist yet, like a get-or-create.",
+    "level": "Jr",
+    "asked": 11,
+    "code": [
+      {
+        "label": "Look up, don't create",
+        "lang": "ts",
+        "lines": [
+          "data \"aws_ami\" \"ubuntu\" {",
+          "  most_recent = true",
+          "  owners = [\"099720109477\"]",
+          "  filter {",
+          "    name   = \"name\"",
+          "    values = [\"ubuntu*-24.04-*\"]",
+          "  }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does lifecycle prevent_destroy do, and what is its main limitation?",
+    "a": "Setting lifecycle { prevent_destroy = true } makes Terraform reject any plan that would destroy that resource, erroring out before apply, which guards stateful resources like prod databases or state buckets from accidental deletion. It is a planning safeguard, not a real lock: it only blocks destroys initiated through that configuration. Its key limitation is that you cannot remove the resource block while prevent_destroy is set, since deleting the block triggers a destroy that the flag forbids, so you must first set it to false or remove the resource via state operations. It also doesn't stop someone deleting the resource out-of-band in the console.",
+    "fs": "prevent_destroy blocks destroy plans for critical resources, but you must flip it off before removing the block, and it can't stop out-of-band console deletes.",
+    "fj": "prevent_destroy permanently locks the resource so nothing can ever delete it, even outside Terraform.",
+    "level": "Mid",
+    "asked": 10,
+    "code": [
+      {
+        "label": "Guard a stateful resource",
+        "lang": "ts",
+        "lines": [
+          "resource \"aws_db_instance\" \"prod\" {",
+          "  # ...",
+          "  lifecycle {",
+          "    prevent_destroy = true",
+          "  }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you compose separate Terraform configurations using the terraform_remote_state data source?",
+    "a": "When you split infrastructure into separate state files, for example a networking layer and an app layer, the app config reads the network's outputs via the terraform_remote_state data source, pointing at the same backend and key. It exposes the other state's root outputs as data.terraform_remote_state.<name>.outputs.<key>, creating a read-time dependency between layers. This couples the consumer to the producer's backend and requires read access to that state, which leaks all of its outputs. A looser alternative is to publish values to a parameter store or SSM and read them with a normal data source, avoiding direct state coupling.",
+    "fs": "terraform_remote_state reads another layer's outputs across backends, but it couples you to their state and exposes all outputs; SSM/Parameter Store is a looser-coupled alternative.",
+    "fj": "Each Terraform config is fully isolated, so there's no way for one to use another's outputs.",
+    "level": "Mid",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Read another layer's state",
+        "lang": "ts",
+        "lines": [
+          "data \"terraform_remote_state\" \"net\" {",
+          "  backend = \"s3\"",
+          "  config = {",
+          "    bucket = \"tf-state\"",
+          "    key    = \"net/app.tfstate\"",
+          "    region = \"us-east-1\"",
+          "  }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When is terraform apply -target appropriate, and why is it considered a code smell if used routinely?",
+    "a": "The -target flag restricts an operation to a specific resource and its dependencies, skipping the rest of the graph. It is meant for exceptional recovery, such as working around a provider bug, unblocking a half-applied state, or surgically fixing one resource after a partial failure. Using it routinely is a smell because it produces a plan that ignores the full configuration, so the targeted apply can leave your infrastructure inconsistent with what a normal plan would do, and HashiCorp explicitly warns it's not for day-to-day use. If you find yourself reaching for -target often, the real fix is usually to split the configuration into smaller, independently-applied root modules.",
+    "fs": "-target is an emergency surgical tool that bypasses the full graph; reaching for it routinely signals you should split the config into smaller root modules instead.",
+    "fj": "I use -target all the time to apply just the part I'm working on so plans run faster.",
+    "level": "Mid",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Surgical, not routine",
+        "lang": "ts",
+        "lines": [
+          "# recovery only, e.g. after a",
+          "# partial apply failure:",
+          "terraform apply \\",
+          "  -target=aws_instance.web"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you structure a CI/CD pipeline for Terraform so applies are safe and reviewable?",
+    "a": "On a pull request, run terraform fmt -check, validate, and terraform plan -out=tfplan, then post the plan as a PR comment so reviewers approve the exact diff. On merge to the main branch, the pipeline runs terraform apply tfplan against the saved plan file, guaranteeing it applies precisely what was reviewed with no re-plan drift. The pipeline authenticates via short-lived OIDC credentials rather than long-lived keys, uses a remote backend with locking so concurrent runs serialize, and gates the apply stage behind a required approval. Plan artifacts can expire, so the apply must run soon after, or re-plan and re-approve.",
+    "fs": "Plan in CI on the PR, save the plan, and apply that artifact on merge via OIDC with backend locking and an approval gate, so apply equals what was reviewed.",
+    "fj": "The pipeline just runs terraform apply -auto-approve on every push to main.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Plan on PR, apply on merge",
+        "lang": "ts",
+        "lines": [
+          "# PR job:",
+          "terraform plan -out=tfplan",
+          "# comment the plan for review",
+          "# merge job (gated):",
+          "terraform apply tfplan"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you force Terraform to recreate a single resource, and why is terraform taint discouraged now?",
+    "a": "Use terraform apply -replace=ADDRESS (or terraform plan -replace to preview), which tells Terraform to destroy and recreate just that instance instead of updating it in place. This is the modern path because it shows up as a normal, reviewable plan and changes nothing until you apply. The older terraform taint command is deprecated since 0.15.2: it mutated state immediately, before any plan, so a change of mind required terraform untaint, and the replacement was invisible in plan until you ran apply. So -replace is preview-first and state-safe, while taint was an imperative state edit.",
+    "fs": "Use -replace, which surfaces the destroy/recreate in a reviewable plan and changes nothing until apply; taint is deprecated because it mutated state up front.",
+    "fj": "I run terraform taint to mark the resource, that's the standard way to recreate it.",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Preview then replace",
+        "lang": "ts",
+        "lines": [
+          "terraform plan \\",
+          "  -replace=aws_instance.web",
+          "# reviewed? then:",
+          "terraform apply \\",
+          "  -replace=aws_instance.web"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Secrets end up in plaintext in Terraform state. What are the real mitigations?",
+    "a": "Any secret a resource needs, a generated DB password, a private key, an API token, is written to state in plaintext, regardless of sensitive = true, which only redacts CLI display. So the state file itself is the secret store and must be protected: a remote backend with encryption at rest, strict IAM on the bucket, and no committing state to Git. Better still, don't put the secret in Terraform at all: have the resource read it from a secrets manager (AWS Secrets Manager, Vault) at runtime, or use a Vault provider with dynamic short-lived credentials so the long-lived secret never lands in state. OpenTofu additionally offers native client-side state encryption.",
+    "fs": "Secrets are plaintext in state no matter what sensitive does; encrypt and lock down the backend, and prefer reading secrets from a manager at runtime over storing them in Terraform.",
+    "fj": "As long as I mark variables and outputs sensitive, my secrets aren't stored in state.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "How do you validate inputs and assumptions in a module using validation, preconditions, and postconditions?",
+    "a": "A variable validation block checks an input at plan time against a condition and emits a custom error if it fails, catching bad parameters early, for example enforcing an allowed environment name. A precondition in a resource, data, or output lifecycle verifies an assumption before the block is processed, such as confirming a looked-up AMI's architecture, while a postcondition verifies a guarantee after, such as that an instance got a private DNS name. All three halt the operation on failure with your message. The separate check block, by contrast, only warns and does not block, so it suits non-fatal continuous assertions about infrastructure health.",
+    "fs": "validation guards inputs at plan time; pre/postconditions assert assumptions before/after a block and halt on failure; check blocks only warn.",
+    "fj": "Terraform can't validate inputs, I just hope callers pass the right values.",
+    "level": "Sr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Input validation rule",
+        "lang": "ts",
+        "lines": [
+          "variable \"env\" {",
+          "  type = string",
+          "  validation {",
+          "    condition = contains(",
+          "      [\"dev\",\"stg\",\"prod\"], var.env)",
+          "    error_message = \"bad env\"",
+          "  }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is OpenTofu, how does it differ from Terraform, and how do you decide between them?",
+    "a": "OpenTofu is the MPL-2.0 open-source fork of Terraform created after HashiCorp relicensed Terraform under the BSL in 2023; it lives under Linux Foundation governance with a public roadmap. It is largely a drop-in replacement for the same HCL, but the two have begun diverging: OpenTofu shipped native client-side state encryption (1.7), provider-defined functions, for_each on provider blocks, early variable evaluation, and an -exclude flag, which Terraform's open-source CLI lacks. Choose OpenTofu for open governance, faster community features, or to avoid BSL terms; stay on Terraform for tight HCP Terraform/Cloud integration and official enterprise support. Migration from recent Terraform versions is usually straightforward, but new modules may use features specific to one tool.",
+    "fs": "OpenTofu is the MPL-licensed, Linux-Foundation fork; it added state encryption, provider-defined functions, and -exclude. Pick it for open governance, stay on Terraform for HCP/enterprise ties.",
+    "fj": "OpenTofu and Terraform are identical, so it doesn't matter which one a team picks.",
+    "level": "Sr",
+    "asked": 11
+  }
+]

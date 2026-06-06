@@ -1,0 +1,844 @@
+[
+  {
+    "q": "What does Delta Lake give you over plain Parquet files on cloud storage?",
+    "a": "Delta Lake is Parquet plus a JSON transaction log (_delta_log) that adds ACID transactions, so writes either fully commit or never appear. On top of Parquet it provides time travel, schema enforcement on write, and MERGE/UPDATE/DELETE for upserts and CDC. It also improves reads via per-file min/max statistics for data skipping and OPTIMIZE for compacting small files, while remaining an open format other engines can read.",
+    "fj": "Delta is just Parquet but faster.",
+    "fs": "Delta adds ACID transactions via a transaction log, MERGE, time travel, and schema enforcement on top of Parquet — fundamentally different guarantees, not just speed.",
+    "level": "Jr",
+    "asked": 28,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Delta-only ops on a Parquet table",
+        "lines": [
+          "-- _delta_log/*.json tracks commits",
+          "MERGE INTO tgt t USING src s",
+          "  ON t.id = s.id",
+          "  WHEN MATCHED THEN UPDATE SET *",
+          "  WHEN NOT MATCHED THEN INSERT *;",
+          "SELECT * FROM tgt VERSION AS OF 3;",
+          "-- impossible on plain Parquet"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Describe the medallion architecture (bronze / silver / gold). What goes in each layer and why?",
+    "a": "Bronze ingests source data exactly as it arrives with added metadata, serving as the permanent audit record. Silver applies parsing, type-casting, deduplication, and joins (including CDC MERGE) to produce cleaned, conformed tables, and gold holds purpose-built aggregations and wide denormalized tables optimized for specific consumers. The three layers isolate failures and make pipelines deterministic: a schema change only forces reprocessing from bronze onward rather than rebuilding everything, and each layer can be independently tested and monitored.",
+    "fj": "Bronze is raw, silver is cleaner, gold is final.\" (No explanation of why)",
+    "fs": "Bronze preserves the source record for reprocessing; silver enforces quality and schema; gold serves specific consumers. The layers isolate failures and make pipelines deterministic.",
+    "level": "Mid",
+    "asked": 18
+  },
+  {
+    "q": "What is Delta Lake time travel and how do you use it in practice?",
+    "a": "Time travel lets you query or restore a Delta table at any prior version or timestamp without backups, using VERSION AS OF or TIMESTAMP AS OF, with DESCRIBE HISTORY listing all versions. It works because Delta never deletes files on write — it adds new files and marks old ones removed in the log, so prior views can be reconstructed until VACUUM cleans the files (default 7-day retention). The most valuable use is recovering an accidental overwrite or delete: find the prior version, verify it, then RESTORE TABLE TO VERSION AS OF, which is an instant, auditable rollback. It also enables reproducing a report from a specific date on a live table.",
+    "fj": "You can only look at old data, you can’t restore it.",
+    "fs": "RESTORE TABLE creates a new commit that points to the prior version’s files — it’s an instant, auditable rollback, not a file copy.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Recover an accidental overwrite",
+        "lines": [
+          "DESCRIBE HISTORY sales;",
+          "-- find good version, e.g. 41",
+          "SELECT * FROM sales",
+          "  VERSION AS OF 41;  -- verify",
+          "RESTORE TABLE sales",
+          "  TO VERSION AS OF 41;",
+          "-- new commit -> old files, instant"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When would you use an all-purpose cluster vs a job cluster in Databricks, and why does it matter for cost?",
+    "a": "All-purpose clusters stay running and are shared for interactive notebooks, billed at the higher all-purpose DBU rate even when idle. Job clusters are created fresh when a job starts and terminate when it completes, billed only for runtime at the lower job-cluster rate — typically 40-60% cheaper with zero idle cost. The rule is all-purpose for interactive development and exploration, job clusters for every scheduled production job. SQL Warehouses are a third option optimized for BI SQL queries rather than Spark code.",
+    "fj": "I use an all-purpose cluster for everything so I don’t have to wait for startup.",
+    "fs": "All-purpose clusters are for interactive dev; every production job gets a job cluster to avoid idle billing at the higher DBU rate.",
+    "level": "Mid",
+    "asked": 14
+  },
+  {
+    "q": "How do you decide what format to use when writing data in Databricks — Delta, Parquet, CSV, or JSON?",
+    "a": "Default to Delta Lake for any internal table you query, update, or manage over time, since it adds ACID, schema enforcement, time travel, and MERGE. Use plain Parquet only for staging or handoffs to external systems lacking a Delta connector, and treat CSV/JSON as ingestion-boundary source formats, never as destinations for processed data. The key rule is that format is a destination decision: upstream sends whatever it sends, but everything written inside Databricks should be Delta unless an external system requires otherwise. For cross-organization sharing, consider Delta Sharing.",
+    "fj": "I store everything as CSV for portability.",
+    "fs": "CSV is a source format only. Inside Databricks I write Delta for queryability, ACID, and performance; Parquet only for external handoffs that don’t support Delta.",
+    "level": "Jr",
+    "asked": 10
+  },
+  {
+    "q": "Delta Lake vs plain Parquet on S3 — when would each be the right choice?",
+    "a": "Choose Delta Lake for virtually all production lakehouse use cases — when you need ACID, concurrent writes without corruption, upserts/deletes, schema enforcement, time travel, or automatic compaction. Choose plain Parquet for read-only static datasets, one-time exports, or handoffs to systems with no Delta connector. Delta does not replace Parquet; it uses Parquet as its data format and adds a transaction-log management layer with optimistic concurrency control that detects conflicting concurrent writers. The practical default in a Spark or Databricks environment is to always start with Delta, writing raw Parquet only for external interoperability.",
+    "fj": "Parquet is legacy, Delta replaced it.",
+    "fs": "Delta uses Parquet as its data format and adds a transaction log on top. Parquet is still the right choice for external handoffs and read-only datasets.",
+    "level": "Mid",
+    "asked": 20
+  },
+  {
+    "q": "How does Delta Lake actually implement ACID transactions? Walk me through what happens when a MERGE runs.",
+    "a": "Delta achieves ACID through its transaction log: new Parquet files are written but become visible only when the JSON commit file lands, so a crash before commit leaves orphaned files that are simply ignored. Isolation uses optimistic concurrency control — concurrent writers read the current version, do their work, and race to commit the next version number; the loser detects the conflict and either retries or fails. A MERGE identifies which target Parquet files contain matching rows, rewrites only those files with the changes, and atomically records the removed and added files in one commit, leaving unaffected files untouched. Checkpoint files written every 10 commits speed up log replay.",
+    "fj": "Delta has ACID because it’s built on top of a database engine.",
+    "fs": "Delta achieves ACID via the transaction log: a write only becomes visible when the commit JSON file is written. There’s no traditional lock manager — it’s optimistic concurrency with conflict detection on commit.",
+    "level": "Sr",
+    "asked": 26,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "MERGE rewrites only matched files",
+        "lines": [
+          "MERGE INTO target t",
+          "USING updates u ON t.id = u.id",
+          "WHEN MATCHED THEN UPDATE SET *",
+          "WHEN NOT MATCHED THEN INSERT *;",
+          "-- one commit JSON records",
+          "-- removed + added files atomically",
+          "-- untouched files stay as-is"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Walk me through how you’d implement a CDC (change data capture) pipeline from a Postgres source into a Delta Lake silver table using MERGE.",
+    "a": "Capture changes from Postgres with Debezium into Kafka or cloud storage carrying operation type and before/after images, then ingest raw events append-only into a bronze Delta table via Auto Loader or the Kafka connector. To build silver, read bronze events, deduplicate to the latest operation per primary key within each micro-batch, then MERGE with branches that delete on DELETE, update on UPDATE, and insert on INSERT. Use a Structured Streaming checkpoint or high-watermark for idempotency so restarts do not re-apply processed changes, and choose mergeSchema or strict enforcement depending on whether the source schema can drift. The within-batch dedup is essential to avoid insert-then-update ordering bugs.",
+    "fj": "I’d overwrite the silver table on each CDC batch.",
+    "fs": "Full overwrites are expensive and non-atomic on large tables. I’d use MERGE to apply only the changed rows, matching on primary key and branching on operation type.",
+    "level": "Sr",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Dedup-to-latest, then MERGE per op",
+        "lines": [
+          "# in foreachBatch: dedup to latest",
+          "# op per id, then branched merge:",
+          "(tgt.alias('t')",
+          "  .merge(latest.alias('s'),'t.id=s.id')",
+          "  .whenMatchedDelete('s.op = \"D\"')",
+          "  .whenMatchedUpdateAll()",
+          "  .whenNotMatchedInsertAll().execute())"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is Auto Loader and when would you use it instead of a batch file listing?",
+    "a": "Auto Loader is the cloudFiles Structured Streaming source that incrementally detects and processes new files as they land, maintaining a checkpoint of already-processed files so each run is O(new files) rather than O(total files). It supports two detection modes — directory listing and file notification via S3/Event Grid events for near-real-time pickup — and handles schema inference, incremental schema evolution, and rescued data for unknown fields. Use it whenever files drop continuously or frequently into cloud storage and you need incremental processing without writing your own file-tracking logic, which is the standard bronze ingestion mechanism in the medallion pattern.",
+    "fj": "I’d just use spark.read.parquet() on the whole prefix every time.",
+    "fs": "That re-lists and re-reads everything on each run. Auto Loader with a checkpoint is O(new files) and handles millions of files in a prefix without performance degradation.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "re-lists everything each run",
+        "accent": "bug",
+        "lines": [
+          "df = spark.read.parquet(path)",
+          "# O(total files) every run"
+        ]
+      },
+      {
+        "lang": "pyspark",
+        "label": "Auto Loader: O(new files)",
+        "accent": "fix",
+        "lines": [
+          "df = (spark.readStream",
+          "  .format('cloudFiles')",
+          "  .option('cloudFiles.format','json')",
+          "  .option('cloudFiles.schemaLocation', ck)",
+          "  .load(path))  # checkpoint skips seen"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does Delta Lake handle schema evolution, and what’s the difference between `mergeSchema` and `overwriteSchema`?",
+    "a": "By default Delta enforces schema, rejecting non-matching writes before any data lands so schema drift surfaces immediately. mergeSchema enables additive evolution — new source columns are automatically added while existing columns and types are preserved — which suits event pipelines where new properties appear over time. overwriteSchema, used in overwrite mode, destructively replaces the entire table schema even dropping columns or changing types, so it is reserved for intentional, breaking redefinitions. Neither allows arbitrary type changes, though recent versions support type widening like int to long behind a feature flag.",
+    "fj": "I use overwriteSchema whenever I need to add a column.",
+    "fs": "overwriteSchema replaces the whole schema destructively. To add columns, I use mergeSchema. overwriteSchema is only for intentional, breaking schema changes.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "additive: keeps existing cols",
+        "lines": [
+          "(df.write.format('delta')",
+          "  .mode('append')",
+          "  .option('mergeSchema','true')",
+          "  .saveAsTable('events'))"
+        ]
+      },
+      {
+        "lang": "pyspark",
+        "label": "destructive: replaces schema",
+        "lines": [
+          "(df.write.format('delta')",
+          "  .mode('overwrite')",
+          "  .option('overwriteSchema','true')",
+          "  .saveAsTable('events'))",
+          "# can drop cols / change types"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide between Structured Streaming (micro-batch) and batch jobs for a Databricks pipeline?",
+    "a": "Match the architecture to the freshness SLA: use Structured Streaming when data must be processed continuously with seconds-to-minutes latency, and use batch when data arrives in discrete chunks and minutes-to-hours latency is acceptable. Streaming adds real operational complexity — checkpoint management, watermarking for late data, and stateful-operation caveats — so do not stream just because you can. A common production sweet spot is the hybrid pattern: ingest via Auto Loader to bronze, then run batch silver and gold jobs on a schedule, decoupling ingestion latency from transformation complexity. The trigger availableNow mode gives incremental batch semantics with streaming checkpointing.",
+    "fj": "I always use streaming because it’s more modern.",
+    "fs": "I match the architecture to the latency SLA. For hourly pipelines, a triggered batch job is simpler. Streaming earns its complexity when freshness is measured in seconds or minutes.",
+    "level": "Mid",
+    "asked": 16
+  },
+  {
+    "q": "How do you choose between Delta Live Tables and hand-written Databricks jobs for a new pipeline?",
+    "a": "Delta Live Tables is a declarative framework that handles orchestration, dependency resolution, lineage, retries, data quality expectations, and CDC via APPLY CHANGES INTO, reducing pipeline boilerplate. Hand-written notebooks plus Workflows give full control over execution logic, Spark tuning, complex conditional flow, and non-Spark steps. Choose DLT for greenfield pipelines following standard medallion patterns where built-in quality and lineage matter, and hand-written jobs when you need fine-grained performance control or unusual logic. The trade-off is that DLT lowers operational overhead but abstracts Spark config and is harder to debug locally, and the two can be combined.",
+    "fj": "DLT is just notebooks with a different syntax.",
+    "fs": "DLT is a declarative framework with built-in dependency resolution, data quality expectations, automatic lineage, and CDC via APPLY CHANGES INTO — it replaces a lot of pipeline boilerplate but trades fine-grained control.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "DLT declarative CDC",
+        "lines": [
+          "APPLY CHANGES INTO live.silver",
+          "FROM stream(live.bronze)",
+          "KEYS (id)",
+          "APPLY AS DELETE WHEN op = 'D'",
+          "SEQUENCE BY ts",
+          "COLUMNS * EXCEPT (op, ts);",
+          "-- replaces hand-written MERGE"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Databricks vs Snowflake for a net-new data platform — how do you choose?",
+    "a": "Choose based on the dominant workload and team skills rather than tribal preference. Snowflake wins for SQL analytics and BI with near-zero ops and predictable concurrency, while Databricks wins for ML/AI, Python-heavy engineering, streaming, and open Delta format that avoids storage lock-in. Cost models differ — Snowflake bills simple per-warehouse-second credits, Databricks bills DBUs plus your cloud compute with more knobs and spot-instance savings. Lines are blurring as Snowflake adds Python and Iceberg and Databricks adds strong SQL warehousing and Serverless, so anchor the choice on where the team spends most of its time.",
+    "fj": "Databricks is always better because it has Spark.",
+    "fs": "It depends on the dominant workload and team. Snowflake wins on SQL analytics + ops simplicity; Databricks wins on ML, streaming, open format. I’d pick based on where the team spends 80% of its time.",
+    "level": "Sr",
+    "asked": 19
+  },
+  {
+    "q": "A Delta table that ingests streaming data has degraded read performance over time. Diagnose it and fix it.",
+    "a": "This is the small-files problem: streaming micro-batches each write a few small Parquet files, so over time the table accumulates tens of thousands of tiny files and every query pays file-metadata overhead. Diagnose with DESCRIBE DETAIL to check numFiles and average file size, then run OPTIMIZE to compact files to roughly 128MB-1GB and follow with VACUUM to reclaim storage. For ongoing prevention, enable Auto Optimize (optimizeWrite and autoCompact) or, for new tables on DBR 13.3+, use liquid clustering, which clusters incrementally on OPTIMIZE without full rewrites and replaces Z-ORDER. More executors do not help because the bottleneck is file count, not compute.",
+    "fj": "I’d add more executors to make the queries faster.",
+    "fs": "More executors don’t help when the bottleneck is file metadata overhead from tens of thousands of small files. The fix is OPTIMIZE for compaction and liquid clustering for structural prevention.",
+    "level": "Sr",
+    "asked": 24,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Diagnose and compact",
+        "lines": [
+          "DESCRIBE DETAIL events;",
+          "-- numFiles huge, sizeInBytes small",
+          "OPTIMIZE events;   -- ~128MB-1GB",
+          "VACUUM events;     -- reclaim files",
+          "-- prevent: cluster incrementally",
+          "ALTER TABLE events",
+          "  CLUSTER BY (user_id, event_date);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your organization is migrating to Unity Catalog. Walk me through what Unity Catalog provides and how you’d govern a multi-team lakehouse with it.",
+    "a": "Unity Catalog is a centralized, deny-by-default governance layer across all workspaces, replacing per-workspace Hive metastores with a three-tier catalog.schema.table namespace. It provides fine-grained ANSI SQL GRANT/REVOKE down to rows and columns via row filters and column masks enforced at query time, automatic column-level lineage, and cross-workspace data discovery. Migration uses UPGRADE TABLE for managed tables and external-location registration without moving data. For multi-team governance, use a catalog per environment, schemas per team with team ownership, and cross-team read access through views with row filters rather than copying redacted tables.",
+    "fj": "Unity Catalog is just a metadata catalog like AWS Glue.",
+    "fs": "UC is a full governance layer: centralized access control with row/column-level security, automatic lineage, cross-workspace discovery, and a deny-by-default security model — far beyond a metadata catalog.",
+    "level": "Sr",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Three-tier names + fine-grained grants",
+        "lines": [
+          "GRANT SELECT ON prod.sales.orders",
+          "  TO `analysts`;  -- catalog.schema.tbl",
+          "ALTER TABLE prod.sales.orders",
+          "  SET ROW FILTER region_flt",
+          "  ON (region);  -- enforced at query"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How would you approach migrating a legacy on-prem Hive/HDFS data warehouse to Databricks on the cloud?",
+    "a": "Work in phases: assess and prioritize Hive tables by value and complexity, migrate storage to S3/ADLS with distcp while converting formats to Delta, rewrite Hive QL and Spark 1.x/2.x jobs to Spark 3.x watching for breaking behavioral differences, and replace Oozie/Airflow orchestration with Databricks Workflows. Register tables in Unity Catalog and replicate Ranger/Sentry ACLs as GRANTs during the migration rather than deferring governance. The non-negotiable is running old and new pipelines in parallel and validating row counts, aggregates, and schema before cutover, and establishing cost-attribution tags and cluster policies from day one to avoid sticker shock.",
+    "fj": "I’d copy the data and repoint the Spark jobs — it’s just Spark.",
+    "fs": "Spark 2.x vs 3.x has breaking behavioral differences. I’d run parallel jobs and validate output before cutting over, with a full schema + aggregate reconciliation framework.",
+    "level": "Sr",
+    "asked": 17
+  },
+  {
+    "q": "How do you control and reduce Databricks compute costs in a production environment?",
+    "a": "The biggest lever is job-cluster discipline: run all scheduled production jobs on ephemeral job clusters at the lower DBU rate with zero idle cost, never on always-on all-purpose clusters. Use spot/preemptible worker nodes for 60-70% savings with an on-demand driver, enable autoscaling, and use auto-stopping or Serverless SQL Warehouses for BI instead of clusters. Enforce cluster policies that cap DBUs, restrict instance types, and require auto-termination to prevent over-provisioning, and enable Photon for SQL-heavy workloads. Finally, tag jobs by team and query Unity Catalog billing tables for cost attribution and accountability.",
+    "fj": "I’d just use smaller clusters to save money.",
+    "fs": "Smaller clusters for the wrong workload type doesn’t fix idle billing. The structural fix is job clusters for all production jobs, spot workers, cluster policies to prevent over-provisioning, and cost attribution to create team accountability.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "How do you decide between traditional Hive partitioning, Z-ORDER, and liquid clustering for a high-volume Delta table?",
+    "a": "Hive partitioning physically splits the table into subdirectories and works when queries almost always filter on the partition column, but high-cardinality columns create millions of tiny directories. Z-ORDER co-locates multi-column values within files for better data skipping but requires a full rewrite each OPTIMIZE and decays as new files land, so it suits existing tables on older runtimes. Liquid clustering (DBR 13.3+) is the current best practice for new tables: incremental, tree-based, up to four changeable clustering columns, and graceful with high cardinality, replacing both partitioning and Z-ORDER. The exception is when an external system needs Hive partition directories for its own pruning.",
+    "fj": "I’d partition by user_id for better performance.",
+    "fs": "Partitioning by user_id creates millions of tiny partition directories — the small-files problem at scale. I’d use liquid clustering on user_id instead, which handles high cardinality without directory explosion.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "millions of tiny dirs",
+        "accent": "bug",
+        "lines": [
+          "CREATE TABLE t (...)",
+          "PARTITIONED BY (user_id);",
+          "-- 1 dir per user -> small files"
+        ]
+      },
+      {
+        "lang": "sql",
+        "label": "incremental, high-card safe",
+        "accent": "fix",
+        "lines": [
+          "CREATE TABLE t (...)",
+          "CLUSTER BY (user_id);",
+          "-- liquid clustering, up to 4 cols"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When would you choose Delta Live Tables over hand-written jobs for a production pipeline, and what are the hidden costs of each?",
+    "a": "Choose DLT for standard medallion pipelines wanting built-in Expectations, automatic Unity Catalog lineage, declarative CDC via APPLY CHANGES INTO, and reduced boilerplate; choose hand-written jobs for fine-grained Spark tuning, complex branching, non-Spark steps, or strong-Spark teams. DLT's hidden costs are restricted Spark config control, no local debugging, extra driver compute, and a slightly higher DBU rate. Hand-written jobs' hidden cost is that you build retry logic, dependency resolution, quality checks, and lineage yourself, which is hundreds of lines DLT generates for free. A common hybrid runs DLT for bronze-to-silver and a hand-written task for a custom tuned gold aggregation.",
+    "fj": "DLT is always better because it’s the new way to build pipelines.",
+    "fs": "DLT reduces boilerplate and adds quality + lineage, but it limits Spark config control and has worse local debugging. I choose DLT for standard medallion patterns and hand-written jobs for performance-critical custom pipelines.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "Delta Live Tables vs Databricks Workflows with notebooks — compare them as production pipeline frameworks for a data engineer choosing between them.",
+    "a": "DLT is declarative — it handles execution, dependency ordering, retries, lineage, and first-class quality Expectations, with APPLY CHANGES INTO making CDC far simpler than hand-writing MERGE. Workflows plus notebooks is imperative, giving full Spark config access, local/interactive debugging, and spot-instance control, but you must build quality checks, lineage, and retry logic yourself. DLT uses a slightly higher DBU rate and cannot natively trigger external steps like dbt or API calls, while Workflows can orchestrate anything. The verdict is DLT for standard medallion CDC pipelines where quality and lineage matter, Workflows for performance-critical or non-standard pipelines, and the two compose since a Workflow can include a DLT task.",
+    "fj": "I’d always use DLT — it’s the future of Databricks pipelines.",
+    "fs": "DLT is excellent for standard medallion + CDC pipelines with quality requirements, but it constrains Spark tuning and debugging. I use it where it fits and hand-written jobs where it doesn’t — and they compose via Workflows.",
+    "level": "Sr",
+    "asked": 15
+  },
+  {
+    "q": "What is Photon and what kinds of workloads does it actually speed up — and where does it NOT help?",
+    "a": "Photon is Databricks' native vectorized query engine written in C++ that replaces JVM-based Spark execution at the operator level while Catalyst still plans the query. It processes data in columnar batches using CPU SIMD registers, avoids JVM garbage-collection pauses, and uses faster hash joins and a redesigned columnar shuffle, giving roughly 3x-8x speedups on SQL and DataFrame scans, joins, and aggregations. It does NOT accelerate Python/Scala UDFs, RDD APIs, or stateful streaming, and gives little benefit on sub-2-second queries; on unsupported operators it transparently falls back to Spark. The catch is that Photon-enabled compute bills at a higher DBU rate, so it pays off only when the speedup outweighs the rate.",
+    "fj": "Photon just makes every Databricks job faster, so I turn it on everywhere.",
+    "fs": "Photon accelerates vectorizable SQL/DataFrame work — scans, joins, aggregations — but skips Python UDFs and RDDs and bills at a higher DBU rate, so it pays off on SQL-heavy workloads, not UDF-bound or tiny ones.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "python",
+        "label": "UDF forces Spark, not Photon",
+        "accent": "bug",
+        "lines": [
+          "@udf('string')",
+          "def clean(s): return s.strip()",
+          "df.withColumn('c', clean('raw'))",
+          "# Python UDF -> Photon can't run it"
+        ]
+      },
+      {
+        "lang": "sql",
+        "label": "native expr stays in Photon",
+        "accent": "fix",
+        "lines": [
+          "SELECT trim(raw) AS c FROM src;",
+          "-- vectorized, runs in Photon"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Cluster policies: what problem do they solve, and how would you write one to keep a team’s costs bounded?",
+    "a": "A cluster policy is an admin-defined JSON rule set that constrains which compute attributes users may set, simplifying the create-cluster UI and enforcing guardrails for cost and security. Each attribute gets one limitation type — fixed (locked value), allowlist, range (min/max), or forbidden — so you can force auto-termination, cap autoscaling max_workers, restrict node types to cheaper families, require spot workers, and mandate tags for cost attribution. To bound a team's spend I'd fix autotermination_minutes, set a range on workers, allowlist a few instance types, and require a cost-center tag, then grant only that policy to the team. Note that policy default values aren't auto-applied via the Clusters API unless you pass apply_policy_default_values=true.",
+    "fj": "Cluster policies just set a default cluster size you can change later.",
+    "fs": "A policy enforces guardrails — fixed/allowlist/range/forbidden per attribute — like mandatory auto-termination, capped max_workers, allowlisted node types, and required cost tags, so users can’t over-provision or skip governance.",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Policy: cap cost, force shutdown",
+        "lines": [
+          "{",
+          " \"autotermination_minutes\": {",
+          "   \"type\": \"fixed\", \"value\": 20 },",
+          " \"autoscale.max_workers\": {",
+          "   \"type\": \"range\", \"maxValue\": 8 },",
+          " \"custom_tags.cost_center\": {",
+          "   \"type\": \"fixed\",",
+          "   \"value\": \"de-team\" }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your nightly MERGE into a 2TB Delta table is rewriting huge amounts of data even for a few updates. What’s happening and how do you fix it?",
+    "a": "Classic copy-on-write write amplification: a MERGE that touches even one row in a Parquet file rewrites the whole file, so scattered updates across many files rewrite far more than the changed rows. First enable deletion vectors so DELETE/UPDATE/MERGE mark rows as removed in a side vector (merge-on-read) instead of rewriting files, then let OPTIMIZE physically materialize them later. Also shrink the matched-file set with liquid clustering or Z-ORDER on the merge key so updates concentrate in fewer files, and prune the source with a date predicate in the ON clause so Delta can skip non-matching files entirely. On Unity Catalog managed tables, predictive optimization can run OPTIMIZE automatically.",
+    "fj": "I’d give the cluster more memory so the rewrite finishes faster.",
+    "fs": "The bottleneck is write amplification from copy-on-write, not compute. I enable deletion vectors for merge-on-read, cluster/Z-ORDER on the merge key to shrink the matched file set, and add a predicate so Delta skips non-matching files.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "merge-on-read + tight predicate",
+        "lines": [
+          "ALTER TABLE tgt SET TBLPROPERTIES (",
+          " 'delta.enableDeletionVectors'='true');",
+          "MERGE INTO tgt t USING src s",
+          "  ON t.id = s.id",
+          "  AND t.dt >= current_date() - 2",
+          "WHEN MATCHED THEN UPDATE SET *;",
+          "OPTIMIZE tgt;  -- materialize later"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A teammate runs Auto Loader on JSON logs and new fields keep silently disappearing. What’s going on and how do you fix it?",
+    "a": "With Auto Loader's default schema evolution mode (addNewColumns), when an unexpected column appears the stream fails so it can restart with the wider schema, but fields that don't fit the inferred schema land in the _rescued_data column rather than being dropped — and if you never select _rescued_data, that data looks like it vanished. The fix is to surface _rescued_data, set cloudFiles.schemaEvolutionMode appropriately, and pin types with schemaHints so numeric-looking strings aren't mis-inferred. Always configure a stable schemaLocation checkpoint; without it Auto Loader re-infers and can flip-flop types between runs. For strict pipelines, route _rescued_data rows to a quarantine table instead of ignoring them.",
+    "fj": "Auto Loader infers the schema automatically, so I don’t configure anything.",
+    "fs": "Unmatched fields go to _rescued_data, not into your columns. I surface and quarantine _rescued_data, set schemaEvolutionMode + schemaHints, and pin a schemaLocation so types don’t flip-flop across runs.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "surface rescued data + hints",
+        "lines": [
+          "df = (spark.readStream",
+          " .format('cloudFiles')",
+          " .option('cloudFiles.format','json')",
+          " .option('cloudFiles.schemaLocation',ck)",
+          " .option('cloudFiles.schemaHints',",
+          "         'amount double')",
+          " .load(path))",
+          "df.select('*','_rescued_data')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How would you build a production RAG / GenAI app on Databricks using Mosaic AI, and where does governance fit?",
+    "a": "Use Mosaic AI Vector Search to index your chunks: it provisions inside the workspace and auto-syncs embeddings from a Delta source table so the index stays current as data changes. Generation goes through Foundation Model APIs or Model Serving endpoints (open or external models behind one governed gateway), and the Agent Framework wires retrieval plus the LLM into a deployable agent, with Agent Evaluation and MLflow 3.0 tracing for quality and observability. Governance is the differentiator: Unity Catalog secures the source tables, the vector index, models, and serving endpoints under one permission model with lineage, so retrieval respects table ACLs rather than leaking restricted rows. The common junior mistake is bolting an external vector DB onto Databricks and losing that unified governance.",
+    "fj": "I’d export the embeddings to Pinecone and call the OpenAI API directly.",
+    "fs": "Mosaic AI Vector Search auto-syncs from a Delta table and stays inside Unity Catalog governance, so retrieval honors table ACLs and lineage. Serving and the agent are governed end-to-end — not a bolted-on external vector DB.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "What is the Delta transaction log (_delta_log) and what's actually stored in it?",
+    "a": "The _delta_log directory holds an ordered series of JSON commit files (00000.json, 00001.json, ...), one per atomic write, recording the actions in that commit: add file, remove file, metadata, and protocol. Each commit is a full transaction, and the current table state is the replay of all commits up to the latest version. Every Nth commit (default 10) Delta writes a Parquet checkpoint that collapses prior commits so readers don't replay the entire history. The log also carries per-file statistics like min/max and row counts that power data skipping.",
+    "fj": "The log is just a list of what files exist right now.",
+    "fs": "It's an ordered series of immutable commit actions (add/remove/metadata) replayed to derive state, with periodic Parquet checkpoints — not a flat file listing.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Inspect commits and files",
+        "lines": [
+          "DESCRIBE HISTORY sales;",
+          "-- _delta_log/00000000000000000007.json",
+          "-- {\"add\":{...,\"stats\":\"{min,max}\"}}",
+          "-- every 10th commit -> checkpoint"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does VACUUM do in Delta Lake, and what's the danger of running it with a short retention?",
+    "a": "VACUUM permanently deletes data files no longer referenced by the table and older than the retention threshold (default 7 days), reclaiming storage from files that OPTIMIZE, MERGE, or overwrites have logically removed. It does not touch files still referenced by the current version, so it never corrupts live reads. The danger is that VACUUM with a short retention deletes the older files time travel depends on, so DESCRIBE HISTORY still lists old versions but querying them fails. Databricks guards against this with a 7-day safety check you must explicitly disable to go lower.",
+    "fj": "VACUUM cleans up the table, so I run it with RETAIN 0 HOURS to save the most space.",
+    "fs": "RETAIN 0 HOURS deletes files time travel and in-flight readers need — it can break concurrent queries and destroy rollback history. Keep at least the default 7 days unless you truly understand the trade-off.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Safe vs dangerous",
+        "lines": [
+          "VACUUM sales;  -- default 7-day retain",
+          "-- breaks time travel + live reads:",
+          "SET spark.databricks.delta.retention",
+          "  DurationCheck.enabled = false;",
+          "VACUUM sales RETAIN 0 HOURS;"
+        ],
+        "accent": "bug"
+      }
+    ]
+  },
+  {
+    "q": "What problem do deletion vectors solve and how do they change the read path?",
+    "a": "Deletion vectors switch Delta from copy-on-write to merge-on-read for DELETE, UPDATE, and MERGE: instead of rewriting an entire Parquet file to remove a few rows, Delta writes a tiny compressed bitmap that marks specific row positions as deleted. Writes become far cheaper because untouched rows in the file aren't rewritten. Reads pay a small cost: the scan applies the deletion vector to mask out marked rows before returning data. A later OPTIMIZE physically materializes the deletions, purging the vectors and rewriting the files. This is the default behavior on recent runtimes for managed tables.",
+    "fj": "Deletion vectors make deletes free with no downside.",
+    "fs": "They make writes cheap but shift cost to reads, which must apply the vector to mask rows. You still run OPTIMIZE periodically to materialize deletes and keep read overhead bounded.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "When would you reach for liquid clustering over Z-ORDER on a Delta table you're actively maintaining?",
+    "a": "Liquid clustering is the current default choice: it clusters incrementally as part of OPTIMIZE rather than rewriting the whole table, lets you change clustering keys with ALTER TABLE without a full rewrite, and handles high-cardinality and skewed columns gracefully. Z-ORDER co-locates multi-column values but rewrites all touched files on every OPTIMIZE and decays as new data lands, so its cost grows with churn. You can't combine liquid clustering with Hive partitioning or Z-ORDER on the same table. Reach for liquid clustering on any new or high-churn table; Z-ORDER survives mainly on older runtimes or existing tables not yet migrated.",
+    "fj": "Liquid clustering and Z-ORDER are the same thing with a new name.",
+    "fs": "Z-ORDER rewrites all touched files each OPTIMIZE and you can't change the columns without rebuilding. Liquid clustering is incremental, key-changeable via ALTER TABLE, and high-cardinality safe.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Change keys without a rewrite",
+        "lines": [
+          "CREATE TABLE t (...) CLUSTER BY (uid);",
+          "-- later, evolve the access pattern:",
+          "ALTER TABLE t CLUSTER BY (uid, dt);",
+          "OPTIMIZE t;  -- incremental, not full"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "What is predictive optimization for Unity Catalog managed tables, and why does it change how you think about maintenance?",
+    "a": "Predictive optimization automatically runs ANALYZE, OPTIMIZE, and VACUUM (and can pick CLUSTER BY columns) on Unity Catalog managed tables, deciding when and how based on observed write and query patterns, using serverless compute. It's enabled by default for newer accounts, so you stop hand-scheduling maintenance jobs and instead let the platform keep file sizes, statistics, and storage in check. The practical shift is that manual nightly OPTIMIZE/VACUUM jobs become unnecessary for managed tables, and you monitor cost and impact via the system.storage predictive optimization history table. It only applies to managed tables, which is a strong reason to prefer managed over external.",
+    "fj": "I still need to schedule my own OPTIMIZE and VACUUM jobs on every table.",
+    "fs": "For Unity Catalog managed tables, predictive optimization runs OPTIMIZE/VACUUM/ANALYZE automatically on serverless — manual maintenance jobs are redundant there. It's a reason to prefer managed tables.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "In Unity Catalog, what's the difference between a managed table and an external table, and which should you default to?",
+    "a": "A managed table lets Unity Catalog own both governance and the storage lifecycle: it lives in the schema's managed storage location, and DROP deletes the underlying files after a retention window (around 7 days). An external table registers data at a path you control under an external location, so DROP removes only the metadata and leaves files in place. Default to managed tables because they unlock predictive optimization, performance features, and full lifecycle governance. Use external tables for query-in-place over data another system writes, or for a fast one-click upgrade you later migrate to managed.",
+    "fj": "External tables are safer because Databricks can't delete my data.",
+    "fs": "Managed is the default: it unlocks predictive optimization and lifecycle governance. External is for query-in-place on data owned by another system — DROP on managed has a retention window before files are removed, not an instant wipe.",
+    "level": "Mid",
+    "asked": 16
+  },
+  {
+    "q": "What are Unity Catalog volumes and external locations, and when do you use a volume vs a table?",
+    "a": "An external location is a named, governable pointer to a cloud storage path backed by a storage credential, the unit on which you GRANT access to raw storage. A volume is a UC-governed object for non-tabular files (images, PDFs, model artifacts, landing-zone files) addressed via a /Volumes path, and it can be managed (UC owns the location) or external (you point it at an external-location path). Use a table for structured data you query with SQL, and a volume for arbitrary files you read, write, or stage — for example an Auto Loader landing zone or ML training images — all under one permission and lineage model.",
+    "fj": "I'll use DBFS mounts to access my files.",
+    "fs": "DBFS mounts bypass Unity Catalog governance. Use a UC volume (/Volumes path) for non-tabular files so access is governed, audited, and lineage-tracked like everything else.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Governed file path, not a mount",
+        "lines": [
+          "path = '/Volumes/prod/raw/landing/'",
+          "df = (spark.readStream",
+          "  .format('cloudFiles')",
+          "  .option('cloudFiles.format','json')",
+          "  .load(path))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does Unity Catalog's three-level namespace work, and how is it different from the old Hive metastore?",
+    "a": "Unity Catalog addresses every object as catalog.schema.table, adding a catalog tier above the schema.table pairing the legacy Hive metastore used. A metastore is the top governance container attached to a region/account, and catalogs typically map to environments or business domains, schemas to teams or subject areas. Unlike the per-workspace Hive metastore, one UC metastore is shared across workspaces, so a table is defined once and discoverable everywhere, with centralized ANSI GRANT/REVOKE, lineage, and auditing. A common pattern is a catalog per environment (dev/staging/prod) with schemas per team.",
+    "fj": "Unity Catalog just renamed databases to schemas; it's the same two-level naming.",
+    "fs": "UC adds a catalog tier (catalog.schema.table) and one metastore spans all workspaces with centralized grants and lineage — the Hive metastore was two-level and per-workspace.",
+    "level": "Jr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Three-level reference",
+        "lines": [
+          "USE CATALOG prod;",
+          "SELECT * FROM sales.orders;",
+          "-- fully qualified:",
+          "SELECT * FROM prod.sales.orders;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do row filters and column masks work in Unity Catalog, and why use them over building redacted copies?",
+    "a": "A row filter is a SQL UDF attached to a table that returns a boolean per row, evaluated at query time so each caller sees only rows they're allowed to; a column mask is a UDF on a column that rewrites or redacts the value (for example hashing an email) based on the caller's group. Both enforce fine-grained access at query time within the single source table. The alternative — maintaining separate redacted copies per audience — duplicates storage, drifts out of sync, and multiplies pipelines. Filters and masks keep one governed table and apply policy dynamically using functions like is_account_group_member.",
+    "fj": "I'd make a separate table per team with the sensitive columns removed.",
+    "fs": "Redacted copies duplicate storage and drift. A row filter / column mask UDF enforces policy at query time on the single source table using is_account_group_member, so there's one governed copy.",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Mask by group at query time",
+        "lines": [
+          "CREATE FUNCTION mask_email(e STRING)",
+          " RETURN CASE WHEN is_account_group",
+          "  _member('pii_admins') THEN e",
+          "  ELSE sha2(e,256) END;",
+          "ALTER TABLE users ALTER COLUMN email",
+          " SET MASK mask_email;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does Unity Catalog data lineage capture, and what's a concrete way you'd use it?",
+    "a": "Unity Catalog automatically captures table- and column-level lineage for operations run through Databricks — notebooks, SQL, jobs, and pipelines — recording upstream sources and downstream consumers, plus the notebooks/queries that produced each link. It's derived from query execution, not hand-maintained, so it stays current. Concretely, before altering or dropping a gold column you check downstream lineage to find every dashboard and job that reads it and assess blast radius; during an incident you trace a bad value upstream to the exact source table and transformation. Lineage is also queryable via system tables for programmatic impact analysis.",
+    "fj": "Lineage is just a diagram I draw in the docs.",
+    "fs": "UC lineage is captured automatically from executed queries at table and column level — I use it for impact analysis before a schema change and for root-causing a bad value back to its source.",
+    "level": "Mid",
+    "asked": 11
+  },
+  {
+    "q": "Compare job compute, all-purpose compute, and serverless compute on Databricks. When does each fit?",
+    "a": "All-purpose compute is long-lived shared interactive compute billed at the highest DBU rate, for notebook development and exploration. Job (classic) compute spins up per job run and terminates after, at a much lower rate, for scheduled production work — but you wait on cluster startup and manage instance types. Serverless compute removes that: Databricks manages the pool so jobs and notebooks start in seconds with no cluster config, billed only for what runs. The rule of thumb: serverless for fast startup and zero ops, classic job compute when you need specific instance types, init scripts, or fine Spark tuning, and all-purpose only for interactive dev.",
+    "fj": "Serverless is just an all-purpose cluster that's always on.",
+    "fs": "Serverless is a Databricks-managed pool with near-instant start and per-use billing, no cluster to configure or leave idle. All-purpose is long-lived shared interactive compute at the top DBU rate.",
+    "level": "Mid",
+    "asked": 14
+  },
+  {
+    "q": "What are instance pools in Databricks and what problem do they solve?",
+    "a": "An instance pool keeps a set of cloud VM instances warm and idle so clusters that attach to the pool acquire nodes in seconds instead of waiting on cloud provisioning. The pool reduces job startup latency and autoscaling lag, which matters for short, frequent jobs where minutes of cold VM acquisition dominate runtime. You pay the underlying cloud cost for idle pooled instances (no DBU charge while idle), so you size the minimum idle count to balance fast starts against idle VM spend. Many teams point job clusters at a pool of spot instances to combine fast starts with low cost. Note that serverless compute removes the need for pools entirely.",
+    "fj": "Instance pools are clusters I keep running to avoid startup time.",
+    "fs": "A pool is warm idle VMs (cloud cost only, no DBU) that clusters draw nodes from for fast starts — it's not a running cluster, and serverless makes pools largely unnecessary.",
+    "level": "Sr",
+    "asked": 10
+  },
+  {
+    "q": "How does autoscaling work on a Databricks cluster, and where does it fall short?",
+    "a": "Autoscaling adds workers when tasks queue up and removes them when they sit idle, between a min and max you set, so you don't pay for peak capacity during light stages. Databricks optimized autoscaling scales up aggressively and down gradually to avoid thrashing. It falls short when a stage has a fixed parallelism that can't use extra workers, when skew leaves one task running while others finish (more workers don't help one hot task), or for very short jobs where scale-up lag eats the benefit. It also can't fix the small-files or pruning problems that masquerade as compute shortages.",
+    "fj": "Autoscaling means I never have to think about cluster size again.",
+    "fs": "Autoscaling can't help a skewed stage where one task is the bottleneck, fixed-parallelism stages, or very short jobs, and it won't fix small-files or poor pruning — those need data fixes, not more workers.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "A Spark stage on Databricks has one task running long after all others finished. What's happening and how do you fix it?",
+    "a": "That's data skew: one partition holds far more rows than the others (a hot join key, a null-heavy key, or skewed groupBy), so its task dominates wall-clock time while the cluster sits mostly idle. First confirm in the Spark UI by comparing per-task input/shuffle bytes. AQE skew join handling splits oversized skewed partitions automatically and is on by default, so verify it's enabled; for stubborn cases add salting (append a random bucket to the key, join, then aggregate) or isolate and broadcast the hot keys separately. Adding workers does not help because the bottleneck is a single partition, not total capacity.",
+    "fj": "I'll add more executors so the slow task gets more resources.",
+    "fs": "More executors don't help one oversized partition. Let AQE skew handling split it, or salt the hot key so its rows spread across tasks — the bottleneck is skew, not capacity.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Salt a hot join key",
+        "lines": [
+          "from pyspark.sql import functions as F",
+          "n = 16  # salt buckets",
+          "big = big.withColumn('s',",
+          "  (F.rand()*n).cast('int'))",
+          "small = small.crossJoin(",
+          "  spark.range(n).toDF('s'))",
+          "j = big.join(small,['key','s'])"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is Adaptive Query Execution (AQE) and what does it actually change at runtime?",
+    "a": "AQE re-optimizes a query mid-flight using the accurate statistics available at the end of each shuffle stage, rather than relying solely on the planner's cold estimates. It does three high-value things: coalesces many small post-shuffle partitions into fewer right-sized ones (fixing over-partitioning), switches a sort-merge join to a broadcast hash join when a side turns out small enough, and splits skewed partitions so one hot task doesn't dominate. Because it reacts to real data sizes, it removes much of the manual tuning (shuffle partition counts, broadcast hints) older Spark required. It's enabled by default on Databricks.",
+    "fj": "AQE just means Spark plans the query before running it, like always.",
+    "fs": "AQE re-plans at runtime using post-shuffle stats — coalescing partitions, flipping to broadcast joins, and splitting skew — which static planning can't do because it lacks accurate sizes upfront.",
+    "level": "Sr",
+    "asked": 13
+  },
+  {
+    "q": "Your Databricks job is slow and the Spark UI shows heavy spill to disk. What does that mean and how do you address it?",
+    "a": "Spill means a task's working set (a sort, aggregation, or join build side) exceeded executor memory, so Spark wrote intermediate data to local disk and read it back, which is far slower than memory. Diagnose via the Spark UI spill columns on the heavy stage. Fixes: increase parallelism so each partition is smaller (often AQE-coalesced partitions are too large for the operation), reduce the data entering the operation via pushdown filters and column pruning, replace a memory-hungry join with a broadcast when one side is small, or move to a memory-optimized instance type. More partitions usually beats a bigger box because the root cause is per-task data volume.",
+    "fj": "Spill is fine, it just uses disk when memory runs out.",
+    "fs": "Spill is a real slowdown — disk round-trips on the hot path. I shrink per-task data with more parallelism, pushdown filters, or a broadcast join before reaching for a bigger instance.",
+    "level": "Sr",
+    "asked": 15
+  },
+  {
+    "q": "When does Spark broadcast a join versus shuffle both sides, and how do you influence it on Databricks?",
+    "a": "Spark broadcasts the smaller side when its estimated size is under spark.sql.autoBroadcastJoinThreshold (10MB default), replicating it to every executor so the large side never shuffles — a broadcast hash join, dramatically cheaper than a sort-merge join that shuffles both sides across the network. AQE can also convert to broadcast at runtime once it sees the actual built size. You influence it by raising the threshold for a known-small dimension, adding a broadcast() hint, or ensuring stats are accurate; conversely you avoid broadcasting a table that's too large to fit in executor memory, which causes OOM. The classic win is broadcasting a small dimension against a huge fact.",
+    "fj": "Bigger joins are always slow, nothing I can do.",
+    "fs": "If one side fits in memory, broadcast it so the large side never shuffles — a broadcast hash join avoids the network-wide shuffle of a sort-merge join. Use a broadcast() hint or accurate stats; AQE can also flip it at runtime.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Broadcast small dim vs huge fact",
+        "lines": [
+          "from pyspark.sql.functions import (",
+          "  broadcast)",
+          "j = fact.join(broadcast(dim),'dim_id')",
+          "# dim copied to every executor;",
+          "# fact never shuffles"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "What's the role of the checkpoint in Databricks Structured Streaming, and what breaks if you delete or share it?",
+    "a": "The checkpoint directory is the stream's durable state: it records source offsets (what's been read), the write-ahead log, commit markers, and any operator state for stateful queries, which together give exactly-once progress tracking across restarts. Each streaming query needs its own dedicated checkpoint location. Deleting it makes the stream forget its position, so on restart it reprocesses from the configured starting offset (duplicates or gaps); pointing two queries at the same checkpoint corrupts both. You also generally can't reuse a checkpoint after changing the query in incompatible ways, since the stored state no longer matches the new plan.",
+    "fj": "If a stream is stuck, I just delete the checkpoint and restart it.",
+    "fs": "Deleting the checkpoint loses the read offsets and state, causing reprocessing or data loss. Each query needs its own checkpoint, and you can't share or carelessly change-then-reuse one.",
+    "level": "Sr",
+    "asked": 16
+  },
+  {
+    "q": "Why are sinks written via foreachBatch only at-least-once, and how do you make them exactly-once on Databricks?",
+    "a": "Structured Streaming guarantees exactly-once into Delta sinks because Delta commits the batch atomically with the offset. With foreachBatch you run arbitrary code per micro-batch, and if the job fails after the external write but before the offset commits, the batch reruns and writes again — so it's at-least-once. To get effective exactly-once you make the write idempotent: for Delta targets use the txnAppId and txnVersion writer options so Delta deduplicates a replayed batch, or for external systems use an idempotent upsert (MERGE on a key, or a unique constraint) so re-applying the same batch is a no-op.",
+    "fj": "foreachBatch is exactly-once because Structured Streaming handles that for me.",
+    "fs": "foreachBatch is at-least-once because the external write can succeed before the offset commits, so a retry re-writes. Make it idempotent — txnAppId/txnVersion for Delta or a key-based MERGE for external sinks.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Idempotent Delta write in batch",
+        "lines": [
+          "def upsert(batch_df, batch_id):",
+          "  (batch_df.write.format('delta')",
+          "    .option('txnAppId','etl1')",
+          "    .option('txnVersion',batch_id)",
+          "    .mode('append').save(path))",
+          "stream.writeStream.foreachBatch(upsert)"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Auto Loader directory listing mode vs file notification mode — when do you choose each?",
+    "a": "In directory listing mode Auto Loader lists the source path to find new files, which needs no cloud setup and is fine for low-to-moderate file volumes, but listing cost grows with the number of files in the directory. File notification mode subscribes to cloud events (SNS/SQS, Event Grid, Pub/Sub) so new files are pushed to a queue, giving near-real-time, scalable detection independent of directory size, at the cost of provisioning the notification/queue resources and the IAM to manage them. Choose listing for simplicity and modest volume; switch to notification for high file counts, deep directories, or low-latency ingestion. Auto Loader can also auto-configure the notification resources for you.",
+    "fj": "Directory listing and file notification are the same speed, just different config.",
+    "fs": "Listing cost scales with directory size and is fine for modest volumes. File notification uses cloud events so detection is push-based and scales independently of file count — that's the choice for high volume or low latency.",
+    "level": "Mid",
+    "asked": 11
+  },
+  {
+    "q": "What is Lakeflow Declarative Pipelines, and what changed from Delta Live Tables?",
+    "a": "Lakeflow Declarative Pipelines is the current name (since the 2025 Data + AI Summit) for what was Delta Live Tables: a declarative framework where you define streaming tables and materialized views and the engine handles dependency ordering, incremental refresh, retries, lineage, and data-quality Expectations. Existing DLT code runs unchanged — it's primarily a rebrand under the broader Lakeflow umbrella (Connect for ingestion, Declarative Pipelines for transformation, Jobs for orchestration), and the core engine was donated to Apache Spark as Spark Declarative Pipelines. CDC still uses APPLY CHANGES (now also expressible via the broader API). For interview purposes, treat DLT and Lakeflow Declarative Pipelines as the same product.",
+    "fj": "Lakeflow Declarative Pipelines is a brand-new product that replaces DLT, so my DLT code won't run.",
+    "fs": "It's a rename/repositioning of DLT under the Lakeflow umbrella — existing DLT code runs unchanged. Same declarative engine, now also open-sourced into Apache Spark.",
+    "level": "Mid",
+    "asked": 13
+  },
+  {
+    "q": "What are Expectations in Lakeflow Declarative Pipelines / DLT, and how do the three handling modes differ?",
+    "a": "Expectations are declarative data-quality constraints attached to a table in a pipeline, each a boolean SQL condition plus a policy for failing rows. EXPECT (warn) keeps bad rows but records the violation count in pipeline metrics for monitoring. EXPECT ... ON VIOLATION DROP ROW removes failing rows from the output so downstream tables stay clean while the metric still tracks how many were dropped. EXPECT ... ON VIOLATION FAIL UPDATE aborts the pipeline update entirely, for invariants that must never be breached. The value is that quality checks live in the pipeline definition with built-in metrics, instead of being hand-rolled filters with no observability.",
+    "fj": "Expectations just drop bad rows silently.",
+    "fs": "Expectations have three policies — warn (keep + count), drop row, or fail the update — and all emit quality metrics. Silent dropping is only the DROP ROW mode; the violation count is always tracked.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Three violation policies",
+        "lines": [
+          "@dlt.expect('valid_ts', 'ts IS NOT NULL')",
+          "@dlt.expect_or_drop('pos_amt','amt > 0')",
+          "@dlt.expect_or_fail('has_id',",
+          "  'id IS NOT NULL')",
+          "@dlt.table",
+          "def silver(): return dlt.read('bronze')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you implement SCD Type 2 history in a Lakeflow Declarative Pipeline?",
+    "a": "Use APPLY CHANGES INTO with STORED AS SCD TYPE 2: you declare the keys, a SEQUENCE BY column for ordering, and the source change stream, and the engine maintains current and historical rows automatically, closing out old versions and opening new ones with validity windows. This replaces hand-written MERGE logic that tracks effective-from/effective-to timestamps and current-row flags, which is error-prone around out-of-order events and concurrent updates. SCD TYPE 1 (overwrite, no history) is the alternative when you only need the latest state. The SEQUENCE BY column is what makes late or out-of-order CDC events apply in the correct order.",
+    "fj": "I'd write a MERGE that sets is_current = false and inserts a new row each time.",
+    "fs": "APPLY CHANGES INTO ... STORED AS SCD TYPE 2 maintains the validity windows and current flags for you, ordering by SEQUENCE BY so out-of-order CDC events apply correctly — far safer than a hand-rolled MERGE.",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Declarative SCD2",
+        "lines": [
+          "APPLY CHANGES INTO live.dim_customer",
+          "FROM stream(live.cdc)",
+          "KEYS (customer_id)",
+          "SEQUENCE BY event_ts",
+          "STORED AS SCD TYPE 2;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a Databricks SQL warehouse, and how do serverless, pro, and classic differ?",
+    "a": "A SQL warehouse is compute optimized for BI and SQL analytics (not arbitrary Spark code), running Photon and the DBSQL query engine behind a JDBC/ODBC endpoint for dashboards and ad-hoc SQL. Serverless warehouses start in seconds on Databricks-managed compute with no idle clusters and the highest DBU rate, ideal for spiky BI traffic. Pro warehouses run in your cloud account with most features but slower start and the cost of idle/standby. Classic is the older, most limited tier. Serverless also enables fast auto-stop and multi-cluster scale-out for concurrency, so it's the default for interactive BI where startup latency and bursty concurrency matter.",
+    "fj": "A SQL warehouse is just a cluster I run my notebooks on.",
+    "fs": "A SQL warehouse is Photon-backed compute for BI/SQL behind a JDBC/ODBC endpoint, not general notebook compute. Serverless starts in seconds and scales out for concurrency; pro/classic run in your account with slower starts.",
+    "level": "Jr",
+    "asked": 13
+  },
+  {
+    "q": "How would you orchestrate a multi-step nightly pipeline with Databricks Workflows / Lakeflow Jobs?",
+    "a": "Define a job as a DAG of tasks with explicit dependencies, where each task is a notebook, SQL query, Python script, dbt project, or a pipeline run, and Databricks runs independent tasks in parallel and dependent ones in order. Attach an ephemeral job cluster (or serverless) so compute exists only for the run, set per-task retries with backoff, and add conditional/if-else and for-each tasks for branching and fan-out. Trigger on a schedule, a file arrival, or another job's completion, and wire failure alerts to email/Slack/PagerDuty. Use task values to pass small results between tasks and shared job clusters across tasks to avoid repeated startup.",
+    "fj": "I'd chain the steps by having one notebook call the next with dbutils.notebook.run.",
+    "fs": "Sequential notebook.run chaining gives no parallelism, no per-task retries, and poor observability. A Workflows/Jobs DAG runs independent tasks in parallel with per-task retries, conditional branching, and alerting.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "You need to attribute Databricks spend across teams and find waste. What do you actually do?",
+    "a": "Enforce tagging so every job, cluster, and warehouse carries a team/cost-center tag (via cluster policies that make the tag mandatory), then query the Unity Catalog billing system tables (system.billing.usage joined to list prices) grouped by tag, SKU, and compute type. That surfaces who spends what and which SKU — all-purpose DBUs on production jobs, idle warehouses, or oversized clusters are the usual waste. Pair it with the query history / cost system tables to find expensive recurring queries. The structural fixes follow the data: move production work to job/serverless compute, add auto-stop, right-size, and set budget alerts. Tagging plus system tables is what turns cost into accountability.",
+    "fj": "I'd look at the total bill in the account console.",
+    "fs": "The account total has no attribution. I enforce cost tags via cluster policies, then query system.billing.usage by tag/SKU to pinpoint waste — idle warehouses, all-purpose DBUs on jobs, oversized clusters — and fix structurally.",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Attribute spend by team tag",
+        "lines": [
+          "SELECT custom_tags['team'] AS team,",
+          "  sku_name, sum(usage_quantity) dbus",
+          "FROM system.billing.usage",
+          "WHERE usage_date >= current_date()-30",
+          "GROUP BY 1,2 ORDER BY dbus DESC;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why do many small files hurt a Delta table even when total data size is modest, and how do you prevent it structurally?",
+    "a": "Every file carries fixed overhead: a metadata entry in the transaction log, an open/seek on read, and per-file task scheduling, so tens of thousands of tiny files make queries pay overhead that dwarfs the actual data scan, and listing/planning slows too. Streaming micro-batches and frequent small writes are the usual cause. Structurally you prevent it with optimized writes (optimizeWrite/autoCompact) so Delta coalesces files as it writes, liquid clustering so OPTIMIZE keeps file sizes healthy incrementally, and on Unity Catalog managed tables predictive optimization runs compaction automatically. The target file size is roughly 128MB to 1GB; OPTIMIZE remediates an existing mess.",
+    "fj": "Small files are fine as long as the total table isn't that big.",
+    "fs": "It's file count, not total size — each file adds log, IO, and scheduling overhead. Prevent with optimized writes / liquid clustering / predictive optimization; OPTIMIZE fixes an existing pile-up.",
+    "level": "Jr",
+    "asked": 14
+  },
+  {
+    "q": "What is AI/BI Genie on Databricks, at a high level?",
+    "a": "Genie is Databricks' AI/BI natural-language interface: users ask business questions in plain English in a Genie Space and it generates the SQL, runs it, and returns a results table or chart. It's grounded in Unity Catalog — using table and column descriptions, curated example queries, and business-term instructions an analyst supplies — so it's a governed, context-aware text-to-SQL experience rather than raw schema-to-LLM guessing, and it respects the asker's UC permissions. It's built into Databricks SQL and shows its reasoning steps and the SQL it generated so analysts can verify. Keep the framing light: Genie is the conversational BI layer, distinct from deep agent building in Mosaic AI.",
+    "fj": "Genie lets the LLM see my whole database and write any SQL it wants.",
+    "fs": "Genie is grounded in a curated Genie Space (table/column descriptions, example queries, business terms) under Unity Catalog governance and respects the asker's permissions — not unconstrained schema-to-LLM.",
+    "level": "Jr",
+    "asked": 12
+  },
+  {
+    "q": "Give me a high-level overview of Mosaic AI on Databricks and what it's for.",
+    "a": "Mosaic AI is Databricks' suite for building, serving, and governing AI on top of the lakehouse. The pieces that matter at a high level: Model Serving exposes models and agents as autoscaling REST endpoints; Vector Search (AI Search) indexes embeddings synced from Delta tables for retrieval; the Agent Framework plus MLflow handle building, tracing, and evaluating agents; and Foundation Model APIs give governed access to LLMs. The throughline is Unity Catalog governance over data, models, indexes, and endpoints with lineage, so AI runs inside the same security boundary as your data. Keep it light here — deep GenAI/agent engineering is its own topic; this is just the map of what Mosaic AI covers.",
+    "fj": "Mosaic AI is just Databricks' name for calling the OpenAI API.",
+    "fs": "Mosaic AI is a governed stack — Model Serving, Vector Search, Agent Framework, MLflow, Foundation Model APIs — unified under Unity Catalog so models, indexes, and endpoints share data governance and lineage, not a single external API call.",
+    "level": "Jr",
+    "asked": 11
+  },
+  {
+    "q": "What is the lakehouse architecture, and what problem does it solve that a data warehouse plus a separate data lake did not?",
+    "a": "The lakehouse keeps data in open files (Parquet) on cheap cloud object storage but adds a metadata/transaction layer (Delta Lake) that gives it warehouse-grade features: ACID transactions, schema enforcement, fine-grained governance, and fast BI SQL — directly on the lake. The old two-tier setup ran a data lake for cheap raw/ML storage and a separate warehouse for BI, forcing constant ETL copies between them, duplicate storage, stale data, and split governance. The lakehouse collapses that into one governed copy that serves BI, streaming, and ML from the same tables, which is the core idea behind Databricks' platform.",
+    "fj": "A lakehouse is just a data lake with a nicer dashboard on top.",
+    "fs": "It's a data lake plus a transaction/metadata layer (Delta) giving ACID, governance, and BI-grade SQL on open files — one governed copy serving BI, streaming, and ML, instead of copying between a lake and a separate warehouse.",
+    "level": "Jr",
+    "asked": 12
+  }
+]

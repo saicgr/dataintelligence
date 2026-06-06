@@ -1,0 +1,374 @@
+[
+  {
+    "q": "What are the three pillars of observability, and what does each answer?",
+    "a": "The three pillars are logs, metrics, and traces. Logs are timestamped, often structured event records that answer 'what exactly happened' for a single event. Metrics are aggregated numeric time series (counters, gauges, histograms) that are cheap to store and answer 'how is the system behaving over time'. Traces follow a single request across service boundaries and answer 'where did the time go and which service failed'. Modern practice correlates all three via shared trace and span IDs rather than treating them as silos.",
+    "fs": "I'd correlate them with a shared trace_id so a metric spike links to exemplar traces and the logs for that exact request.",
+    "fj": "You just send everything to the logging tool and grep it when something breaks.",
+    "level": "Jr"
+  },
+  {
+    "q": "Why are metrics usually cheaper than logs for monitoring at scale?",
+    "a": "Metrics are pre-aggregated numeric time series, so storage cost grows with the number of distinct time series (cardinality), not with request volume. A counter incremented a billion times is still one tiny time series. Logs store one record per event, so cost scales linearly with traffic and they are far more expensive to index and query. The common pattern is metrics for alerting and dashboards, and logs and traces for drilling into specific failures.",
+    "fs": "Metrics cost scales with cardinality, not event count, so a busy endpoint is nearly free until you add high-cardinality labels.",
+    "fj": "Logs are cheaper because you only pay when something is wrong.",
+    "level": "Jr"
+  },
+  {
+    "q": "What is structured logging and why is it preferred over plain text?",
+    "a": "Structured logging emits logs as machine-parseable key-value records (typically JSON) instead of free-form strings. This lets the backend index fields like user_id, status, and trace_id so you can filter and aggregate without brittle regex parsing. It also enables automatic correlation: injecting trace_id and span_id into every log line ties logs to the trace that produced them. The tradeoff is slightly more verbose output and discipline around a consistent schema.",
+    "fs": "I emit JSON logs with trace_id and span_id injected so a log search jumps straight to the originating distributed trace.",
+    "fj": "Structured logging just means adding more print statements with timestamps.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "structured log line",
+        "lang": "ts",
+        "lines": [
+          "{",
+          "  \"level\": \"error\",",
+          "  \"msg\": \"checkout failed\",",
+          "  \"user_id\": \"u_842\",",
+          "  \"status\": 500,",
+          "  \"trace_id\": \"4bf92f3577b34da6\",",
+          "  \"span_id\": \"00f067aa0ba902b7\"",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Define SLI, SLO, and SLA and how they relate.",
+    "a": "An SLI (Service Level Indicator) is a measured quantitative signal of service quality, such as the fraction of requests served under 300ms or the success rate. An SLO (Service Level Objective) is an internal target for an SLI over a window, for example 99.9% of requests succeed over 28 days. An SLA (Service Level Agreement) is an external contract with customers that usually carries financial penalties, and is set looser than the SLO so you breach the SLO and react before the SLA is at risk. SLI is the measurement, SLO is your goal, SLA is the promise.",
+    "fs": "I set the SLO stricter than the SLA so the internal target gives us runway to fix things before contractual penalties hit.",
+    "fj": "SLI, SLO, and SLA are basically the same thing, just uptime percentages.",
+    "level": "Mid"
+  },
+  {
+    "q": "What is an error budget and how does it change team behavior?",
+    "a": "An error budget is one minus the SLO: a 99.9% SLO leaves a 0.1% budget of allowed failures over the window. It converts reliability into a concrete, spendable quantity that balances feature velocity against stability. When the budget is healthy, teams can ship aggressively and take risks; when it is nearly exhausted, an error budget policy can freeze risky deploys until reliability recovers. This depersonalizes the dev-versus-ops tension by replacing opinions with a shared number.",
+    "fs": "When the budget is burned we trigger the error-budget policy and freeze feature launches until we earn reliability back.",
+    "fj": "An error budget is how much money we set aside to fix bugs.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "budget for 99.9% over 28d",
+        "lang": "ts",
+        "lines": [
+          "SLO        = 99.9%",
+          "budget     = 100% - 99.9% = 0.1%",
+          "window     = 28 days = 40320 min",
+          "allowed_bad = 40320 * 0.001",
+          "           = ~40.3 min of errors"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you pick a good SLI for a request-driven API service?",
+    "a": "A good SLI is a ratio of good events to valid events that closely tracks user-perceived experience, typically availability (fraction of non-5xx responses) and latency (fraction of requests under a threshold). You measure it as close to the user as possible, often at the load balancer, so it captures what clients actually see. Avoid SLIs based on internal resource health like CPU, because those are causes, not symptoms of user pain. Keep the set small so the SLO stays meaningful and actionable.",
+    "fs": "I express the SLI as good_events / valid_events measured at the edge, so it mirrors what the customer actually experiences.",
+    "fj": "A good SLI is keeping CPU and memory under 80 percent.",
+    "level": "Sr"
+  },
+  {
+    "q": "Explain the RED method and when to use it.",
+    "a": "RED stands for Rate (requests per second), Errors (failed requests per second), and Duration (latency distribution of requests). It is a request-centric methodology that treats each service as a black box and focuses on user-facing performance, making it ideal for APIs, microservices, and request-driven systems. The strength of RED is consistency: every service gets the same three signals, so dashboards and on-call mental models stay uniform across the fleet. It pairs naturally with symptom-based, user-focused alerting.",
+    "fs": "RED gives every microservice an identical three-signal dashboard, so on-call doesn't relearn each service during an incident.",
+    "fj": "RED is just measuring CPU, RAM, and disk on each box.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "RED in PromQL",
+        "lang": "ts",
+        "lines": [
+          "# Rate",
+          "sum(rate(http_requests_total[5m]))",
+          "# Errors",
+          "sum(rate(http_requests_total{",
+          "  status=~\"5..\"}[5m]))",
+          "# Duration p99",
+          "histogram_quantile(0.99,",
+          "  rate(http_req_duration_bucket[5m]))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain the USE method and how it differs from RED.",
+    "a": "USE stands for Utilization, Saturation, and Errors, applied to each physical resource such as CPU, memory, disk, and network. Utilization is the percent of time the resource is busy, saturation is the queued or pending work it cannot service yet, and errors is the count of error events. USE is resource-centric and aimed at infrastructure health, whereas RED is request-centric and aimed at service performance. The two are complementary: RED tells you users are hurting and USE often tells you which saturated resource is the cause.",
+    "fs": "RED is about whether users are happy; USE is about whether machines are happy. I run both and pivot from symptom to saturated resource.",
+    "fj": "USE and RED are the same method with different letters.",
+    "level": "Sr"
+  },
+  {
+    "q": "What is metric cardinality and why does high cardinality cause problems?",
+    "a": "Cardinality is the number of unique time series a metric produces, which equals the product of the distinct values across all its label dimensions. Adding an unbounded label like user_id, request_id, or full URL path causes a combinatorial explosion that can balloon memory, slow queries, and crash a Prometheus server. The fix is to keep labels bounded and low-cardinality, such as status_code, region, and route template rather than the raw path. High-cardinality dimensions belong in traces or logs (or exemplars), not in metric labels.",
+    "fs": "I keep labels bounded and push high-cardinality identifiers like user_id into traces or exemplars, never into a metric label.",
+    "fj": "Just add a user_id label so we can break the metric down per user.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "cardinality explosion",
+        "lang": "ts",
+        "lines": [
+          "# routes(20) * status(5) * region(3)",
+          "#   = 300 series  (fine)",
+          "http_requests_total{route,status,region}",
+          "",
+          "# adding user_id (1M users)",
+          "#   = 300 * 1,000,000 series  (BOOM)",
+          "http_requests_total{...,user_id}"
+        ],
+        "accent": "bug"
+      }
+    ]
+  },
+  {
+    "q": "Histogram vs summary in Prometheus: when do you choose each for latency?",
+    "a": "A summary computes quantiles client-side and exposes them directly, which is accurate per instance but cannot be aggregated, since quantiles from different instances cannot be merged. A histogram exposes bucketed counts and the quantile is computed server-side with histogram_quantile(), which is approximate but can be aggregated across instances, regions, and time. For service-wide latency SLOs you almost always want histograms because you need fleet-wide percentiles. The tradeoff is you must pick bucket boundaries up front, and each bucket adds a time series.",
+    "fs": "I use histograms for SLO latency because you can't average p99s across instances, but you can aggregate histogram buckets.",
+    "fj": "Just use a summary and average the p99 across all the pods.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "why averaging p99 is wrong",
+        "lang": "ts",
+        "lines": [
+          "# BAD: avg of per-pod quantiles",
+          "avg(http_p99)  # statistically wrong",
+          "",
+          "# GOOD: aggregate buckets, then quantile",
+          "histogram_quantile(0.99,",
+          "  sum by (le)(",
+          "    rate(http_req_bucket[5m])))"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Why prefer percentiles over averages for latency SLIs?",
+    "a": "Averages hide the tail: a service can show a healthy 50ms mean while 1% of users wait 5 seconds, and those tail users are often your most active or highest-value traffic. Percentiles like p95 and p99 expose that tail and map directly to user pain, which is why latency SLIs are defined as 'fraction of requests under a threshold' rather than 'average latency'. A single slow dependency or GC pause shows up clearly at p99 but is invisible in the mean. You generally watch p50, p95, and p99 together to see both typical and worst-case behavior.",
+    "fs": "I alert on p99 against an SLO threshold because the mean masks the tail, and the tail is where users actually churn.",
+    "fj": "Average response time is fine, ours is only 80 milliseconds.",
+    "level": "Jr"
+  },
+  {
+    "q": "What is OpenTelemetry and what problem does it solve?",
+    "a": "OpenTelemetry (OTel) is a CNCF vendor-neutral standard and set of SDKs for generating and exporting telemetry across three signals: traces, metrics, and logs (with profiling emerging). Its core value is decoupling instrumentation from the backend: you instrument once with the OTel API and can switch vendors by changing exporter config, avoiding lock-in. It standardizes context propagation via W3C Trace Context so trace_id and span_id flow across service and language boundaries. It also defines semantic conventions so attribute names like http.request.method are consistent everywhere.",
+    "fs": "OTel decouples instrumentation from the backend, so we swap vendors by changing exporter config, not re-instrumenting the fleet.",
+    "fj": "OpenTelemetry is just another vendor's agent you install on the box.",
+    "level": "Jr"
+  },
+  {
+    "q": "What does the OpenTelemetry Collector do and why deploy one?",
+    "a": "The Collector is a standalone proxy that receives telemetry, processes it, and exports it to one or more backends, structured as receiver, processor, and exporter pipelines. Running it decouples your apps from backends so apps just ship OTLP to the Collector while routing, batching, retries, and redaction happen centrally. It is commonly deployed as a per-node agent for local collection plus a gateway tier for fan-out, aggregation, and tail-based sampling. This means changing or adding a backend is a Collector config change, not a fleet redeploy.",
+    "fs": "I run an agent-plus-gateway Collector topology so batching, redaction, and tail sampling are config, not an app redeploy.",
+    "fj": "You don't need a collector, just point every app straight at the vendor's endpoint.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "collector pipeline",
+        "lang": "ts",
+        "lines": [
+          "receivers:  [otlp]",
+          "processors: [batch, memory_limiter]",
+          "exporters:  [otlphttp/vendor]",
+          "service:",
+          "  pipelines:",
+          "    traces:",
+          "      receivers:  [otlp]",
+          "      processors: [batch]",
+          "      exporters:  [otlphttp/vendor]"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does context propagation work in distributed tracing?",
+    "a": "Context propagation carries the trace context (trace_id, parent span_id, and sampled flag) from one service to the next so spans from different services join into one trace. The dominant standard is W3C Trace Context, which injects the context into the HTTP traceparent header so it survives process and language boundaries. When a service receives a request, it extracts the parent context, creates a child span, and re-injects the updated context into downstream calls. Without correct propagation you get disconnected single-service spans instead of one end-to-end trace.",
+    "fs": "I rely on W3C traceparent so context survives across languages, and audit that every egress client re-injects it.",
+    "fj": "Each service just logs its own request id and we stitch traces together later by timestamp.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "W3C traceparent header",
+        "lang": "ts",
+        "lines": [
+          "traceparent:",
+          "  00-4bf92f3577b34da6a3ce929d-",
+          "  00f067aa0ba902b7-01",
+          "# version-traceid-spanid-flags",
+          "# flags 01 = sampled"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between a trace and a span?",
+    "a": "A trace represents one end-to-end request as it flows through the system and is identified by a single trace_id. A span is one named unit of work within that trace, such as an HTTP handler or a database call, with its own span_id, start and end timestamps, attributes, and a parent reference. Spans form a directed acyclic graph (usually a tree) whose edges are parent-child relationships, so the trace is the whole graph and spans are its nodes. Each span carries timing plus attributes and events that explain what happened during that operation.",
+    "fs": "The trace is the DAG; spans are nodes with parent links, attributes, and events. I lean on span attributes to localize the slow hop.",
+    "fj": "A trace and a span are the same, just zoomed in.",
+    "level": "Jr"
+  },
+  {
+    "q": "Head-based vs tail-based sampling: trade-offs?",
+    "a": "Head-based sampling decides whether to keep a trace at its start, before the outcome is known, so it is cheap and stateless but blindly drops traces and may discard the rare error you most wanted. Tail-based sampling buffers all spans of a trace until it completes, then decides, so it can deterministically keep every error and slow trace at the cost of memory, latency, and Collector complexity. A common production pattern is tail-based sampling in the Collector gateway that always keeps errors and high-latency traces while sampling the healthy majority. The decision must be consistent across services so you never keep a partial trace.",
+    "fs": "I run tail sampling in the gateway to always keep errors and slow traces, accepting the buffering cost for that selectivity.",
+    "fj": "Just sample 1 percent at the start; if we miss an error it'll happen again.",
+    "level": "Sr"
+  },
+  {
+    "q": "What distinguishes symptom-based alerting from cause-based alerting?",
+    "a": "Symptom-based alerts fire on user-visible problems such as elevated error rate or latency, while cause-based alerts fire on internal conditions like high CPU or a full disk. The SRE guidance is to page primarily on symptoms because they catch real user impact regardless of root cause and dramatically reduce noise. Cause-based signals are still valuable, but as diagnostic context on dashboards rather than as pages. Paging on every cause produces alert fatigue, where on-call engineers stop trusting and reading the pages.",
+    "fs": "I page on user symptoms tied to the SLO and keep cause metrics as dashboard context, which kills most of the noise.",
+    "fj": "We page whenever CPU goes above 80 percent so we catch problems early.",
+    "level": "Mid"
+  },
+  {
+    "q": "Explain multi-window, multi-burn-rate alerting and the problem it solves.",
+    "a": "Burn rate is how fast you are spending the error budget relative to the SLO, where a burn rate of 1 exactly exhausts the budget by the end of the window. A single threshold forces a bad tradeoff: a fast trigger flaps on brief spikes, while a slow trigger misses a gradual burn. Multi-window, multi-burn-rate alerting combines a fast high-burn alert (a short and long window agreeing) for sudden outages with a slower low-burn alert for steady degradation. Requiring a short and long window to both breach suppresses spike-driven false positives while still catching slow leaks.",
+    "fs": "I run a page-level fast burn (e.g. 14.4x over 1h and 5m) plus a ticket-level slow burn, so spikes don't page but leaks don't hide.",
+    "fj": "We just alert when the error rate goes over 5 percent for five minutes.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "fast-burn alert (Prometheus)",
+        "lang": "ts",
+        "lines": [
+          "# page if budget burns 14.4x",
+          "# over BOTH 1h and 5m windows",
+          "- alert: ErrorBudgetFastBurn",
+          "  expr: |",
+          "    job:slo_err:ratio5m > 0.0144",
+          "    and",
+          "    job:slo_err:ratio1h > 0.0144",
+          "  for: 2m"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What makes an effective on-call alert and rotation?",
+    "a": "An effective alert is actionable, urgent, and tied to user impact: every page should require a human to do something now, and ideally link to a runbook. The rotation should be sustainable, commonly weekly with a primary and a secondary, and bounded so engineers are not paged constantly, since too many pages cause fatigue and missed real incidents. Non-urgent issues should become tickets, not pages, and every page should be reviewed so noisy alerts are tuned or deleted. Tracking page volume per shift is a key health metric for the rotation.",
+    "fs": "Every page is actionable with a runbook link, and I review page volume per shift to delete noise before it burns out the rotation.",
+    "fj": "We alert on everything so nothing slips through, and whoever's around grabs it.",
+    "level": "Mid"
+  },
+  {
+    "q": "What makes a good dashboard, and what are common anti-patterns?",
+    "a": "A good service dashboard leads with the signals that map to user experience, typically the RED metrics (rate, errors, duration) plus current SLO and error-budget status, arranged so the most important answers are at the top. It should help answer 'is the service healthy and if not where is the problem' within seconds, with consistent layouts across services so on-call can navigate any of them. Anti-patterns include wall-of-graphs dashboards with hundreds of panels nobody reads, vanity metrics with no decision attached, and inconsistent layouts that force relearning during an incident. Drill-down should flow from symptom dashboards to resource and dependency views.",
+    "fs": "I template a RED-plus-SLO dashboard per service so layouts are identical and on-call reads any service in seconds during an incident.",
+    "fj": "More graphs is better, so I put every metric we collect on one big dashboard.",
+    "level": "Mid"
+  },
+  {
+    "q": "Walk through the lifecycle of incident response.",
+    "a": "Incident response moves through detection (an alert or report surfaces user impact), triage and declaration (assess severity and declare an incident with clear roles), and coordination under an Incident Commander who owns decisions while others own communications and operations. The immediate goal is mitigation to stop user pain (rollback, failover, or feature flag) before chasing full root cause. Once stable, you resolve, then run a blameless postmortem that produces tracked action items. Clear role separation and a single source of truth (an incident channel or doc) keep large incidents from devolving into chaos.",
+    "fs": "I separate the Incident Commander from comms and ops, mitigate before root-causing, and drive every postmortem action item to closure.",
+    "fj": "When something breaks everyone jumps in the channel and we fix it however we can.",
+    "level": "Sr"
+  },
+  {
+    "q": "What is a blameless postmortem and why does MTTR matter?",
+    "a": "A blameless postmortem analyzes an incident by focusing on systemic and process causes rather than blaming individuals, on the premise that people act reasonably given the information they had and that punishment just drives problems underground. It documents a timeline, contributing factors, impact, and concrete action items with owners so the same failure does not recur. MTTR (mean time to recovery) measures how long incidents take to mitigate and is a core reliability metric, often more controllable than MTBF because you cannot prevent every failure but you can recover faster. Lowering MTTR usually comes from better detection, runbooks, and safe rollbacks, all of which postmortems drive.",
+    "fs": "Blameless means we fix the system, not the person; I track action-item closure rate and MTTR trend as the real output of postmortems.",
+    "fj": "The postmortem is about finding who broke it so it doesn't happen again.",
+    "level": "Sr"
+  },
+  {
+    "q": "What are the four golden signals of monitoring, and what does each tell you?",
+    "a": "Defined in Google's SRE book, the golden signals are latency, traffic, errors, and saturation. Latency is how long requests take, ideally split into success and error latency since failed requests can be deceptively fast. Traffic is demand on the system, such as requests per second. Errors is the rate of failed requests, and saturation is how full the system is relative to its constraining resource, often the best leading indicator of impending trouble. If you can only instrument four things on a user-facing service, these four catch nearly every meaningful failure mode.",
+    "fs": "I split latency into success vs error buckets, because a fast 500 otherwise drags the latency distribution down and hides the outage.",
+    "fj": "The four golden signals are CPU, memory, disk, and network.",
+    "level": "Jr",
+    "asked": 24
+  },
+  {
+    "q": "Compare the three core metric types: counter, gauge, and histogram. When do you use each?",
+    "a": "A counter is a monotonically increasing total that only goes up (or resets to zero on restart), so you always apply rate() to it rather than reading it raw: think total requests or total errors. A gauge is a value that goes up and down and is read as-is, such as queue depth, in-flight requests, or memory in use. A histogram samples observations into pre-configured buckets plus a sum and count, letting you compute server-side percentiles and rates over a distribution like request latency or payload size. Choosing the wrong type is a common bug, for example storing a running total as a gauge so rate() silently misbehaves.",
+    "fs": "I reach for a counter+rate() for throughput, a gauge for levels like queue depth, and a histogram whenever I'll want a percentile.",
+    "fj": "I just use a gauge for everything and read the latest number off the dashboard.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "label": "right type per signal",
+        "lang": "python",
+        "lines": [
+          "reqs = Counter('http_reqs_total')",
+          "inflight = Gauge('http_inflight')",
+          "lat = Histogram('http_lat_sec',",
+          "  buckets=[.05,.1,.25,.5,1,2.5])",
+          "reqs.inc()        # only goes up",
+          "inflight.inc(); inflight.dec()",
+          "lat.observe(0.42) # -> percentiles"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How should you use log levels, and how does log sampling control cost without losing signal?",
+    "a": "Log levels (ERROR, WARN, INFO, DEBUG, TRACE) classify severity so you can run verbose DEBUG in dev but ship INFO and above in production, keeping volume and cost in check. ERROR should mean a human may need to act, not merely a handled exception, otherwise the level loses meaning and people stop trusting it. For high-volume INFO and DEBUG, sampling keeps a representative fraction rather than every line, and trace-aware sampling keeps all logs for a sampled trace so a request's story stays intact. You should never sample away errors; sample the noisy happy path and keep the rare failures at full fidelity.",
+    "fs": "I keep ERROR meaning 'act on this', sample the chatty INFO path, and never drop error logs so the rare failure is always there.",
+    "fj": "We log everything at INFO in production and just buy more log storage when the bill grows.",
+    "level": "Jr",
+    "asked": 13
+  },
+  {
+    "q": "Beyond logs and dashboards, how do you actually fight alert fatigue?",
+    "a": "Alert fatigue happens when on-call gets so many low-value pages that they start ignoring or auto-acknowledging them, so a real incident slips through. The cure is mostly deletion and tuning: page only on actionable, user-impacting symptoms tied to an SLO, and demote everything else to tickets or dashboards. Every alert should link to a runbook so the responder knows what to do, and alerts with no runbook and no recent true positive are candidates for removal. Grouping and deduplicating related alerts into one incident, plus tracking pages-per-shift and false-positive rate, turns alert hygiene into a measured, ongoing practice rather than a one-time cleanup.",
+    "fs": "I review pages-per-shift and false-positive rate every week and delete any alert that hasn't fired a true positive or lacks a runbook.",
+    "fj": "If on-call is getting too many pages, we tell them to just check the dashboard more often.",
+    "level": "Mid",
+    "asked": 15
+  },
+  {
+    "q": "What are the pillars of data pipeline observability, and how do they differ from app observability?",
+    "a": "Data observability watches the health of data flowing through pipelines, commonly framed as freshness, volume, distribution, schema, and lineage. Freshness asks whether a table updated on time, volume watches row counts for partial loads or duplicates, distribution checks that values stay within expected statistical shape (nulls, ranges, cardinality), schema detects breaking column changes, and lineage maps upstream and downstream impact. Unlike app observability, which centers on request latency and errors, data observability centers on whether the data itself is correct, complete, and on time, since a pipeline can be perfectly 'up' while silently delivering stale or wrong data. Lineage is what lets you answer which dashboards and models break when one source goes bad.",
+    "fs": "I monitor freshness, volume, distribution, schema, and lineage, because a pipeline can be green on uptime while quietly serving stale or null-filled data.",
+    "fj": "If the pipeline job exits zero and the warehouse is up, the data is fine.",
+    "level": "Mid",
+    "asked": 19
+  },
+  {
+    "q": "What is a data SLA, and how do you express freshness and quality as one?",
+    "a": "A data SLA is an agreement with data consumers about when and how good a dataset will be, the analog of an availability SLA for a service. Freshness is usually stated as a max staleness or delivery deadline, for example 'the orders table is updated by 06:00 and is never more than 3 hours stale'. Quality is expressed as measurable checks: completeness (row count within an expected band), validity (nulls or out-of-range values under a threshold), and uniqueness (no duplicate keys). You enforce it with automated freshness and volume monitors plus assertion tests that fail the pipeline or alert on breach, and you track the breach rate the way you track an error budget. The key shift is treating data delivery as a contract with a deadline, not best-effort.",
+    "fs": "I encode freshness as a max-staleness deadline and quality as completeness/validity/uniqueness checks, then alert on SLA breach like an error budget burn.",
+    "fj": "A data SLA just means the nightly job is scheduled to run at midnight.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "label": "freshness + quality checks",
+        "lang": "python",
+        "lines": [
+          "lag = now() - max(loaded_at)",
+          "assert lag < hours(3)   # freshness",
+          "n = count(rows_today)",
+          "assert 0.8*expected < n   # volume",
+          "assert null_rate(amount) < 0.01",
+          "assert dup_keys(id) == 0  # uniqueness",
+          "# breach -> page + halt downstream"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "How do you do anomaly detection on metrics without drowning in false positives?",
+    "a": "Static thresholds break for metrics with seasonality, since a traffic level that's normal at noon is an incident at 3am, so anomaly detection learns the expected pattern and flags deviations from it. Common approaches range from simple rolling statistics (z-score or MAD against a moving baseline) to seasonal decomposition and models that learn daily and weekly cycles. The hard part is precision: naive detectors fire constantly, so you require a deviation to persist over a window, compare against the same time last week rather than the last hour, and band by expected variance. In practice teams reserve anomaly detection for signals where good static SLO thresholds don't exist, and still gate paging on user-impacting symptoms to avoid noise.",
+    "fs": "I compare against the same hour last week and require the deviation to persist, so a normal daily peak doesn't read as an anomaly.",
+    "fj": "We just set a fixed threshold and alert any time the metric crosses it.",
+    "level": "Sr",
+    "asked": 11
+  },
+  {
+    "q": "What is an exemplar, and how does it bridge a metric spike to the exact failing trace?",
+    "a": "An exemplar is a sample trace ID (with its timestamp and value) attached to a specific histogram bucket, so an aggregated metric can point at concrete example requests that landed in it. This solves the core tension that metrics are low-cardinality and cheap but anonymous, while traces are high-cardinality and rich but can't be alerted on directly. With exemplars, you can see a p99 latency spike on a dashboard and click straight through to a real slow trace that produced it, instead of guessing which request was slow. It's the practical glue of the three pillars: high-cardinality IDs live in traces and exemplars, never in metric labels, yet the metric still gives you a one-click path to root cause.",
+    "fs": "I attach trace-ID exemplars to latency histograms so a p99 spike links to an actual slow trace, keeping cardinality out of the metric itself.",
+    "fj": "To find the slow request behind a p99 spike, I add a request_id label to the latency metric.",
+    "level": "Sr",
+    "asked": 9
+  }
+]

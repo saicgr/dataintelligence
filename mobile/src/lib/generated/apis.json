@@ -1,0 +1,463 @@
+[
+  {
+    "q": "What is the difference between REST, gRPC, and GraphQL?",
+    "a": "REST uses HTTP/1.1 with JSON and resource URLs; it is simple, cacheable, and the safe default for public APIs. gRPC uses HTTP/2 with binary Protobuf and a .proto contract that generates client/server stubs; it is fast, supports streaming, and is favored for internal service-to-service calls. GraphQL exposes a single endpoint with a typed schema and lets clients ask for exactly the fields they need, avoiding over/under-fetching. Pick REST for broad compatibility, gRPC for low-latency internal microservices, GraphQL for flexible client-driven queries over complex graphs.",
+    "fs": "REST = ubiquitous default, gRPC = fast internal binary streaming, GraphQL = client picks fields.",
+    "fj": "Says gRPC and GraphQL are just 'newer REST' and always better.",
+    "level": "Mid"
+  },
+  {
+    "q": "Why is gRPC often faster than REST/JSON?",
+    "a": "gRPC serializes messages as Protobuf, a compact binary format that is smaller and faster to encode/decode than text JSON. It runs over HTTP/2, which adds multiplexing (many calls on one connection), header compression, and binary framing. It also supports streaming (client, server, and bidirectional) natively. Benchmarks often show it several times faster than REST/JSON for high-volume internal traffic. The tradeoff: binary payloads are not human-readable, browser support needs gRPC-Web, and tooling is heavier.",
+    "fs": "Protobuf binary + HTTP/2 multiplexing/streaming beats text JSON over HTTP/1.1.",
+    "fj": "Thinks gRPC is faster only because 'Google made it'.",
+    "level": "Mid"
+  },
+  {
+    "q": "What does idempotency mean for an HTTP API, and which methods are idempotent?",
+    "a": "An operation is idempotent if making the same request multiple times has the same effect on server state as making it once. GET, PUT, DELETE, HEAD, and OPTIONS are idempotent by spec; POST and PATCH are generally not. Note idempotent is not the same as 'safe': GET/HEAD are safe (no state change), while DELETE is idempotent but not safe. Idempotency matters because clients retry on timeouts and network failures, and idempotent operations can be retried safely without side effects like duplicate records.",
+    "fs": "Same request repeated = same end state; PUT/DELETE/GET idempotent, POST/PATCH not.",
+    "fj": "Confuses idempotent with safe, or thinks idempotent means 'returns the same response'.",
+    "level": "Jr"
+  },
+  {
+    "q": "How do you make a POST (e.g. a payment) safe to retry?",
+    "a": "Use an idempotency key. The client generates a unique key (typically a UUIDv4) and sends it in an Idempotency-Key header. On first receipt, the server processes the request, stores the result keyed by that value, and returns it. If the same key arrives again (a retry), the server returns the stored result instead of creating a duplicate charge. Keys should expire after a window (e.g. 24h), and you must lock/dedupe concurrently arriving duplicates. Stripe and many payment APIs use exactly this pattern.",
+    "fs": "Client sends Idempotency-Key; server stores result per key and replays it on retries.",
+    "fj": "Says 'just check if a charge already exists' without a dedicated key or concurrency handling.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Idempotent create",
+        "lang": "ts",
+        "lines": [
+          "async function createCharge(key, body) {",
+          "  const hit = await store.get(key);",
+          "  if (hit) return hit; // replay",
+          "  const lock = await store.lock(key);",
+          "  if (!lock) throw new Error('busy');",
+          "  const res = await charge(body);",
+          "  await store.set(key, res, '24h');",
+          "  return res;",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain OAuth2 vs a plain JWT. How do they relate?",
+    "a": "OAuth2 is an authorization framework: it defines flows (e.g. Authorization Code with PKCE, Client Credentials) by which a client obtains an access token to act on a resource owner's behalf, without seeing their password. JWT is just a token format: a signed, base64url-encoded JSON object with header, claims, and signature. OAuth2 often issues JWTs as access tokens, but it can use opaque tokens too. So they answer different questions: OAuth2 = how you get and delegate a token; JWT = how a token is encoded and verified. JWTs are self-contained, so the resource server validates the signature locally without a DB lookup.",
+    "fs": "OAuth2 = delegation flows; JWT = a token format OAuth2 may issue. Different layers.",
+    "fj": "Treats 'OAuth' and 'JWT' as interchangeable names for the same thing.",
+    "level": "Mid"
+  },
+  {
+    "q": "What are the main parts of a JWT and how is it validated?",
+    "a": "A JWT has three dot-separated parts: header (alg/type), payload (claims like sub, exp, iat, iss, aud), and signature. To validate, the server recomputes the signature over header.payload using the secret (HS256) or public key (RS256) and checks it matches; then it verifies claims: exp not expired, iss and aud match expected values, and nbf if present. The payload is only base64url-encoded, not encrypted, so never put secrets in it. Use short-lived access tokens plus a refresh token, and prevent 'alg: none' downgrade attacks by pinning the expected algorithm.",
+    "fs": "Verify signature with the right key, then check exp/iss/aud; payload is signed, not secret.",
+    "fj": "Thinks JWT payload is encrypted, or trusts the token's own 'alg' header blindly.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Pin the algorithm",
+        "lang": "ts",
+        "lines": [
+          "jwt.verify(token, publicKey, {",
+          "  algorithms: ['RS256'], // never 'none'",
+          "  issuer: 'https://auth.example.com',",
+          "  audience: 'api://orders'",
+          "});"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why use short-lived access tokens with refresh tokens?",
+    "a": "Access tokens are usually self-contained JWTs validated locally, so they cannot be cheaply revoked before they expire. Keeping them short-lived (minutes) limits the blast radius if one leaks. A longer-lived refresh token, stored securely and exchanged at the auth server for new access tokens, lets sessions persist without re-login. The auth server can revoke refresh tokens and rotate them on each use (refresh token rotation) to detect theft. This separates 'frequent, cheap, local checks' from 'rare, revocable, server-side checks'.",
+    "fs": "Short access tokens cap leak damage; revocable rotating refresh tokens keep sessions alive.",
+    "fj": "Issues one long-lived token forever and has no revocation story.",
+    "level": "Sr"
+  },
+  {
+    "q": "What are common strategies for API versioning?",
+    "a": "URI path versioning (/v1/orders) is the most visible and easy to route/cache, but couples version to the URL. Header/media-type versioning (Accept: application/vnd.api.v2+json) keeps URLs clean and is more RESTful but is harder to test in a browser. Query-param versioning (?version=2) is simple but easy to omit. Many teams default to URL path versioning for clarity and only bump the major version on breaking changes, layering additive (non-breaking) changes within a version. Whatever you choose, document the deprecation policy and sunset dates.",
+    "fs": "Path versioning is the pragmatic default; bump major only on breaking changes.",
+    "fj": "Creates /v2 for every tiny additive field change.",
+    "level": "Mid"
+  },
+  {
+    "q": "What changes are backward-compatible vs breaking in an API?",
+    "a": "Backward-compatible (safe, additive): adding a new optional field to a response, adding a new optional request parameter with a default, adding a new endpoint, or adding a new enum value clients are told to tolerate. Breaking: removing or renaming a field, changing a field's type or meaning, making an optional parameter required, tightening validation, changing default behavior, or altering status codes. The rule of thumb (Postel/robustness + 'tolerant reader'): consumers must ignore unknown fields, and producers must not remove or repurpose existing ones within a version.",
+    "fs": "Additive optional changes are safe; removals/renames/type or semantic changes are breaking.",
+    "fj": "Thinks 'we'll just rename the field, clients can update' is non-breaking.",
+    "level": "Sr"
+  },
+  {
+    "q": "How would you deprecate an API field or endpoint gracefully?",
+    "a": "Announce early and keep the old behavior working during a sunset window. Mark the field as deprecated in docs and the OpenAPI spec, and signal it at runtime via the Deprecation and Sunset HTTP headers (and a Warning). Keep emitting both old and new fields for a transition period so consumers migrate incrementally. Monitor usage by client/version to know who still calls the deprecated path, reach out to them, and only remove it after traffic drops to near zero and the sunset date passes. Never remove silently.",
+    "fs": "Deprecate with Deprecation/Sunset headers + docs, dual-write, monitor usage, then remove.",
+    "fj": "Removes the old field on the announced date regardless of who's still calling it.",
+    "level": "Sr"
+  },
+  {
+    "q": "Compare token bucket and sliding-window rate limiting.",
+    "a": "Token bucket: a bucket holds up to N tokens, refilled at a steady rate; each request consumes a token, and an empty bucket means reject (429). It allows short bursts up to the bucket size while bounding the average rate, and is used by Stripe and AWS. Fixed window counts requests per calendar window but allows a 2x spike at the boundary. Sliding window log/counter tracks request timestamps within the last N seconds for smoother enforcement, at higher memory cost. Token bucket is the common default; sliding window when you must avoid boundary bursts.",
+    "fs": "Token bucket allows bounded bursts cheaply; sliding window is smoother but costlier.",
+    "fj": "Uses a fixed window and is surprised by the 2x burst at the window edge.",
+    "level": "Mid"
+  },
+  {
+    "q": "What status code and headers signal rate limiting to a client?",
+    "a": "Return 429 Too Many Requests when a client exceeds its limit. Include a Retry-After header (seconds or an HTTP date) telling the client when to retry. Most APIs also expose informational headers: X-RateLimit-Limit (cap per window), X-RateLimit-Remaining (calls left), and X-RateLimit-Reset (when the window resets). Well-behaved clients read Retry-After and back off rather than hammering. For server overload (not per-client limits) 503 with Retry-After is more appropriate.",
+    "fs": "429 + Retry-After, plus X-RateLimit-Limit/Remaining/Reset for client self-throttling.",
+    "fj": "Returns 403 or 500 for throttling and gives no Retry-After.",
+    "level": "Jr"
+  },
+  {
+    "q": "Compare offset pagination with cursor (keyset) pagination.",
+    "a": "Offset pagination (LIMIT N OFFSET M) is simple and allows jumping to any page, but the database must scan and discard M rows, so deep pages get slow (O(offset)), and inserts/deletes between requests cause skipped or duplicated rows. Cursor/keyset pagination remembers the last seen sort key (e.g. created_at,id) and queries WHERE (created_at,id) > (last) ORDER BY ... LIMIT N. It seeks directly via an index, giving stable, near-constant performance regardless of depth, but you can't jump to an arbitrary page. Use cursor pagination for large, frequently changing, or deeply paginated datasets.",
+    "fs": "Offset scans+discards and drifts; keyset seeks by indexed sort key for stable deep paging.",
+    "fj": "Defaults to OFFSET everywhere and wonders why page 5000 is slow.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Keyset page query",
+        "lang": "sql",
+        "lines": [
+          "SELECT id, created_at, title",
+          "FROM posts",
+          "WHERE (created_at, id) < (:c_ts, :c_id)",
+          "ORDER BY created_at DESC, id DESC",
+          "LIMIT 20;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How should a paginated API return cursors to clients?",
+    "a": "Return an opaque cursor, typically a base64url-encoded payload holding the last sort key(s) and direction, plus a next link or next_cursor. Treat it as opaque so clients don't parse or fabricate it and you can change its internals later. Optionally HMAC-sign the cursor with a server secret so tampering is detectable and rejected. Include a tie-breaker (a unique column like id) in the sort to keep ordering deterministic. Don't leak raw internal IDs or row offsets, and document whether the cursor is stable across data changes.",
+    "fs": "Opaque, optionally HMAC-signed cursor encoding (sort_key,id); return next_cursor not page numbers.",
+    "fj": "Returns the raw DB offset as the 'cursor' and lets clients edit it.",
+    "level": "Sr"
+  },
+  {
+    "q": "When do you use 2xx vs 4xx vs 5xx status codes?",
+    "a": "2xx = success: 200 OK, 201 Created (resource made, often with Location), 202 Accepted (async, not done yet), 204 No Content. 4xx = client error, don't blindly retry as-is: 400 bad request, 401 unauthenticated, 403 forbidden, 404 not found, 409 conflict, 422 unprocessable (validation), 429 too many requests. 5xx = server error, often retryable: 500 internal, 502 bad gateway, 503 unavailable (with Retry-After), 504 gateway timeout. The dividing line: 4xx means the client must change something; 5xx means the server failed and the same request might succeed later.",
+    "fs": "4xx = caller's fault (fix request); 5xx = server's fault (often retryable).",
+    "fj": "Returns 200 with an 'error' field in the body for failures.",
+    "level": "Jr"
+  },
+  {
+    "q": "What's the difference between 401 and 403?",
+    "a": "401 Unauthorized means 'not authenticated' — the request lacks valid credentials or the token is missing/expired/invalid; the response should include a WWW-Authenticate header, and the fix is to log in or refresh the token. 403 Forbidden means 'authenticated but not allowed' — the server knows who you are but you lack permission for this resource, and retrying with the same credentials won't help. The naming is historically confusing (401 literally says 'Unauthorized' but means unauthenticated), so interviewers love this one.",
+    "fs": "401 = who are you (authenticate); 403 = I know you but you can't (authorize).",
+    "fj": "Returns 401 for permission failures and 403 for missing tokens, reversed.",
+    "level": "Jr"
+  },
+  {
+    "q": "When is 201 vs 202 vs 204 the right success code?",
+    "a": "201 Created: a request synchronously created a new resource; return it (or a reference) and a Location header pointing to it. 202 Accepted: the request was accepted for asynchronous processing and is not complete yet — common for jobs/queues; you typically return a status URL the client can poll. 204 No Content: success with intentionally no body, common for DELETE or a PUT that updates without returning the entity. Choosing precisely tells clients whether to read a body, poll for completion, or follow a Location.",
+    "fs": "201 done+created (Location), 202 queued (poll later), 204 done with no body.",
+    "fj": "Always returns 200 for every successful write.",
+    "level": "Mid"
+  },
+  {
+    "q": "How should clients implement retries with timeouts safely?",
+    "a": "Set an explicit per-request timeout so a hung call fails fast instead of holding resources. Retry only idempotent or idempotency-keyed requests, and only on transient failures (timeouts, connection errors, 502/503/504, 429). Use exponential backoff with jitter to avoid thundering-herd synchronization, honor Retry-After when present, and cap the number of attempts and total deadline. Pair retries with a circuit breaker so you stop hammering a clearly-down dependency. Blindly retrying every error (including 400/409) or retrying non-idempotent POSTs causes duplicates and cascading overload.",
+    "fs": "Timeout + bounded exponential backoff with jitter, only on transient/idempotent calls, honor Retry-After.",
+    "fj": "Retries everything immediately in a tight loop, including non-idempotent POSTs.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Backoff with jitter",
+        "lang": "python",
+        "lines": [
+          "for attempt in range(max_attempts):",
+          "    try:",
+          "        return call(timeout=2.0)",
+          "    except Transient as e:",
+          "        if attempt == max_attempts - 1:",
+          "            raise",
+          "        base = min(cap, 0.5 * 2**attempt)",
+          "        time.sleep(random.random() * base)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why add jitter to exponential backoff?",
+    "a": "Pure exponential backoff makes all clients that failed at the same instant retry at the same future instants (1s, 2s, 4s...), so they synchronize and slam the recovering server in waves — a thundering herd that prevents recovery. Adding randomness (jitter) spreads retries across the interval so load is smooth. 'Full jitter' picks a random delay in [0, base] each attempt. AWS's analysis showed full/equal jitter dramatically reduces contention and completes work faster than backoff alone. It's a one-line change with outsized resilience benefits.",
+    "fs": "Jitter de-synchronizes retries so recovering servers aren't hit by simultaneous waves.",
+    "fj": "Thinks fixed exponential delays are enough and clients won't align.",
+    "level": "Mid"
+  },
+  {
+    "q": "How do webhooks work and how do you secure them?",
+    "a": "A webhook is a server-to-server push: when an event occurs, the provider POSTs a payload to a URL you registered, so you don't have to poll. Secure them by verifying authenticity: the provider signs the raw request body with a shared secret using HMAC-SHA256 and sends the signature (and a timestamp) in a header; your endpoint recomputes the HMAC over the exact raw bytes and compares using a constant-time check. Also reject old timestamps to stop replay, return 2xx fast and process async, and make handling idempotent because providers retry and may deliver duplicates or out-of-order events.",
+    "fs": "Verify HMAC over raw body + timestamp, dedupe by event id, ack fast and process async.",
+    "fj": "Trusts the webhook payload without signature verification.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Verify webhook",
+        "lang": "python",
+        "lines": [
+          "import hmac, hashlib",
+          "def verify(raw, sig, secret):",
+          "    mac = hmac.new(",
+          "        secret, raw, hashlib.sha256",
+          "    ).hexdigest()",
+          "    return hmac.compare_digest(mac, sig)"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Why must webhook consumers be idempotent?",
+    "a": "Webhook providers guarantee at-least-once delivery, not exactly-once: if your endpoint is slow, times out, or returns a non-2xx, they retry, so the same event can arrive multiple times. Networks can also reorder events. If your handler isn't idempotent, retries create duplicate records (double-charged orders, double emails). The fix: each event has a unique id; record processed ids and skip duplicates, or design the side effect to be naturally idempotent (upsert by event id). Acknowledge with 2xx only after you've durably accepted the event.",
+    "fs": "Delivery is at-least-once with retries, so dedupe by event id or use upserts.",
+    "fj": "Assumes each webhook fires exactly once and processes it without dedup.",
+    "level": "Sr"
+  },
+  {
+    "q": "How should an API validate incoming requests?",
+    "a": "Validate at the boundary against a schema before any business logic: types, required fields, formats, ranges, enum values, and string lengths. Use a declarative schema (JSON Schema / OpenAPI, or a library like zod/pydantic) so validation is consistent and self-documenting. Reject invalid input with 400 (malformed) or 422 (well-formed but semantically invalid) and return a structured error listing which fields failed. Allowlist expected fields rather than trusting input, and never rely on client-side validation. This is also a security control: it blocks injection and malformed payloads early.",
+    "fs": "Schema-validate at the edge, allowlist fields, return 400/422 with per-field errors.",
+    "fj": "Relies on front-end validation and trusts whatever the body contains.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Schema validation",
+        "lang": "ts",
+        "lines": [
+          "const Body = z.object({",
+          "  email: z.string().email(),",
+          "  age: z.number().int().min(0).max(120),",
+          "});",
+          "const r = Body.safeParse(req.body);",
+          "if (!r.success)",
+          "  return res.status(422).json(r.error);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does an API gateway do?",
+    "a": "An API gateway is a single entry point in front of backend services that handles cross-cutting concerns so each service doesn't reimplement them: routing/composition to the right service, authentication and authorization, rate limiting and throttling, TLS termination, request/response transformation, caching, and observability (logging, metrics, tracing). In microservices it decouples clients from internal topology and can aggregate calls. The tradeoff is it's a critical shared component and potential bottleneck/single point of failure, so it must be highly available and kept thin (avoid burying business logic in it).",
+    "fs": "Single edge for routing, authn/z, rate limiting, TLS, observability — keep it thin and HA.",
+    "fj": "Thinks a gateway is just a load balancer, or stuffs business logic into it.",
+    "level": "Mid"
+  },
+  {
+    "q": "Walk through what happens to a request as it passes through an API gateway.",
+    "a": "A typical pipeline: (1) TLS termination and basic request parsing; (2) authentication — validate the JWT/API key and reject 401 if invalid; (3) authorization/scopes check, 403 if not allowed; (4) rate limiting / quota check, 429 if exceeded; (5) routing to the correct upstream service, possibly with request transformation or aggregation; (6) forward with a timeout and retry/circuit-breaker policy; (7) transform the response, attach correlation/trace IDs, and emit metrics and logs. Failing fast on auth and limits before touching backends protects the core services from bad or excessive traffic.",
+    "fs": "TLS->authn->authz->rate limit->route w/ timeout->transform->observe; reject early to shield backends.",
+    "fj": "Sends every request straight to the backend and checks auth deep inside the service.",
+    "level": "Sr"
+  },
+  {
+    "q": "What are the core constraints of REST, and what does the Richardson Maturity Model add on top?",
+    "a": "REST's architectural constraints are client-server separation, statelessness (each request carries its own context), cacheability, a uniform interface (resources, representations, self-descriptive messages), and a layered system; HATEOAS is the optional hypermedia constraint. The Richardson Maturity Model grades how 'RESTful' an API is: Level 0 is a single endpoint tunneling RPC, Level 1 introduces distinct resource URLs, Level 2 uses HTTP verbs and status codes correctly (where most 'REST' APIs sit), and Level 3 adds hypermedia controls (HATEOAS) so responses link to next actions. Most production APIs target Level 2 deliberately and skip full HATEOAS because few clients consume hypermedia links. The point is to use HTTP's semantics, not to chase a purity badge.",
+    "fs": "Stateless + uniform interface + cacheable; Richardson L2 (verbs+status codes) is the pragmatic target, L3 adds HATEOAS.",
+    "fj": "Calls any JSON-over-HTTP endpoint 'REST' even when it's one POST tunneling RPC.",
+    "level": "Mid",
+    "asked": 9
+  },
+  {
+    "q": "Walk through the semantics of GET, POST, PUT, PATCH, and DELETE. When is PUT vs PATCH correct?",
+    "a": "GET reads a resource and is safe and idempotent. POST creates a subordinate resource or triggers a non-idempotent action and typically returns 201 with a Location. PUT replaces a resource entirely at a known URL and is idempotent, so the client must send the full representation. PATCH applies a partial modification (e.g. JSON Patch or JSON Merge Patch) and is generally not idempotent unless you design it to be. DELETE removes a resource and is idempotent. The PUT-vs-PATCH rule: PUT when the client owns the URL and sends the whole entity; PATCH when sending only the changed fields against a server-assigned resource.",
+    "fs": "GET safe; PUT full-replace+idempotent; PATCH partial (often not idempotent); POST create/action; DELETE idempotent.",
+    "fj": "Uses POST for everything and treats PATCH and PUT as interchangeable.",
+    "level": "Jr",
+    "asked": 11
+  },
+  {
+    "q": "What are the classic operational pitfalls of a GraphQL API and how do you mitigate them?",
+    "a": "GraphQL's single flexible endpoint creates several traps. The N+1 problem: a nested query fans out into one DB call per parent, fixed with a per-request DataLoader that batches and caches. Unbounded query cost: a malicious or careless client can request deeply nested or huge result sets, so you enforce query depth limits, complexity/cost analysis, and pagination. Caching is harder than REST because everything is a POST to one URL, so you lean on persisted queries, response caching by query hash, and field-level caching. Errors are partial: a 200 can carry an 'errors' array alongside data, so clients must inspect it. Schema evolution favors deprecating fields over versioning.",
+    "fs": "Watch N+1 (DataLoader), query-cost (depth/complexity limits), weak HTTP caching (persisted queries), partial errors.",
+    "fj": "Exposes the schema with no depth or cost limits and assumes GraphQL caches like REST.",
+    "level": "Sr",
+    "asked": 10,
+    "code": [
+      {
+        "label": "Batch with DataLoader",
+        "lang": "ts",
+        "lines": [
+          "const userLoader = new DataLoader(",
+          "  async (ids) => {",
+          "    const rows = await db.users",
+          "      .whereIn('id', ids);",
+          "    return ids.map(id =>",
+          "      rows.find(r => r.id === id));",
+          "  });"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Compare the OAuth2 Authorization Code (with PKCE) and Client Credentials flows. When do you use each?",
+    "a": "Authorization Code with PKCE is for flows acting on behalf of a human: the user authenticates at the authorization server, which returns a short-lived code to the app's redirect URI, and the app exchanges that code (plus a PKCE verifier) for tokens. PKCE binds the code to the originating client so an intercepted code is useless, which is why it's now required for both public (mobile/SPA) and confidential clients. Client Credentials is for machine-to-machine where there is no user: the service authenticates with its own client_id/secret and gets an access token for its own identity. Use Authorization Code+PKCE for user-facing apps; Client Credentials for backend jobs and service-to-service calls. The deprecated Implicit and Resource Owner Password flows should not be used.",
+    "fs": "Auth Code+PKCE = on behalf of a user (PKCE stops code interception); Client Credentials = machine-to-machine.",
+    "fj": "Reaches for the Implicit or password grant, or hardcodes a user's credentials for a service call.",
+    "level": "Mid",
+    "asked": 13
+  },
+  {
+    "q": "When are API keys appropriate versus OAuth tokens, and how do you manage them safely?",
+    "a": "API keys are a simple shared secret identifying a calling application or project, good for server-to-server access to your own API, partner integrations, and usage metering/rate-limiting per key. They authenticate the app, not an end user, and carry no standard scoping or expiry, so they're weaker than OAuth for delegated, user-scoped access. Manage them by issuing per-client (never one global key), supporting rotation and instant revocation, scoping each key to least privilege, transmitting only over TLS in a header (not the URL, which leaks into logs), and hashing keys at rest so a DB leak doesn't expose them. For acting on a user's behalf or fine-grained permissions, use OAuth tokens instead.",
+    "fs": "API keys ID an app for S2S/metering; per-client, scoped, rotatable, hashed at rest, in a header not the URL.",
+    "fj": "Ships one shared key in the query string and logs it, with no rotation or revocation.",
+    "level": "Jr",
+    "asked": 8
+  },
+  {
+    "q": "What is mutual TLS (mTLS) and where does it fit in API security?",
+    "a": "Ordinary TLS authenticates only the server to the client; mutual TLS adds the reverse, so the client also presents an X.509 certificate that the server validates against a trusted CA. This gives strong, cryptographic identity for both parties at the transport layer, independent of any bearer token, which is why it's used for service-to-service auth inside a zero-trust mesh, partner B2B integrations, and high-assurance APIs (banking, payments). It also enables certificate-bound access tokens (RFC 8705) so a stolen bearer token can't be replayed from another client. The cost is operational: issuing, distributing, rotating, and revoking client certs at scale, usually handled by a service mesh or internal PKI rather than by hand.",
+    "fs": "mTLS authenticates both client and server via X.509 certs at the transport layer; strong S2S/zero-trust identity.",
+    "fj": "Thinks standard HTTPS already authenticates the client, or rolls cert rotation by hand at scale.",
+    "level": "Sr",
+    "asked": 7
+  },
+  {
+    "q": "How should an API return structured errors, and what does RFC 9457 (problem+json) standardize?",
+    "a": "Return errors with the correct HTTP status code plus a machine-readable body, rather than a 200 with an ad-hoc error field. RFC 9457 (which obsoletes RFC 7807) defines the application/problem+json media type with five standard members: type (a URI identifying the problem class), title (short human summary), status (the HTTP code, advisory), detail (specifics for this occurrence), and instance (a URI for this particular error). You can add extension members like a request/correlation id, retry timing, or a per-field validation list. Using a stable type URI lets clients branch on error class without string-matching prose, and a consistent shape across endpoints makes error handling uniform.",
+    "fs": "problem+json: type/title/status/detail/instance + extensions; branch on the stable type URI, not on prose.",
+    "fj": "Returns 200 with a free-text 'error' string that clients must regex to interpret.",
+    "level": "Mid",
+    "asked": 9,
+    "code": [
+      {
+        "label": "problem+json body",
+        "lang": "ts",
+        "lines": [
+          "res.status(409)",
+          " .type('application/problem+json')",
+          " .json({",
+          "  type: 'https://api/probs/dup',",
+          "  title: 'Duplicate order',",
+          "  status: 409,",
+          "  instance: '/orders/abc'",
+          " });"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain ETags and conditional requests. How do they save bandwidth and prevent lost updates?",
+    "a": "An ETag is an opaque validator (a hash or version) the server returns with a representation. On a later GET the client sends If-None-Match: <etag>; if the resource is unchanged the server replies 304 Not Modified with no body, so the client reuses its cache and saves bandwidth. ETags also enable optimistic concurrency on writes: the client sends If-Match: <etag> on a PUT/PATCH, and if the resource changed underneath it the server returns 412 Precondition Failed instead of silently overwriting — preventing the lost-update problem. Strong ETags must match byte-for-byte; weak ETags (W/) allow semantically-equivalent variations. Pair ETags with Cache-Control to control both freshness and revalidation.",
+    "fs": "ETag + If-None-Match -> 304 (cheap revalidation); If-Match -> 412 (optimistic concurrency, no lost update).",
+    "fj": "Skips If-Match and lets concurrent PUTs blindly overwrite each other.",
+    "level": "Mid",
+    "asked": 10,
+    "code": [
+      {
+        "label": "Optimistic update",
+        "lang": "ts",
+        "lines": [
+          "// client read returned ETag \"v7\"",
+          "PUT /orders/42",
+          "If-Match: \"v7\"",
+          "// if server is at v8 ->",
+          "//   412 Precondition Failed",
+          "// client refetches and retries"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do Cache-Control directives control HTTP caching for an API?",
+    "a": "Cache-Control governs who may cache a response and for how long. max-age=N sets the freshness lifetime in seconds; while fresh, caches serve without contacting the origin. public allows shared (CDN/proxy) caching, private restricts it to the end-user's browser. no-cache means a cache may store the response but must revalidate (e.g. via ETag) before reuse, while no-store forbids storing it at all — use it for sensitive data. s-maxage overrides max-age for shared caches, and stale-while-revalidate lets a cache serve a slightly stale copy while refreshing in the background. For per-user API responses, private with a short max-age plus ETag revalidation is a common, safe combination.",
+    "fs": "max-age sets freshness; public/private scope; no-cache=revalidate, no-store=never store; s-maxage for CDNs.",
+    "fj": "Confuses no-cache (revalidate) with no-store (never store), or marks per-user data public.",
+    "level": "Jr",
+    "asked": 8
+  },
+  {
+    "q": "How does a client-side circuit breaker work, and why pair it with retries?",
+    "a": "A circuit breaker wraps calls to a dependency and tracks failures. In CLOSED state calls flow normally while it counts errors/timeouts; once failures cross a threshold it trips to OPEN and fails fast for a cooldown window, returning immediately (or a fallback) instead of piling up calls on a struggling service. After the cooldown it moves to HALF-OPEN, allowing a few trial requests: success closes the circuit, failure re-opens it. Pair it with retries-plus-backoff because retries alone amplify load on a failing dependency and can cause a retry storm; the breaker is the stop valve that prevents cascading failure and gives the downstream time to recover. Tune thresholds and cooldown to your dependency's real failure profile.",
+    "fs": "CLOSED->OPEN (fail fast) on failure threshold->HALF-OPEN trial->close/reopen; stops retry storms cascading.",
+    "fj": "Relies on retries alone, which just amplifies load on the already-failing dependency.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "label": "Breaker state check",
+        "lang": "python",
+        "lines": [
+          "if breaker.state == 'OPEN':",
+          "    if now < breaker.retry_at:",
+          "        raise CircuitOpen()",
+          "    breaker.state = 'HALF_OPEN'",
+          "try:",
+          "    r = call(); breaker.record_ok()",
+          "except Exception:",
+          "    breaker.record_fail(); raise"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is CORS, what triggers a preflight, and why can't it protect your API?",
+    "a": "CORS is a browser security mechanism: by default the same-origin policy blocks a page on origin A from reading responses from origin B, and CORS lets the server opt in via response headers like Access-Control-Allow-Origin. For 'non-simple' requests (custom headers, methods beyond GET/POST/HEAD, or certain content types) the browser first sends an OPTIONS preflight; the server answers with Allow-Origin/Allow-Methods/Allow-Headers and a Max-Age to cache the decision. Critically, CORS is enforced by the browser, not the server, and only governs cross-origin reads from web pages — it is not authentication or authorization. Non-browser clients (curl, mobile, server-to-server) ignore it entirely, so you still need real auth on the API. Avoid reflecting arbitrary origins or using a wildcard with credentials.",
+    "fs": "CORS = browser opt-in for cross-origin reads; OPTIONS preflight for non-simple requests; not auth, not server-enforced.",
+    "fj": "Treats CORS as an API security control and 'fixes' errors by reflecting any Origin with credentials.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "When do you choose WebSockets vs Server-Sent Events vs long polling for real-time updates?",
+    "a": "Long polling is the lowest-common-denominator: the client makes an HTTP request the server holds open until data is ready, then immediately re-requests. It works everywhere through proxies but has overhead and latency per cycle. Server-Sent Events (SSE) is a one-way server-to-client stream over a single long-lived HTTP response with built-in auto-reconnect and event IDs — ideal for notifications, feeds, or streaming LLM tokens where the client only consumes. WebSockets upgrade the connection to a full-duplex bidirectional channel, best for chat, collaborative editing, or games where the client also pushes frequently. Pick SSE for simple server-push (it's cheaper and reconnects for free), WebSockets when you genuinely need two-way low-latency, and long polling only as a fallback.",
+    "fs": "Long poll = universal fallback; SSE = one-way server push (auto-reconnect); WebSocket = full-duplex two-way.",
+    "fj": "Reaches for WebSockets for one-way notifications that SSE would handle more cheaply.",
+    "level": "Mid",
+    "asked": 10
+  },
+  {
+    "q": "Why offer bulk/batch endpoints, and what are the design hazards?",
+    "a": "Bulk endpoints let a client send many operations in one request (e.g. POST /orders/batch with an array, or bulk import), cutting round-trip overhead and per-request auth/rate-limit cost versus N separate calls. The hazards: partial failure — decide whether the batch is all-or-nothing (transactional) or per-item, and if per-item, return a structured per-item result with index, status, and error so the client knows exactly what failed. Cap the batch size to bound memory and latency, and apply rate limits by item count, not request count, so one giant batch can't bypass throttling. For very large or slow jobs, make it asynchronous: accept the batch with 202, return a job id, and let the client poll for progress. Keep each item idempotent so retrying a partially-applied batch is safe.",
+    "fs": "Batch cuts round trips; decide all-or-nothing vs per-item results, cap size, throttle by items, go async (202) when large.",
+    "fj": "Returns one overall 200/500 for a 10k-item batch with no per-item status, so clients can't tell what applied.",
+    "level": "Sr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Per-item batch result",
+        "lang": "ts",
+        "lines": [
+          "{",
+          " results: [",
+          "  { i: 0, status: 201, id: 'a1' },",
+          "  { i: 1, status: 422,",
+          "    error: 'email invalid' }",
+          " ]",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is contract testing, and how does an OpenAPI spec reduce integration breakage?",
+    "a": "An OpenAPI spec is a machine-readable description of your API's paths, request/response schemas, and status codes; treated as the source of truth it drives code generation, request/response validation, mock servers, and docs, so producer and consumer share one definition. Contract testing verifies that the API a provider exposes still satisfies what consumers actually depend on — without spinning up the full system. Consumer-driven contract testing (e.g. Pact) records the requests a consumer makes and the responses it expects, then replays them against the provider in CI so a provider change that would break a consumer fails the build before deploy. Combined with schema validation against the OpenAPI spec, this catches breaking changes (removed fields, type changes) at PR time rather than in production.",
+    "fs": "OpenAPI = shared source of truth (gen/validate/mock); contract tests (Pact) fail CI when a provider breaks a consumer.",
+    "fj": "Relies on hand-written docs and discovers breaking changes only when a downstream service errors in prod.",
+    "level": "Mid",
+    "asked": 7
+  },
+  {
+    "q": "What is backpressure in an API, and how do you apply it without dropping work?",
+    "a": "Backpressure is the signal a system sends upstream when it can't keep up, so producers slow down instead of overwhelming a consumer and causing unbounded queue growth, memory blowups, and latency collapse. At the API edge you apply it explicitly: rate limit and return 429 with Retry-After, bound concurrency with admission control / a semaphore and shed load with 503 when saturated, and cap request and queue sizes rather than buffering without limit. For streaming protocols, the transport helps — HTTP/2 and gRPC have flow-control windows, and reactive frameworks let a slow consumer request N items at a time. The anti-pattern is an unbounded in-memory queue that absorbs a spike until the process OOMs; bounded queues plus a clear 429/503 signal let clients back off and retry with jitter.",
+    "fs": "Backpressure = tell producers to slow down: 429/Retry-After, bounded queues, admission control/503, flow control on streams.",
+    "fj": "Absorbs every spike into an unbounded in-memory queue until the service runs out of memory.",
+    "level": "Sr",
+    "asked": 6
+  },
+  {
+    "q": "How do you design a reliable webhook delivery system on the provider side?",
+    "a": "Decouple event production from delivery: when an event occurs, persist it durably and hand delivery to a queue/worker rather than POSTing inline on the request path. Each attempt POSTs the signed payload (HMAC over the raw body plus a timestamp) and treats only a fast 2xx as success; on non-2xx or timeout, retry with exponential backoff and jitter over a bounded window (e.g. hours), then mark it failed and surface it. Make delivery idempotent from the consumer's side by sending a stable event id so duplicates are safe, since you guarantee at-least-once. Add a per-endpoint circuit breaker so a consistently-failing customer endpoint doesn't starve workers, and give customers a dashboard to inspect, replay, and rotate signing secrets. A short request timeout per attempt keeps one slow consumer from blocking the pool.",
+    "fs": "Persist event, deliver async via queue, sign (HMAC+timestamp), retry w/ backoff+jitter, stable event id, per-endpoint breaker.",
+    "fj": "POSTs the webhook synchronously in the originating request and gives up after one failed attempt.",
+    "level": "Sr",
+    "asked": 9
+  }
+]

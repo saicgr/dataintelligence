@@ -1,0 +1,478 @@
+[
+  {
+    "q": "What is a Pod, and why does Kubernetes schedule Pods instead of containers?",
+    "a": "A Pod is the smallest deployable unit in Kubernetes: one or more containers that share a network namespace (same IP and port space) and can share storage volumes. Containers in a Pod are always co-located and co-scheduled on the same node and share their lifecycle. You rarely create Pods directly; a controller like a Deployment manages them so they get recreated on failure.",
+    "fs": "Containers in a Pod share the network and IPC namespace, so they reach each other over localhost while the Pod gets one cluster IP.",
+    "fj": "A Pod is just another word for a container.",
+    "level": "Jr"
+  },
+  {
+    "q": "How does a Deployment manage Pods, and what sits between them?",
+    "a": "A Deployment is a declarative controller that describes a desired state (image, replica count, labels) and creates a ReplicaSet to enforce it. The ReplicaSet actually creates and maintains the Pods, while the Deployment manages ReplicaSets across versions to enable rolling updates and rollbacks. Each image change produces a new ReplicaSet, and the old one is kept (scaled to zero) for rollback history.",
+    "fs": "Deployment owns ReplicaSets, ReplicaSet owns Pods; a new template hash spawns a fresh ReplicaSet, which is what makes rollback possible.",
+    "fj": "A Deployment directly creates Pods with no controller in between.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "create + inspect",
+        "lang": "ts",
+        "lines": [
+          "kubectl create deploy web \\",
+          "  --image=nginx:1.27 --replicas=3",
+          "kubectl get rs -l app=web",
+          "kubectl rollout status deploy/web"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are the main Service types and how do they differ?",
+    "a": "ClusterIP (the default) gives a stable virtual IP reachable only inside the cluster. NodePort opens a static port (30000-32767) on every node and forwards to the ClusterIP. LoadBalancer provisions an external cloud load balancer that points at the NodePort. Each type builds on the previous one: LoadBalancer creates a NodePort, which creates a ClusterIP.",
+    "fs": "A Service is a stable virtual IP plus a label selector; kube-proxy programs iptables/IPVS rules so the VIP load-balances to the matching Pod endpoints.",
+    "fj": "You always need a LoadBalancer to let Pods talk to each other inside the cluster.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "ClusterIP service",
+        "lang": "ts",
+        "lines": [
+          "apiVersion: v1",
+          "kind: Service",
+          "metadata: { name: web }",
+          "spec:",
+          "  selector: { app: web }",
+          "  ports:",
+          "  - port: 80",
+          "    targetPort: 8080"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does a Service know which Pods to route traffic to?",
+    "a": "A Service uses a label selector that matches Pod labels; the matching Pods become the Service's Endpoints (tracked as EndpointSlices). kube-proxy watches these endpoints and programs iptables or IPVS rules so the Service's ClusterIP load-balances across them. Crucially, a Pod only appears in the endpoint list once it passes its readiness probe, so unready Pods receive no traffic.",
+    "fs": "Endpoints are derived from the selector and gated by readiness, so a Service silently drops a Pod from rotation the moment its readiness probe fails.",
+    "fj": "The Service routes to Pods by their names or IP addresses listed manually in the Service spec.",
+    "level": "Jr"
+  },
+  {
+    "q": "How does the Horizontal Pod Autoscaler decide when to scale, and what does it scale on?",
+    "a": "The HPA periodically compares an observed metric (commonly CPU) against a target and adjusts the Deployment's replica count. For CPU, it computes utilization as actual usage divided by the Pod's resource request, not the limit, so requests must be set accurately. desiredReplicas = ceil(currentReplicas * currentMetric / targetMetric). It can also scale on memory or custom/external metrics via the metrics API.",
+    "fs": "HPA utilization is usage over requests, so a missing or tiny CPU request makes utilization meaningless and causes runaway scaling.",
+    "fj": "HPA scales based on the CPU limit, and you don't need resource requests for it to work.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "autoscale on CPU",
+        "lang": "ts",
+        "lines": [
+          "kubectl autoscale deploy web \\",
+          "  --cpu-percent=70 \\",
+          "  --min=3 --max=10",
+          "# desired = ceil(cur * usage/target)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why won't an HPA on CPU scale a Pod that has no CPU request set?",
+    "a": "HPA computes CPU utilization as a percentage of the Pod's CPU request. If no request is defined, there is no denominator, so the HPA cannot calculate utilization and reports the metric as unknown, leaving replicas unchanged. The fix is to set a realistic CPU request on every container in the targeted Pods. This is why requests are a prerequisite for resource-based autoscaling.",
+    "fs": "No request means no utilization denominator; the HPA shows <unknown>/70% and never scales until you add requests.",
+    "fj": "It should still scale because HPA just reads raw CPU usage from the node.",
+    "level": "Mid"
+  },
+  {
+    "q": "What is the difference between resource requests and limits?",
+    "a": "A request is the amount of CPU/memory guaranteed and reserved for a container; the scheduler uses requests (not limits) to decide which node a Pod fits on. A limit is the hard ceiling enforced at runtime: exceeding a memory limit gets the container OOMKilled, while exceeding a CPU limit causes throttling rather than termination. The scheduler ignores limits entirely when placing Pods.",
+    "fs": "The scheduler bin-packs on requests only; limits are enforced later by the kubelet and cgroups, and CPU is throttled while memory is killed.",
+    "fj": "Requests and limits are the same thing, and the scheduler places Pods based on their limits.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "resources block",
+        "lang": "ts",
+        "lines": [
+          "resources:",
+          "  requests:",
+          "    cpu: \"250m\"",
+          "    memory: \"256Mi\"",
+          "  limits:",
+          "    cpu: \"500m\"",
+          "    memory: \"512Mi\""
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are the QoS classes, and how do requests/limits determine them?",
+    "a": "Kubernetes assigns each Pod a QoS class from its requests and limits. Guaranteed means every container sets equal requests and limits for both CPU and memory. Burstable means at least one request or limit is set but they don't all match the Guaranteed criteria. BestEffort means no requests or limits at all. Under node memory pressure the kubelet evicts BestEffort first, then Burstable, then Guaranteed last.",
+    "fs": "QoS drives eviction order: BestEffort dies first, Guaranteed last, so set requests==limits for memory on anything you can't afford to lose.",
+    "fj": "QoS classes are something you set manually with a field on the Pod.",
+    "level": "Sr"
+  },
+  {
+    "q": "Walk through diagnosing a Pod stuck in CrashLoopBackOff.",
+    "a": "CrashLoopBackOff means the container keeps starting then exiting, so the kubelet restarts it with exponential backoff. Start with kubectl describe pod to read the last state, exit code, and events, then kubectl logs --previous to see output from the crashed instance. Common causes are a bad command/config, a missing dependency or secret, a failing liveness probe, or OOMKilled. Fix the root cause; the backoff is a symptom, not the disease.",
+    "fs": "Backoff is just the restart policy reacting; the real signal is the previous container's exit code and logs, which I read with logs --previous.",
+    "fj": "I'd just delete the Pod so it reschedules and hope it comes up clean.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "triage commands",
+        "lang": "ts",
+        "lines": [
+          "kubectl describe pod web-xyz",
+          "# check Last State + Exit Code",
+          "kubectl logs web-xyz --previous",
+          "kubectl get events \\",
+          "  --sort-by=.lastTimestamp"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A container shows OOMKilled with exit code 137. What happened and how do you fix it?",
+    "a": "OOMKilled means the container exceeded its memory limit (or the node ran out of memory) and the kernel sent SIGKILL; the exit code is 137 because that is 128 + 9 (SIGKILL). Confirm it via kubectl describe pod showing Reason: OOMKilled. Fixes include raising the memory limit, fixing a memory leak, or right-sizing the workload after measuring real usage with kubectl top. Setting memory request equal to limit (Guaranteed QoS) also protects it from node-pressure eviction.",
+    "fs": "137 = 128 + SIGKILL(9); it's the cgroup memory limit, not CPU, so I right-size memory or hunt the leak rather than just bumping the number.",
+    "fj": "Exit code 137 is a generic crash, so I'd restart it and add more CPU.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "confirm OOMKill",
+        "lang": "ts",
+        "lines": [
+          "kubectl describe pod api-7d \\",
+          "  | grep -A3 'Last State'",
+          "# Reason: OOMKilled  Exit Code: 137",
+          "kubectl top pod api-7d"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between liveness, readiness, and startup probes?",
+    "a": "A liveness probe decides whether to restart a container; failing it makes the kubelet kill and restart the container (good for deadlocks). A readiness probe decides whether the Pod should receive Service traffic; failing it removes the Pod from endpoints without restarting it. A startup probe protects slow-booting apps: while it runs, liveness and readiness probes are suspended, so a long initialization isn't mistaken for a crash.",
+    "fs": "Liveness restarts, readiness gates traffic, startup buys init time; conflating liveness and readiness is the classic cause of restart storms during slow boots.",
+    "fj": "They all do the same health check, so I just configure one of them.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "three probes",
+        "lang": "ts",
+        "lines": [
+          "livenessProbe:",
+          "  httpGet: { path: /healthz, port: 8080 }",
+          "readinessProbe:",
+          "  httpGet: { path: /ready, port: 8080 }",
+          "startupProbe:",
+          "  httpGet: { path: /healthz, port: 8080 }",
+          "  failureThreshold: 30",
+          "  periodSeconds: 10"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why can an aggressive liveness probe make an outage worse?",
+    "a": "If a liveness probe is too strict (short timeout, low failureThreshold) it will fail during transient load or slow startup and the kubelet will restart the container. During a dependency slowdown this restarts healthy-but-busy Pods, dropping capacity and amplifying the outage into a crash loop. Liveness should only catch unrecoverable states like deadlocks; use a readiness probe (which just removes traffic) for transient unhealthiness, and a startup probe for slow boots.",
+    "fs": "Liveness should answer 'is this process wedged forever,' not 'is it slow right now'; otherwise it turns latency spikes into self-inflicted restart storms.",
+    "fj": "Make the liveness probe as strict as possible so unhealthy Pods restart immediately.",
+    "level": "Sr"
+  },
+  {
+    "q": "How do you perform a rolling update and tune its speed/safety?",
+    "a": "Changing a Deployment's Pod template triggers the default RollingUpdate strategy, which creates a new ReplicaSet and shifts replicas over gradually, governed by maxSurge (extra Pods allowed above desired) and maxUnavailable (Pods allowed to be missing). maxSurge=1, maxUnavailable=0 is the safe, slow setting: a new Pod must pass readiness before an old one is removed, so capacity never dips. Readiness probes are what make the rollout wait for healthy Pods.",
+    "fs": "maxUnavailable=0 with maxSurge>0 guarantees no capacity loss, but it relies on an honest readiness probe to gate progression.",
+    "fj": "A rolling update kills all old Pods first and then starts the new ones.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "strategy block",
+        "lang": "ts",
+        "lines": [
+          "strategy:",
+          "  type: RollingUpdate",
+          "  rollingUpdate:",
+          "    maxSurge: 1",
+          "    maxUnavailable: 0"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A bad image just rolled out. How do you roll back?",
+    "a": "Use kubectl rollout undo deploy/<name> to revert to the previous ReplicaSet, since the Deployment keeps old ReplicaSets (scaled to zero) up to its revisionHistoryLimit. You can inspect available revisions with kubectl rollout history and roll back to a specific one with --to-revision. The rollback is itself a controlled rolling update, so it respects the same readiness gating. If the rollout is mid-flight, kubectl rollout pause/resume lets you stop it before reverting.",
+    "fs": "Rollback just promotes the prior ReplicaSet, so the revisionHistoryLimit is your blast-radius budget; set it deliberately rather than leaving it default.",
+    "fj": "Roll back by manually editing the image back and deleting all the new Pods.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "rollback flow",
+        "lang": "ts",
+        "lines": [
+          "kubectl rollout history deploy/web",
+          "kubectl rollout undo deploy/web",
+          "kubectl rollout undo deploy/web \\",
+          "  --to-revision=4",
+          "kubectl rollout status deploy/web"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between a ConfigMap and a Secret, and how are they consumed?",
+    "a": "Both store key-value config decoupled from the image: ConfigMaps for non-sensitive data, Secrets for sensitive data like passwords and tokens. They can be injected as environment variables or mounted as files in a volume; volume mounts can update live, while env vars are fixed at Pod start. A key caveat: Secret values are only base64-encoded, not encrypted, unless you enable encryption-at-rest for etcd and restrict RBAC.",
+    "fs": "Secrets are base64, not encrypted; real protection comes from etcd encryption-at-rest plus tight RBAC, not from the Secret kind itself.",
+    "fj": "Secrets are encrypted by default, so base64-encoding them is enough security.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "create + consume",
+        "lang": "ts",
+        "lines": [
+          "kubectl create secret generic db \\",
+          "  --from-literal=password=s3cr3t",
+          "env:",
+          "- name: DB_PASS",
+          "  valueFrom:",
+          "    secretKeyRef:",
+          "      name: db",
+          "      key: password"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "If you update a ConfigMap, do running Pods see the change?",
+    "a": "It depends on how the ConfigMap is consumed. Values injected as environment variables are read once at container start, so they do not change until the Pod is recreated. Values mounted as a volume are eventually updated in place by the kubelet (within a sync period), but most apps won't reread the file unless they watch it. The common pattern is to roll the Deployment (often via a checksum annotation) so a config change forces new Pods.",
+    "fs": "Env-var config is frozen at start; I add a config checksum annotation to the Pod template so any ConfigMap change triggers a rollout.",
+    "fj": "Editing a ConfigMap instantly updates the environment variables in all running Pods.",
+    "level": "Sr"
+  },
+  {
+    "q": "What are namespaces for, and what do they isolate (and not isolate)?",
+    "a": "Namespaces partition a cluster into virtual sub-clusters, scoping object names, RBAC, ResourceQuotas, and LimitRanges so teams or environments don't collide. They isolate names and policy, and enable DNS like service.namespace.svc.cluster.local. However, namespaces are not a security or network boundary by default: Pods in different namespaces can still reach each other unless you add NetworkPolicies, and nodes are cluster-scoped, not namespaced.",
+    "fs": "A namespace is a policy and naming boundary, not a network or node boundary; cross-namespace traffic flows freely until a NetworkPolicy stops it.",
+    "fj": "Namespaces fully isolate workloads so Pods in different namespaces can't talk to each other.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "scope + DNS",
+        "lang": "ts",
+        "lines": [
+          "kubectl create ns team-a",
+          "kubectl -n team-a get pods",
+          "# reach a svc across namespaces:",
+          "# web.team-a.svc.cluster.local"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does an Ingress do, and what is the role of an Ingress Controller?",
+    "a": "An Ingress is an API object defining HTTP/HTTPS routing rules (host- and path-based) plus TLS termination that map external requests to backend Services. The Ingress object is just configuration; it does nothing without an Ingress Controller (e.g. ingress-nginx, Traefik) running in the cluster that watches Ingress resources and programs an actual reverse proxy/load balancer. So you typically need one cloud LoadBalancer for the controller, which then fans out to many Services by hostname and path.",
+    "fs": "The Ingress object is inert config; the controller is the data plane, which is why nothing happens until you install one and it claims the ingressClass.",
+    "fj": "An Ingress routes traffic on its own without anything else installed in the cluster.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "host/path routing",
+        "lang": "ts",
+        "lines": [
+          "spec:",
+          "  ingressClassName: nginx",
+          "  rules:",
+          "  - host: app.example.com",
+          "    http:",
+          "      paths:",
+          "      - path: /api",
+          "        pathType: Prefix",
+          "        backend:",
+          "          service:",
+          "            name: api",
+          "            port: { number: 80 }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain taints and tolerations, and how they differ from node affinity.",
+    "a": "A taint on a node repels Pods that don't tolerate it; a toleration on a Pod lets it be scheduled onto a tainted node. Taint effects are NoSchedule (block new Pods), PreferNoSchedule (soft avoid), and NoExecute (also evict already-running Pods that don't tolerate it). Taints/tolerations are a repulsion mechanism (keep Pods off nodes), whereas node affinity/nodeSelector is an attraction mechanism (pull Pods toward labeled nodes); a toleration permits but does not require placement.",
+    "fs": "Tolerations only grant permission to land on a tainted node, they don't attract; you pair them with node affinity to actually steer Pods onto, say, GPU nodes.",
+    "fj": "Adding a toleration forces the Pod to run on that specific tainted node.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "taint + toleration",
+        "lang": "ts",
+        "lines": [
+          "kubectl taint nodes gpu1 \\",
+          "  gpu=true:NoSchedule",
+          "tolerations:",
+          "- key: gpu",
+          "  operator: Equal",
+          "  value: \"true\"",
+          "  effect: NoSchedule"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A node was tainted with NoExecute. What happens to its running Pods?",
+    "a": "A NoExecute taint evicts already-running Pods on that node that don't tolerate the taint, unlike NoSchedule which only blocks new placements. Pods with a matching toleration stay; a toleration may include tolerationSeconds to allow a grace period before eviction. This is the mechanism behind not-ready/unreachable handling: the node controller adds NoExecute taints like node.kubernetes.io/unreachable, and Pods are evicted after their tolerationSeconds expire. Evicted Pods owned by a controller get rescheduled elsewhere.",
+    "fs": "NoExecute evicts non-tolerating Pods immediately; tolerationSeconds is the knob controlling how long a Pod rides out a not-ready or unreachable node before being moved.",
+    "fj": "Tainting a node only stops new Pods; the ones already running are never affected.",
+    "level": "Sr"
+  },
+  {
+    "q": "Pods are stuck in Pending. How do you find out why?",
+    "a": "Pending means the Pod is accepted but not yet scheduled onto a node. Run kubectl describe pod and read the Events: the scheduler reports the exact reason, commonly Insufficient cpu/memory (requests exceed any node's free capacity), unmatched node affinity/nodeSelector, untolerated taints, or no available PersistentVolume. Fix by lowering requests, adding capacity/scaling nodes, adjusting affinity, or adding the right toleration. The describe events are the single most useful diagnostic here.",
+    "fs": "Pending is a scheduling failure, so I read the FailedScheduling event verbatim; it names whether it's requests, taints, affinity, or volume binding.",
+    "fj": "Pending just means it's slow to start, so I wait or restart it.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "why pending",
+        "lang": "ts",
+        "lines": [
+          "kubectl describe pod web-xyz",
+          "# Events: FailedScheduling",
+          "#   Insufficient cpu",
+          "kubectl get nodes -o wide"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a StatefulSet and when would you use it over a Deployment?",
+    "a": "A StatefulSet manages stateful apps that need stable, unique network identities and stable persistent storage. Unlike a Deployment, it gives each Pod a stable ordinal name (web-0, web-1), a stable DNS hostname via a headless Service, and its own PersistentVolumeClaim that survives rescheduling. Pods are created, scaled, and updated in a predictable order. Use it for databases, queues, or clustered systems (Kafka, ZooKeeper); use a Deployment for stateless, interchangeable replicas.",
+    "fs": "StatefulSet guarantees stable identity + per-Pod PVC + ordered rollout, which is exactly what quorum-based systems need and Deployments can't provide.",
+    "fj": "StatefulSet and Deployment are interchangeable; you'd just pick whichever.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "stable identity",
+        "lang": "ts",
+        "lines": [
+          "kind: StatefulSet",
+          "spec:",
+          "  serviceName: db",
+          "  replicas: 3",
+          "  volumeClaimTemplates:",
+          "  - metadata: { name: data }",
+          "    spec:",
+          "      accessModes: [ReadWriteOnce]",
+          "      resources:",
+          "        requests: { storage: 10Gi }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is an init container and when would you use one?",
+    "a": "An init container runs to completion before any of a Pod's app containers start; if it fails, the kubelet restarts the Pod per its restartPolicy. You can list several and they run sequentially, each finishing before the next begins, sharing the Pod's volumes and network. Use them for setup work that must happen first: waiting on a dependency to be reachable, running a schema migration, or fetching config/secrets into a shared volume. They keep that one-time logic out of your app image and out of the main container's startup path.",
+    "fs": "Init containers run in order to completion before app containers, so they're where I put 'wait for the DB' or 'run the migration' instead of bloating the main container's entrypoint.",
+    "fj": "An init container runs alongside the main container the whole time the Pod is up.",
+    "level": "Jr",
+    "asked": 9
+  },
+  {
+    "q": "What is the difference between a Job and a CronJob?",
+    "a": "A Job runs a Pod (or several) to successful completion and then stops, retrying on failure up to backoffLimit and tracking completions/parallelism for batch work like a one-off migration or report. A CronJob is a higher-level controller that creates a Job on a recurring schedule using cron syntax. So a CronJob is to a Job what a Deployment is to a Pod: the scheduler that stamps out the lower-level object. Watch concurrencyPolicy (Allow/Forbid/Replace) and startingDeadlineSeconds so overlapping or missed runs behave the way you expect.",
+    "fs": "A Job runs once to completion; a CronJob just creates a Job on a schedule, so concurrencyPolicy and the history limits are the knobs that actually matter in prod.",
+    "fj": "A CronJob keeps a long-running Pod alive and triggers it on a timer.",
+    "level": "Jr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "scheduled job",
+        "lang": "ts",
+        "lines": [
+          "kind: CronJob",
+          "spec:",
+          "  schedule: \"0 2 * * *\"",
+          "  concurrencyPolicy: Forbid",
+          "  jobTemplate:",
+          "    spec:",
+          "      backoffLimit: 3",
+          "      template: { ... }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do PersistentVolumes, PersistentVolumeClaims, and StorageClasses fit together?",
+    "a": "A PersistentVolume (PV) is a piece of storage in the cluster; a PersistentVolumeClaim (PVC) is a Pod's request for storage by size and access mode, and Kubernetes binds the PVC to a matching PV. Rather than pre-creating PVs, a StorageClass enables dynamic provisioning: when a PVC names a class, a provisioner creates a PV on demand (e.g. an EBS volume). The access mode matters: ReadWriteOnce binds to one node, ReadWriteMany allows many, and ReadWriteOncePod restricts to a single Pod. A Pod consumes storage by referencing the PVC, never the PV directly.",
+    "fs": "The PVC is the abstraction the Pod depends on; the StorageClass+provisioner conjures the PV behind it, which is why most clusters never hand-create PVs anymore.",
+    "fj": "A Pod mounts a PersistentVolume directly without any claim in between.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "label": "claim + dynamic class",
+        "lang": "ts",
+        "lines": [
+          "kind: PersistentVolumeClaim",
+          "spec:",
+          "  storageClassName: gp3",
+          "  accessModes: [ReadWriteOnce]",
+          "  resources:",
+          "    requests: { storage: 20Gi }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you steer Pods onto specific nodes, and how does that differ from taints?",
+    "a": "nodeSelector and node affinity are attraction mechanisms that pull Pods toward nodes carrying certain labels. Node affinity is the richer form: requiredDuringScheduling is a hard rule the scheduler must satisfy, while preferredDuringScheduling is a soft weight it tries to honor but won't block on. Pod affinity/anti-affinity instead place Pods relative to other Pods (co-locate or spread across topology zones). This contrasts with taints/tolerations, which repel Pods off nodes; affinity attracts, taints repel, and you often pair a taint on dedicated nodes with matching affinity to land the right workloads there.",
+    "fs": "Affinity attracts and taints repel, so on a dedicated GPU pool I taint the nodes (keep others off) and add required node affinity (pull my workload on) together.",
+    "fj": "Node affinity and taints are the same feature for pinning Pods to nodes.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "By default Pods can talk to any other Pod. How do you lock that down with NetworkPolicy?",
+    "a": "A NetworkPolicy is a namespaced object that selects Pods via a podSelector and whitelists allowed ingress and/or egress; the moment a Pod is selected by any policy, all traffic of that direction is denied except what's explicitly allowed. A common baseline is a default-deny policy (empty podSelector, both policyTypes, no rules) per namespace, then additive allow policies. The critical caveat: NetworkPolicies are only enforced if your CNI plugin supports them (Calico, Cilium); on a plugin that doesn't, the API accepts the object but silently ignores it, giving false security.",
+    "fs": "Policies are deny-by-default once a Pod is selected, but only if the CNI enforces them; on a non-enforcing plugin the object is accepted and ignored, which is worse than knowing you have nothing.",
+    "fj": "Creating a NetworkPolicy automatically secures traffic regardless of which network plugin is installed.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "label": "default-deny ingress",
+        "lang": "ts",
+        "lines": [
+          "kind: NetworkPolicy",
+          "spec:",
+          "  podSelector: {}",
+          "  policyTypes: [Ingress]",
+          "  # no ingress rules = deny all in"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What problem does Helm solve, and what is a release?",
+    "a": "Helm is the de facto package manager for Kubernetes: a chart bundles templated manifests plus a default values file, so you ship one parameterized package instead of copy-pasting YAML per environment. Installing a chart creates a release, a named, versioned instance tracked in-cluster, which lets helm upgrade roll forward and helm rollback revert to a prior revision atomically. You override values per environment (replicas, image tag, resources) without forking the templates. The win is templating, parameterization, and lifecycle/versioning of a whole app's manifests as a unit.",
+    "fs": "A chart is the template+values package; a release is a versioned install, which is what makes helm rollback a one-command revert to a known-good revision.",
+    "fj": "Helm is just a way to run kubectl apply on a folder of static YAML files.",
+    "level": "Mid",
+    "asked": 9
+  },
+  {
+    "q": "What is the operator pattern, and how do CRDs and controllers combine to make one?",
+    "a": "A CustomResourceDefinition (CRD) extends the Kubernetes API with a new object kind (say, a PostgresCluster) so users declare desired state in familiar YAML. An operator pairs that CRD with a custom controller that runs a reconciliation loop: it watches the custom resource, compares desired state against actual cluster state, and takes corrective action to converge them. This encodes a human operator's runbook (provisioning, backups, failover, version upgrades) into software that runs continuously. Use it for stateful or complex apps where day-2 operations are too intricate for a plain Deployment plus Helm.",
+    "fs": "The CRD is the new API type, the controller's reconcile loop is the brains; together they turn an ops runbook into a control loop that self-heals toward the spec.",
+    "fj": "An operator is just a Helm chart with some extra YAML and no running component.",
+    "level": "Sr",
+    "asked": 10
+  },
+  {
+    "q": "A node is under memory pressure and the kubelet starts evicting Pods. What determines who goes first?",
+    "a": "This is node-pressure eviction, driven by the kubelet (not the scheduler) when a resource like memory crosses an eviction threshold. The kubelet ranks victims by QoS class first: BestEffort, then Burstable Pods exceeding their requests (ordered by how far usage exceeds the request), and Guaranteed Pods last. Pod priority breaks ties within a tier. Soft thresholds give a grace period for graceful shutdown; hard thresholds kill immediately with a 0s grace period. Evicted Pods show status Evicted and, if controller-owned, reschedule elsewhere, so setting memory requests==limits is the real protection.",
+    "fs": "Node-pressure eviction is the kubelet's doing and ranks by QoS then how far over-request you are, so I make critical workloads Guaranteed rather than relying on luck.",
+    "fj": "Eviction is random, so there's nothing you can do to protect an important Pod.",
+    "level": "Sr",
+    "asked": 9
+  }
+]

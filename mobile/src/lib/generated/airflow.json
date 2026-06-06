@@ -1,0 +1,759 @@
+[
+  {
+    "q": "What is an Airflow DAG and how does the scheduler decide when to run it?",
+    "a": "A DAG is a collection of tasks with defined acyclic dependencies, requiring dag_id, start_date, and a schedule. The scheduler creates a DAG run for each interval once data_interval_end has passed in wall-clock time, so a daily DAG with start_date Jan 1 first runs on Jan 2 for the Jan 1 interval. With catchup=True (default) all missed intervals are backfilled, while catchup=False only runs the most recent interval. The scheduler reparses each DAG file every few seconds, so top-level code must stay lightweight with no DB or network calls at parse time.",
+    "fj": "The DAG runs on the start_date.",
+    "fs": "The first run triggers after data_interval_end passes — a daily DAG with start_date Jan 1 first runs on Jan 2, processing the Jan 1 interval.",
+    "level": "Jr",
+    "asked": 28,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "catchup off",
+        "lines": [
+          "dag = DAG(",
+          "  dag_id='daily_etl',",
+          "  start_date=datetime(2024,1,1),",
+          "  schedule='@daily',",
+          "  catchup=False,  # only latest",
+          ")"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between execution_date, logical_date, and data_interval_start in Airflow?",
+    "a": "execution_date is the legacy Airflow 1.x name for the logical date, still exposed as a template macro. logical_date (Airflow 2.2+) is the canonical name for the start of the data interval being processed, not the wall-clock run time, with data_interval_start and data_interval_end as explicit bounds. The macro {{ ds }} renders data_interval_start as YYYY-MM-DD for filtering the partition you process. Never use datetime.now() inside a task, since a backfill of last month's data running today would use today's date and produce wrong results.",
+    "fj": "I use datetime.now() to get today's date in my task.",
+    "fs": "datetime.now() breaks backfills — I use {{ ds }} or {{ data_interval_start }} so the task processes the correct interval regardless of when it actually runs.",
+    "level": "Jr",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "bug",
+        "lines": [
+          "@task",
+          "def load():",
+          "  day = datetime.now().date()",
+          "  # backfill uses TODAY -> wrong"
+        ]
+      },
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "@task",
+          "def load(ds=None):",
+          "  day = ds  # data_interval_start",
+          "  # correct for any backfill date"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are Airflow operators and how do you choose between PythonOperator, BashOperator, and a provider operator like BigQueryInsertJobOperator?",
+    "a": "An operator defines a single unit of work as a template, and a running instance is a task instance. PythonOperator runs a callable directly in the worker process and suits lightweight glue, BashOperator runs shell commands but risks injection via untrusted Jinja inputs, and provider operators are thin wrappers that push work to external services and return quickly. The rule of thumb is to use provider operators when work happens in an external system, PythonOperator for lightweight Python logic, and avoid PythonOperator for heavy compute. For heavy work, trigger an external job and poll for completion rather than running it on the orchestration worker.",
+    "fj": "I use PythonOperator for my Spark job because Python is easier.",
+    "fs": "PythonOperator runs in the Airflow worker — heavy compute belongs in an external system. I'd use SparkSubmitOperator or the Databricks operator to submit the job and let Airflow poll for completion.",
+    "level": "Mid",
+    "asked": 18
+  },
+  {
+    "q": "How do retries work in Airflow, and how do you configure alerting on task failure?",
+    "a": "Set retries=N with a retry_delay between attempts, and optionally retry_exponential_backoff for transient rate limits; once retries are exhausted the task moves to failed. For alerting, set on_failure_callback to send Slack/PagerDuty notifications, or use email_on_failure with an SMTP connection. Deadline Alerts (Airflow 3.1+, replacing the removed SLA feature) fire when a DAG run exceeds a wall-clock threshold, which is distinct from a per-task timeout. execution_timeout hard-kills tasks that exceed a duration, preventing hung tasks from holding a worker slot indefinitely.",
+    "fj": "I just set email_on_failure=True and leave it.",
+    "fs": "I configure on_failure_callback with the team's Slack/PagerDuty integration so the alert goes to the right channel with context, plus execution_timeout to prevent hung tasks from blocking the pool.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "task config",
+        "lines": [
+          "task = PythonOperator(",
+          "  task_id='load',",
+          "  retries=3,",
+          "  retry_delay=timedelta(minutes=5),",
+          "  retry_exponential_backoff=True,",
+          "  execution_timeout=timedelta(hours=1),",
+          "  on_failure_callback=alert_slack)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "catchup=True vs catchup=False — how do you decide which to set for a new DAG?",
+    "a": "catchup=True (the Airflow default) schedules every interval between start_date and now, which is safe only if the DAG is idempotent and genuinely needs historical data. catchup=False runs only the most recent interval and suits monitoring, alerting, and near-real-time ingestion where replaying history is meaningless. The risk of catchup=True with an old start_date is flooding the scheduler with hundreds of simultaneous runs that hammer the source system. The safe pattern is catchup=False by default, paired with max_active_runs and explicit backfill CLI commands when history is needed.",
+    "fj": "I just leave it as the default (True) and don't think about it.",
+    "fs": "I default to catchup=False for most DAGs and use explicit backfills when I need historical data — an old start_date + catchup=True is a flood risk I avoid by design.",
+    "level": "Mid",
+    "asked": 14
+  },
+  {
+    "q": "How do you set task dependencies in Airflow, and when would you use trigger rules other than the default?",
+    "a": "Set dependencies with the >> operator or set_downstream, including list forms like [task_a, task_b] >> task_c. The default trigger rule all_success runs a task only when all upstreams succeed, which is correct for linear pipelines. Other rules cover non-linear flow: all_done for cleanup regardless of outcome, one_success after branches, none_failed when skips are acceptable, and all_failed for alert-only-if-everything-broke. The standard branching pattern is BranchPythonOperator followed by a join task with none_failed so a skipped branch doesn't cascade skips downstream.",
+    "fj": "My tasks after the branch are always skipped — I don't know why.",
+    "fs": "That's the default all_success trigger rule — when a branch marks a path as skipped, downstream tasks see a non-success upstream and skip too. The join task needs none_failed.",
+    "level": "Jr",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "branch join",
+        "lines": [
+          "branch >> [path_a, path_b] >> join",
+          "",
+          "join = EmptyOperator(",
+          "  task_id='join',",
+          "  # skipped branch won't cascade",
+          "  trigger_rule='none_failed')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "TaskFlow API vs classic PythonOperator — what's the difference and when do you use each?",
+    "a": "Classic PythonOperator requires explicitly defining the task, passing python_callable and op_kwargs, and manually pushing/pulling XComs. The TaskFlow API's @task decorator (Airflow 2.0+) lets you write plain functions whose return values auto-push to XCom and whose calls auto-declare dependencies, removing boilerplate. Use TaskFlow for Python-heavy pipelines for cleaner code and easier testing. Stick with classic operators when using provider operators that have no @task equivalent, and note you can freely mix both styles in one DAG.",
+    "fj": "TaskFlow runs tasks differently / is faster than classic operators.",
+    "fs": "TaskFlow is syntactic sugar over PythonOperator — same execution model, less boilerplate. The scheduler and executor work identically.",
+    "level": "Jr",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Before",
+        "lines": [
+          "def _f(**ctx):",
+          "  return fetch()",
+          "t = PythonOperator(",
+          "  task_id='f', python_callable=_f)",
+          "# pull XCom manually downstream"
+        ]
+      },
+      {
+        "lang": "python",
+        "label": "After",
+        "lines": [
+          "@task",
+          "def f():",
+          "  return fetch()  # auto XCom",
+          "g(f())  # auto dependency"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What makes an Airflow DAG idempotent, and why does it matter for backfills?",
+    "a": "Idempotent means re-running a task for the same logical date produces the same result with no duplicates or drift. Achieve it by partitioning on the logical date ({{ ds }}) and writing to a deterministic partition you overwrite via INSERT OVERWRITE, delete-by-partition, or MERGE rather than a blind INSERT. Keep tasks atomic by writing to a temp location then swapping, so a mid-task failure never leaves partial state. This makes backfills and retries safe, whereas datetime.now() inside a task would silently corrupt partitions when replaying old dates.",
+    "fj": "I just INSERT the new rows each run.",
+    "fs": "I overwrite the date partition keyed on the logical date — blind INSERT means every retry and backfill duplicates data.",
+    "level": "Sr",
+    "asked": 24,
+    "code": [
+      {
+        "lang": "sql",
+        "accent": "bug",
+        "lines": [
+          "INSERT INTO sales",
+          "SELECT * FROM staging;",
+          "-- retry/backfill duplicates rows"
+        ]
+      },
+      {
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "INSERT OVERWRITE sales",
+          "PARTITION (dt = '{{ ds }}')",
+          "SELECT * FROM staging;",
+          "-- rerun converges, no dupes"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do XComs work in Airflow, and what are the size limit pitfalls you have to manage in production?",
+    "a": "XCom is a key-value store in the metadata database that tasks use to pass small data, via xcom_push/xcom_pull or TaskFlow return values. Because values are serialized into the shared metadata DB, large values degrade scheduler performance, so the practical rule is to keep XComs under about 48 KB. Passing DataFrames, query results, or file contents through XCom is an anti-pattern that bloats the DB and can OOM workers during serialization. The correct pattern is to pass a reference like an S3 path or table name and let the downstream task fetch the data, with custom XCom backends (Airflow 2.7+) available for larger payloads.",
+    "fj": "I pass my query results / DataFrame through XCom to the next task.",
+    "fs": "XCom stores in the metadata DB — I pass a file path or table name, not the data. The downstream task fetches from storage.",
+    "level": "Sr",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "bug",
+        "lines": [
+          "@task",
+          "def extract():",
+          "  return big_df  # bloats meta DB"
+        ]
+      },
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "@task",
+          "def extract():",
+          "  df.to_parquet(path)",
+          "  return path  # pass a reference"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Sensors vs deferrable operators — what is the resource difference and when do you use each?",
+    "a": "A sensor in poke mode holds a worker slot for the entire wait while polling, which is wasteful for long waits. Reschedule mode releases the slot between pokes and re-queues each interval, far more efficient but adding up to one poke interval of latency. Deferrable operators (Airflow 2.2+) suspend via defer(), release the slot entirely, and register a Trigger in the Triggerer's asyncio event loop, letting hundreds of deferred tasks run in one process. Prefer deferrable operators when available, fall back to reschedule mode when no Triggerer exists, and avoid poke mode for waits longer than a few minutes.",
+    "fj": "I use sensors in poke mode — it's simpler.",
+    "fs": "Poke mode holds a worker slot for the entire wait. For anything over a few minutes, I use reschedule mode or a deferrable operator to free the slot.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "free the slot",
+        "lines": [
+          "wait = S3KeySensor(",
+          "  task_id='wait',",
+          "  bucket_key='s3://b/{{ ds }}/_OK',",
+          "  deferrable=True,  # frees slot",
+          "  poke_interval=300)",
+          "# Triggerer runs the async poll"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do Airflow pools work, and when do you reach for them to manage resource contention?",
+    "a": "A pool is a named slot bucket that limits how many task instances using it can run concurrently across all DAGs, with tasks declaring pool and pool_slots. A pool with slots=5 caps concurrent member tasks at 5 regardless of how many DAGs or workers are active, making it ideal for throttling rate-limited APIs, limiting shared database queries, or preventing backfills from overwhelming a source. This solves cross-DAG contention that max_active_tasks and parallelism cannot, since those operate per-DAG or per-deployment. Pools are configured via the UI or CLI, and the default_pool has 128 slots for tasks that specify no pool.",
+    "fj": "I use max_active_runs to limit how much hits the database.",
+    "fs": "max_active_runs limits parallel DAG runs of a single DAG. Pools control concurrency across all DAGs that share a resource — that's what I reach for to protect a shared DB or API.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "throttle a shared API",
+        "lines": [
+          "# pool 'api_pool' has 5 slots",
+          "call = PythonOperator(",
+          "  task_id='call_api',",
+          "  python_callable=hit_api,",
+          "  pool='api_pool',",
+          "  pool_slots=1)  # <=5 across DAGs"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A task is writing rows to a database every run. Walk me through how you'd make it idempotent.",
+    "a": "First identify the partition key, usually the logical date {{ ds }}, then replace append with overwrite using a delete-then-insert, MERGE keyed on the date, or partition overwrite. Wrap the delete/insert in a transaction or use an atomic partition swap so a mid-task failure doesn't leave the partition half-deleted. Remove every datetime.now() in favor of {{ ds }}, since any dynamic today-date breaks backfills. Finally, test by running the task twice for the same date and confirming identical row counts.",
+    "fj": "I'd add a unique constraint to the table to prevent duplicates.",
+    "fs": "A unique constraint causes errors, not idempotency. The right fix is delete-then-insert or MERGE on the partition key so reruns converge to the correct state instead of erroring.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "sql",
+        "accent": "bug",
+        "lines": [
+          "ALTER TABLE t",
+          "  ADD UNIQUE (id);",
+          "-- rerun ERRORS, not idempotent"
+        ]
+      },
+      {
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "DELETE FROM t",
+          "WHERE dt = '{{ ds }}';",
+          "INSERT INTO t SELECT * FROM stg;",
+          "-- rerun converges to same state"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide whether to use `depends_on_past=True` vs controlling rerun behavior with other Airflow primitives?",
+    "a": "depends_on_past=True only runs a task instance if the same task in the previous DAG run succeeded, creating a sequential cross-time dependency. Use it when tasks are inherently state-dependent across dates, such as a cumulative counter building on the prior day. Avoid it for stateless idempotent tasks, since a single failure blocks all future runs and requires manual intervention to clear. For most cases, idempotent partition-overwrite tasks with max_active_runs=1 or pools achieve the throttling without a fragile blocking chain.",
+    "fj": "I use depends_on_past=True on all my tasks to keep things ordered.",
+    "fs": "depends_on_past is for genuinely stateful tasks. For idempotent partition-overwrite tasks, it's unnecessary and creates cascading blocks — I use max_active_runs or pools instead.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "stateful only",
+        "lines": [
+          "running_total = PythonOperator(",
+          "  task_id='cum_sum',",
+          "  python_callable=add_day,",
+          "  # needs prior run to succeed",
+          "  depends_on_past=True)",
+          "# stateless? use max_active_runs"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Compare sensor poke mode, reschedule mode, and deferrable operators. When do you use each and what are the infrastructure implications?",
+    "a": "Poke mode holds the worker slot while polling and is acceptable only for short waits. Reschedule mode releases the slot between polls and suits longer waits when no Triggerer is available, adding one poke interval of wakeup latency. Deferrable operators suspend via self.defer(), free the slot immediately, and register a Trigger in the Triggerer's asyncio event loop, so hundreds of tasks run per Triggerer process. Slot efficiency ranks deferrable best, then reschedule, then poke; deferrable requires running the Triggerer service while the other modes need no extra infrastructure.",
+    "fj": "I use sensors in poke mode — they're easier to understand.",
+    "fs": "Poke mode holds a worker slot for the entire wait. In production with many DAGs, I use reschedule mode as a minimum, or deferrable operators if the Triggerer is available.",
+    "level": "Sr",
+    "asked": 16
+  },
+  {
+    "q": "You need to backfill 18 months of daily data. Walk me through how you control concurrency to avoid overwhelming the source system and the Airflow scheduler.",
+    "a": "Use max_active_runs on the DAG to cap how many date intervals run in parallel, and a pool on source-touching tasks sized to what the source can handle to throttle resource usage across DAGs. Run the backfill in chunks via the CLI (month by month) and avoid catchup=True with a long-history start_date, which floods the scheduler queue instantly. depends_on_past=True is a last resort only for genuine sequential dependencies, since it creates blocking chains. Throughout, monitor source DB connections, scheduler heartbeat, and metadata DB query latency, since the scheduler itself is a constraint.",
+    "fj": "I'd set catchup=True with the old start_date and let Airflow handle it.",
+    "fs": "That floods the scheduler with 547 queued DAG runs instantly. I use max_active_runs + a pool + chunked backfill CLI to control the release rate and protect both the source and the scheduler.",
+    "level": "Sr",
+    "asked": 21,
+    "code": [
+      {
+        "lang": "airflow",
+        "accent": "bug",
+        "lines": [
+          "DAG(start_date=datetime(2024,1,1),",
+          "    schedule='@daily',",
+          "    catchup=True)",
+          "# 547 runs queued at once"
+        ]
+      },
+      {
+        "lang": "airflow",
+        "accent": "fix",
+        "lines": [
+          "DAG(catchup=False,",
+          "    max_active_runs=3)",
+          "# then chunked CLI backfill:",
+          "# airflow dags backfill -s ... -e ..."
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Compare LocalExecutor, CeleryExecutor, and KubernetesExecutor. What are the real trade-offs and how do you choose?",
+    "a": "LocalExecutor runs tasks as subprocesses on the scheduler machine, simple but a single point of failure that doesn't scale horizontally. CeleryExecutor distributes tasks to always-on workers via a broker for fast startup and horizontal scaling, at the cost of idle worker spend and environment drift. KubernetesExecutor launches a fresh pod per task for zero idle cost and full isolation, but adds 15-60s pod startup latency and K8s complexity, while the CeleryKubernetesExecutor hybrid routes most tasks to Celery and specific ones to pods. Choose LocalExecutor for dev/small teams, Celery for steady latency-sensitive throughput, and Kubernetes for bursty, cost-sensitive, or isolation-heavy workloads.",
+    "fj": "KubernetesExecutor is always best because it's cloud-native.",
+    "fs": "KubernetesExecutor has 15-60s pod startup latency — for high-frequency, latency-sensitive tasks, CeleryExecutor with always-on workers is often the right call. I pick based on throughput pattern and SLA requirements.",
+    "level": "Sr",
+    "asked": 19
+  },
+  {
+    "q": "How do you implement cross-DAG dependencies in Airflow, and what are the failure modes of ExternalTaskSensor at scale?",
+    "a": "ExternalTaskSensor polls the metadata DB until a target task in another DAG reaches an allowed state, configured with external_dag_id, external_task_id, and crucially execution_date_fn or execution_delta to map logical dates between DAGs on different schedules. Without that mapping it looks for an identical logical date, so mismatched schedules cause it to wait forever. Failure modes include sensors stuck on upstream failure (needing a timeout or callback), poke-mode slot consumption, and metadata DB stress from frequent polling. The Airflow 2.4+ alternative is Dataset/Asset triggers, where producers mark a Dataset updated and downstream DAGs trigger automatically without polling.",
+    "fj": "I use ExternalTaskSensor with the same execution_date as the upstream.",
+    "fs": "That only works when both DAGs share the same schedule interval. For different schedules, you need execution_delta or execution_date_fn to map between the two — without it the sensor waits forever for a logical date that never exists.",
+    "level": "Sr",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "map across schedules",
+        "lines": [
+          "ExternalTaskSensor(",
+          "  task_id='wait_up',",
+          "  external_dag_id='hourly',",
+          "  external_task_id='done',",
+          "  # align differing logical dates",
+          "  execution_delta=timedelta(hours=1),",
+          "  timeout=3600)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain dynamic task mapping in Airflow 2.3+. When is it the right pattern and what are the operational pitfalls?",
+    "a": "Dynamic task mapping uses .expand() to create a variable number of task instances at runtime based on an upstream task's output, rather than at parse time, with partial() for fixed arguments and expand_kwargs() to vary multiple arguments. An empty input list marks the mapped task SKIPPED, and the default cap is 1,024 instances via max_map_length. It's the right pattern for fan-out workloads where each item needs its own logs, retries, and state. Pitfalls include lazy-sequence outputs that are hard to index, metadata DB and scheduler strain from very large maps, and unknown instance counts that complicate alerting and deadlines.",
+    "fj": "I use a Python for-loop in the DAG file to create dynamic tasks.",
+    "fs": "Python for-loops in DAG code run at parse time — the task list is static and regenerated every few seconds. Dynamic task mapping creates instances at runtime based on actual data, which is cleaner and scalable.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "bug",
+        "lines": [
+          "for f in list_files():",
+          "  process(f)",
+          "# parse-time, static, hits DB early"
+        ]
+      },
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "files = list_files()",
+          "process.partial(env='prod') \\",
+          "  .expand(path=files)",
+          "# runtime fan-out per item"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A pipeline has been double-writing data for 3 weeks due to non-idempotent tasks. Walk me through your incident response and long-term fix.",
+    "a": "First quantify the blast radius (which tables, partitions, and how many duplicate rows) and pause the DAG to stop the bleeding before remediating. Trace the root cause, typically a blind INSERT, datetime.now() replacing the logical date, or retries re-inserting. Remediate each partition with CTAS deduplication and swap rather than in-place DELETE, testing on one partition before running all three weeks. Fix the task to use partition overwrite or MERGE keyed on the logical date, remove datetime.now(), and add automated row-count and uniqueness checks that fail the run before duplicates propagate.",
+    "fj": "I'd just delete the duplicate rows.",
+    "fs": "First I'd pause the DAG to stop new duplicates. Then I'd use CTAS + swap to safely deduplicate each partition — not in-place DELETE which can lock large tables. Then fix the task's write logic to be idempotent, and add automated uniqueness checks.",
+    "level": "Sr",
+    "asked": 16
+  },
+  {
+    "q": "How do you design an Airflow architecture for a team with 50+ DAGs and multiple data domains? What are the organizational and technical decisions?",
+    "a": "Organize DAGs in a monorepo with per-domain folders and naming conventions rather than a flat folder, and use per-domain pools so one team's backfill can't starve another's deadline-bound production. Choose CeleryExecutor or KubernetesExecutor based on latency versus cost, and enforce CI/CD with DagBag integrity checks and staging before production. Apply RBAC so teams edit only their domain, and route alerting by DAG tags to the right on-call team rather than a shared channel. At high task volume, monitor scheduler heartbeat latency and run multiple schedulers (HA scheduler, Airflow 2.1+).",
+    "fj": "Just put all DAGs in one folder and give everyone access.",
+    "fs": "At 50+ DAGs, flat structure and shared access creates ownership ambiguity and blast radius problems. I'd use domain folders, RBAC, domain-specific pools, and per-team alerting routing from the start.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "Airflow vs Prefect vs Dagster — when would you choose each for a new data engineering team?",
+    "a": "Airflow is task-centric with a battle-tested, massive ecosystem and the broadest provider library, best for teams with existing expertise or managed platforms, though its DAG-as-code model is verbose and scaling the scheduler is harder. Prefect is Python-first with minimal boilerplate and a hybrid cloud/local execution model, suited to Python-fluent teams wanting rapid iteration on smaller pipelines, but with a smaller ecosystem. Dagster is asset-centric with built-in lineage, integrated testing, and type annotations, ideal for teams prioritizing data quality and engineering rigor, at the cost of a steeper learning curve. Choose Airflow for ecosystem breadth, Dagster for asset lineage and rigor, and Prefect for Python-native simplicity.",
+    "fj": "Airflow is the industry standard so I'd always use it.",
+    "fs": "Airflow has the broadest ecosystem and most operator support, but Dagster's asset model and built-in lineage are worth evaluating for a modern platform. I'd base the decision on team expertise, integration needs, and how much data quality infrastructure I want out of the box.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "What's the difference between an SLA miss and a task timeout in Airflow, and how has SLA handling changed in Airflow 3?",
+    "a": "A timeout (execution_timeout) is a per-task limit that hard-kills a task once it runs too long. An SLA was a softer signal that a task or DAG hadn't completed within an expected wall-clock window, firing a callback while letting the run continue. In Airflow 3.0 the legacy sla and sla_miss_callback parameters were removed (they only ever measured against the logical date and were notoriously buggy), and Airflow 3.1 replaces them with Deadline Alerts, which trigger when a DAG run exceeds a user-defined duration relative to a reference time. The key distinction: a timeout changes task state, while a deadline/SLA only notifies.",
+    "fj": "SLA and execution_timeout are basically the same thing.",
+    "fs": "A timeout kills the task; an SLA/deadline only alerts and lets the run continue. And in Airflow 3 the old sla_miss_callback is gone — I'd use Deadline Alerts (3.1+) for the missed-window notification.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "kill vs notify",
+        "lines": [
+          "# hard-kills the task at 1h",
+          "execution_timeout=timedelta(hours=1)",
+          "",
+          "# Airflow 3.1+: notify on slow run",
+          "# DeadlineAlert replaces sla=...",
+          "# (sla_miss_callback removed in 3.0)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Two DAGs share a pool and one is starving the other for slots. How do priority_weight and weight_rule let you control which tasks get scheduled first?",
+    "a": "When pool slots free up, the scheduler sorts queued task instances by effective priority and runs the highest first. priority_weight (default 1) sets a task's base priority, and weight_rule determines how it's combined: downstream (default) adds the weights of all downstream tasks so upstream work is favored, upstream favors downstream work, and absolute uses the raw priority_weight verbatim. To make a latency-critical DAG win contention, raise its tasks' priority_weight; absolute is also recommended for very large DAGs because it skips the dependency-tree summation and speeds up task creation. Note priority only orders tasks competing for the same pool — it does not preempt a running task.",
+    "fj": "I'll just give the important DAG its own bigger pool.",
+    "fs": "Priority only reorders the queue within a pool when slots free up — it never preempts a running task. I set a higher priority_weight (often weight_rule='absolute') on the latency-critical tasks so they're picked first when a slot opens.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "win the slot race",
+        "lines": [
+          "critical = PythonOperator(",
+          "  task_id='sla_job',",
+          "  pool='shared_pool',",
+          "  priority_weight=100,",
+          "  weight_rule='absolute')",
+          "# picked first when a slot frees"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A task shows up as a 'zombie' and gets marked failed even though nothing in your code raised. What is actually happening and how do you triage it?",
+    "a": "A zombie is a task instance the metadata DB still thinks is running, but whose local task job has stopped heartbeating, usually because the worker process was SIGKILLed (OOM, pod eviction, node loss). The scheduler detects this when no heartbeat arrives within scheduler_zombie_task_threshold (default 300s) and marks the task failed (then retried if retries remain). Triage: check worker memory and the OOM killer (a task that fails with no logs is the classic OOM signature), confirm the pod/node wasn't evicted, and look for heartbeat gaps. Fixes include raising worker memory or chunking the data, and for genuinely long single steps, raising the zombie threshold so a slow-but-alive task isn't falsely reaped.",
+    "fj": "The task failed so there must be a bug in my Python code.",
+    "fs": "No logs plus a zombie-killed status is the OOM fingerprint — the worker was SIGKILLed before it could log. I check worker memory and the OOM killer first, then chunk the data or raise the memory limit, not chase a phantom code bug.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "airflow",
+        "label": "airflow.cfg / env",
+        "lines": [
+          "# scheduler reaps if no heartbeat",
+          "# within this many seconds (def 300)",
+          "scheduler_zombie_task_threshold = 300",
+          "",
+          "# long but alive? raise it so it",
+          "# isn't falsely killed as a zombie",
+          "# fix OOM first: more mem / chunking"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why is top-level code in a DAG file dangerous, and what belongs there versus inside a task?",
+    "a": "Everything at module level runs every time the scheduler parses the file, which by default happens roughly every 30 seconds (min_file_process_interval). A top-level API call, DB query, Variable.get, or heavy import therefore fires constantly, slowing parsing and hammering the source long before any task runs. The rule is that a DAG file should declare tasks and dependencies and nothing else: move all I/O, computation, and heavy imports inside the task callable so they run only at execution time. Use lazy imports for libraries like pandas or boto3, and never fetch a Variable at top level to gate task creation.",
+    "fj": "I call Variable.get() at the top of the file to decide which tasks to build.",
+    "fs": "Top-level Variable.get hits the metadata DB on every parse, every ~30s. I fetch config inside the task at runtime, or use a Jinja template, so parsing stays cheap.",
+    "level": "Mid",
+    "asked": 19,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "bug",
+        "lines": [
+          "df = pd.read_sql(BIG_QUERY)",
+          "# runs on EVERY parse (~30s)",
+          "@task",
+          "def use(): return df.head()"
+        ]
+      },
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "@task",
+          "def use():",
+          "  import pandas as pd",
+          "  return pd.read_sql(BIG_QUERY)",
+          "# I/O only at run time"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is an Airflow Connection, how does a Hook use it, and where should secrets actually live?",
+    "a": "A Connection is a named record (conn_id) holding host, port, login, password, and an extra JSON blob for service credentials, and a Hook is the reusable client that reads a Connection and talks to that external system, so operators stay credential-free. You reference connections by conn_id rather than hardcoding secrets, and the Hook resolves them at runtime. In production you back connections with a secrets backend (AWS Secrets Manager, Vault, GCP Secret Manager) instead of the metadata DB, so rotation happens outside Airflow. Never put passwords in DAG code or Variables in plaintext; pass a conn_id and let the Hook fetch credentials.",
+    "fj": "I put the database password directly in the operator arguments.",
+    "fs": "I store credentials in a Connection (or a secrets backend like Vault) and pass only the conn_id. The Hook resolves it at runtime, so secrets never live in code or git.",
+    "level": "Jr",
+    "asked": 14
+  },
+  {
+    "q": "How do Airflow Variables differ from params, and what's the trap with using Variables in a DAG?",
+    "a": "Variables are a global key-value store in the metadata DB for environment-level config like API URLs or batch sizes, fetched with Variable.get. Params are per-DAG/per-run values defined on the DAG and overridable at trigger time, ideal for run-specific inputs. The trap is calling Variable.get at the top level of a DAG file, which queries the DB on every parse cycle and degrades the scheduler. Fetch Variables inside a task, or render them lazily via the Jinja form {{ var.value.my_key }}, which only resolves at task execution. Store a single JSON Variable and use var.json to avoid many separate lookups.",
+    "fj": "I sprinkle Variable.get() calls throughout my DAG file to configure everything.",
+    "fs": "Top-level Variable.get runs on every parse. I pull them inside the task, or use the {{ var.value.x }} Jinja form that resolves at runtime, and bundle related config into one JSON Variable.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "# lazy: resolves at run time",
+          "BashOperator(task_id='t',",
+          "  bash_command=",
+          "  'run --env {{ var.value.env }}')",
+          "# not Variable.get() at top level"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain data-aware (asset) scheduling in Airflow. How do outlets and inlets replace a time schedule, and what changed in Airflow 3?",
+    "a": "Instead of a cron schedule, a consumer DAG can be scheduled on one or more Datasets (renamed Assets in Airflow 3). A producer task declares the Asset in its outlets, and on successful completion Airflow emits an asset event that triggers any DAG scheduled on that Asset, with no polling and no ExternalTaskSensor. Critically, the update fires only if the task succeeds; a failed or skipped task emits nothing. Inlets let a task read the asset events without affecting scheduling. Airflow 3 generalizes this into event-driven scheduling that can also react to external messaging systems, so a pipeline runs when its inputs are actually ready rather than at a guessed time.",
+    "fj": "I schedule the downstream DAG 30 minutes after the upstream to be safe.",
+    "fs": "Time-padding is fragile. I schedule the consumer on the Asset the producer writes to its outlets, so it triggers exactly when the upstream task succeeds, with no polling and no guessed delay.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "sales = Asset('s3://b/sales')",
+          "@task(outlets=[sales])",
+          "def build(): write()  # emits event",
+          "# consumer:",
+          "@dag(schedule=[sales])",
+          "def downstream(): ..."
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you pass the runtime context into a TaskFlow task, and what are the key context keys you use?",
+    "a": "With the TaskFlow @task decorator you receive context by declaring named parameters that Airflow injects: ds and ds_nodash for the logical date, data_interval_start/end for the explicit interval bounds, ti for the task instance (xcom_push/pull), params for run inputs, and dag_run for the run object. You can also call get_current_context() inside the function for the full dict. These are the same values exposed to Jinja as {{ ds }}, {{ ti }}, etc. Pulling the date from context rather than datetime.now keeps tasks idempotent across backfills, since context always reflects the interval being processed.",
+    "fj": "I add **kwargs and dig through it hoping the date is in there.",
+    "fs": "I declare the keys I need directly as params (ds, data_interval_start, ti, params), or call get_current_context(). They mirror the Jinja macros and always reflect the processed interval, not wall-clock now.",
+    "level": "Jr",
+    "asked": 13
+  },
+  {
+    "q": "Walk through the full set of trigger rules beyond all_success. When do you use one_success, none_failed_min_one_success, all_done, and one_done?",
+    "a": "all_success (default) needs every upstream successful. none_failed allows successes and skips but no failures, and none_failed_min_one_success is the correct join after a branch: it tolerates the skipped path but still requires at least one real success, replacing the older none_failed_or_skipped. one_success runs as soon as any single upstream succeeds, good for race-to-first patterns. all_done runs once every upstream finishes regardless of outcome, the rule for cleanup/notification tasks. one_done fires when any upstream reaches success or failed. all_skipped, all_failed, and always cover edge alerting and unconditional tasks.",
+    "fj": "After my branch I just leave the join on the default and it skips.",
+    "fs": "The default all_success skips the join when a branch path is skipped. The right join rule is none_failed_min_one_success: it accepts the skipped branch but still requires a genuine upstream success.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "join = EmptyOperator(",
+          "  task_id='join',",
+          "  trigger_rule=",
+          "  'none_failed_min_one_success')",
+          "# tolerates skipped branch path"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does @task.branch (BranchPythonOperator) decide which downstream path runs, and what's the classic mistake?",
+    "a": "A branch task returns the task_id (or list of task_ids) of the path(s) to follow; every other directly-downstream task is marked skipped. The decision is data-driven at runtime, returning a string that must exactly match a real downstream task_id, or Airflow raises an error. The classic mistake is forgetting that the skip cascades: any task downstream of a skipped branch also skips under the default all_success rule, so the join needs none_failed_min_one_success. Also return only task_ids that are immediate downstreams of the branch; returning a deeper task won't behave as expected.",
+    "fj": "My branch returns a value and I check it in the next task with an if-statement.",
+    "fs": "@task.branch must return the task_id(s) to run; non-returned branches are skipped automatically. I don't gate logic with an in-task if — I let the branch skip the unused path and join with none_failed_min_one_success.",
+    "level": "Jr",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "@task.branch",
+          "def pick(ds):",
+          "  if is_weekend(ds):",
+          "    return 'weekend_load'",
+          "  return 'weekday_load'",
+          "# returns the task_id to run"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain how the Triggerer process works for deferrable operators, and what happens to a deferred task during a Triggerer restart.",
+    "a": "When a deferrable operator calls self.defer(), the task instance frees its worker slot and the work becomes a Trigger object that runs in the Triggerer's single asyncio event loop, so one Triggerer can service hundreds or thousands of waits concurrently. When the Trigger's condition fires, it hands control back and the scheduler re-queues the task to resume on a worker. Triggers must be async, fast, and serializable. The Triggerer can run highly available with multiple instances, and on restart deferred triggers are reloaded from the metadata DB and resumed, so a restart doesn't lose waiting tasks. Without a running Triggerer, deferrable tasks stay stuck in deferred state.",
+    "fj": "If the Triggerer restarts, all my deferred tasks fail and have to retry.",
+    "fs": "Triggers are persisted in the metadata DB, so on Triggerer restart they reload and resume, no waiting task is lost. You can also run multiple Triggerers for HA. What does break things is having no Triggerer at all.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "Compare parallelism, max_active_tasks_per_dag, max_active_runs_per_dag, and pools. Which limit bites when too many tasks queue?",
+    "a": "These are nested ceilings. parallelism (default 32) caps running+queued tasks per scheduler across the whole deployment. max_active_tasks_per_dag (default 16, the old dag_concurrency) caps concurrent task instances across all runs of one DAG. max_active_runs_per_dag caps how many DAG runs of one DAG are active at once, the key throttle for backfills. Pools cap concurrency for a named resource across all DAGs. When tasks pile up queued, identify which ceiling is active: a single greedy DAG usually hits max_active_tasks; a backfill hits max_active_runs; shared-resource contention hits the pool; and a global stall points at parallelism or worker slots.",
+    "fj": "Tasks are stuck queued so I just add more workers.",
+    "fs": "More workers won't help if the cap is logical. I check which ceiling is binding: parallelism, max_active_tasks_per_dag, max_active_runs_per_dag, or a pool. Often it's max_active_runs on a backfill, not worker capacity.",
+    "level": "Sr",
+    "asked": 15
+  },
+  {
+    "q": "How do you write fast tests for a DAG? Walk through DagBag import checks, dag.test(), and unit-testing task logic.",
+    "a": "Tier the tests. First, a DagBag integrity test asserts dagbag.import_errors is empty so a syntax error or bad import never reaches production, and it can also assert no cycles and required tags. Second, dag.test() runs the whole DAG in-process against a real or SQLite metadata DB to validate wiring and execution end-to-end, with options to skip sensor tasks by regex. Third and most valuable, factor business logic into plain Python functions and unit-test them with pytest plus mocks for external systems, since that logic doesn't need Airflow at all. Run the import test in CI on every commit as the fast gate.",
+    "fj": "I just deploy to staging and watch the UI for import errors.",
+    "fs": "That's slow. I run a DagBag test in CI asserting import_errors is empty, use dag.test() for wiring, and unit-test the extracted Python logic with mocks. The UI check becomes a last resort, not the first.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "python",
+        "label": "CI import gate",
+        "lines": [
+          "def test_no_import_errors():",
+          "  db = DagBag(include_examples=False)",
+          "  assert db.import_errors == {}",
+          "# fast: catches syntax/import bugs"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why does Airflow 3 forbid task code from touching the metadata DB directly, and how do tasks get Variables, Connections, and XComs now?",
+    "a": "Airflow 3 introduced the Task Execution API (AIP-72), making it a client-server architecture where workers no longer hold DB credentials or open a session to the metadata database. Task code that imported airflow.models or a Session to query state directly is broken; instead all runtime interactions, state transitions, heartbeats, XCom read/write, and Variable/Connection lookups, go through the API server. This isolates tasks, enables remote and multi-language execution, and removes a major security and stability liability. DAG authoring imports also move under the airflow.sdk namespace, and legacy paths like airflow.models.dag.DAG are deprecated.",
+    "fj": "In my task I open a Session and query the Airflow DB to check another task's state.",
+    "fs": "Airflow 3 cut direct DB access from tasks. Workers talk to the Task Execution API, not the metadata DB. I use the SDK and context (ti, Variable, Connection) which route through the API server instead of importing airflow.models.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "What problem do setup and teardown tasks solve that ordinary tasks with all_done can't?",
+    "a": "Setup/teardown (Airflow 2.7+) model the create-resource, use-it, destroy-it lifecycle. A teardown runs once its setup succeeded and its work tasks finish, even if those work tasks failed, and it also fires if the run is manually marked success or failed, so an expensive resource like a cluster is always cleaned up. By default a teardown's own failure doesn't fail the DAG run unless you set on_failure_fail_dagrun=True, and teardowns are excluded from run-state evaluation. Crucially, clearing a work task also re-runs its setup and teardown, so a rerun recreates and re-cleans its resources, which a plain all_done cleanup task cannot guarantee.",
+    "fj": "I add a cleanup task with trigger_rule='all_done' to delete the cluster.",
+    "fs": "all_done cleanup doesn't recreate the resource when you clear and rerun the work task, and it counts toward run state. Setup/teardown links them so reruns recreate the resource, and teardown still runs even on failure.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "python",
+        "label": "lifecycle",
+        "lines": [
+          "create = make_cluster()",
+          "delete = drop_cluster().as_teardown(",
+          "  setups=create)",
+          "create >> work >> delete",
+          "# delete runs even if work fails"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "You need to pass a 200 MB result between tasks. Walk me through a custom XCom backend versus the reference pattern.",
+    "a": "The default XCom serializes into the metadata DB, so a 200 MB payload would bloat the DB and can OOM the worker, the standard anti-pattern. The simplest fix is the reference pattern: the producer writes the blob to object storage and returns only the path. If you want this transparent, configure a custom XCom backend by subclassing BaseXCom and overriding serialize_value/deserialize_value to offload large values to S3/GCS while keeping the pointer in the DB, set via AIRFLOW__CORE__XCOM_BACKEND. Airflow also ships XComObjectStorageBackend with an xcom_objectstorage_threshold so values above a byte size spill to object storage automatically.",
+    "fj": "I just return the big object from the task and let XCom handle it.",
+    "fs": "Default XCom puts it in the metadata DB and risks OOM. I either return an S3 path (reference pattern) or configure a custom/object-storage XCom backend with a size threshold so large values spill to S3 transparently.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "python",
+        "label": "custom backend",
+        "lines": [
+          "class S3Xcom(BaseXCom):",
+          "  @staticmethod",
+          "  def serialize_value(v, **k):",
+          "    key = put_s3(v)",
+          "    return BaseXCom.serialize_value(key)",
+          "# set core.xcom_backend = S3Xcom"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain the KubernetesExecutor pod lifecycle and how pod_override lets you customize resources per task.",
+    "a": "KubernetesExecutor launches a fresh worker pod for each task instance, which runs the single task, writes logs and final state, then terminates, so there is zero idle compute and full isolation at the cost of 15-60s startup latency per task. You shape each pod with a base pod template plus the executor_config={'pod_override': ...} on the task, supplying a V1Pod spec to set memory/CPU requests and limits, GPU resources, node selectors, tolerations, or a custom image. This lets a memory-heavy task request 16 GB while neighbors stay small, instead of sizing every worker for the worst case as you would with always-on Celery workers.",
+    "fj": "All my Kubernetes tasks share one fixed pod size, so I size for the biggest one.",
+    "fs": "With KubernetesExecutor each task gets its own pod, so I set per-task resources via executor_config pod_override. The heavy task requests 16 GB and GPUs; the rest stay small, no need to oversize everything.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "python",
+        "label": "pod_override",
+        "lines": [
+          "@task(executor_config={",
+          "  'pod_override': k8s.V1Pod(",
+          "    spec=k8s.V1PodSpec(containers=[",
+          "      k8s.V1Container(name='base',",
+          "        resources=big_mem)]))})",
+          "def heavy(): ..."
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When does expand_kwargs beat expand for dynamic task mapping, and what guards do you set on a large map?",
+    "a": "Plain .expand(arg=list) maps one argument over a list, and .partial() pins the constant arguments. When each mapped instance needs several arguments that vary together, .expand_kwargs() takes a list of dicts so each dict becomes one task instance's full kwargs, avoiding awkward zipping of parallel lists. Guards matter at scale: max_map_length defaults to 1,024 and an empty input list marks the mapped task skipped, so handle the zero-item case. Very large maps strain the scheduler and metadata DB and complicate alerting since the instance count is unknown until runtime, so cap fan-out and consider chunking items per instance.",
+    "fj": "I zip three parallel lists into expand() and hope they line up.",
+    "fs": "Parallel lists are fragile. When several args vary per instance I use expand_kwargs() with a list of dicts, pin constants with partial(), and guard for empty input (skips) and the max_map_length cap.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "load.partial(conn='dw').expand_kwargs([",
+          "  {'tbl':'a','mode':'full'},",
+          "  {'tbl':'b','mode':'inc'},",
+          "])",
+          "# each dict = one task instance"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the standalone DAG processor, why run it, and how does HA scheduling fit the production picture?",
+    "a": "By default the scheduler parses DAG files itself, but you can run a standalone DAG processor as a separate process so file parsing is isolated from scheduling decisions. This improves security and stability: untrusted DAG code is parsed away from the scheduler, and a slow or heavy parse can't stall the scheduling loop, which is the recommendation for multi-team deployments. Separately, Airflow supports running multiple active schedulers (HA, since 2.0) that coordinate through row-level locks in the metadata DB with no leader election, giving failover and higher scheduling throughput. In Airflow 3 the standalone DAG processor is a first-class component of the client-server architecture.",
+    "fj": "Running two schedulers will double-schedule my tasks.",
+    "fs": "Airflow's HA scheduler uses row-level locking in the metadata DB so multiple active schedulers coordinate without double-scheduling, no leader election needed. I also run a standalone DAG processor to isolate parsing from the scheduling loop.",
+    "level": "Sr",
+    "asked": 10
+  }
+]

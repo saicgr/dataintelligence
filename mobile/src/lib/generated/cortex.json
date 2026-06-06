@@ -1,0 +1,351 @@
+[
+  {
+    "q": "What is Snowflake Cortex and why do teams pick it over calling an external LLM API?",
+    "a": "Cortex is Snowflake's serverless AI layer that exposes LLMs, embeddings, retrieval, and classic ML as SQL functions and managed services that run inside your Snowflake account. Because inference runs within the governance boundary, your data never egresses to a third-party API, existing RBAC and masking policies still apply, and there is no infrastructure to provision. Snowflake also commits that customer data and prompts are not used to train the underlying models. The tradeoff is you're limited to the models and regions Snowflake offers, but for governed enterprise data that's usually the point.",
+    "fj": "Cortex is just a wrapper that forwards my rows to OpenAI.",
+    "fs": "Inference runs inside Snowflake's boundary with no data egress, governed by the same RBAC and masking. Snowflake also doesn't train models on your data — that's the whole governance pitch.",
+    "level": "Jr",
+    "asked": 17
+  },
+  {
+    "q": "Name the AISQL functions you'd reach for and what each one does.",
+    "a": "The AISQL family (the AI_ prefixed functions, mostly GA as of Nov 2025) covers the common tasks: AI_COMPLETE for free-form LLM generation, AI_CLASSIFY for single- or multi-label categorization, AI_FILTER for a yes/no predicate you can put in WHERE or JOIN, and AI_AGG to reason across many rows without hitting a context-window limit. For vectors and retrieval there's AI_EMBED and AI_SIMILARITY, and for unstructured inputs there's AI_PARSE_DOCUMENT for PDFs/docs and AI_TRANSCRIBE for audio and video. AI_EXTRACT and AI_SENTIMENT round out structured extraction and tone scoring. They're all called inline in a SELECT, so you build AI pipelines in plain SQL.",
+    "fj": "I'd write a Python UDF and loop the rows through an LLM client myself.",
+    "fs": "There's a purpose-built function for each task — AI_FILTER for predicates, AI_AGG for cross-row reasoning, AI_CLASSIFY for labels. Hand-rolling a UDF loop loses pushdown, batching, and the governance story.",
+    "level": "Jr",
+    "asked": 16,
+    "code": [
+      {
+        "label": "AISQL inline in a SELECT",
+        "lang": "sql",
+        "lines": [
+          "SELECT id,",
+          "  AI_CLASSIFY(body,",
+          "    ['bug','billing','praise'])",
+          "    AS topic,",
+          "  AI_SENTIMENT(body) AS tone",
+          "FROM tickets;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you use AI_COMPLETE versus a task-specific function like SUMMARIZE, SENTIMENT, TRANSLATE, or EXTRACT_ANSWER?",
+    "a": "Task-specific functions (the SNOWFLAKE.CORTEX.SUMMARIZE / SENTIMENT / TRANSLATE / EXTRACT_ANSWER family) are tuned for one job, need no prompt engineering, and are cheaper and more predictable for that job — reach for them when the task fits exactly. AI_COMPLETE is the general escape hatch: you pick a model and write your own prompt, which you want for anything bespoke, multi-step, or that needs a custom output shape. A senior move is to prefer the narrow function when it fits and only drop to AI_COMPLETE when you genuinely need the flexibility, since the narrow ones are easier to keep correct and cost less. Newer AI_-prefixed versions (AI_SENTIMENT, AI_TRANSLATE, AI_SUMMARIZE_AGG) supersede some of the older ones.",
+    "fj": "I just use AI_COMPLETE with a clever prompt for everything.",
+    "fs": "If the task is exactly summarize/translate/sentiment, the dedicated function is cheaper, needs no prompt tuning, and is more stable. I only reach for AI_COMPLETE when I need a custom prompt or output shape.",
+    "level": "Jr",
+    "asked": 13
+  },
+  {
+    "q": "Show me how AI_FILTER changes a query, and why it's better than wrapping AI_COMPLETE.",
+    "a": "AI_FILTER takes a natural-language predicate and returns a BOOLEAN, so you can drop it straight into a WHERE clause (or even a JOIN condition) and let the optimizer treat it like any other filter. That's cleaner and more composable than calling AI_COMPLETE to emit 'yes'/'no' and then string-matching the output, which is brittle and forces you to parse free text. The senior caveat is cost: an LLM predicate runs per row, so you filter cheaply with normal SQL first and only let AI_FILTER see the already-narrowed set. Pairing it with the PROMPT() helper lets you template column values safely into the predicate.",
+    "fj": "I call AI_COMPLETE asking 'reply YES or NO' and filter on the text.",
+    "fs": "AI_FILTER returns a real BOOLEAN usable in WHERE/JOIN — no fragile string parsing. And I pre-filter with cheap SQL first so the LLM only scores the rows that survive, since it bills per row.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "label": "AI predicate in WHERE",
+        "lang": "sql",
+        "lines": [
+          "SELECT id, body FROM tickets",
+          "WHERE created > DATEADD(day,-7,",
+          "        CURRENT_DATE)        -- cheap",
+          "  AND AI_FILTER(PROMPT(",
+          "    'Is this an outage report? {0}',",
+          "    body));               -- LLM last"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does AI_AGG differ from running AI_COMPLETE row by row, and when does it matter?",
+    "a": "AI_AGG is an aggregate function: it takes a column and a prompt and reasons across all the rows in a group at once, returning a single synthesized answer like a themed summary of every review for a product. Unlike calling AI_COMPLETE per row and then trying to merge outputs, AI_AGG is designed not to be capped by a single model's context window — it handles the fan-in internally. Use it for 'summarize/what are the themes across these N rows' questions where row-by-row would either miss cross-row patterns or overflow context. It pairs naturally with GROUP BY to produce one insight per segment.",
+    "fj": "I'd AI_COMPLETE each row then concatenate the summaries.",
+    "fs": "AI_AGG reasons across the whole group in one shot and isn't bounded by the context window. Concatenating per-row summaries loses cross-row themes and can blow past context limits.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "label": "One insight per group",
+        "lang": "sql",
+        "lines": [
+          "SELECT product_id,",
+          "  AI_AGG(review_text,",
+          "    'Summarize the top complaints')",
+          "    AS themes",
+          "FROM reviews",
+          "GROUP BY product_id;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you choose a model in Cortex, and what is cross-region inference?",
+    "a": "Cortex offers a menu of models — Anthropic Claude, Meta Llama, Mistral, OpenAI, and Snowflake's own — and you pass the model name as a string to AI_COMPLETE. The choice is a quality/cost/latency tradeoff: a large frontier model for hard reasoning, a smaller model for high-volume cheap classification. Models aren't available in every cloud region, so Snowflake offers cross-region inference, controlled by the account-level CORTEX_ENABLED_CROSS_REGION parameter, which lets Cortex route a request to a region where the model exists. The catch is that inference data may transit another region, so for strict data-residency requirements you keep it constrained rather than ANY_REGION.",
+    "fj": "I always pick the biggest, smartest model to be safe.",
+    "fs": "Match the model to the job — a cheap small model for bulk classification, a frontier model only for hard reasoning. And cross-region inference has a residency implication: ANY_REGION can route your request out of region, which may not be acceptable.",
+    "level": "Jr",
+    "asked": 15
+  },
+  {
+    "q": "What is the semantic model behind Cortex Analyst, and why does it beat raw text-to-SQL?",
+    "a": "Cortex Analyst is grounded by a semantic model — either a YAML file on a stage or a native semantic view object — that defines the tables, the relationships, the named metrics, and the business synonyms (so 'revenue' maps to the right SUM of the right column). That grounding is what makes it reliable: instead of guessing schema from raw DDL, the model answers in the business's vocabulary and uses pre-defined metric definitions, which is exactly where naive text-to-SQL hallucinates joins and miscomputes aggregates. A semantic view has the advantage of living in Snowflake under RBAC and sharing, versus a YAML you manage on a stage. The semantic layer is the product — the LLM is the easy part.",
+    "fj": "Cortex Analyst just reads my schema and writes SQL automatically.",
+    "fs": "It's grounded by a curated semantic model — metrics, relationships, and business synonyms — not raw DDL. That curation is why it beats generic text-to-SQL, which guesses joins and aggregations and quietly gets numbers wrong.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "label": "Semantic model essentials (YAML)",
+        "lang": "sql",
+        "lines": [
+          "# semantic model on a stage",
+          "tables:",
+          "  - name: orders",
+          "    metrics:",
+          "      - name: revenue",
+          "        expr: SUM(amount)",
+          "    synonyms: [sales, gmv]"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A stakeholder says Cortex Analyst gives wrong numbers sometimes. How do you raise its accuracy?",
+    "a": "The biggest lever is verified queries: you curate a repository of known-good question/SQL pairs so that when a user asks something similar, Analyst reuses the trusted query instead of generating fresh SQL. Beyond that, you tighten the semantic model — add missing synonyms, clarify ambiguous column names, and define metrics explicitly so it can't pick the wrong column. You also handle ambiguity by having Analyst ask a clarifying question rather than guess, and you constrain it to the curated tables so it can't wander. Snowflake can even analyze your verified queries to auto-enrich the rest of the semantic layer, widening the set of questions it answers correctly.",
+    "fj": "I'd just switch it to a bigger LLM and hope the SQL improves.",
+    "fs": "Accuracy comes from the semantic layer, not the model. I add verified queries so common questions reuse trusted SQL, fix ambiguous metric/synonym definitions, and make it ask for clarification instead of guessing.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "Explain how Cortex Search works under the hood and what TARGET_LAG controls.",
+    "a": "Cortex Search is a managed retrieval service: you point it at a text column and it builds and maintains a hybrid index combining vector (semantic) and keyword (lexical) search, then applies semantic reranking so the most relevant passages float to the top — that hybrid-plus-rerank stack measurably beats vector-only retrieval. You don't manage chunking infrastructure, embedding refresh, or an external vector DB. TARGET_LAG declares how fresh the index should stay relative to the base table; Snowflake refreshes the service to keep it within that lag as source rows change, trading compute cost against staleness. It serves low-latency queries (hundreds of ms) and is the retrieval engine you ground a RAG chatbot on.",
+    "fj": "It's just a vector database I have to keep re-embedding myself.",
+    "fs": "It's hybrid vector+keyword with semantic reranking, and it auto-maintains the index. TARGET_LAG sets the freshness SLA so I don't manage re-embedding or refresh jobs — that's the managed part.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "label": "Managed hybrid index",
+        "lang": "sql",
+        "lines": [
+          "CREATE CORTEX SEARCH SERVICE docs_svc",
+          "  ON content",
+          "  WAREHOUSE = wh",
+          "  TARGET_LAG = '1 hour'",
+          "AS SELECT doc_id, content",
+          "   FROM support_docs;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Walk me through building RAG in Snowflake. When would you use Cortex Search vs hand-rolling it?",
+    "a": "The managed path is Cortex Search: create a search service over your text column, query it for the top passages, then feed those passages plus the question into AI_COMPLETE to generate a grounded answer — Snowflake handles embedding, the hybrid index, and reranking. The DIY path uses primitives: EMBED_TEXT (e.g. EMBED_TEXT_768) to create vectors, store them in a VECTOR column, and retrieve with VECTOR_COSINE_SIMILARITY in a SQL ORDER BY. You hand-roll only when you need full control over chunking, a custom embedding model, or unusual retrieval logic; otherwise Cortex Search wins because it also gives you keyword matching, reranking, and automatic index maintenance you'd otherwise build and operate yourself.",
+    "fj": "RAG in Snowflake means I always store embeddings and do cosine similarity by hand.",
+    "fs": "That DIY VECTOR + VECTOR_COSINE_SIMILARITY path works, but Cortex Search adds keyword matching, reranking, and auto-refresh for free. I only hand-roll when I need a custom embedding model or chunking strategy.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "label": "DIY retrieval with vectors",
+        "lang": "sql",
+        "lines": [
+          "-- store: VECTOR(FLOAT,768) column",
+          "SELECT chunk,",
+          "  VECTOR_COSINE_SIMILARITY(emb,",
+          "    EMBED_TEXT_768('e5-base-v2',",
+          "      'how do refunds work?')) AS s",
+          "FROM kb ORDER BY s DESC LIMIT 5;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are Cortex Agents and what problem do they solve over calling Analyst or Search directly?",
+    "a": "Cortex Agents (GA Nov 2025) are the orchestration layer: given a natural-language request, an agent plans, decides which tools to call, and runs multiple steps — using Cortex Analyst as the tool for structured/SQL questions and Cortex Search as the tool for unstructured document retrieval, plus optional custom tools via stored procedures or UDFs and even a web-search tool. The value is routing and multi-step reasoning: a question like 'compare the contract terms for these two vendors and tie it to their spend' needs both document retrieval and a SQL aggregation, which a single Analyst or Search call can't do alone. The agent decomposes the task, invokes each tool, evaluates intermediate results, and composes a final answer.",
+    "fj": "An agent is just Cortex Analyst with a chat box on top.",
+    "fs": "An agent orchestrates multiple tools and steps — it routes structured sub-questions to Analyst and document sub-questions to Search, then composes them. Analyst alone can't retrieve from PDFs, and Search alone can't aggregate a metric.",
+    "level": "Sr",
+    "asked": 13
+  },
+  {
+    "q": "You need to pull structured fields out of thousands of scanned PDFs. How do you do it in Cortex?",
+    "a": "Land the files in a stage and call AI_PARSE_DOCUMENT to turn each document into clean text or markdown — its LAYOUT mode preserves tables, headings, and reading order (and is required for image extraction), while OCR mode is the faster default for plain text-heavy scans. With the structure preserved, you then extract specific fields with AI_EXTRACT or AI_COMPLETE using a structured output schema, or use page_split/page_filter to process only the pages you need. Because it's a SQL function, this fans out across the warehouse and scales to thousands of documents without standing up a separate OCR pipeline. The senior tip is LAYOUT for anything with tables or multi-column layout, OCR when it's flat text and you want speed.",
+    "fj": "I'd export the PDFs and run a separate OCR/Python service to parse them.",
+    "fs": "AI_PARSE_DOCUMENT does layout-aware extraction in SQL — LAYOUT mode keeps tables and reading order intact. Then AI_EXTRACT pulls the fields. No separate OCR service, and it scales across the warehouse.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Parse then extract fields",
+        "lang": "sql",
+        "lines": [
+          "SELECT AI_EXTRACT(",
+          "  AI_PARSE_DOCUMENT(",
+          "    TO_FILE('@stg', rel_path),",
+          "    {'mode':'LAYOUT'}):content,",
+          "  ['invoice_no','total','due_date'])",
+          "FROM invoices;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Cortex also has classic ML functions like FORECAST and ANOMALY_DETECTION. When do those beat a GenAI approach?",
+    "a": "Cortex ML functions — FORECAST, ANOMALY_DETECTION, CLASSIFICATION, and TOP_INSIGHTS — are purpose-built statistical/ML models for numeric and time-series data, trained on your own data in two steps (train a model object, then predict). For 'what will next quarter's demand be', 'which metric points are outliers', or 'which dimension drove this drop', these are the right tool: they're cheaper, deterministic, explainable, and far more accurate on tabular data than asking an LLM to eyeball numbers. GenAI is for language and unstructured content; you don't forecast a revenue series by prompting a chat model. Knowing to route numeric/time-series problems to the ML functions and language problems to AISQL is the senior signal.",
+    "fj": "I'd ask AI_COMPLETE to predict next month's sales from the history.",
+    "fs": "Numeric forecasting and outlier detection belong to FORECAST and ANOMALY_DETECTION — purpose-built, cheaper, deterministic, and explainable. LLMs are for language, not for projecting a time series.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Time-series forecast in SQL",
+        "lang": "sql",
+        "lines": [
+          "CREATE SNOWFLAKE.ML.FORECAST m(",
+          "  INPUT_DATA => SYSTEM$REFERENCE(",
+          "    'VIEW','sales_ts'),",
+          "  TIMESTAMP_COLNAME => 'ds',",
+          "  TARGET_COLNAME => 'y');",
+          "CALL m!FORECAST(",
+          "  FORECASTING_PERIODS => 30);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When would you fine-tune a model in Cortex versus prompting or RAG?",
+    "a": "Reach for prompting first and RAG when the model needs current or proprietary facts — those are cheaper, faster to iterate, and don't bake knowledge into weights. Cortex Fine-tuning (serverless, parameter-efficient/PEFT) earns its place when you need to teach a consistent style, format, or domain behavior that prompting can't reliably enforce, or to make a smaller, cheaper model match a larger one's quality on a narrow task. It is not how you inject knowledge — facts go in via RAG, not fine-tuning. You provide labeled training pairs, Snowflake produces an adaptor, and you call it through AI_COMPLETE; cost is per training token plus inference, so you weigh that against just using a bigger base model.",
+    "fj": "If the model isn't accurate enough, fine-tune it on my documents.",
+    "fs": "Fine-tuning teaches style and behavior, not facts — facts belong in RAG. I exhaust prompting and retrieval first, and only fine-tune to lock in a format or to make a small cheap model match a big one on a narrow task.",
+    "level": "Sr",
+    "asked": 11
+  },
+  {
+    "q": "How do you keep Cortex LLM outputs safe and machine-parseable in production?",
+    "a": "Two distinct controls. For safety, Cortex Guard is a flag on the completion that filters unsafe or harmful model responses — you enable it so the model's output is screened before it reaches users. For reliability of the data shape, use structured outputs: pass a response_format JSON schema (GA) so the model is forced to return JSON conforming to your schema, which removes the brittle 'parse free text and hope' step downstream. Together they mean you can trust both the content and the structure. The PROMPT() helper additionally lets you template column values into prompts cleanly instead of fragile string concatenation.",
+    "fj": "I parse the model's free-text answer with a regex and add a 'be safe' line to the prompt.",
+    "fs": "Use the real controls: Cortex Guard to filter unsafe responses, and a response_format JSON schema so output is guaranteed-valid JSON. Regex-parsing free text and 'please be safe' prompts are not production guardrails.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Schema-constrained output",
+        "lang": "sql",
+        "lines": [
+          "SELECT AI_COMPLETE('claude-4-sonnet',",
+          "  PROMPT('Extract: {0}', body),",
+          "  {'response_format':",
+          "    {'type':'json',",
+          "     'schema':{'type':'object',",
+          "       'properties':{...}}}});"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How is Cortex billed, and how do you monitor and control the spend?",
+    "a": "Cortex AI functions bill in credits per token (input plus output), so cost scales with rows processed, prompt size, and crucially the model you pick — a frontier model can be an order of magnitude more expensive per token than a small one. The danger pattern is an LLM function over a huge unfiltered table, which can quietly run up a large bill in one query. You monitor with the ACCOUNT_USAGE Cortex functions usage history views, which break out tokens and credits per function and model, and you control spend by pre-filtering rows before the AI call, choosing the cheapest model that meets quality, and setting budgets/cost controls Snowflake now provides for AI functions. Cortex Search and Analyst have their own serverless cost components on top.",
+    "fj": "Cortex is just part of my warehouse cost, so I don't track it separately.",
+    "fs": "It's per-token credits and very sensitive to model choice and row count — an LLM over an unfiltered table is a runaway-bill trap. I watch the Cortex usage history views and pre-filter rows before the AI call.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Per-model token/credit usage",
+        "lang": "sql",
+        "lines": [
+          "SELECT function_name, model_name,",
+          "  sum(token_credits) AS credits,",
+          "  sum(tokens) AS tokens",
+          "FROM snowflake.account_usage",
+          "  .cortex_functions_usage_history",
+          "GROUP BY 1,2 ORDER BY credits DESC;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A security reviewer asks how Cortex handles data governance. What's your answer?",
+    "a": "Inference runs inside your Snowflake account, so data isn't sent to an external model provider and stays within the same security perimeter, subject to your existing RBAC, masking, and row-access policies. Access to Cortex is itself governed by database roles: SNOWFLAKE.CORTEX_USER (granted to PUBLIC by default) gates the AI functions, and you can revoke it from PUBLIC and grant only to approved roles — there are narrower roles like CORTEX_ANALYST_USER for least privilege. Snowflake states customer data and prompts are not used to train the foundation models, and you can opt out of AI features entirely. Model and feature availability is region-dependent, which intersects with data residency when cross-region inference is enabled.",
+    "fj": "Governance is fine because Snowflake is SOC 2 compliant.",
+    "fs": "Concretely: data stays in-account under existing RBAC/masking, access is gated by the CORTEX_USER database role (which I can revoke from PUBLIC), and Snowflake doesn't train on customer data. Cross-region inference is the one residency caveat to check.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "label": "Restrict Cortex access via RBAC",
+        "lang": "sql",
+        "lines": [
+          "-- remove blanket access",
+          "REVOKE DATABASE ROLE",
+          "  SNOWFLAKE.CORTEX_USER",
+          "  FROM ROLE PUBLIC;",
+          "-- grant only to approved role",
+          "GRANT DATABASE ROLE",
+          "  SNOWFLAKE.CORTEX_USER",
+          "  TO ROLE ai_team;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate the quality of a Cortex RAG app before you ship it?",
+    "a": "Use Snowflake's AI Observability, which is powered by TruLens: you instrument the app with tracing, build a test set of representative questions (and ideally reference answers), and run batch evaluations that score each response on metrics like groundedness — is the answer actually supported by the retrieved context — and context relevance — did retrieval pull the right passages. The metrics use an LLM-as-judge (you can pick the judge model; a default like a Llama model is used otherwise) to score 0–1 with an explanation, so you can isolate whether failures are a retrieval problem or a generation problem. The point is to measure quality with a repeatable harness instead of eyeballing a few demo queries before going live.",
+    "fj": "I click through a handful of questions, and if they look right we ship.",
+    "fs": "I run AI Observability / TruLens evals on a test set — groundedness and context relevance scored by an LLM judge — so I can tell whether failures come from retrieval or generation. Vibe-checking a few queries isn't evaluation.",
+    "level": "Sr",
+    "asked": 11
+  },
+  {
+    "q": "Design a chatbot over Snowflake that answers both 'what's revenue this quarter' and 'what does the contract say'. How do you route?",
+    "a": "Structured, metric-style questions go to Cortex Analyst (grounded by the semantic model, it generates and runs SQL), and unstructured 'what does this document say' questions go to Cortex Search for passage retrieval feeding AI_COMPLETE. The clean way to do the routing is a Cortex Agent, which decides per turn which tool to invoke — or which to invoke for each part of a compound question — rather than you writing brittle if/else intent logic. For the UI, Streamlit-in-Snowflake keeps the whole app inside the governance boundary with no data leaving the account. The mental model: structured numbers to Analyst, documents to Search, an Agent to route and combine, Streamlit to serve.",
+    "fj": "I'll send every question to Cortex Analyst and let it figure it out.",
+    "fs": "Analyst only does structured SQL — it can't read a contract PDF. I route metric questions to Analyst and document questions to Search, and let a Cortex Agent decide per question. Streamlit-in-Snowflake keeps it all in-boundary.",
+    "level": "Sr",
+    "asked": 13
+  },
+  {
+    "q": "Your AI_COMPLETE call over a 200M-row table failed partway and you got a partial, expensive result. What went wrong and how do you fix it?",
+    "a": "Running an LLM function across a massive unfiltered table is both slow and a cost risk, and a single hard error on one row can abort the whole statement, leaving you billed for the tokens already processed. The fixes: pre-filter aggressively so the LLM only sees rows that actually need it, materialize results incrementally (batch by partition or process via a stream/task so a failure resumes instead of restarting), and use the TRY_ variant / error-detail handling so a bad row returns an error value rather than killing the query. Pick a cheaper model for bulk passes and reserve the frontier model for the hard subset. This is the same 'filter cheap, then AI' discipline that controls cost.",
+    "fj": "I'll just rerun the same query on a bigger warehouse so it finishes.",
+    "fs": "A bigger warehouse doesn't fix it — the issues are an unfiltered scan and one bad row aborting the statement. I pre-filter, batch incrementally so it resumes, and use TRY_COMPLETE / error handling so a single row can't kill (and re-bill) the whole run.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Resilient bulk AI",
+        "lang": "sql",
+        "lines": [
+          "-- only rows that need an LLM",
+          "INSERT INTO out",
+          "SELECT id,",
+          "  TRY_COMPLETE('mistral-large2',",
+          "    PROMPT('Classify: {0}', body))",
+          "FROM new_rows           -- a stream",
+          "WHERE needs_review;     -- pre-filter"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Compare AI_CLASSIFY with the Cortex ML CLASSIFICATION function. They sound the same.",
+    "a": "They solve different problems. AI_CLASSIFY is a zero-shot LLM call: you give it plain-language category definitions and it labels free text or images with no training data, ideal when labels are described in words (topic, intent, sentiment bucket) and you have no labeled history. The ML CLASSIFICATION function trains a supervised model on your own labeled tabular features and predicts a class from numeric/categorical columns — it needs training data but is cheaper at inference, deterministic, and stronger on structured signals. So: unstructured text/no labels and semantic categories → AI_CLASSIFY; you have labeled tabular features and want a fast, repeatable predictor → ML CLASSIFICATION. Choosing wrong means either paying LLM rates for a tabular problem or having no training data for the supervised one.",
+    "fj": "Both classify rows, so I'd just use whichever I've heard of.",
+    "fs": "AI_CLASSIFY is zero-shot over text/images from plain-language labels; ML CLASSIFICATION is a supervised model trained on labeled tabular features. Text with no labels → AI_CLASSIFY. Labeled numeric features → ML CLASSIFICATION, which is cheaper and deterministic.",
+    "level": "Sr",
+    "asked": 10
+  },
+  {
+    "q": "What's the difference between a semantic model (YAML) and a semantic view for Cortex Analyst, and which do you pick?",
+    "a": "A semantic model is a YAML file you author and upload to a stage; a semantic view is a native schema-level Snowflake object that captures the same logical layer — tables, relationships, metrics, synonyms — but lives in the database. The semantic view is generally the stronger choice for production because it's governed by Snowflake RBAC, can be shared like any other object, and is managed with SQL DDL rather than a file you have to version and ship to a stage. The YAML is handy for quick iteration, external version control, or when you're prototyping. Either way the substance is the same: the quality of the metric and synonym definitions is what determines Analyst's accuracy, not which container you store them in.",
+    "fj": "They're the same thing, just file versus object — pick either.",
+    "fs": "Functionally similar, but the semantic view is a native object under RBAC and sharing, managed with DDL — better for production governance. YAML is fine for prototyping. The real work is the metric and synonym definitions either way.",
+    "level": "Mid",
+    "asked": 10
+  }
+]

@@ -1,0 +1,625 @@
+[
+  {
+    "q": "Design a basic batch pipeline that loads daily sales data from a CSV in S3 into a data warehouse for analyst queries.",
+    "a": "Start by clarifying volume, query pattern, arrival time, and the freshness SLA before drawing anything. A scheduled job picks up the new CSV from S3, validates row counts and schema, applies business logic, and writes output partitioned by event_date so queries can prune to a single day. Make the write idempotent by overwriting the date partition rather than appending, so re-runs and backfills never create duplicates. Serve the partitioned table to BI tools and monitor for zero rows, schema mismatch, and job failure.",
+    "fj": "Drawing the architecture immediately without asking any clarifying questions.",
+    "fs": "Before I draw anything — what is the freshness SLA, roughly how many rows per day, and what is the primary query pattern?",
+    "level": "Sr",
+    "asked": 22
+  },
+  {
+    "q": "What does idempotency mean in a data pipeline, and how do you make a write operation idempotent?",
+    "a": "Idempotent means running the same operation multiple times produces the same result as running it once, with no duplicates or drift. For batch pipelines, overwrite a deterministic partition keyed on the logical date; for row-level writes, use MERGE or UPSERT keyed on a unique event ID instead of blindly appending. Avoid using NOW() or wall-clock timestamps to decide what to write, since retries and backfills may run at different times and produce different results. The payoff is safe retries and backfills: if any step fails, you re-run without manual cleanup.",
+    "fj": "We make sure the pipeline only runs once.",
+    "fs": "In production, things fail and retry — I design writes to be idempotent so a re-run is always safe: overwrite the partition or MERGE on a unique key.",
+    "level": "Mid",
+    "asked": 18,
+    "code": [
+      {
+        "label": "Not idempotent",
+        "lang": "sql",
+        "accent": "bug",
+        "lines": [
+          "-- retry duplicates rows",
+          "INSERT INTO sales",
+          "SELECT * FROM staging;"
+        ]
+      },
+      {
+        "label": "Idempotent",
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "MERGE INTO sales t",
+          "USING staging s",
+          "  ON t.event_id = s.event_id",
+          "WHEN MATCHED THEN UPDATE SET *",
+          "WHEN NOT MATCHED THEN INSERT *;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why do we partition data in a warehouse or data lake, and what column should you typically partition on?",
+    "a": "Partitioning physically splits data into segments by a column's value so a query filtering on the partition key reads only matching segments and skips the rest, which is called partition pruning. For time-series data, partition by event date or event timestamp rather than ingest time, since that matches the most common query filter and avoids late-arriving data landing in the wrong partition. Choose the column that appears in most WHERE clauses, such as event_date, region, or product_category. Avoid over-partitioning, which creates the small-files problem; aim for partitions of at least 100 MB each.",
+    "fj": "I would partition by the ingest timestamp.",
+    "fs": "I partition by event timestamp — data should live in the partition that matches when it happened, not when the pipeline processed it.",
+    "level": "Jr",
+    "asked": 15,
+    "code": [
+      {
+        "label": "Partition + prune",
+        "lang": "sql",
+        "lines": [
+          "-- write split by event_date",
+          "INSERT INTO sales",
+          "PARTITION (event_date)",
+          "SELECT *, event_date FROM src;",
+          "-- reads ONE partition (pruned)",
+          "SELECT * FROM sales",
+          "WHERE event_date = '2026-06-03';"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide whether to use batch processing or streaming for a new pipeline?",
+    "a": "Start with the freshness SLA: if analysts need data within hours, batch is almost always simpler, cheaper, and easier to test. Streaming is warranted only when sub-minute latency is a genuine product requirement like fraud detection or live alerting, and it brings real operational cost in stateful processing, watermarks, exactly-once complexity, and harder backfills. Micro-batch running every 5 to 15 minutes is a pragmatic middle ground that is fast enough without the full streaming burden. Ask for the real latency number first; if the answer is same-day or within an hour, batch or micro-batch wins on every other axis.",
+    "fj": "I would use Kafka — real-time is always better.",
+    "fs": "First: what does 'real-time' mean here in minutes? Streaming adds significant operational burden; micro-batch often gets you the latency you need at a fraction of the cost.",
+    "level": "Mid",
+    "asked": 14
+  },
+  {
+    "q": "What questions do you ask before designing a data pipeline? Walk me through your requirements-gathering checklist.",
+    "a": "Cover functional needs (what data, from where, how often, and who consumes it), scale (rows and bytes per day and growth rate), and the latency or freshness SLA. Pin down access patterns since point lookups versus aggregations versus full scans drive partitioning, and reliability needs since late or missing data tolerance drives idempotency design. Clarify whether consumers can tolerate duplicates deduplicated downstream or require no duplicates at all, and how the pipeline should handle schema evolution. The specific architecture matters far less than anchoring every choice to a stated requirement.",
+    "fj": "Jumping to a technology choice without asking any clarifying questions.",
+    "fs": "Asking for volume, latency SLA, consumer access patterns, and reliability requirements before proposing anything.",
+    "level": "Mid",
+    "asked": 11
+  },
+  {
+    "q": "Batch processing vs streaming — what are the real trade-offs, and when does each win?",
+    "a": "Batch processes a bounded dataset on a schedule: simple, cheap, deterministic, and easy to test and backfill, with latency bounded by the schedule. Streaming processes unbounded events as they arrive for low latency but adds stateful processing, watermarks, checkpoint management, harder backfills, and 24/7 compute cost that can be 10 to 100x more expensive. Micro-batch running every 5 to 15 minutes gets fast-enough latency with batch's simplicity and covers most near-real-time use cases. Batch wins when the SLA is hours or backfills are common; streaming wins only when latency must be sub-minute or downstream consumers act on individual events.",
+    "fj": "Streaming is always better — lower latency.",
+    "fs": "Streaming wins on latency, but adds stateful complexity, hard backfills, and 24/7 compute cost. I choose it only when the SLA genuinely requires sub-minute freshness.",
+    "level": "Mid",
+    "asked": 13
+  },
+  {
+    "q": "Design a pipeline that ingests 10 million user events per day from a mobile app and makes them queryable within 15 minutes. Walk me through your design.",
+    "a": "Clarify peak traffic, whether 15 minutes is a hard SLA, and the query patterns, then ingest through a durable log (Kafka or Kinesis) so a downstream outage does not drop events and you can replay on failure. Process with a micro-batch consumer every 5 minutes that enriches and deduplicates on a client-generated event_id via MERGE, since mobile clients retry and produce duplicates. Handle late-arriving data with a lookback window on the watermark so events up to about an hour late merge into the correct partition. Write to a lakehouse partitioned by event_date, compact small files hourly, and monitor Kafka consumer lag as the leading indicator against the SLA.",
+    "fj": "I would write directly from the API to the warehouse.",
+    "fs": "The warehouse is not an ingestion buffer. I put Kafka between the API and processing — it absorbs spikes, decouples failure domains, and enables replay without dropping events.",
+    "level": "Sr",
+    "asked": 28
+  },
+  {
+    "q": "How do you handle late-arriving data in a streaming or micro-batch pipeline?",
+    "a": "Late-arriving data is events whose event timestamp is older than the current processing time, commonly from offline mobile syncs, network delays, or upstream retries. Use watermarks to define a threshold so events within it are merged into the correct partition and events beyond it are dropped or routed to a side output. For micro-batch, use a lookback window that re-processes the trailing N hours so late arrivals are caught automatically, combined with an idempotent MERGE on event_id. For accuracy-critical use cases like billing, add a nightly reprocessing job that overwrites affected partitions from the raw event log.",
+    "fj": "Events always arrive in order so this is not a concern.",
+    "fs": "In practice mobile clients sync offline events hours or days late. I design with a watermark and a lookback window so late events are merged into the correct partition.",
+    "level": "Sr",
+    "asked": 23,
+    "code": [
+      {
+        "label": "Watermark + dedup",
+        "lang": "pyspark",
+        "lines": [
+          "(events",
+          " .withWatermark('event_ts',",
+          "                '1 hour')",
+          " .dropDuplicates(['event_id']))",
+          "# events >1h late are dropped"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your streaming pipeline produces thousands of tiny Parquet files per day. Analysts say queries are slow. Diagnose and fix it.",
+    "a": "This is the small-files problem: each micro-batch or streaming write creates one file per partition, so a date partition accumulates thousands of tiny files. Columnar readers are optimized for large files, and each tiny file incurs file-open and metadata overhead, so thousands of files mean thousands of round trips before reading a single byte. Fix it by running OPTIMIZE or a compaction job that rewrites each partition into right-sized 128 to 256 MB files, scheduled off-peak, and consider increasing the micro-batch interval or enabling auto-compaction. Verify with before-and-after query times and the file count per partition.",
+    "fj": "I would add more compute or a larger warehouse.",
+    "fs": "This is the small-files problem. I would run OPTIMIZE/compaction to merge tiny files into right-sized ones — more compute does not help when the bottleneck is file metadata overhead.",
+    "level": "Sr",
+    "asked": 19,
+    "code": [
+      {
+        "label": "Compact tiny files",
+        "lang": "sql",
+        "lines": [
+          "-- merge into ~128-256MB files",
+          "OPTIMIZE events",
+          "WHERE event_date = '2026-06-03';",
+          "",
+          "-- then reclaim old files",
+          "VACUUM events;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide between at-least-once and exactly-once delivery semantics for a data pipeline?",
+    "a": "At-least-once guarantees delivery but may produce duplicates, so it requires an idempotent consumer, while true exactly-once delivers and processes each event once via distributed transactions at higher latency and complexity. The practical production approach is effectively-exactly-once: at-least-once delivery plus an idempotent sink that MERGEs on event_id, so duplicate deliveries converge to the correct result. Choose true exactly-once for money movement, billing, and financial reconciliation where a duplicate is irreversible. Choose at-least-once with an idempotent sink for analytics, dashboards, and ML features where a handled duplicate has no consequence.",
+    "fj": "Always use exactly-once — it is safer.",
+    "fs": "Exactly-once adds latency and complexity. For analytics I use at-least-once plus idempotent MERGE — the result is correct at a fraction of the cost. I reserve true exactly-once for financial transactions.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "label": "Idempotent sink",
+        "lang": "sql",
+        "lines": [
+          "-- duplicate deliveries converge",
+          "MERGE INTO facts t",
+          "USING batch s",
+          "  ON t.event_id = s.event_id",
+          "WHEN NOT MATCHED THEN INSERT *;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Push vs pull ingestion — which pattern do you use and when?",
+    "a": "In push, the source initiates the transfer on its schedule via webhooks or S3 drops; in pull, your pipeline polls or queries the source on your schedule, giving you control over cadence and the data window. Push wins when the source is push-native or you lack database access, while pull wins when you need to control the backfill window or the source supports efficient incremental queries. Backfillability is the clearest differentiator: pull lets you adjust the query window and re-run, whereas push depends on the source re-sending history, which many webhook sources cannot do. A common safe pattern is a hybrid where the source pushes to durable storage and your pipeline pulls from there.",
+    "fj": "Push is better — lower latency.",
+    "fs": "Push gives lower latency but puts schedule control in the source. Pull gives us control over cadence and backfills. For vendor integrations I often use a hybrid: they push to S3, we pull from S3 on our schedule.",
+    "level": "Jr",
+    "asked": 14
+  },
+  {
+    "q": "Lambda architecture vs Kappa architecture — what is the difference, and when would you use each?",
+    "a": "Lambda runs two parallel pipelines, an accurate slow batch layer and a real-time speed layer, merged at a serving layer, while Kappa uses a single streaming pipeline and replays the event log for historical reprocessing. Lambda wins when replaying petabytes through a streaming engine is too slow or you are adding real-time to an existing batch system, but its core problem is that two codebases computing the same logic inevitably diverge and reconciling differing numbers is painful. Kappa wins when historical replay is affordable and you want one codebase. The modern default favors Kappa or the lakehouse pattern (streaming ingest plus batch compaction on Delta or Iceberg) to avoid dual-codebase reconciliation bugs.",
+    "fj": "Lambda is better because you get both batch accuracy and real-time.",
+    "fs": "Lambda's two codebases diverge and reconciliation bugs are painful. For new systems I default to Kappa or a lakehouse pattern — one pipeline, one source of truth.",
+    "level": "Sr",
+    "asked": 20
+  },
+  {
+    "q": "Design a data pipeline that processes 1 billion events per day and makes aggregated metrics available to analysts within 5 minutes. Walk me through the full design.",
+    "a": "Spend the first few minutes clarifying peak rate, query patterns, and retention, and estimate the load at roughly 11,600 events/sec average and about 1 TB/day raw. Ingest into Kafka with hundreds of partitions keyed by user_id and idempotent producers, then process with Flink using 5-minute tumbling windows, 30-second checkpoints, and event_id deduplication in a RocksDB state store. Write aggregates to a time-series store like ClickHouse or Druid for sub-second queries and archive raw events to Delta or Iceberg on S3 as the canonical replay source, since Kafka retention is bounded. Make the design backfill-safe by reprocessing from S3, and monitor consumer lag, checkpoint duration, and aggregate anomalies.",
+    "fj": "Drawing the architecture immediately without estimating the numbers.",
+    "fs": "11,600 events/sec average — what is peak? That determines whether micro-batch or true streaming is required, and how many partitions.",
+    "level": "Sr",
+    "asked": 31
+  },
+  {
+    "q": "Design a feature store for a machine learning platform that serves both batch training and real-time inference.",
+    "a": "Clarify feature count, entities, inference latency SLA, update frequency, and training volume, then design around the core problem of training-serving skew, where features at training time must match what is available at inference. Build an offline store on Delta or Hive partitioned by entity and date that supports point-in-time joins so training data reflects only feature values that existed before the label time, preventing future-data leakage. Build an online store in Redis or DynamoDB keyed by entity_id holding the latest values for sub-5ms reads, and use a dual-write pipeline that populates both stores, ideally mediated by Kafka so a failed write can replay. Use the same feature computation code for batch and streaming to prevent skew.",
+    "fj": "I would just query the database at inference time to get the latest features.",
+    "fs": "Querying a transactional database at 5ms inference latency at scale is not viable, and it does not solve training-serving skew. You need a dedicated online store (Redis) and offline store with point-in-time join support.",
+    "level": "Sr",
+    "asked": 24,
+    "code": [
+      {
+        "label": "Point-in-time join",
+        "lang": "sql",
+        "lines": [
+          "SELECT l.*, f.value",
+          "FROM labels l JOIN features f",
+          "  ON f.entity_id = l.entity_id",
+          " AND f.ts <= l.label_ts  -- no leak",
+          "QUALIFY row_number() OVER (PARTITION",
+          "  BY l.id ORDER BY f.ts DESC) = 1;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Design a metrics and dashboard backend for a SaaS product with 50,000 business customers, each needing real-time and historical views of their own usage data.",
+    "a": "Clarify metric count, freshness SLA, cardinality, retention, and tenancy isolation, then estimate that per-minute raw storage would be about 7.2 billion rows/day, making pre-aggregation the key design choice. Ingest into Kafka partitioned by customer_id, compute rolling per-customer aggregates with Flink or Spark Streaming, and write them to a time-series store like ClickHouse, Druid, or TimescaleDB for low-latency dashboard queries. Archive raw events to Delta or Iceberg on S3 for ad-hoc SQL and metric recomputation, and enforce multi-tenancy by partitioning on customer_id plus row-level security in the serving layer. A thin dashboard API reads the time-series store for real-time views and the historical store for long ranges, with a read-through cache.",
+    "fj": "I would query raw events per customer on every dashboard load.",
+    "fs": "At 50,000 customers and 100 metrics, querying raw events per load is not viable. Pre-aggregate to hourly buckets in the time-series store — dashboard queries become reads of a few hundred rows, not millions.",
+    "level": "Sr",
+    "asked": 21
+  },
+  {
+    "q": "How do you design a backfill-safe data pipeline from the start? What properties must it have?",
+    "a": "Backfill-safe means re-running for any historical range produces the same correct output as the original run, with no duplicates, loss, or wrong aggregates. The key properties are idempotent writes that overwrite a deterministic keyed slot, using the scheduler's logical date rather than NOW() so a backfill computes the correct interval, and an immutable raw source of truth in append-only storage that derived tables can always be regenerated from. Process each partition independently from the raw source rather than chaining off the previous day's derived table, so errors do not propagate and partitions can be parallelized. Test it by running the pipeline twice for the same date and asserting the output is identical.",
+    "fj": "I use NOW() to get the current date in the pipeline.",
+    "fs": "Using NOW() breaks backfills — a run for January 15th executed today produces today's data in the January 15th slot. I use the logical date passed by the scheduler.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "label": "Breaks backfill",
+        "lang": "python",
+        "accent": "bug",
+        "lines": [
+          "# backfill of Jan 15 run today",
+          "# writes TODAY into Jan 15 slot",
+          "day = date.today()"
+        ]
+      },
+      {
+        "label": "Backfill-safe",
+        "lang": "airflow",
+        "accent": "fix",
+        "lines": [
+          "# scheduler's logical date",
+          "day = '{{ ds }}'  # e.g. Jan 15",
+          "# same input -> same output"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When would you apply OPTIMIZE and Z-ordering (or liquid clustering) to a Delta Lake table, and what are the costs?",
+    "a": "OPTIMIZE compacts many small files in a partition into fewer roughly 1 GB files to fix the small-files problem, run after streaming ingestion or on a schedule, but it rewrites data so it costs I/O proportional to partition size. Z-ordering co-locates related data on a multi-dimensional curve so the engine can skip file ranges when filtering on frequently-queried non-partition columns like user_id. Liquid clustering is an adaptive Delta 3.0+ replacement that reorganizes data automatically without manual column specification. Target only recently modified partitions with a WHERE clause to control cost, and run VACUUM afterward to reclaim storage, but only once you have confirmed time-travel queries within the retention window are not needed.",
+    "fj": "I would run OPTIMIZE on the whole table every day.",
+    "fs": "Full table OPTIMIZE rewrites all data — very expensive on a large table. I target recent partitions with WHERE and run full OPTIMIZE only when compaction is critically needed.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "label": "Scoped OPTIMIZE",
+        "lang": "sql",
+        "lines": [
+          "-- recent partition only",
+          "OPTIMIZE events",
+          "WHERE event_date >= '2026-06-01'",
+          "ZORDER BY (user_id);",
+          "-- or adaptive (Delta 3.0+):",
+          "ALTER TABLE events",
+          "CLUSTER BY (user_id);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Lambda vs Kappa architecture: given a system processing 500 billion events per month, when would you choose each, and what are the trade-offs you would fight for in a design review?",
+    "a": "Lambda runs an accurate batch layer and a real-time speed layer merged at serving, but at scale the merge logic is error-prone and debugging divergent numbers means tracing two codebases. Pure Kappa replays the full event log through Flink, which at 500 billion events/month may be slower and more expensive than a Spark batch backfill and depends on Kafka retention covering the replay window. The practical answer is the lakehouse pattern: Flink writes to Delta or Iceberg with at-least-once plus MERGE, OPTIMIZE compacts hourly, and historical reprocessing reads the S3 archive via Spark batch, giving one codebase with batch-quality reads and streaming freshness. In a design review, fight against Lambda's dual-codebase divergence and against pure Kappa's petabyte-scale replay cost.",
+    "fj": "Lambda is better because you always have accurate batch data.",
+    "fs": "Lambda's accuracy comes with a dual codebase that always diverges. For new systems I fight for the lakehouse pattern — single pipeline, streaming freshness, batch-optimized reads, no reconciliation problem.",
+    "level": "Sr",
+    "asked": 22
+  },
+  {
+    "q": "Log-based vs query-based CDC — explain the difference and which one you would choose to replicate a Postgres OLTP database into your warehouse.",
+    "a": "Query-based CDC polls the source table on a schedule using an updated_at or incrementing column, which is simple but adds query load, lags by the poll interval, and silently misses hard deletes and any rows changed between polls. Log-based CDC reads the database's write-ahead log directly (Postgres logical replication / replication slots, consumed by Debezium), capturing every insert, update, and delete in commit order with sub-second latency and typically under ~5% load on the source. For replicating an OLTP database I default to log-based CDC because it catches deletes, preserves transaction order, and does not hammer the source. The cost is operational: you must manage replication slots, since an unconsumed slot causes WAL to accumulate and can fill the source disk.",
+    "fj": "I'll just poll the table every hour with WHERE updated_at > last_run.",
+    "fs": "Query-based polling misses hard deletes and intra-interval changes. I use log-based CDC off the WAL via Debezium — it captures deletes in commit order, but I monitor replication-slot lag so WAL never fills the disk.",
+    "level": "Sr",
+    "asked": 20,
+    "code": [
+      {
+        "label": "Query-based gap",
+        "lang": "sql",
+        "accent": "bug",
+        "lines": [
+          "-- misses DELETEs entirely,",
+          "-- and rows changed twice",
+          "SELECT * FROM orders",
+          "WHERE updated_at > :last_run;"
+        ]
+      },
+      {
+        "label": "Log-based (WAL)",
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "-- Debezium reads this slot;",
+          "-- captures I/U/D in order",
+          "SELECT slot_name, active,",
+          "  pg_size_pretty(",
+          "    pg_wal_lsn_diff(",
+          "      pg_current_wal_lsn(),",
+          "      restart_lsn)) AS lag",
+          "FROM pg_replication_slots;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "You set a Kafka consumer to auto-commit offsets and process each message. After a crash you notice some records were processed but their work was lost, and others were processed twice. What is going on and how do you make the consumer correct?",
+    "a": "Auto-commit advances the offset on a timer independent of your processing, so the consumer can commit an offset for a record it has not finished writing (lost on crash) or crash after writing but before committing (re-delivered and double-processed). The fix is at-least-once with an idempotent consumer: disable auto-commit, do the work first, then commit the offset only after the write succeeds, and make the write itself dedupe on a unique event_id via UPSERT or a processed-IDs table so a re-delivery is a no-op. This is the standard production pattern because Kafka guarantees at-least-once, not exactly-once, end to end. Reserve transactional read-process-write (consume-transform-produce in one Kafka transaction with read_committed) for cases that must atomically write back to Kafka.",
+    "fj": "Enable auto-commit and assume each message is handled once.",
+    "fs": "Kafka delivery is at-least-once, so duplicates are inevitable. I disable auto-commit, commit after the write, and make the write idempotent by UPSERTing on event_id — a replay just no-ops.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "label": "Idempotent consumer",
+        "lang": "python",
+        "lines": [
+          "for msg in consumer:  # no autocommit",
+          "  db.execute(",
+          "    'INSERT INTO t(id,..) VALUES(..)'",
+          "    ' ON CONFLICT (id) DO NOTHING',",
+          "    msg.event_id, ...)",
+          "  consumer.commit()  # after write"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does it actually take to get a true exactly-once SINK in a streaming job, and why is an idempotent upsert usually preferred?",
+    "a": "A true exactly-once sink must commit its output atomically with the engine's checkpoint, which means either a transactional sink doing two-phase commit (Flink's TwoPhaseCommitSink, Kafka transactions with read_committed, or a JDBC XA sink) or a sink that writes then commits in lockstep with checkpoint barriers. This adds the checkpoint interval to end-to-end latency and reduces throughput by roughly 10-20% from transaction coordination. The far more common production choice is effectively-once: run at-least-once and make the sink idempotent by UPSERTing on a deterministic key, so duplicate flushes after a checkpoint replay simply overwrite to the same value. It is preferred because it is cheaper, has lower latency, and works against sinks that do not support transactions, as long as every record carries a stable unique key.",
+    "fj": "I just set the sink to exactly-once mode and assume it works.",
+    "fs": "A real exactly-once sink needs 2PC tied to checkpoints, which costs latency and ~10-20% throughput. If records have a stable key I prefer at-least-once plus an idempotent UPSERT — same result, cheaper, no transactional sink required.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "label": "Flink 2PC sink",
+        "lang": "ts",
+        "lines": [
+          "// commit coupled to checkpoint:",
+          "// preCommit -> stage txn",
+          "// checkpoint barrier passes",
+          "// commit() -> make visible",
+          "// recover -> abort stale txns"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why do teams put a schema registry in front of Kafka, and what does setting compatibility to BACKWARD let you do safely?",
+    "a": "A schema registry stores Avro/Protobuf/JSON schemas centrally and enforces a compatibility check at produce time so a producer cannot publish a record whose schema would break existing consumers; messages carry only a small schema ID instead of the full schema. BACKWARD compatibility (the Confluent default) means a consumer on the new schema can read data written with the previous schema, so the rule is deploy consumers first, then producers, and you may add optional fields with defaults or delete fields but not add a required field without a default. FORWARD is the inverse (old consumers read new data, producers first), and FULL allows either deploy order but is restrictive in practice. Choosing the right mode is what lets you evolve schemas during rolling deploys without a coordinated big-bang upgrade.",
+    "fj": "We just send JSON and add fields whenever we want.",
+    "fs": "Free-form JSON means a producer change silently breaks consumers at runtime. A registry with BACKWARD compatibility rejects breaking changes at produce time — I add optional fields with defaults and upgrade consumers before producers.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "label": "Breaking change",
+        "lang": "ts",
+        "accent": "bug",
+        "lines": [
+          "// new REQUIRED field, no default",
+          "// -> registry rejects under",
+          "//    BACKWARD; old data has none",
+          "{ name: 'amount', type: 'int' }"
+        ]
+      },
+      {
+        "label": "Backward-safe",
+        "lang": "ts",
+        "accent": "fix",
+        "lines": [
+          "// optional + default = safe add",
+          "{ name: 'amount',",
+          "  type: ['null','int'],",
+          "  default: null }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "One Kafka partition is lagging badly while the others are idle, and adding consumers does not help. What is happening and how do you fix it?",
+    "a": "This is a hot partition from key skew: throughput is bound by the partition, not the topic, so when one key (a whale tenant, a celebrity user) carries most of the volume its partition becomes the bottleneck and adding consumers cannot help because at most one consumer in a group reads a given partition. Diagnose by comparing per-partition byte rate to the average; a max-to-average ratio above ~2 is the signal. Fixes, in order: widen the routing key with a composite key like tenant_id|entity_id to spread load while keeping inner-entity ordering; for a single intractable hot key, salt it with a bounded suffix (key#0..K-1) to fan it across partitions, accepting that strict per-key ordering across salt buckets is lost; or route the worst offenders to a dedicated topic. Choose based on whether you can give up ordering.",
+    "fj": "Add more partitions and more consumers — that scales it.",
+    "fs": "A single partition caps throughput and only one consumer reads it, so adding consumers does nothing. This is key skew — I widen the partition key (composite) or salt the one hot key, trading some ordering for balance.",
+    "level": "Sr",
+    "asked": 19,
+    "code": [
+      {
+        "label": "Skewed key",
+        "lang": "python",
+        "accent": "bug",
+        "lines": [
+          "# 90% of traffic = 1 tenant",
+          "# -> one hot partition",
+          "producer.send(t, key=tenant_id,",
+          "              value=evt)"
+        ]
+      },
+      {
+        "label": "Salt the hot key",
+        "lang": "python",
+        "accent": "fix",
+        "lines": [
+          "# fan one key across K buckets",
+          "bucket = randint(0, K-1)",
+          "key = f'{tenant_id}#{bucket}'",
+          "producer.send(t, key=key,",
+          "              value=evt)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your Flink job's end-to-end latency is climbing and the source shows growing Kafka lag. The UI marks an early operator as 'backpressured'. Walk me through diagnosing and fixing it.",
+    "a": "Backpressure means a downstream operator cannot keep up, so via Flink's credit-based flow control it stops granting buffer credits upstream, and that signal propagates back to the source, which slows consumption and grows Kafka lag. The operator flagged as backpressured is healthy but blocked; the real bottleneck is the first operator downstream of it that is NOT backpressured (high busyTimeMsPerSecond, low backPressuredTimeMsPerSecond), so read the chain from the source forward to that boundary. Common root causes are a slow sink (external DB throttling), data skew sending one key group to one subtask, or an under-provisioned operator, often visible as one hot subtask. Fix by scaling the bottleneck operator's parallelism, rebalancing skew, batching/async-I/O the slow sink, or relieving GC pressure — not by scaling the source, which only buffers more.",
+    "fj": "The flagged operator is the slow one, so I'll give it more resources.",
+    "fs": "Backpressure propagates upstream via credit-based flow control, so the flagged operator is the victim. I find the first NON-backpressured operator downstream — that's the real bottleneck — and scale or de-skew it, often a slow sink.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "label": "Find the bottleneck",
+        "lang": "ts",
+        "lines": [
+          "// per-subtask metrics:",
+          "// backPressuredTimeMsPerSecond ~1000",
+          "//   -> blocked (victim)",
+          "// busyTimeMsPerSecond ~1000 AND",
+          "// backPressured ~0",
+          "//   -> THIS is the bottleneck"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A product owner asks for a 'multi-region active-active' setup for the platform's primary datastore and wants zero data loss. What questions and trade-offs do you raise?",
+    "a": "First pin the real targets in numbers: RPO (acceptable data loss) and RTO (acceptable downtime), because they drive cost and topology. Active-passive with asynchronous replication is cheaper and simpler but has a non-zero RPO equal to replication lag, so a regional failure can lose the in-flight tail; synchronous replication gives RPO≈0 but pays the cross-region round-trip on every write. True active-active accepting writes in multiple regions gives the lowest RTO but creates the hard problem: concurrent writes to the same key in different regions conflict, and you must choose a resolution strategy — last-writer-wins (simple, silently drops a write), CRDTs/app-level merge, or a single-writer-per-key scheme. 'Zero data loss' plus 'active-active' usually cannot both be cheap; I would push for active-passive with synchronous replication for the strongly-consistent core and reserve active-active for data that tolerates LWW or merges.",
+    "fj": "Active-active everywhere means we never lose data and never go down.",
+    "fs": "Active-active gives low RTO but creates write conflicts and split-brain — someone must own conflict resolution (LWW vs merge). If they truly need RPO≈0 I steer toward synchronous active-passive for the consistent core; you rarely get cheap, active-active, and zero-loss at once.",
+    "level": "Sr",
+    "asked": 21
+  },
+  {
+    "q": "What is the difference between vertical and horizontal scaling, and why do most large data systems eventually go horizontal?",
+    "a": "Vertical scaling (scaling up) means giving one machine more CPU, RAM, or disk; it is simple and needs no code changes, but it has a hard ceiling, gets expensive non-linearly, and leaves that single box as both a bottleneck and a single point of failure. Horizontal scaling (scaling out) adds more machines and spreads work across them, giving near-linear capacity and fault tolerance, but it forces you to solve partitioning, coordination, and consistency. Stateless services scale out trivially behind a load balancer; the hard part is always the stateful tier — the database or the shuffle in a distributed job. For data systems the volume eventually exceeds any single machine, so the design question becomes how to partition state, not how to buy a bigger box.",
+    "fj": "Just get a bigger server when it gets slow.",
+    "fs": "Scaling up has a ceiling and is a single point of failure. I scale out the stateless tier easily, but the real design work is partitioning the stateful tier — the database or the shuffle.",
+    "level": "Jr",
+    "asked": 17
+  },
+  {
+    "q": "Explain how a load balancer works and the difference between L4 and L7 load balancing. When would you pick each?",
+    "a": "A load balancer sits in front of a pool of servers and distributes incoming requests so no single instance is overwhelmed, while also doing health checks to route around dead nodes. An L4 (transport) balancer routes on IP and TCP/UDP port without inspecting payload, so it is fast, cheap, and protocol-agnostic — good for raw throughput. An L7 (application) balancer terminates the connection and reads the HTTP request, so it can route by path or header, do TLS termination, sticky sessions, and per-route rate limiting at the cost of more CPU per request. Pick L4 for simple high-throughput TCP balancing, L7 when you need content-based routing, and remember the balancer itself must be made redundant or it becomes the single point of failure.",
+    "fj": "A load balancer just round-robins traffic across servers.",
+    "fs": "It also health-checks and routes around dead nodes. L4 routes on IP/port and is fast; L7 reads the HTTP request so it can route by path/header and do TLS — I pick L7 when I need content-based routing.",
+    "level": "Jr",
+    "asked": 16
+  },
+  {
+    "q": "Walk me through cache-aside, write-through, and write-back. Which would you use for a read-heavy feature-serving layer and why?",
+    "a": "In cache-aside (lazy loading) the app reads the cache, and on a miss loads from the database and populates the cache, so only requested data is cached and a cache failure just means slower reads — the standard read-heavy pattern. Write-through writes synchronously to the cache and the database together, keeping them consistent at the cost of higher write latency and caching data that may never be read. Write-back writes to the cache and flushes to the database asynchronously, giving the fastest writes but risking data loss if the cache dies before the flush. For a read-heavy feature-serving layer I use cache-aside, usually warmed by the same pipeline that computes features, with a TTL plus event-driven invalidation so stale features age out predictably.",
+    "fj": "I'd use write-back so writes are always fast.",
+    "fs": "Write-back risks losing un-flushed writes if the cache dies. For a read-heavy feature store I use cache-aside warmed by the pipeline, with a TTL plus invalidation on update — a cache miss just falls back to the source.",
+    "level": "Mid",
+    "asked": 18
+  },
+  {
+    "q": "Cache invalidation is famously hard. What strategies do you use, and how do you prevent a cache stampede?",
+    "a": "The three levers are TTL expiry (simple, but serves stale data up to the TTL), explicit invalidation on write (delete the key rather than update it, so the next read repopulates fresh), and event-driven invalidation off a change stream or CDC feed for cross-service caches. Prefer delete-on-write over update-on-write because updating races with concurrent reads and can write back a stale value. A cache stampede happens when a hot key expires and thousands of requests miss simultaneously and all hit the database; mitigate it with request coalescing (a single in-flight loader per key), a short randomized jitter on TTLs so keys do not expire in lockstep, or serving slightly stale data while one worker refreshes in the background. For derived data, version the cache key so a new computation lands on a new key and old entries age out.",
+    "fj": "Just set a TTL and the cache takes care of itself.",
+    "fs": "TTL alone serves stale data and causes stampedes when a hot key expires. I delete-on-write, add TTL jitter, and coalesce concurrent misses so only one loader hits the database per key.",
+    "level": "Sr",
+    "asked": 15
+  },
+  {
+    "q": "What problem does a CDN actually solve, and what kinds of data should and should not live behind one?",
+    "a": "A CDN is a globally distributed set of edge caches that serve content from a node near the user, cutting latency by shortening the network path and offloading traffic from the origin so it scales reads dramatically. It is ideal for static and rarely-changing assets — images, JS/CSS bundles, video segments, model artifacts, large downloadable datasets — and for cacheable API responses keyed by URL. It is a poor fit for highly personalized or rapidly-changing data, since per-user content has near-zero cache hit rate and forces origin round-trips anyway. The hard part is invalidation: you control freshness with Cache-Control TTLs and purge stale objects on deploy, and for content that changes you use versioned URLs (content hashes in the filename) so a new version is simply a new cache key.",
+    "fj": "Put everything behind the CDN to make the whole app faster.",
+    "fs": "CDNs shine for static/cacheable assets near the user. Personalized per-user data has a near-zero hit rate, so it just adds a hop. I version asset URLs with a content hash so a deploy is a new cache key, not a purge.",
+    "level": "Jr",
+    "asked": 13
+  },
+  {
+    "q": "What is database sharding, how do you choose a shard key, and what goes wrong with a bad one?",
+    "a": "Sharding partitions a dataset horizontally across multiple databases so each shard holds a subset of rows and the fleet's total capacity scales with shard count. The shard key decides which shard a row lives on, and it must have high cardinality and even access distribution so load spreads uniformly. A bad key creates hot shards: a low-cardinality key (like country) or a monotonically increasing key (like a timestamp or auto-increment ID) sends most traffic to one shard, which becomes the bottleneck while others sit idle. The other trap is cross-shard queries and joins — anything not filtered by the shard key has to fan out to every shard and merge, which is slow, so you pick the key to match your dominant access pattern (often user_id or tenant_id). Resharding later is painful, so it is worth getting the key right up front.",
+    "fj": "I'd shard on an auto-increment ID since it's unique.",
+    "fs": "A monotonic key sends all new writes to one shard — an instant hot shard. I pick a high-cardinality key that matches the dominant access pattern, like user_id, so load spreads and most queries hit a single shard.",
+    "level": "Mid",
+    "asked": 19
+  },
+  {
+    "q": "Explain consistent hashing and the role of virtual nodes. Why is it better than hash-mod-N for a distributed cache?",
+    "a": "With naive hash-mod-N partitioning, changing the node count changes the modulus, so almost every key remaps and the whole cache is effectively invalidated at once. Consistent hashing instead maps both keys and nodes onto a hash ring, and a key is owned by the first node clockwise from it, so adding or removing a node only moves the keys in that node's arc — about K/N keys instead of all of them. Virtual nodes fix the uneven-distribution problem: each physical node is placed at many points on the ring (typically 100 to 200), so when a node leaves, its load is redistributed across many neighbors rather than dumped on one, and heterogeneous capacity is handled by giving bigger nodes more virtual points. This is why caches, sharded stores, and partition assignment in systems like Dynamo and Cassandra use it.",
+    "fj": "Use hash(key) % N to pick the node.",
+    "fs": "hash-mod-N remaps nearly every key when N changes, wiping the cache. Consistent hashing moves only ~K/N keys, and virtual nodes spread each physical node across the ring so load and rebalancing stay even.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "label": "Mod-N vs ring lookup",
+        "lang": "python",
+        "lines": [
+          "# brittle: N changes -> remap all",
+          "node = nodes[hash(key) % len(nodes)]",
+          "# consistent: walk ring clockwise",
+          "i = bisect(ring_keys, hash(key))",
+          "node = ring[ring_keys[i % len(ring_keys)]]"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Compare leader-follower (single-leader) and multi-leader replication. What are the failure and consistency implications of each?",
+    "a": "In single-leader replication all writes go to one leader that streams its change log to read-only followers; it is simple, gives a clear ordering, and avoids write conflicts, but the leader is a write bottleneck and its failure requires a failover (electing a new leader, with a risk of losing un-replicated writes under async replication). Multi-leader replication lets several nodes — often one per region — accept writes and replicate to each other, which improves write availability and local write latency but introduces the hard problem of concurrent conflicting writes to the same key, which you must resolve with last-writer-wins, version vectors, or CRDTs. Replication can be synchronous (a write waits for replicas, giving durability at higher latency) or asynchronous (fast, but a leader crash can lose the un-replicated tail). For most OLTP and warehouse-backing stores, single-leader is the default; multi-leader is reserved for multi-region write locality where you can tolerate conflict resolution.",
+    "fj": "Multi-leader is better because every node can take writes.",
+    "fs": "Multi-leader buys write availability but creates concurrent write conflicts you must resolve (LWW, version vectors, CRDTs). I default to single-leader for a clear write order and only go multi-leader for multi-region write locality.",
+    "level": "Sr",
+    "asked": 16
+  },
+  {
+    "q": "State the CAP theorem precisely, and explain how PACELC extends it. Where does a system like DynamoDB or Cassandra land?",
+    "a": "CAP says that when a network partition (P) occurs, a distributed system must choose between consistency (C) — every read sees the latest write — and availability (A) — every request gets a non-error response; you cannot have both during a partition. The common misreading is that you 'pick two of three': partitions are not optional, so the real choice is C-vs-A only while partitioned. PACELC extends this to the normal case: Else (E), when there is no partition, you still trade Latency (L) against Consistency (C), because synchronous coordination for strong consistency costs round-trips. So a system is classified as PA/EL or PC/EC: Dynamo-style stores and Cassandra are PA/EL — available and low-latency, eventually consistent — while a system like CockroachDB or Spanner is PC/EC, choosing consistency in both regimes. The framing matters because it forces you to name the latency cost of strong consistency even when nothing is broken.",
+    "fj": "CAP means pick two of consistency, availability, and partition tolerance.",
+    "fs": "Partitions aren't optional, so CAP is really C-vs-A only during a partition. PACELC adds the normal-case trade-off: Else you trade Latency vs Consistency. Cassandra/Dynamo are PA/EL; Spanner is PC/EC.",
+    "level": "Mid",
+    "asked": 21
+  },
+  {
+    "q": "Explain strong, eventual, and read-your-writes consistency. When is eventual consistency acceptable in a data platform?",
+    "a": "Strong consistency means every read returns the most recent committed write, as if there were a single copy; it requires coordination and so costs latency and availability under partitions. Eventual consistency means replicas converge to the same value given no new writes, but a read right after a write may return a stale value — the trade for low latency and high availability. Read-your-writes (a session guarantee) is a useful middle ground: a user always sees their own writes even if other users see them slightly later, which avoids the jarring 'I just saved that and it vanished' bug while staying cheap. In a data platform, eventual consistency is usually fine for analytics, dashboards, recommendations, and feature serving where a few seconds of staleness is invisible; reserve strong consistency for money movement, inventory counts, idempotency/dedup checks, and anything where a stale read causes incorrect action.",
+    "fj": "Always use strong consistency to be safe.",
+    "fs": "Strong consistency costs latency and availability everywhere. Analytics and feature serving tolerate eventual consistency fine; I reserve strong consistency for money, inventory, and dedup checks — and use read-your-writes where users must see their own updates.",
+    "level": "Mid",
+    "asked": 15
+  },
+  {
+    "q": "When do you reach for a message queue versus an event log/stream like Kafka? They both move messages — what's the real distinction?",
+    "a": "A traditional task queue (SQS, RabbitMQ) is consumer-centric: a message is delivered to one worker, acknowledged, and then deleted, which is ideal for distributing independent units of work where order rarely matters and you want competing consumers to drain a backlog. An event log/stream (Kafka, Kinesis) is an append-only, retained, replayable record: messages stay for a retention window, are ordered within a partition, and many independent consumer groups can each read the full stream at their own offset. So the deciding questions are: do multiple independent consumers need the same events (stream), do you need replay and reprocessing from history (stream), or is this fire-and-forget work distribution that should vanish once done (queue)? For data pipelines you usually want the log so you can add new consumers and backfill by resetting offsets; for job dispatch a queue is simpler and cheaper.",
+    "fj": "A queue and Kafka are basically the same thing.",
+    "fs": "A queue deletes a message after one worker acks it — great for work distribution. A log retains and reorders events so many consumer groups can replay independently. For pipelines I want the log so I can add consumers and backfill; for job dispatch a queue is simpler.",
+    "level": "Mid",
+    "asked": 17
+  },
+  {
+    "q": "Design rate limiting for a public API. Walk me through the token bucket algorithm and why you'd choose it over a fixed window.",
+    "a": "A fixed-window counter (N requests per minute) is simple but allows a burst of up to 2N across the boundary — a client can fire N at 0:59 and N more at 1:00. The token bucket fixes this: a bucket holds up to B tokens and refills at a steady rate R per second; each request consumes a token, and if the bucket is empty the request is rejected or queued. This caps the long-run average at R while still permitting a controlled burst of size B, which matches real client behavior and is friendlier than the leaky bucket's strictly-smoothed output. In a distributed setup you keep the counter in a shared store like Redis (using an atomic Lua script or INCR with expiry) keyed per client so all API nodes share one limit, and you return 429 with a Retry-After header. Token bucket is the common default because it bounds the average without punishing legitimate short bursts.",
+    "fj": "I'll just count requests per minute and reset the counter each minute.",
+    "fs": "A fixed window lets a client double the limit across the boundary. Token bucket caps the long-run average at the refill rate while allowing a bounded burst, and I keep the counter in Redis with an atomic op so all nodes share one limit.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "label": "Token bucket check",
+        "lang": "python",
+        "lines": [
+          "now = time()",
+          "tokens = min(B, tokens + (now-last)*R)",
+          "last = now",
+          "if tokens >= 1:",
+          "    tokens -= 1; allow()",
+          "else: reject(429)  # Retry-After"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Before designing, an interviewer asks for back-of-the-envelope capacity estimates for a system ingesting 100M events/day. Walk me through the math.",
+    "a": "Convert daily volume to a per-second rate first: 100M/day divided by ~86,400 seconds is roughly 1,150 events/sec average, and I assume peak is 2 to 5x average, so I design the ingestion path for about 3,000 to 5,000 events/sec. For storage, multiply event count by average serialized size — at ~1 KB/event that is 100 GB/day raw, so ~3 TB/month and ~36 TB/year before compression, which columnar formats typically cut 3 to 5x. I then sanity-check throughput against the chosen transport (e.g., how many Kafka partitions at a safe per-partition rate) and storage against retention and budget. The point of the estimate is not precision but order of magnitude: it tells me whether this is a single-node job or a partitioned distributed system, and which component is the likely bottleneck before I draw a single box.",
+    "fj": "I'd just start drawing the architecture and size it later.",
+    "fs": "First I do the math: 100M/day is ~1,150/sec average, design for 3-5k/sec peak; at 1KB/event that's 100GB/day raw, ~36TB/year before compression. That order-of-magnitude tells me distributed vs single-node before I draw anything.",
+    "level": "Mid",
+    "asked": 20
+  },
+  {
+    "q": "How do you deduplicate a high-volume event stream at scale without holding every ID you've ever seen in memory?",
+    "a": "True exact dedup over all history requires remembering every event_id forever, which is unbounded, so production dedup is almost always windowed: you keep a set of seen IDs for a bounded time window (say the last 24 hours, matching how late your duplicates realistically arrive) in a state store with TTL eviction, and treat anything outside the window as new. For approximate, memory-cheap dedup you use a Bloom filter, which answers 'definitely new' or 'probably seen' in a few bits per key, accepting a tunable false-positive rate that may drop a rare real event — fine for metrics, not for billing. The durable backstop for exactness is an idempotent sink: even if a duplicate slips through the window, a MERGE on event_id at the warehouse converges to the correct result. So the layered answer is a windowed seen-set or Bloom filter for cheap inline dedup plus an idempotent MERGE for correctness.",
+    "fj": "I'll keep a set of every event ID I've ever seen and check membership.",
+    "fs": "An all-time ID set is unbounded. I dedup over a bounded window with TTL eviction (or a Bloom filter for cheap approximate dedup), and lean on an idempotent MERGE-on-event_id at the sink as the exact backstop.",
+    "level": "Sr",
+    "asked": 17,
+    "code": [
+      {
+        "label": "Windowed seen-set",
+        "lang": "python",
+        "lines": [
+          "# Redis SET with TTL = dedup window",
+          "new = redis.set(f'seen:{event_id}',",
+          "                1, nx=True, ex=86400)",
+          "if not new:",
+          "    skip()   # duplicate within 24h",
+          "# warehouse MERGE = exact backstop"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A single tenant's traffic is creating a hot partition in your warehouse table and queries on it are slow. How do you diagnose and mitigate it?",
+    "a": "First confirm it is skew, not a global problem: compare per-partition row counts or bytes and look for one partition (one tenant, one day, one device type) holding a disproportionate share — a max-to-average ratio well above 2 is the signal. The mitigations, in order of preference: change the partitioning scheme so the key spreads more evenly (a composite key like tenant_id plus a time bucket, or partition by date and sub-cluster within), or salt the single intractable hot key with a bounded suffix so it fans across N physical partitions, accepting that you must union the salt buckets on read. For read performance specifically, add clustering/sort within the partition or pre-aggregate the whale tenant separately. The anti-pattern is just adding compute — that does not help when one partition is the bottleneck, because the work cannot be split below the partition boundary.",
+    "fj": "I'd just give the cluster more compute to power through it.",
+    "fs": "More compute can't split work below a single hot partition. I confirm skew via per-partition byte ratio, then repartition on a composite key or salt the one hot key across N buckets, unioning them on read.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "label": "Salt a hot tenant",
+        "lang": "sql",
+        "accent": "fix",
+        "lines": [
+          "-- write: spread whale across 8 buckets",
+          "salt = abs(hash(row_id)) % 8",
+          "PARTITION BY (tenant_id, salt)",
+          "-- read: union the salt buckets back",
+          "WHERE tenant_id = :t"
+        ]
+      }
+    ]
+  }
+]

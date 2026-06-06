@@ -1,0 +1,504 @@
+[
+  {
+    "q": "What does 'least privilege' mean in IAM, and how do you actually arrive at a least-privilege policy?",
+    "a": "Least privilege means a principal gets only the permissions it needs to do its job, nothing more. In practice you start from zero (deny by default) and grant specific actions on specific resources, often scoped further with conditions. The credible path is to grant broadly in dev, then use access-analysis tooling (e.g. AWS IAM Access Analyzer, which reads CloudTrail) to generate a policy from the actions actually used, and tighten from there.",
+    "fs": "I generate policies from observed CloudTrail activity via Access Analyzer, scope by resource ARN and conditions, and review unused permissions on a schedule.",
+    "fj": "I just attach the AWS managed PowerUserAccess or AdministratorAccess policy so it works.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Resource-scoped, deny-by-default",
+        "lang": "ts",
+        "lines": [
+          "{",
+          "  \"Effect\": \"Allow\",",
+          "  \"Action\": [\"s3:GetObject\"],",
+          "  \"Resource\":",
+          "    \"arn:aws:s3:::reports/2026/*\"",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between an IAM permissions boundary and a Service Control Policy (SCP)?",
+    "a": "Both set a maximum (a ceiling), not a grant. A permissions boundary is attached per-identity (user or role) to cap what its identity-based policies can grant, which is ideal for delegating role creation safely. An SCP is an AWS Organizations guardrail that applies to every principal in an account or OU automatically, so it scales for org-wide least privilege. Effective permissions are the intersection: an action must be allowed by the SCP, the boundary, and the identity policy.",
+    "fs": "SCPs for org-wide guardrails that auto-apply to new accounts, boundaries for delegating role creation without privilege escalation; effective perms are the intersection of all three.",
+    "fj": "They're basically the same thing, just an allow-list of permissions.",
+    "level": "Sr"
+  },
+  {
+    "q": "Why prefer IAM roles over long-lived access keys for application and service access?",
+    "a": "Roles deliver short-lived, automatically-rotated credentials via STS, so there is no static secret to leak, commit, or forget to rotate. Workloads assume a role (instance profile, IRSA on EKS, or OIDC federation from CI like GitHub Actions) and receive temporary tokens scoped to that role. Long-lived keys are the most common cause of breaches because they live in env vars and config files indefinitely.",
+    "fs": "I use OIDC federation and instance/IRSA roles so nothing holds a static key; STS credentials expire in minutes and rotate automatically.",
+    "fj": "I create an IAM user, generate an access key, and put it in the app's environment variables.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "GitHub Actions OIDC, no stored key",
+        "lang": "ts",
+        "lines": [
+          "- uses: aws-actions/",
+          "    configure-aws-credentials@v4",
+          "  with:",
+          "    role-to-assume: arn:aws:iam::",
+          "      111122223333:role/ci-deploy",
+          "    aws-region: us-east-1"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain encryption at rest versus encryption in transit, and why you need both.",
+    "a": "Encryption in transit (TLS) protects data moving across the network from eavesdropping and tampering; encryption at rest protects stored data (disks, object stores, backups, snapshots) if media or storage is compromised. They defend different threat models, so one is not a substitute for the other. A complete posture enforces TLS 1.2+ on every connection and uses server-side encryption (e.g. SSE-KMS, encrypted EBS/RDS) for everything persisted, including backups.",
+    "fs": "I enforce TLS 1.2+ end to end and default-encrypt all storage with KMS, including snapshots and backups, since the threat models are different.",
+    "fj": "We use HTTPS, so the data is already encrypted everywhere.",
+    "level": "Jr"
+  },
+  {
+    "q": "What is envelope encryption and why does KMS use it instead of encrypting data directly?",
+    "a": "Envelope encryption encrypts data with a data encryption key (DEK), then encrypts that DEK with a key encryption key (KEK) that never leaves KMS. KMS's GenerateDataKey returns a plaintext DEK (used locally, then discarded) and an encrypted DEK that you store alongside the ciphertext. This avoids sending bulk data over the network to KMS (KMS only handles small keys), scales to large objects, and lets you rotate the KEK without re-encrypting all data.",
+    "fs": "DEK encrypts the data locally, KMS only wraps the DEK with a KEK that never leaves the HSM, so rotation re-wraps keys instead of re-encrypting petabytes.",
+    "fj": "I just send the whole file to KMS and it encrypts it for me.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Generate + use a data key",
+        "lang": "ts",
+        "lines": [
+          "aws kms generate-data-key \\",
+          "  --key-id alias/app-kek \\",
+          "  --key-spec AES_256",
+          "# returns Plaintext (use, wipe)",
+          "# and CiphertextBlob (store w/ data)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the danger of storing secrets in environment variables or a .env file committed to git?",
+    "a": "Secrets in env vars leak through crash dumps, logs, child processes, and CI output, and once committed to git they persist in history forever even after deletion. The fix is a dedicated secrets manager (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager) that the app fetches at runtime, plus pre-commit scanning (gitleaks, trufflehog) and a .gitignore for .env files. If a secret was ever committed, it must be rotated, not just removed.",
+    "fs": "Secrets come from a manager at runtime with audit logging; I gate commits with gitleaks and treat any committed secret as compromised and rotate it.",
+    "fj": "I added the .env to .gitignore after committing it, so we're fine now.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Block secrets pre-commit",
+        "lang": "ts",
+        "lines": [
+          "# .pre-commit-config.yaml",
+          "- repo: https://github.com/",
+          "    gitleaks/gitleaks",
+          "  hooks:",
+          "    - id: gitleaks"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between dynamic secrets and rotated static secrets in a system like Vault?",
+    "a": "A rotated static secret is one long-lived credential that Vault periodically changes (the secret still exists between rotations and is shared by all consumers). A dynamic secret is generated on demand per request with a short lease/TTL and is automatically revoked when the lease expires, so credentials are unique, short-lived, and don't exist until read. Dynamic secrets shrink the blast radius and exposure window dramatically; static rotation is the fallback when a backend can't issue credentials dynamically.",
+    "fs": "I prefer per-request dynamic secrets with 1-hour TTLs and automatic lease revocation; static rotation is only for backends that can't mint credentials on demand.",
+    "fj": "Rotation means changing the password every 90 days in a spreadsheet.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Dynamic DB creds, 1h lease",
+        "lang": "ts",
+        "lines": [
+          "vault read database/creds/app-ro",
+          "# username: v-token-app-ro-x9...",
+          "# password: <generated>",
+          "# lease_duration: 3600s",
+          "# revoked automatically at TTL"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you safely rotate a database credential that a live service is using without downtime?",
+    "a": "Use a dual-secret (two-password) rotation pattern: create a second credential, deploy it so the app can use either, switch traffic to the new one, verify, then retire the old. AWS Secrets Manager implements this with an alternating-users Lambda; the app always reads the current secret from the manager rather than caching it. The key is overlap: both the old and new credentials are valid during the cutover so no in-flight request fails.",
+    "fs": "Alternating-user rotation with an overlap window where both creds are valid, and the app resolves the secret at connect time so cutover is seamless.",
+    "fj": "I change the password in the database and then quickly update the app config before too many requests fail.",
+    "level": "Sr"
+  },
+  {
+    "q": "What is PII and how should it be governed differently from ordinary data?",
+    "a": "PII (personally identifiable information) is data that can identify a person directly (name, SSN, email) or indirectly when combined. Governance requires data classification and a catalog so you know where PII lives, access controls and masking so only authorized roles see raw values, encryption, retention/deletion policies tied to regulations (GDPR, CCPA), and audit logging of access. The first practical step is discovery and tagging columns by sensitivity, because you can't protect what you haven't classified.",
+    "fs": "I classify and tag PII columns in the catalog first, then enforce masking, retention, and access policies that reference those tags so controls follow the data.",
+    "fj": "PII is just any data, and we keep it all in the warehouse forever in case we need it.",
+    "level": "Jr"
+  },
+  {
+    "q": "Compare dynamic data masking, static masking, and tokenization for protecting PII columns.",
+    "a": "Dynamic data masking hides values at query time based on the querying role; the raw data still sits in storage, so it's good for read-time least exposure but not anonymization. Static masking permanently replaces sensitive values with realistic fakes, ideal for non-prod/test copies where raw data should never exist. Tokenization replaces sensitive values with undecipherable tokens that can be detokenized only by an authorized service, giving reversible protection with the real data held outside the analytics store.",
+    "fs": "Dynamic masking for read-time role-based exposure, static masking for non-prod copies, and tokenization when I need reversible de-identification with the raw value kept out of the warehouse.",
+    "fj": "Masking and tokenization are the same; I just hash the column and call it done.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Snowflake masking policy",
+        "lang": "sql",
+        "lines": [
+          "CREATE MASKING POLICY mask_email AS",
+          "  (val string) RETURNS string ->",
+          "  CASE WHEN CURRENT_ROLE()",
+          "         IN ('PII_READER') THEN val",
+          "  ELSE '***MASKED***' END;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the principle of network isolation, and how do public vs private subnets implement it in a VPC?",
+    "a": "Network isolation limits which resources can reach each other so a compromise can't move laterally. In a VPC, a public subnet has a route to an internet gateway (for load balancers, NAT), while a private subnet has no inbound route from the internet; databases and app servers live there and reach out only via a NAT gateway. Security groups (stateful, instance-level) and network ACLs (stateless, subnet-level) further restrict traffic, ideally allowing only the specific ports and source groups required.",
+    "fs": "Data tier in private subnets with no IGW route, egress via NAT, and security groups that reference other SGs by ID rather than CIDR ranges.",
+    "fj": "I put everything in one subnet and open the security group to 0.0.0.0/0 so the services can talk.",
+    "level": "Jr"
+  },
+  {
+    "q": "How do you let a service in a private subnet reach AWS APIs (like S3 or KMS) without sending traffic over the internet?",
+    "a": "Use VPC endpoints: a gateway endpoint for S3 and DynamoDB, or interface endpoints (PrivateLink, an ENI with a private IP) for services like KMS, Secrets Manager, and most others. Traffic stays on the AWS network, you can drop the NAT gateway dependency for those calls, and you can attach endpoint policies plus security groups to restrict who uses the endpoint. This both improves security (no internet exposure) and reduces NAT data-processing cost.",
+    "fs": "Interface/gateway VPC endpoints keep S3, KMS, and Secrets Manager traffic on PrivateLink, and endpoint policies further restrict which principals and buckets are reachable.",
+    "fj": "I just open the NAT gateway to the internet so it can hit the AWS APIs.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Interface endpoint (Terraform)",
+        "lang": "ts",
+        "lines": [
+          "resource \"aws_vpc_endpoint\" \"kms\" {",
+          "  vpc_id = aws_vpc.main.id",
+          "  service_name = \"com.amazonaws.",
+          "    us-east-1.kms\"",
+          "  vpc_endpoint_type = \"Interface\"",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the #1 risk in the OWASP Top 10 2025, and how do you defend against it?",
+    "a": "Broken Access Control is #1 in OWASP Top 10 2025 (and SSRF was folded into it). It occurs when users can act outside their intended permissions, e.g. by tampering with an ID in a URL (IDOR), forced browsing, or missing function-level checks. Defenses: deny by default, enforce authorization server-side on every request (never trust the client), verify object ownership before returning data, and use centralized access-control logic rather than scattered per-endpoint checks.",
+    "fs": "Deny by default, enforce ownership/authorization server-side on every object access through one central policy layer, and treat SSRF as an access-control problem too.",
+    "fj": "We hide the admin page link in the UI so regular users can't get to it.",
+    "level": "Mid"
+  },
+  {
+    "q": "What is a Software Supply Chain Failure (new in OWASP Top 10 2025) and how do you mitigate it?",
+    "a": "Software Supply Chain Failures (A03:2025) cover risks from third-party dependencies, build pipelines, and distribution: malicious or compromised packages, typosquatting, dependency confusion, and tampered build artifacts. Mitigations include pinning dependencies with lockfiles and hashes, generating and verifying an SBOM, scanning dependencies (e.g. with SCA tooling) for known CVEs, using signed artifacts and provenance (SLSA, Sigstore/cosign), and isolating/hardening CI so a build can't be tampered with.",
+    "fs": "I pin with hash-locked lockfiles, generate an SBOM, verify artifact provenance with SLSA/cosign signatures, and gate CI on SCA scans for known CVEs.",
+    "fj": "We just run npm install of the latest versions; popular packages are safe.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Verify a signed artifact",
+        "lang": "ts",
+        "lines": [
+          "cosign verify \\",
+          "  --certificate-identity \\",
+          "    deploy@corp.com \\",
+          "  --certificate-oidc-issuer \\",
+          "    https://accounts.google.com \\",
+          "  ghcr.io/corp/api:1.4.2"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is dependency confusion and how do you prevent it?",
+    "a": "Dependency confusion is a supply-chain attack where an attacker publishes a package to a public registry using the same name as one of your private/internal packages with a higher version number; the resolver pulls the malicious public one. Prevention: scope/namespace internal packages, configure the package manager to pull internal names only from the private registry, pin and hash-lock versions, and reserve your internal names on the public registry so they can't be claimed.",
+    "fs": "I namespace internal packages, lock each scope to its registry, hash-pin versions, and pre-register internal names publicly so the public registry can't shadow them.",
+    "fj": "Our internal packages have unique names, so nobody could publish the same thing.",
+    "level": "Sr"
+  },
+  {
+    "q": "What should an effective audit log capture, and why must audit logs be tamper-resistant?",
+    "a": "An audit log should record who did what, to which resource, when, from where, and the outcome (allow/deny), with a stable identifier and enough context to reconstruct events. It must be tamper-resistant because if an attacker who gains access can also edit or delete logs, the trail is worthless for incident response and compliance. You achieve this with append-only, immutable storage (e.g. S3 Object Lock / WORM), shipping logs to a separate account or system, and integrity validation (CloudTrail log file validation, hash chaining).",
+    "fs": "Logs go to a separate, append-only WORM store in a logging account with CloudTrail file-integrity validation, so even an admin in the workload account can't rewrite history.",
+    "fj": "The app writes a log line to the same database table, and admins can clean it up if needed.",
+    "level": "Mid"
+  },
+  {
+    "q": "Why centralize audit logs into a separate, locked-down account or system?",
+    "a": "Centralizing logs into a dedicated logging account (or SIEM) means an attacker who compromises a workload account cannot also alter or destroy the evidence, since they lack access to the log store. It also enables consistent retention, cross-account correlation, and a single place to run detections and alerts. In AWS this is typically an Organization-level CloudTrail writing to an S3 bucket in a separate account with Object Lock and restricted, monitored access.",
+    "fs": "A central org-trail to a dedicated logging account with Object Lock and break-glass-only access separates the auditor from the audited.",
+    "fj": "Each team keeps its own logs in its own account so they can manage them.",
+    "level": "Sr"
+  },
+  {
+    "q": "Why should you rotate encryption keys, and what does KMS automatic key rotation actually do?",
+    "a": "Key rotation limits how much data is protected by any single key, so a compromised key exposes a smaller window, and it satisfies compliance mandates. With AWS KMS automatic rotation, KMS generates new key material annually (or on a configurable period) but keeps old material so previously encrypted data still decrypts transparently; the key ID and ciphertext metadata are unchanged, so you don't re-encrypt anything. For imported or customer-managed material you must rotate manually and re-wrap data keys.",
+    "fs": "KMS automatic rotation swaps backing material on a schedule while retaining old versions for decrypt, so rotation is a metadata change, not a re-encryption of all ciphertext.",
+    "fj": "Rotating keys means I have to download and re-encrypt every object with a brand new key.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Enable annual rotation",
+        "lang": "ts",
+        "lines": [
+          "aws kms enable-key-rotation \\",
+          "  --key-id alias/app-kek \\",
+          "  --rotation-period-in-days 365"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a customer-managed key (CMK) versus an AWS-managed key, and when do you need a CMK?",
+    "a": "An AWS-managed key is created and controlled by a service on your behalf with limited configurability; a customer-managed key is one you create and fully control: its key policy, grants, rotation schedule, and crucially the ability to deny or revoke access. You need a customer-managed key when you require a custom key policy (e.g. cross-account access), control over rotation, the ability to disable/delete the key to make data unreadable, or auditable, granular access via CloudTrail. The trade-off is you own the operational responsibility.",
+    "fs": "I use customer-managed keys when I need custom key policies, cross-account grants, controllable rotation, or the kill-switch ability to revoke decrypt access.",
+    "fj": "AWS-managed and customer-managed keys are the same; I just pick whatever default shows up.",
+    "level": "Sr"
+  },
+  {
+    "q": "How do you enforce that an S3 bucket is never publicly accessible and always encrypted?",
+    "a": "Layer the controls: enable S3 Block Public Access at both the account and bucket level (which overrides permissive ACLs/policies), set a default encryption configuration (SSE-KMS) so every object is encrypted, and add a bucket policy that denies any PutObject without the expected encryption header and denies non-TLS access via aws:SecureTransport. Then enforce org-wide with an SCP or AWS Config rule so the guardrail can't be turned off per-bucket. Defense in depth means a single misconfiguration doesn't expose data.",
+    "fs": "Account-level Block Public Access plus default SSE-KMS, a deny-insecure-transport bucket policy, and an SCP/Config rule so no one can re-open it.",
+    "fj": "I'll just remember to uncheck 'make public' when I create each bucket.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Deny non-TLS access",
+        "lang": "ts",
+        "lines": [
+          "{",
+          "  \"Effect\": \"Deny\",",
+          "  \"Principal\": \"*\",",
+          "  \"Action\": \"s3:*\",",
+          "  \"Resource\": \"arn:aws:s3:::data/*\",",
+          "  \"Condition\": { \"Bool\": {",
+          "    \"aws:SecureTransport\": \"false\"",
+          "  } } }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is SQL injection (an OWASP perennial) and what is the single most effective defense?",
+    "a": "SQL injection happens when untrusted input is concatenated into a SQL string, letting an attacker change the query's meaning to read, modify, or destroy data. The single most effective defense is parameterized queries (prepared statements), which send the SQL structure and the data separately so input is always treated as a value, never as code. Input validation, least-privilege DB accounts, and an allow-list for things like ORDER BY columns are useful layers, but never a substitute for parameterization.",
+    "fs": "Always parameterized statements so data can't change query structure, backed by least-privilege DB roles and allow-lists for any identifier that can't be a bind parameter.",
+    "fj": "I escape quotes in the input string before building the query, that's enough.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Parameterized, not concatenated",
+        "lang": "python",
+        "lines": [
+          "cur.execute(",
+          "  \"SELECT * FROM users \"",
+          "  \"WHERE email = %s\",",
+          "  (user_email,),",
+          ")"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "What is the principle of separation of duties, and how does break-glass access fit in?",
+    "a": "Separation of duties means no single person can complete a sensitive end-to-end action alone (e.g. the developer who writes a change isn't the sole approver who deploys it to prod), which reduces fraud and mistakes. For emergencies you provide break-glass access: a tightly scoped, heavily audited, time-bound elevation (often requiring MFA and generating immediate alerts) that is used only when normal approval paths are unavailable. The combination keeps day-to-day access minimal while still allowing controlled emergency response.",
+    "fs": "Day-to-day least privilege with peer-approved promotions, plus a monitored, time-boxed, MFA-gated break-glass role that pages security the moment it's assumed.",
+    "fj": "We give the on-call engineer permanent admin so they can fix anything fast.",
+    "level": "Sr"
+  },
+  {
+    "q": "What is the difference between authentication and authorization, and why must you not conflate them?",
+    "a": "Authentication (authN) answers 'who are you' by verifying identity with credentials, a token, or a certificate; authorization (authZ) answers 'what may you do' by checking that the proven identity has permission for a specific action on a specific resource. They are separate stages: a user can be perfectly authenticated and still be denied. The classic data-platform bug is verifying login but never re-checking object ownership, which becomes an IDOR/broken-access-control hole. Both checks belong server-side on every request, never inferred from the client.",
+    "fs": "AuthN proves identity, authZ checks permission per action and resource; I enforce both server-side on every request and never assume a logged-in user is allowed.",
+    "fj": "If the user logged in successfully, they're authorized to see the data.",
+    "level": "Jr",
+    "asked": 14
+  },
+  {
+    "q": "Explain the difference between OAuth 2.0, OIDC, and SAML, and which you'd reach for.",
+    "a": "OAuth 2.0 is an authorization framework: it issues access tokens that let an app call an API on a user's behalf, but it says nothing about identity. OIDC (OpenID Connect) is a thin authentication layer on top of OAuth 2.0 that adds an ID token (a signed JWT) so you actually learn who the user is, and it's the modern choice for web, SPA, and mobile login. SAML is an older XML-based, browser-redirect protocol still dominant for enterprise SSO. For any non-browser client (mobile, CLI, SPA), use Authorization Code flow with PKCE; SAML doesn't fit native apps well.",
+    "fs": "OAuth2 = API authorization, OIDC = authentication via an ID token on top of OAuth2, SAML = enterprise XML SSO; for mobile/SPA I use Authorization Code + PKCE.",
+    "fj": "OAuth logs the user in, so it's basically a login protocol.",
+    "level": "Mid",
+    "asked": 16
+  },
+  {
+    "q": "Why is the Authorization Code flow with PKCE preferred over the Implicit flow for SPAs and mobile apps?",
+    "a": "The Implicit flow returned tokens directly in the URL fragment, exposing them to browser history, logs, and referrer leakage, and is now deprecated. Authorization Code returns a short-lived code that's exchanged server-side for tokens. PKCE (Proof Key for Code Exchange, RFC 7636) hardens this for public clients that can't keep a secret: the client sends a hashed code_challenge up front and the original code_verifier at exchange, so an attacker who intercepts the code can't redeem it. It's now the recommended flow for every client type.",
+    "fs": "Authorization Code + PKCE binds the code to the client via a verifier so a stolen code is useless; Implicit leaked tokens in the URL and is deprecated.",
+    "fj": "SPAs should use the Implicit flow since they can't keep a client secret.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "label": "PKCE challenge",
+        "lang": "python",
+        "lines": [
+          "verifier = secrets.token_urlsafe(64)",
+          "challenge = b64url(sha256(",
+          "  verifier.encode()).digest())",
+          "# send challenge on /authorize,",
+          "# send verifier on /token exchange"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are the most dangerous JWT pitfalls, and how do you avoid them?",
+    "a": "Three big ones: accepting alg:none (an unsigned token) or letting the token dictate the algorithm, which lets an attacker forge tokens or downgrade RS256 to HS256 using the public key as the HMAC secret; not validating exp, iss, and aud, so stale or wrong-audience tokens are accepted; and storing tokens in localStorage where any XSS steals them. Fixes: pin the expected algorithm server-side, verify the signature plus standard claims, keep access tokens short-lived, and store them in memory with the refresh token in an HttpOnly, Secure, SameSite cookie.",
+    "fs": "I pin the algorithm server-side, reject alg:none, validate exp/iss/aud, keep access tokens short, and never put them in localStorage where XSS can lift them.",
+    "fj": "JWTs are signed, so as long as it decodes I can trust the claims inside.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "label": "Pin algo, verify claims",
+        "lang": "python",
+        "lines": [
+          "jwt.decode(token, pub_key,",
+          "  algorithms=['RS256'],",
+          "  audience='api',",
+          "  issuer='https://idp')",
+          "# never trust header.alg;",
+          "# never pass algorithms=None"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Compare RBAC and ABAC for access control. When does ABAC earn its complexity?",
+    "a": "RBAC (role-based) grants permissions to roles and assigns users to roles, so access depends on a coarse role like 'analyst' or 'admin' — simple to reason about and audit, but it suffers role explosion when you need fine context. ABAC (attribute-based) evaluates a policy over attributes of the subject, resource, action, and environment (department, data classification, region, time), so one policy can express 'analysts may read rows tagged for their own region'. ABAC earns its complexity for data-residency, multi-tenant, and row/column-scoped rules where RBAC would need an unmanageable number of roles. Many real systems combine both.",
+    "fs": "RBAC keys off roles and is easy to audit; ABAC evaluates subject/resource/environment attributes and shines for region, tenancy, and classification rules where roles would explode.",
+    "fj": "ABAC is just RBAC with more roles.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "How do row-level and column-level security work, and why enforce them in the database rather than the application?",
+    "a": "Row-level security (RLS) filters which rows a principal sees via a policy predicate (e.g. region = current user's region), while column-level security masks or restricts specific columns by role or tag. Enforcing them in the engine — Postgres RLS policies, Snowflake row access and masking policies, BigQuery authorized views — means every query path is covered: ad-hoc SQL, BI tools, and exports all obey the same rule. App-layer filtering is bypassed the moment someone connects directly or a new service forgets the WHERE clause, so the database is the only chokepoint that can't be skipped.",
+    "fs": "RLS predicates filter rows and masking policies restrict columns at the engine level, so every connection (BI, ad-hoc, export) is covered; app-side filtering is bypassed by any direct query.",
+    "fj": "I add a WHERE clause in the app to filter rows per tenant, that's enough.",
+    "level": "Mid",
+    "asked": 10,
+    "code": [
+      {
+        "label": "Postgres RLS policy",
+        "lang": "sql",
+        "lines": [
+          "ALTER TABLE orders",
+          "  ENABLE ROW LEVEL SECURITY;",
+          "CREATE POLICY tenant_iso ON orders",
+          "  USING (tenant_id =",
+          "    current_setting('app.tenant'));"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is Cross-Site Scripting (XSS), and what is the layered defense against it?",
+    "a": "XSS is when an attacker gets the browser to execute attacker-controlled script in your page's origin, letting them steal tokens, hijack sessions, or act as the user. Stored XSS persists the payload (e.g. in a comment), reflected XSS bounces it off a URL parameter, and DOM-based XSS happens entirely client-side via unsafe sinks like innerHTML. The primary defense is context-aware output encoding plus a templating framework that auto-escapes; layer on a strict Content-Security-Policy to block inline script, and avoid dangerous sinks. Sanitize only when you must render user HTML, using a vetted library.",
+    "fs": "I rely on auto-escaping templates and context-aware encoding, add a strict CSP, and avoid innerHTML; sanitization with a vetted library is the last resort for user-supplied HTML.",
+    "fj": "I strip <script> tags from the input and it's safe.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "What is CSRF, how does it differ from XSS, and how do you prevent it?",
+    "a": "CSRF (Cross-Site Request Forgery) tricks a logged-in user's browser into sending a state-changing request to your site, abusing automatically-attached cookies — the attacker never sees the response, they just cause an action. It differs from XSS, which runs script in your origin to read data and tokens. Prevent CSRF with the SameSite cookie attribute (Lax or Strict) so cookies aren't sent on cross-site requests, plus anti-CSRF tokens (synchronizer or double-submit) on mutations. Token-in-header APIs (Authorization: Bearer) are largely immune because the token isn't auto-attached like a cookie.",
+    "fs": "CSRF abuses auto-sent cookies to forge state changes; I defend with SameSite cookies plus anti-CSRF tokens, and bearer-token APIs are mostly immune since the header isn't auto-attached.",
+    "fj": "CSRF and XSS are the same browser attack with different names.",
+    "level": "Mid",
+    "asked": 11
+  },
+  {
+    "q": "What is the zero-trust security model and how does it differ from the perimeter model?",
+    "a": "The perimeter (castle-and-moat) model trusts anything inside the network, so one breached host can move laterally to everything. Zero trust drops implicit network trust: every request is authenticated, authorized, and encrypted based on identity and device posture, regardless of source IP — 'never trust, always verify'. In practice that means per-service identity (mTLS, signed tokens), least-privilege authorization on every call, microsegmentation, and continuous verification rather than a one-time VPN gate. For data platforms it means a service in the same VPC still has to prove who it is to reach the warehouse.",
+    "fs": "Zero trust removes implicit network trust: every request is authenticated and authorized by identity/device, not by being 'inside', so a breached host can't roam laterally.",
+    "fj": "Once a service is inside the VPC it's trusted, that's what the private network is for.",
+    "level": "Sr",
+    "asked": 13
+  },
+  {
+    "q": "What is mTLS and when do you require it over ordinary one-way TLS?",
+    "a": "Ordinary TLS authenticates only the server to the client and encrypts the channel; mutual TLS (mTLS) adds a client certificate so both sides prove identity, giving strong cryptographic service-to-service authentication. You require it for zero-trust service meshes, machine-to-machine APIs, and database/broker connections where you want to authenticate the caller by certificate rather than a shared secret. The cost is certificate lifecycle: issuance, rotation, and revocation, usually handled by a mesh (Istio/Linkerd) or a private CA so short-lived certs rotate automatically. It complements, not replaces, app-layer authorization.",
+    "fs": "mTLS makes both client and server present certificates, giving cryptographic service identity for zero-trust meshes and M2M; a mesh or private CA automates short-lived cert rotation.",
+    "fj": "TLS already encrypts the traffic, so mTLS is just redundant overhead.",
+    "level": "Sr",
+    "asked": 9
+  },
+  {
+    "q": "What does STRIDE give you in threat modeling, and how do you use it on a data pipeline?",
+    "a": "STRIDE is Microsoft's mnemonic for six threat categories: Spoofing (faking identity), Tampering (altering data/code), Repudiation (denying an action), Information disclosure (leaking data), Denial of service, and Elevation of privilege. You draw a data-flow diagram, mark trust boundaries, then walk each element asking which STRIDE threats apply and what control mitigates each — Spoofing maps to strong authN, Tampering to integrity/signing, Repudiation to audit logging, Information disclosure to encryption and least privilege. On a pipeline you'd model the ingest endpoint, the warehouse, and each cross-account hop as a trust boundary.",
+    "fs": "STRIDE = Spoofing, Tampering, Repudiation, Information disclosure, DoS, Elevation of privilege; I walk a data-flow diagram's trust boundaries and map each threat to a concrete control.",
+    "fj": "Threat modeling is just running a vulnerability scanner before release.",
+    "level": "Sr",
+    "asked": 10
+  },
+  {
+    "q": "What is the 'lethal trifecta' for AI agents, and how do you break it?",
+    "a": "Coined by Simon Willison, the lethal trifecta is when an LLM agent simultaneously has access to private data, exposure to untrusted content, and the ability to externally communicate (exfiltrate). Any agent with all three is structurally vulnerable: a prompt injection hidden in a document or email can instruct it to read secrets and send them out, with no traditional code bug involved. You break it by removing one leg — strip exfiltration channels, isolate untrusted input from privileged tools, or gate sensitive actions behind human approval. Detecting the injected text reliably is not a solution; the architecture must not allow all three at once.",
+    "fs": "The lethal trifecta is private data + untrusted content + exfiltration in one agent; I break it by removing a leg (no outbound channel, sandboxed untrusted input, or human-in-the-loop) rather than trusting a filter.",
+    "fj": "We add a system prompt telling the model to ignore injected instructions, so it's safe.",
+    "level": "Sr",
+    "asked": 18
+  },
+  {
+    "q": "What is indirect prompt injection, and how does it threaten a RAG or tool-using system?",
+    "a": "Indirect prompt injection plants malicious instructions in content the model will later ingest — a web page, a PDF, a retrieved document, a calendar invite — so the attacker never talks to the model directly. In a RAG pipeline, a poisoned chunk retrieved into context can hijack the model to leak other context, call tools, or emit a data-exfiltrating link or image. Because the model can't reliably distinguish trusted instructions from untrusted data in the same context window, defenses are architectural: treat all retrieved content as untrusted, constrain tool scope and output channels, sanitize/escape rendered output, and require approval for high-impact actions.",
+    "fs": "Indirect injection hides instructions in retrieved/ingested content; since the model can't separate data from instructions, I treat all retrieved text as untrusted and constrain tools and output channels.",
+    "fj": "Only the user can prompt-inject, so validating the user's message is enough.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "How do you classify data, and why is classification the foundation of every other control?",
+    "a": "Data classification tags data by sensitivity — typically public, internal, confidential, and restricted/PII — usually at the column or asset level in a catalog. It's foundational because every downstream control (encryption strength, masking, retention, who can grant access, where it may be stored) keys off the label: you can't enforce a residency or masking rule on data you haven't categorized. The practical pattern is automated discovery/classification feeding tags, then policies that reference tags rather than column names, so controls follow the data as it flows and new columns inherit protection automatically.",
+    "fs": "I tag data by sensitivity in the catalog and write tag-based policies, so masking, retention, and access controls follow the data instead of being hand-applied per column.",
+    "fj": "Classification is paperwork; the real security is encryption.",
+    "level": "Jr",
+    "asked": 9
+  },
+  {
+    "q": "What is data residency, and how do GDPR and CCPA shape where and how long you keep data?",
+    "a": "Data residency is the requirement that certain data physically live (and sometimes be processed) within a specific jurisdiction. GDPR (EU) grants rights like access, deletion ('right to be forgotten'), and portability, requires a lawful basis and data-minimization, and restricts cross-border transfers; CCPA/CPRA (California) adds opt-out of sale and deletion rights. Practically this means region-pinned storage and compute, deletion and retention pipelines that can actually purge a subject across systems and backups, and a data map proving where PII lives. Multi-region warehouses must keep EU data in EU regions and avoid silent replication elsewhere.",
+    "fs": "Residency pins PII to a jurisdiction; GDPR/CCPA force deletion, minimization, and transfer limits, so I region-pin storage/compute and build deletion pipelines that reach every copy including backups.",
+    "fj": "We store everything in us-east-1 and add a privacy policy page, that covers GDPR.",
+    "level": "Mid",
+    "asked": 11
+  },
+  {
+    "q": "Why do you hash passwords with bcrypt/Argon2 instead of SHA-256, and what is salting?",
+    "a": "Fast hashes like SHA-256 are built for speed, so an attacker with a leaked table can try billions of guesses per second; password hashing needs to be deliberately slow and memory-hard. bcrypt, scrypt, and Argon2 add a tunable work factor so each guess is expensive, blunting brute force. A unique random salt per password (stored alongside the hash) ensures identical passwords produce different hashes and defeats precomputed rainbow tables. Argon2id is the current recommendation for new systems; never store plaintext, never use a single fast hash, and never reuse one global salt.",
+    "fs": "Passwords need a slow, memory-hard hash (Argon2id/bcrypt) with a tunable work factor and a unique per-password salt; SHA-256 is too fast and salting defeats rainbow tables.",
+    "fj": "We SHA-256 the password before storing it, so it's hashed and safe.",
+    "level": "Jr",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Argon2id, per-password salt",
+        "lang": "python",
+        "lines": [
+          "from argon2 import PasswordHasher",
+          "ph = PasswordHasher()",
+          "h = ph.hash(password)  # salt baked in",
+          "ph.verify(h, attempt)",
+          "# never store plaintext or raw SHA256"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "What is multi-factor authentication, and why are phishing-resistant factors better than SMS or TOTP?",
+    "a": "MFA requires two or more independent factors — something you know (password), have (a key or phone), or are (biometric) — so a stolen password alone isn't enough. But not all second factors are equal: SMS codes are vulnerable to SIM-swap and interception, and TOTP/push can be phished or fatigue-bombed. Phishing-resistant factors based on FIDO2/WebAuthn (passkeys, hardware security keys) bind the credential to the site's origin, so a fake login page can't relay the challenge. For privileged and break-glass roles especially, require phishing-resistant MFA rather than SMS.",
+    "fs": "MFA combines independent factors; I prefer FIDO2/WebAuthn passkeys because they're origin-bound and phishing-resistant, unlike SMS (SIM-swap) or TOTP (relay/fatigue).",
+    "fj": "We text a 6-digit code, so the account is protected by MFA.",
+    "level": "Jr",
+    "asked": 12
+  },
+  {
+    "q": "Explain defense in depth, and give a concrete example layering controls around a data warehouse.",
+    "a": "Defense in depth assumes any single control will eventually fail, so you layer independent controls such that a breach must defeat several to cause harm. Around a warehouse that looks like: network isolation (private subnets, VPC endpoints, IP allow-lists) so it isn't reachable from the internet; strong authN (SSO + phishing-resistant MFA, no shared accounts); least-privilege RBAC plus row/column policies so an authenticated user still sees only their slice; encryption at rest and in transit with a customer-managed key kill-switch; and tamper-resistant audit logging to a separate account for detection. No one layer is trusted to be sufficient.",
+    "fs": "I stack independent controls — network isolation, MFA'd SSO, least-privilege RBAC plus RLS/masking, KMS encryption, and immutable audit logs — so defeating one layer still doesn't expose the data.",
+    "fj": "We encrypt the database, so the data is secure.",
+    "level": "Sr",
+    "asked": 10
+  }
+]

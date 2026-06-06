@@ -1,0 +1,695 @@
+[
+  {
+    "q": "Your S3-backed pipeline starts getting 503 SlowDown errors at scale. What is actually happening and how do you fix it?",
+    "a": "S3 partitions request capacity by key prefix, giving you at least 3,500 PUT/POST/DELETE and 5,500 GET requests per second per prefix. SlowDown/503 means one prefix is hot and S3 hasn't finished auto-creating new partitions yet. Spread keys across more prefixes (e.g. a hashed or date-based prefix) so the load fans out, and add jittered retries while S3 scales the partitioning.",
+    "fs": "Talks in terms of per-prefix request rate, not per-bucket, and fixes it by spreading key prefixes.",
+    "fj": "Says 'S3 has a bucket-wide limit, request a quota increase' or blames file size.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "hot prefix vs fanned-out",
+        "lang": "python",
+        "lines": [
+          "# hot: all writes share one prefix",
+          "s3://bucket/data/file_001.parquet",
+          "",
+          "# fanned out across prefixes",
+          "s3://bucket/data/dt=2026-06-04/",
+          "  hash=a1/file_001.parquet"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Why does putting a high-cardinality timestamp directly as an S3 partition key often hurt more than it helps?",
+    "a": "Each distinct partition value becomes a separate folder and a catalog/metastore entry, so partitioning on a raw second/millisecond timestamp explodes into millions of tiny partitions. Query planning then spends more time listing partitions than scanning data, and you get many small files that kill read throughput. Partition on coarse columns that match query filters (year/month/day) and keep file sizes near 128MB-1GB.",
+    "fs": "Reasons about partition cardinality and small-file overhead, picks coarse keys matching the WHERE clause.",
+    "fj": "Thinks 'more partitions = always faster' and partitions on a column queries never filter on.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "good partition layout",
+        "lang": "sql",
+        "lines": [
+          "-- partition on coarse, queried cols",
+          "PARTITIONED BY (",
+          "  dt date,        -- day grain",
+          "  region string",
+          ")",
+          "-- NOT on raw event_ts (ms)"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "In AWS Glue, when would you use a DynamicFrame instead of a Spark DataFrame, and what do you lose?",
+    "a": "DynamicFrames are Glue's self-describing abstraction that tolerates inconsistent or unknown schemas, integrate with job bookmarks for incremental loads, and support pushdown predicates against the Data Catalog. You convert to a Spark DataFrame when you need Spark SQL, window functions, or the broader optimized Spark API, since DynamicFrames are slower and more limited. A common pattern is read as DynamicFrame, toDF() for the heavy transforms, then back for the catalog-aware write.",
+    "fs": "Names bookmarks, pushdown predicates, and ResolveChoice as the DynamicFrame wins; converts to DataFrame for real compute.",
+    "fj": "Treats them as interchangeable, or claims DynamicFrames are faster than DataFrames.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "read, transform, write",
+        "lang": "python",
+        "lines": [
+          "dyf = glueContext.create_dynamic_frame",
+          "  .from_catalog(database=db, table_name=t)",
+          "df = dyf.toDF()        # Spark API",
+          "out = DynamicFrame.fromDF(",
+          "  df, glueContext, 'out')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A Glue job is meant to be incremental but keeps reprocessing all of S3. What's the most likely cause?",
+    "a": "Job bookmarks are either disabled or being defeated. Bookmarks track what was already processed using a transformation_ctx on each source/sink, so if you omit transformation_ctx, don't call job.commit(), or read with plain Spark instead of a DynamicFrame, the bookmark never advances. Enable bookmarks in the job config, give every source a stable transformation_ctx, and commit at the end.",
+    "fs": "Immediately cites transformation_ctx + job.commit() and that bookmarks only work via Glue sources, not raw Spark reads.",
+    "fj": "Suggests manually tracking processed files in a side table without knowing bookmarks exist.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "bookmark requirements",
+        "lang": "python",
+        "lines": [
+          "dyf = glueContext.create_dynamic_frame",
+          "  .from_catalog(",
+          "    database=db, table_name=t,",
+          "    transformation_ctx='src')  # required",
+          "# ... transforms ...",
+          "job.commit()   # advances bookmark"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Explain Redshift distribution styles and how a wrong DISTKEY shows up in query plans.",
+    "a": "KEY co-locates rows with the same value on the same slice so a join on that column needs no redistribution; ALL replicates a small table to every node (great for stable dimensions); EVEN/AUTO round-robins when there's no clear join key. A wrong DISTKEY surfaces as DS_BCAST_INNER or DS_DIST_BOTH in EXPLAIN, meaning Redshift is broadcasting or redistributing data across the network for every join. The goal is DS_DIST_NONE on your biggest, most frequent joins.",
+    "fs": "Reads DS_DIST_NONE vs DS_BCAST_INNER from EXPLAIN and ties DISTKEY choice to the dominant join.",
+    "fj": "Picks DISTKEY to 'spread data evenly' without thinking about joins, or confuses it with the sort key.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "EXPLAIN tells on you",
+        "lang": "sql",
+        "lines": [
+          "EXPLAIN SELECT ...",
+          "  FROM fact f JOIN dim d",
+          "  ON f.dim_id = d.id;",
+          "-- BAD:  DS_BCAST_INNER",
+          "-- GOOD: DS_DIST_NONE"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "What does a Redshift SORTKEY actually buy you, and when is a compound key the wrong choice?",
+    "a": "A sort key keeps blocks physically ordered so Redshift can use zone maps (per-block min/max) to skip blocks that can't match a range filter, which is the main I/O reduction lever. A compound sort key only prunes well when you filter on the leading column(s) in order; if queries filter on different columns unpredictably, the trailing columns give little benefit. For multi-column unpredictable filtering an interleaved key spreads weight evenly, but it costs more to VACUUM, so most teams default to compound on the common time/range column.",
+    "fs": "Explains zone-map block skipping and the leading-column rule; mentions VACUUM to maintain sortedness.",
+    "fj": "Says sort key 'just sorts the output' or thinks interleaved is always better.",
+    "level": "Sr"
+  },
+  {
+    "q": "Walk me through choosing the number of shards for a Kinesis Data Stream and what the partition key controls.",
+    "a": "Each shard handles up to 1MB/s or 1,000 records/s for writes and 2MB/s for reads, so you size shard count to peak ingest throughput, not average. The partition key is MD5-hashed to map a record to a shard, and ordering is only guaranteed within a shard, so records sharing a key (e.g. a user_id) stay ordered. A low-cardinality or skewed key creates a hot shard that throttles even though total capacity looks fine.",
+    "fs": "Sizes by per-shard MB/s and record/s limits and flags hot-shard skew from a bad partition key.",
+    "fj": "Says 'just pick a few shards' or thinks Kinesis guarantees global ordering across the stream.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "shard math",
+        "lang": "python",
+        "lines": [
+          "peak = 8_000   # records/sec",
+          "per_shard = 1_000",
+          "shards = -(-peak // per_shard)  # ceil",
+          "# also check MB/s: 1 MB/s per shard",
+          "# pick max(record_shards, mb_shards)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When would you reach for Kinesis Data Firehose over Kinesis Data Streams?",
+    "a": "Firehose is fully managed delivery: no shards to size, it buffers and batches into S3/Redshift/OpenSearch with optional format conversion to Parquet, and it auto-scales. Choose it when you just need durable near-real-time delivery to a sink and can tolerate a buffer delay (down to ~60s or a size threshold). Choose Data Streams when you need sub-second latency, multiple independent consumers, custom processing, replay, or strict per-key ordering.",
+    "fs": "Frames it as managed delivery vs custom low-latency processing; mentions buffering and Parquet conversion.",
+    "fj": "Thinks Firehose is real-time like Streams, or doesn't know Firehose can't replay or fan out custom consumers.",
+    "level": "Jr"
+  },
+  {
+    "q": "A Lambda triggered by S3 events is occasionally processing the same file twice. How do you reason about it?",
+    "a": "S3-to-Lambda (and most event sources) deliver at-least-once, so retries and rare duplicate events mean your function must be idempotent, not assume exactly-once. Make the work idempotent with a dedup key (object key + version/ETag) tracked in DynamoDB with a conditional write, or design downstream writes as upserts. Also bound blast radius: set sane retries/DLQ so a poison object doesn't loop forever.",
+    "fs": "States at-least-once delivery and designs for idempotency with a conditional dedup key + DLQ.",
+    "fj": "Assumes events fire exactly once and adds no dedup, or 'just catch the exception'.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "idempotent dedup",
+        "lang": "python",
+        "lines": [
+          "table.put_item(",
+          "  Item={'id': f'{key}:{etag}'},",
+          "  ConditionExpression=",
+          "    'attribute_not_exists(id)')",
+          "# raises if already processed -> skip"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "What are the real limits that make Lambda a poor fit for some data jobs, and what do you use instead?",
+    "a": "Lambda caps at 15 minutes runtime, 10GB memory, 10GB ephemeral /tmp, and a 6MB synchronous payload, so large shuffles, long batch jobs, or big in-memory datasets don't fit. It shines for event-driven, short, parallelizable glue work (trigger a Glue/EMR job, transform a single object, fan out per-partition). For heavy transforms use Glue or EMR; for long orchestration use Step Functions to coordinate many short Lambdas.",
+    "fs": "Knows the 15-min/10GB/payload ceilings and routes heavy work to Glue/EMR with Step Functions.",
+    "fj": "Tries to run a full ETL inside one Lambda and hits the 15-minute wall in prod.",
+    "level": "Mid"
+  },
+  {
+    "q": "Two Athena queries scan the same table but one costs 50x more. Athena bills per TB scanned, so what design decisions drive that gap?",
+    "a": "Athena charges by bytes scanned, so columnar formats (Parquet/ORC) let it read only needed columns, compression shrinks bytes, and partition pruning skips whole prefixes when you filter on a partition column. The expensive query is likely scanning row-based CSV/JSON, doing SELECT *, or missing a partition filter so it reads the full dataset. Convert to partitioned compressed Parquet, select only needed columns, and always filter on partition keys.",
+    "fs": "Ties cost directly to bytes scanned: Parquet + compression + partition pruning + column projection.",
+    "fj": "Thinks Athena cost depends on rows returned or query runtime, not bytes scanned.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "cut bytes scanned",
+        "lang": "sql",
+        "lines": [
+          "-- expensive",
+          "SELECT * FROM events;",
+          "",
+          "-- cheap: projection + partition",
+          "SELECT user_id, amount",
+          "FROM events",
+          "WHERE dt = DATE '2026-06-04';"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Your Athena table has thousands of daily partitions and MSCK REPAIR is painfully slow. What's the senior fix?",
+    "a": "MSCK REPAIR and per-partition ALTER ... ADD don't scale because they round-trip the catalog for every partition. Use partition projection: you declare the partition value ranges/format in table properties and Athena computes partitions at query time from the WHERE clause, with zero catalog entries to manage. This gives partition pruning for highly partitioned, predictably-laid-out data without any partition-loading job.",
+    "fs": "Names partition projection and that it computes partitions from table properties, skipping the metastore.",
+    "fj": "Schedules MSCK REPAIR more often or adds partitions one ALTER at a time.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "projection in DDL",
+        "lang": "sql",
+        "lines": [
+          "TBLPROPERTIES (",
+          "  'projection.enabled'='true',",
+          "  'projection.dt.type'='date',",
+          "  'projection.dt.range'=",
+          "    '2024-01-01,NOW',",
+          "  'projection.dt.format'='yyyy-MM-dd'",
+          ")"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Design an IAM policy for a Glue job that reads from one S3 bucket and writes curated data to another. What does least-privilege look like?",
+    "a": "Give the job an IAM role (not a user with long-lived keys) whose policy scopes actions to the exact resources: s3:GetObject on the raw bucket's objects, s3:PutObject on the curated prefix, and the specific Glue/CloudWatch actions it needs. Avoid s3:* and arn:aws:s3:::* — list the bucket ARNs and prefixes, and separate the ListBucket (bucket ARN) from object actions (bucket/* ARN). Lean on IAM Access Analyzer and last-accessed data to trim anything unused.",
+    "fs": "Uses a role, scopes by action and resource ARN/prefix, splits ListBucket from object perms, validates with Access Analyzer.",
+    "fj": "Attaches AmazonS3FullAccess or s3:* on * because 'it was failing and that fixed it'.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "scoped, not wildcard",
+        "lang": "ts",
+        "lines": [
+          "{ Effect: 'Allow',",
+          "  Action: ['s3:GetObject'],",
+          "  Resource:",
+          "   'arn:aws:s3:::raw-bucket/*' }",
+          "// separate stmt: ListBucket on",
+          "//   arn:aws:s3:::raw-bucket"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Why are IAM roles preferred over IAM users with access keys for data services, and how does cross-account access work?",
+    "a": "Roles issue short-lived STS credentials that auto-rotate, so there are no long-lived secrets to leak or rotate manually; you attach roles to services (Glue, EMR, Lambda) instead of embedding keys. Cross-account access uses sts:AssumeRole: the target account's role has a trust policy naming the source account/principal, and the caller's identity policy allows assuming it, so both sides must agree. Scope the trust policy to specific principals (no wildcard) and optionally require MFA or an ExternalId.",
+    "fs": "Explains STS short-lived creds, the two-sided trust + identity policy handshake, and locks the trust policy down.",
+    "fj": "Hardcodes access keys in the job or environment and rotates them 'eventually'.",
+    "level": "Mid"
+  },
+  {
+    "q": "For an intermittent nightly Spark batch, would you run EMR on EC2 or EMR Serverless, and how do Spot Instances factor in?",
+    "a": "For spiky/intermittent jobs EMR Serverless is usually simpler and cheaper because you pay only for the vCPU/memory the job consumes with no cluster to keep warm. EMR on EC2 wins for sustained or 24/7 workloads, especially with Spot on task nodes (up to ~90% off) using instance fleets across multiple instance types and AZs so a Spot reclaim just shifts to another pool. Keep the primary and core nodes on On-Demand for stability; EMR Serverless doesn't support Spot.",
+    "fs": "Matches workload shape to the service, puts only task nodes on Spot via diversified instance fleets.",
+    "fj": "Runs everything on a single On-Demand instance type, or puts core/primary nodes on Spot and loses HDFS.",
+    "level": "Sr"
+  },
+  {
+    "q": "An EMR Spark job runs but is slow and the cluster is half-idle. How do you diagnose and tune it?",
+    "a": "Half-idle usually means under-parallelized: too few partitions for the executor count, or skew sending most data to a few tasks. Check the Spark UI for stage straggler tasks and spill, right-size executor instances/cores/memory to the cluster, and repartition or salt skewed keys so work spreads evenly. Also confirm you're not bottlenecked on a small-file read or a single-shard source upstream.",
+    "fs": "Goes to the Spark UI, reasons about partition count vs cores and skew/spill, then salts or repartitions.",
+    "fj": "Just adds bigger instances or more nodes without finding the actual bottleneck.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "salt a skewed join key",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql import functions as F",
+          "n = 16",
+          "df = df.withColumn('salt',",
+          "  (F.rand()*n).cast('int'))",
+          "# join on (key, salt) to spread",
+          "# the hot key across n tasks"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "When does Amazon Bedrock beat Amazon SageMaker for a data/AI feature, and when do you need SageMaker?",
+    "a": "Bedrock is a serverless API over hosted foundation models (Claude, Titan, Llama) with managed Knowledge Bases for RAG and Agents, so reach for it for fast time-to-value, spiky traffic that scales to zero cost, and access to proprietary models you can't self-host. SageMaker is for control: custom training, deep fine-tuning, bespoke architectures, and hosting your own models on dedicated infrastructure. A common split is Bedrock for the GenAI app layer and SageMaker for classic ML training/serving.",
+    "fs": "Frames Bedrock as managed FM inference + RAG and SageMaker as train/fine-tune/host-your-own control.",
+    "fj": "Thinks SageMaker and Bedrock are competitors for the same job, or that you must train a model to do RAG.",
+    "level": "Jr"
+  },
+  {
+    "q": "You're building RAG over internal docs on AWS. What does a Bedrock Knowledge Base handle for you, and what still needs engineering?",
+    "a": "A Bedrock Knowledge Base manages the RAG plumbing: it chunks and embeds your S3 documents, stores vectors in a backing store (e.g. OpenSearch Serverless, Aurora pgvector), and at query time retrieves relevant chunks and passes them to the foundation model with citations. You still own data quality, chunking strategy and metadata, ingestion/refresh scheduling, access control on the source data, and evaluation of answer quality and hallucination. The retrieval config (top-k, filters) and prompt template are yours to tune.",
+    "fs": "Knows the KB does chunk/embed/retrieve+cite but still owns chunking strategy, refresh, access, and eval.",
+    "fj": "Assumes 'point it at S3 and it's done' with no thought to chunking, freshness, or evaluation.",
+    "level": "Sr"
+  },
+  {
+    "q": "How do the Well-Architected Framework pillars actually change a data pipeline design? Give a concrete tradeoff.",
+    "a": "The pillars (Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization, and Sustainability) force you to make tradeoffs explicit rather than defaulting. For example, Reliability might push you to multi-AZ Kinesis plus DLQs, while Cost Optimization pushes Spot and lifecycle policies, and you decide where each matters per workload. The value is naming the tradeoff (e.g. lower cost via Spot accepts occasional task reprocessing) instead of pretending one design is best on every axis.",
+    "fs": "Names the six pillars and discusses an explicit tradeoff (cost vs reliability) for a real pipeline choice.",
+    "fj": "Recites the pillar names as a checklist with no tradeoff or application to the actual design.",
+    "level": "Jr"
+  },
+  {
+    "q": "Give three high-leverage cost levers for a petabyte-scale S3 + Athena lake and explain why each works.",
+    "a": "First, convert raw CSV/JSON to partitioned, compressed Parquet, since Athena bills per byte scanned, so columnar plus pruning can cut scan cost by up to ~90%. Second, apply S3 lifecycle policies or Intelligent-Tiering to move cold data to cheaper tiers automatically based on access patterns. Third, compact small files into ~128MB-1GB objects to cut request and planning overhead. Use Storage Lens and Cost Explorer to find where the money actually is before optimizing.",
+    "fs": "Quantifies each lever (bytes scanned, tiering, file size) and measures with Storage Lens/Cost Explorer first.",
+    "fj": "Jumps to 'use a cheaper region' or guesses at cuts without measuring where spend concentrates.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "lifecycle to cheaper tiers",
+        "lang": "ts",
+        "lines": [
+          "{ Rules: [{",
+          "  Filter: { Prefix: 'raw/' },",
+          "  Transitions: [{",
+          "    Days: 30,",
+          "    StorageClass:",
+          "      'INTELLIGENT_TIERING' }],",
+          "  Status: 'Enabled' }] }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is S3 Intelligent-Tiering and when does it backfire?",
+    "a": "Intelligent-Tiering auto-moves objects between access tiers (frequent, infrequent, and optional archive tiers) based on observed access, charging a small per-object monitoring fee instead of you guessing the right class. It's ideal when access patterns are unknown or changing. It backfires on huge numbers of tiny objects, where the per-object monitoring and minimum-size accounting (objects under 128KB aren't auto-tiered and bill at frequent-access rates) can outweigh savings, so there predictable lifecycle rules are cheaper.",
+    "fs": "Knows the per-object monitoring fee and the small-object (<128KB) caveat, picks lifecycle for tiny files.",
+    "fj": "Thinks Intelligent-Tiering is always free savings with no downside.",
+    "level": "Jr"
+  },
+  {
+    "q": "What is the Glue Data Catalog's role across Athena, Glue, EMR, and Redshift Spectrum?",
+    "a": "The Glue Data Catalog is a central, Hive-compatible metastore holding table schemas, partition metadata, and S3 locations, so Athena, Glue, EMR/Spark, and Redshift Spectrum all query the same definitions without each maintaining its own. A crawler can infer schema and register partitions, though many teams define tables explicitly to avoid surprise schema drift. It's the single source of truth that lets one S3 dataset be queried by many engines consistently.",
+    "fs": "Calls it the shared Hive-compatible metastore across engines and is wary of crawler-driven schema drift.",
+    "fj": "Thinks the catalog stores the data itself, or that each engine needs its own separate catalog.",
+    "level": "Jr"
+  },
+  {
+    "q": "What's the difference between S3 and a real filesystem that trips up data engineers, and how does it affect Spark writes?",
+    "a": "S3 is an object store with a flat key namespace, not a hierarchical filesystem: 'directories' are just key prefixes, there's no atomic rename, and listings can be expensive at scale. Spark's default commit protocol relies on rename to move files from a temp location, which on S3 is a slow copy-then-delete and can leave partial output on failure. Use the EMRFS S3-optimized committer or a table format (Iceberg/Hudi/Delta) to get atomic, correct commits.",
+    "fs": "Knows rename isn't atomic on S3 and reaches for the S3 committer or a table format for safe commits.",
+    "fj": "Treats S3 like HDFS and assumes _temporary rename-based commits are atomic and free.",
+    "level": "Sr"
+  },
+  {
+    "q": "How do you load 500GB into Redshift efficiently, and why is a single big INSERT the wrong call?",
+    "a": "Use COPY from S3, not row-by-row INSERTs: COPY reads many files in parallel, one file slice per node slice, so splitting the data into a number of files that's a multiple of the slice count maximizes parallelism. Single INSERTs serialize through the leader node and are orders of magnitude slower. Pre-sort or load in sort-key order, and run ANALYZE (and VACUUM if needed) after a large load so the planner and zone maps stay accurate.",
+    "fs": "Uses parallel COPY with file count tuned to slice count, then ANALYZE/VACUUM after the load.",
+    "fj": "Loops INSERT statements or loads one giant gzip file and wonders why only one slice is busy.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "parallel COPY",
+        "lang": "sql",
+        "lines": [
+          "COPY sales",
+          "FROM 's3://bucket/sales/part-'",
+          "IAM_ROLE 'arn:aws:iam::...:role/rs'",
+          "FORMAT AS PARQUET;",
+          "ANALYZE sales;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Walk me through choosing an EC2 instance family for a workload. What do the family letters actually mean?",
+    "a": "The family letter encodes the resource profile: M is balanced general-purpose, C is compute-optimized (high CPU:memory), R/X are memory-optimized for caches and in-memory databases, I/D are storage-optimized with local NVMe, and G/P are GPU/accelerated. You pick the family from the bottleneck, not the total size, then size within it. Graviton (the 'g' suffix, e.g. m7g, c7g) is ARM and usually gives better price-performance, so prefer it unless you have x86-only dependencies.",
+    "fs": "Maps the family letter to the bottleneck and reaches for Graviton (ARM) for price-performance by default.",
+    "fj": "Picks the biggest instance they can afford, or treats all families as interchangeable 'just more CPU'.",
+    "level": "Jr"
+  },
+  {
+    "q": "Your Java Lambda has painful cold starts hurting p99 latency. What are your options and their tradeoffs?",
+    "a": "Provisioned Concurrency keeps a pool of initialized environments warm so there's no init cost, but you pay for it 24/7 whether used or not. SnapStart instead takes a snapshot of the initialized environment and restores it, giving sub-second starts at no extra charge, and now supports Java, Python 3.12+, and .NET 8+. SnapStart can't be combined with Provisioned Concurrency and doesn't allow EFS or >512MB ephemeral storage. For steady predictable traffic use Provisioned Concurrency; for spiky traffic prefer SnapStart, and trim the init phase (lazy-load, smaller deps) either way.",
+    "fs": "Distinguishes Provisioned Concurrency (always-paid warm pool) from SnapStart (free snapshot restore) and knows they're mutually exclusive.",
+    "fj": "Pings the function on a schedule to keep it warm and calls it solved, ignoring concurrency scale-out.",
+    "level": "Mid"
+  },
+  {
+    "q": "ECS on Fargate vs ECS on EC2 vs EKS — how do you actually choose for a containerized service?",
+    "a": "Fargate is serverless containers: no nodes to patch or scale, you pay per-task vCPU/memory per second, best for spiky or low-ops workloads but pricier per unit of sustained compute. ECS on EC2 lets you own and bin-pack the instances, cheaper for steady high-utilization workloads and needed for things Fargate can't do (GPUs in some cases, daemon sets, custom kernels). EKS gives you upstream Kubernetes for portability and a rich ecosystem but adds a $0.10/hr-per-cluster control-plane fee plus real operational complexity. Default to ECS/Fargate for AWS-native simplicity; pick EKS when you need Kubernetes portability or your team already runs it.",
+    "fs": "Separates the orchestrator (ECS vs EKS) from the compute model (Fargate vs EC2) and ties EKS to portability + k8s skills.",
+    "fj": "Thinks Fargate, ECS, and EKS are three competing things at the same layer, or reaches for EKS by default.",
+    "level": "Mid"
+  },
+  {
+    "q": "Explain S3 storage classes and how you'd design a lifecycle policy for logs that are hot for a week then rarely touched.",
+    "a": "Standard is for frequently accessed data; Standard-IA and One Zone-IA cost less to store but charge per-GB retrieval and have a 30-day minimum; Glacier Instant Retrieval is for archive needing millisecond access, Glacier Flexible Retrieval for minutes-to-hours, and Deep Archive for the cheapest, 12-hour-retrieval cold data. For week-hot logs, keep them in Standard, then a lifecycle rule transitions to Standard-IA at ~30 days, Glacier Flexible at ~90, and expires or moves to Deep Archive after the retention horizon. Mind the per-class minimum-duration and per-object transition charges so you don't transition tiny objects too aggressively.",
+    "fs": "Knows IA/Glacier minimum-duration + retrieval fees and stages transitions to match the access curve.",
+    "fj": "Dumps everything in Standard forever, or jumps logs straight to Deep Archive and then can't read them quickly.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "tiered lifecycle",
+        "lang": "ts",
+        "lines": [
+          "{ Rules: [{ Status: 'Enabled',",
+          "  Filter: { Prefix: 'logs/' },",
+          "  Transitions: [",
+          "    { Days: 30, StorageClass:",
+          "      'STANDARD_IA' },",
+          "    { Days: 90, StorageClass:",
+          "      'GLACIER' }],",
+          "  Expiration: { Days: 365 } }] }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is S3's consistency model today, and how does it change how you write pipelines?",
+    "a": "Since Dec 2020 S3 provides strong read-after-write consistency for all GET, PUT, LIST, and DELETE operations in every region, so a successful write is immediately readable and a listing reflects it. That removed the old eventual-consistency hazard where a freshly written object might 404 or a LIST might miss it, which used to force workarounds like consistency layers (EMRFS consistent view). You no longer need those, but note consistency is per-object: it does not make a multi-object write transactional, so for atomic multi-file commits you still want a table format like Iceberg.",
+    "fs": "States S3 is now strongly consistent for reads/lists but stresses it's per-object, not multi-object transactional.",
+    "fj": "Still adds eventual-consistency retry hacks, or assumes strong consistency makes a multi-file write atomic.",
+    "level": "Mid"
+  },
+  {
+    "q": "EBS vs EFS vs instance store — when do you use each for a data workload?",
+    "a": "EBS is a network block volume attached to one instance (gp3 for general SSD, io2 for high-IOPS, st1/sc1 for throughput HDD), durable and resizable, ideal for a database's data directory. EFS is a managed NFS filesystem mountable by many instances at once, elastic and pay-per-use, good for shared scratch or a fleet reading the same files, but higher latency than EBS. Instance store is physically attached NVMe that's blazing fast but ephemeral — it's wiped on stop/terminate — so it's only for caches, scratch, or shuffle data you can recompute. Pick EBS for single-attach durable block, EFS for shared POSIX, instance store for fast-but-disposable.",
+    "fs": "Maps EBS=single-attach durable block, EFS=shared NFS, instance store=ephemeral fast scratch; warns instance store is wiped on stop.",
+    "fj": "Stores a database on instance store, or thinks EBS can be mounted read-write by many instances like EFS.",
+    "level": "Jr"
+  },
+  {
+    "q": "How does a NAT Gateway work, why is it a common cost surprise, and what's the cheaper alternative for AWS-service traffic?",
+    "a": "A NAT Gateway lets instances in a private subnet make outbound connections to the internet while staying unreachable inbound, by translating their private IPs to its own. It bills both an hourly rate and a per-GB data-processing charge, so high-volume egress (e.g. pulling large datasets, container image churn) racks up cost fast, and you pay per AZ if you run one per AZ for HA. For traffic to AWS services like S3 or DynamoDB, use a VPC Gateway Endpoint (free) instead of routing through NAT, and Interface (PrivateLink) endpoints for other services to keep traffic off the public internet.",
+    "fs": "Knows NAT charges hourly + per-GB and routes S3/DynamoDB via free Gateway Endpoints to dodge NAT data-processing fees.",
+    "fj": "Routes all private-subnet traffic including S3 through the NAT Gateway and is shocked by the data-processing bill.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "free gateway endpoint for S3",
+        "lang": "ts",
+        "lines": [
+          "// VPC Gateway Endpoint (no NAT, no $/GB)",
+          "{ ServiceName:",
+          "   'com.amazonaws.us-east-1.s3',",
+          "  VpcEndpointType: 'Gateway',",
+          "  RouteTableIds: [privateRt] }",
+          "// S3/DynamoDB only support Gateway type"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A teammate says 'just open the security group inbound, NACLs are redundant.' Where are they wrong?",
+    "a": "Security Groups and NACLs operate at different layers and behave differently. A Security Group is stateful and attached to an ENI/instance: return traffic for an allowed connection is automatically permitted, and it supports allow-rules only. A NACL is stateless and attached to a subnet: it evaluates each direction independently, supports both allow and deny, and because it's stateless you must explicitly allow ephemeral return ports. NACLs are the right tool for coarse subnet-wide deny rules (e.g. block a bad CIDR) that a Security Group can't express; SGs are your fine-grained per-resource allow-listing. They complement, not replace, each other.",
+    "fs": "Frames SG=stateful per-resource allow-only vs NACL=stateless per-subnet allow+deny, needing ephemeral return ports.",
+    "fj": "Thinks SGs and NACLs are duplicates, or forgets NACL statelessness and blocks all return traffic.",
+    "level": "Jr"
+  },
+  {
+    "q": "When would you choose PrivateLink (interface endpoints) vs VPC peering vs Transit Gateway to connect networks?",
+    "a": "VPC peering is a 1:1 non-transitive link between two VPCs — simple and cheap for a handful, but it doesn't scale because N VPCs need N-squared peerings and routes can't transit through. Transit Gateway is a hub-and-spoke router that connects many VPCs (and on-prem via VPN/Direct Connect) with transitive routing, the standard for a large multi-VPC network. PrivateLink exposes a single service privately across VPCs/accounts via an interface endpoint without exposing the whole network or overlapping-CIDR concerns, so it's for 'expose one service to consumers' rather than 'connect two networks.' Choose by whether you're sharing a service (PrivateLink) or routing between networks at small (peering) or large (TGW) scale.",
+    "fs": "Distinguishes service-exposure (PrivateLink) from network-routing, and peering's non-transitive N-squared limit vs TGW hub.",
+    "fj": "Uses VPC peering for everything and ends up with a mesh that can't transit or scale.",
+    "level": "Sr"
+  },
+  {
+    "q": "Explain Route 53 routing policies and give a use case where the wrong one causes an outage.",
+    "a": "Route 53 supports simple, weighted (split traffic by percentage, good for canaries), latency-based (route to the lowest-latency region), failover (active/passive with health checks), geolocation/geoproximity, and multivalue answer. Failover and latency policies depend on health checks to pull unhealthy endpoints; if you use a plain weighted or simple record without health checks, DNS keeps sending traffic to a dead endpoint. A classic outage is a multi-region active/passive setup configured as 'simple' so failover never triggers, or TTLs set so high that clients cache the failed IP long after Route 53 updates.",
+    "fs": "Names the policies, ties failover/latency routing to health checks, and flags high TTL as a failover trap.",
+    "fj": "Thinks Route 53 is just DNS hosting and doesn't know it can do health-checked failover or weighted canaries.",
+    "level": "Mid"
+  },
+  {
+    "q": "Why is an IAM role preferred over an IAM user, and how does STS AssumeRole actually deliver credentials?",
+    "a": "An IAM user has long-lived static access keys that must be manually rotated and can be leaked; a role has no permanent credentials and instead vends short-lived STS tokens on demand. When a principal calls sts:AssumeRole, STS returns a temporary access key, secret, and session token that expire (15 min to 12 hr), and the SDK refreshes them automatically. Services like EC2/Lambda/ECS assume their execution role transparently via the instance/task metadata, so your code never holds a static key. The role's trust policy controls who may assume it; its permission policy controls what the resulting session can do.",
+    "fs": "Explains roles vend expiring STS tokens via AssumeRole and that trust policy (who) is separate from permissions (what).",
+    "fj": "Creates an IAM user, bakes its access keys into the app, and rotates them 'when we get to it'.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "assume a role for temp creds",
+        "lang": "python",
+        "lines": [
+          "sts = boto3.client('sts')",
+          "r = sts.assume_role(",
+          "  RoleArn='arn:aws:iam::111:role/etl',",
+          "  RoleSessionName='job-42')",
+          "c = r['Credentials']  # expires",
+          "s3 = boto3.client('s3',",
+          "  aws_access_key_id=c['AccessKeyId'],",
+          "  aws_session_token=c['SessionToken'])"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A user has an IAM policy allowing s3:GetObject but still gets AccessDenied. Walk me through IAM policy evaluation.",
+    "a": "AWS denies by default, then evaluates all applicable policies for an explicit deny first — and any explicit Deny (in the identity policy, an SCP, an RCP, a resource policy, a permission boundary, or a session policy) wins over every Allow. For access to be granted the request must be Allowed and not Denied across the intersection of all of these: an SCP or permission boundary that doesn't include s3:GetObject silently blocks it even though the identity policy allows it. So the GetObject denial is usually an org SCP, a permission boundary capping the role, or a bucket policy explicitly denying the principal. Trace it with the IAM Policy Simulator or the Access Denied message's encoded context.",
+    "fs": "Knows explicit-deny-wins and that effective permission is the intersection of identity/SCP/boundary/resource policies.",
+    "fj": "Just adds s3:* to the identity policy and is confused when access is still denied by an SCP or boundary.",
+    "level": "Sr"
+  },
+  {
+    "q": "What is a permission boundary and how is it different from an SCP?",
+    "a": "A permission boundary is an IAM policy attached to a user or role that caps the maximum permissions that identity can ever have — its effective permissions are the intersection of its identity policies and the boundary, so granting s3:* in the identity policy does nothing if the boundary omits it. It's commonly used for delegated admin: you let a team create roles but attach a boundary so the roles they mint can't exceed a safe envelope. An SCP is an AWS Organizations control that caps permissions for entire accounts/OUs and applies to everyone including the root user, whereas a boundary applies to one specific principal. Both are guardrails that only restrict; neither grants permissions on its own.",
+    "fs": "Defines a boundary as a per-principal max-permission cap (intersection) vs SCP as an account-wide org guardrail.",
+    "fj": "Thinks a permission boundary grants permissions, or conflates it with an SCP.",
+    "level": "Sr"
+  },
+  {
+    "q": "What does AWS Lake Formation add on top of the Glue Data Catalog?",
+    "a": "Lake Formation layers fine-grained, centralized governance over the data lake that plain IAM + Glue Catalog can't express conveniently: column-, row-, and cell-level permissions, tag-based access control (LF-Tags), and a single grant model enforced consistently across Athena, Redshift Spectrum, EMR, and Glue. Instead of writing sprawling S3 bucket policies and IAM, you grant table/column permissions like a database, and Lake Formation brokers credentials to the query engines. It also streamlines blueprints for ingest and cross-account data sharing. Use it when you need governed, least-privilege analytics access at column/row granularity rather than coarse bucket-level IAM.",
+    "fs": "Calls out column/row/cell-level + tag-based permissions enforced across engines, beyond bucket-level IAM.",
+    "fj": "Thinks Lake Formation is just another name for the Glue Catalog or only does coarse S3 permissions.",
+    "level": "Sr"
+  },
+  {
+    "q": "Compare SQS, SNS, and EventBridge. Give a concrete pattern where you'd combine them.",
+    "a": "SQS is a durable pull-based queue for decoupling and buffering work so a slow consumer can't drop messages; SNS is push-based pub/sub fan-out delivering one message to many subscribers instantly; EventBridge is a content-based event router with rich rule filtering, schema registry, archive/replay, and SaaS/partner event sources. A common pattern is SNS-to-SQS fan-out: SNS publishes once and multiple SQS queues subscribe, each feeding an independent consumer at its own pace with its own DLQ. EventBridge shines when you need to route by event content to different targets or integrate third-party events, rather than simple broadcast.",
+    "fs": "Distinguishes pull-queue (SQS) vs push fan-out (SNS) vs rule-routing (EventBridge) and uses SNS->SQS fan-out.",
+    "fj": "Uses SNS as a queue (and loses messages when no subscriber is ready) or thinks EventBridge is just SNS.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "SNS fan-out to SQS",
+        "lang": "ts",
+        "lines": [
+          "// publish once, many queues consume",
+          "SNS topic 'order-events'",
+          "  -> SQS queue 'billing' (DLQ)",
+          "  -> SQS queue 'analytics' (DLQ)",
+          "  -> SQS queue 'fulfillment' (DLQ)",
+          "// each consumer scales independently"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you need an SQS FIFO queue instead of Standard, and what does it cost you?",
+    "a": "Standard queues give best-effort ordering and at-least-once delivery with very high throughput; FIFO queues give strict in-order delivery and exactly-once processing within a message group, deduplicating by a dedup ID over a 5-minute window. You need FIFO when order matters per entity (e.g. apply account transactions in sequence) — ordering is guaranteed only within a MessageGroupId, and different groups process in parallel. The cost is throughput: FIFO is capped (high-throughput mode helps) and far lower than Standard's effectively unlimited rate, so don't reach for FIFO unless ordering or dedup is a real requirement.",
+    "fs": "Knows ordering/dedup is per MessageGroupId and that FIFO trades throughput for exactly-once + ordering.",
+    "fj": "Defaults to FIFO 'to be safe' and bottlenecks throughput, or expects global ordering across all groups.",
+    "level": "Mid"
+  },
+  {
+    "q": "A message keeps reappearing in SQS and getting reprocessed forever. What's happening and how do you fix it?",
+    "a": "When a consumer receives a message it becomes invisible for the visibility timeout; if the consumer doesn't delete it within that window (because processing is slow or it crashed), the message becomes visible again and is redelivered. A poison message that always fails will loop forever unless you bound retries. Fix it by setting the visibility timeout above your real processing time (or extend it with ChangeMessageVisibility for long jobs), deleting only after success, and configuring a redrive policy so after maxReceiveCount failures the message moves to a dead-letter queue for inspection instead of cycling.",
+    "fs": "Ties redelivery to visibility-timeout vs processing time and adds a DLQ redrive policy to break the poison-message loop.",
+    "fj": "Just deletes messages on receipt (losing failures) or keeps bumping the timeout without a DLQ.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "redrive to DLQ",
+        "lang": "python",
+        "lines": [
+          "sqs.set_queue_attributes(QueueUrl=q,",
+          "  Attributes={'RedrivePolicy': json.dumps(",
+          "    {'deadLetterTargetArn': dlq_arn,",
+          "     'maxReceiveCount': '5'})})",
+          "# delete only after successful work:",
+          "sqs.delete_message(QueueUrl=q,",
+          "  ReceiptHandle=h)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "You're orchestrating a multi-step data pipeline. Step Functions Standard or Express, and why does the choice matter?",
+    "a": "Standard workflows run up to a year, are exactly-once, durable, and keep full execution history — use them to orchestrate long, auditable, non-idempotent steps like spinning up EMR, running a Glue job, then loading Redshift. Express workflows run up to 5 minutes, are at-least-once (so steps can re-run), bill by invocation/duration, and handle very high event rates — use them for high-volume short event processing. Picking Express for a long non-idempotent pipeline risks duplicate side effects and a 5-minute cap; picking Standard for a million tiny events costs more in state transitions. You can even nest Express inside a Standard Map for the best of both.",
+    "fs": "Matches Standard=long/exactly-once/auditable to orchestration and Express=short/at-least-once/high-volume to event streams.",
+    "fj": "Picks based on which sounds faster, ignoring the exactly-once vs at-least-once and 5-minute distinctions.",
+    "level": "Sr"
+  },
+  {
+    "q": "How does a Step Functions Distributed Map differ from an inline Map, and when do you need it?",
+    "a": "An inline Map iterates over an in-memory array inside one execution, capped at 40 concurrent iterations and the 256KB state payload limit, fine for modest fan-out. Distributed Map runs each iteration as its own child execution and can read items directly from a large S3 dataset or manifest, scaling to massive parallelism (up to ~10,000 concurrent child executions) well beyond the payload limit. You need Distributed Map for large-scale fan-out like processing millions of S3 objects or CSV rows in parallel, with batching and a tolerated-failure threshold. Inline Map is for small arrays already in your state.",
+    "fs": "Knows inline Map is payload-bound/low-concurrency vs Distributed Map reading S3 at massive parallelism.",
+    "fj": "Tries to fan out millions of items with an inline Map and hits the 256KB / 40-concurrency wall.",
+    "level": "Sr"
+  },
+  {
+    "q": "RDS vs Aurora — what does Aurora's architecture actually change about replicas and failover?",
+    "a": "Standard RDS replicates with engine-level async replication and Multi-AZ keeps a separate synchronous standby on its own storage, so failover means promoting/repointing and read replicas can lag. Aurora decouples compute from a shared distributed storage layer replicated 6 ways across 3 AZs, so all up to 15 read replicas read the same volume — replica lag is tiny and failover just promotes an existing replica in seconds with no volume catch-up. Aurora tolerates losing an entire AZ without data loss. Choose RDS for standard engines and lower cost on modest workloads; Aurora for higher throughput, faster failover, and lots of low-lag read replicas.",
+    "fs": "Explains Aurora's shared 6-way storage gives near-zero replica lag and seconds-fast failover vs RDS async replicas.",
+    "fj": "Thinks Aurora is just 'RDS but faster' with no idea the storage layer is shared across replicas.",
+    "level": "Mid"
+  },
+  {
+    "q": "Design the DynamoDB key for an app that queries 'all orders for a customer, newest first.' What goes wrong with a naive design?",
+    "a": "Use a composite primary key: partition key = CUSTOMER#<id> to co-locate one customer's orders, sort key = a date-prefixed value like ORDER#<timestamp> so a Query on the partition returns them already ordered (ScanIndexForward=false for newest-first). The naive mistake is making order_id the partition key, which scatters a customer's orders across partitions and forces a full Scan to gather them — slow and expensive. Also avoid a low-cardinality or skewed partition key (e.g. a status flag) that creates a hot partition. Model the access pattern into the keys; DynamoDB rewards query-by-key and punishes scans.",
+    "fs": "Designs PK=CUSTOMER#id, SK=ORDER#ts for an ordered Query, and avoids order_id-as-PK that forces a Scan.",
+    "fj": "Makes each row's unique id the partition key, then Scans + filters to find a customer's orders.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "single-customer query",
+        "lang": "python",
+        "lines": [
+          "# PK=CUSTOMER#42  SK=ORDER#<ts>",
+          "table.query(",
+          "  KeyConditionExpression=Key('PK')",
+          "    .eq('CUSTOMER#42'),",
+          "  ScanIndexForward=False,  # newest 1st",
+          "  Limit=20)",
+          "# no Scan, no filter scan-and-throw-away"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you add a DynamoDB GSI vs an LSI, and what are the catches with each?",
+    "a": "A Local Secondary Index shares the table's partition key but gives an alternate sort key, supports strong consistency, but must be created at table-creation time and shares the 10GB-per-partition-key limit. A Global Secondary Index has a completely different partition and sort key, can be added anytime, but is eventually consistent and has its own provisioned/on-demand capacity. Reach for a GSI when you need to query by a different attribute entirely (the common case in single-table design with overloaded GSI1PK/GSI1SK); use an LSI only when you need an alternate sort within the same partition with strong consistency. Watch GSI projection — projecting all attributes inflates cost and write amplification.",
+    "fs": "Knows LSI=same PK/alt SK, create-time-only, strongly consistent vs GSI=new keys, anytime, eventually consistent, own capacity.",
+    "fj": "Reaches for an LSI to query by a totally different attribute, or projects ALL into every GSI without cost thought.",
+    "level": "Sr"
+  },
+  {
+    "q": "Explain KMS envelope encryption and why it's used instead of encrypting data directly with the KMS key.",
+    "a": "KMS keys never leave KMS and can't directly encrypt large payloads (there's a ~4KB limit), so services use envelope encryption: KMS generates a unique data key, hands you a plaintext copy to encrypt your data locally and an encrypted copy to store alongside the ciphertext. To decrypt, you send the encrypted data key back to KMS, get the plaintext key, and decrypt locally. This keeps the root key in KMS, lets you encrypt arbitrarily large data fast, and gives per-object keys. Services like S3 SSE-KMS, EBS, and Secrets Manager all do this transparently; the catch at scale is KMS API throttling and per-request cost, which S3 Bucket Keys mitigate by caching a key.",
+    "fs": "Describes data-key generation + local encryption with the KMS root key never leaving KMS, and S3 Bucket Keys to cut KMS calls.",
+    "fj": "Thinks the KMS key itself encrypts every object directly, with no concept of data keys.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "generate a data key",
+        "lang": "python",
+        "lines": [
+          "kms = boto3.client('kms')",
+          "dk = kms.generate_data_key(",
+          "  KeyId='alias/app', KeySpec='AES_256')",
+          "plaintext_key = dk['Plaintext']  # use",
+          "stored_key = dk['CiphertextBlob']  # save",
+          "# encrypt data locally with plaintext_key",
+          "# discard plaintext, keep stored_key"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What do GuardDuty and AWS WAF each protect against, and why aren't they interchangeable?",
+    "a": "GuardDuty is a threat-detection service: it continuously analyzes CloudTrail, VPC Flow Logs, and DNS logs (and now EKS/S3/malware findings) with ML to surface compromised credentials, crypto-mining, unusual API calls, and reconnaissance — it detects and alerts, it doesn't block. WAF is a web application firewall sitting in front of CloudFront/ALB/API Gateway that inspects HTTP(S) requests and blocks attacks like SQL injection, XSS, and bad bots via managed and custom rules with rate limiting. They cover different layers: WAF is inline prevention at the application edge, GuardDuty is account-wide detection across your AWS activity. You run both, plus respond to GuardDuty findings with automation.",
+    "fs": "Separates WAF (inline L7 request blocking) from GuardDuty (account-wide ML threat detection/alerting) — prevent vs detect.",
+    "fj": "Thinks one tool does everything, or expects GuardDuty to block attacks inline like a firewall.",
+    "level": "Mid"
+  },
+  {
+    "q": "What's the difference between a CloudWatch metric, a log, and a trace, and where does X-Ray fit?",
+    "a": "CloudWatch Metrics are numeric time series (CPU, latency, custom business counters) you alarm and dashboard on cheaply at scale. CloudWatch Logs are the raw text/JSON event records you search with Logs Insights for detail and debugging. X-Ray provides distributed tracing: it follows a single request across services (API Gateway to Lambda to DynamoDB) and visualizes a service map with per-segment latency to find where time is spent. The mental model: metrics tell you something is wrong, logs tell you what, traces tell you where in a distributed call path. Custom metrics from high-cardinality dimensions get expensive, so push detail to logs/EMF rather than thousands of metrics.",
+    "fs": "Maps metrics=alarmable time series, logs=detail, X-Ray traces=cross-service request path; warns on high-cardinality custom metrics.",
+    "fj": "Treats logs and metrics as the same thing, or doesn't know X-Ray follows one request across services.",
+    "level": "Jr"
+  },
+  {
+    "q": "Savings Plans vs Reserved Instances — which do you recommend and why, for a fleet that changes instance types often?",
+    "a": "For a fleet whose instance families/regions shift, a Compute Savings Plan is usually the best fit: you commit to a $/hour of compute spend for 1 or 3 years (up to ~66% off) and the discount auto-applies across instance families, sizes, regions, OS, tenancy, and even Fargate and Lambda — so refactoring doesn't strand the commitment. An EC2 Instance Savings Plan gives a deeper discount (~72%) but locks you to one family in one region. Standard RIs give the deepest discount but are the most rigid and tied to specific attributes (Convertible RIs trade some discount for flexibility). Match commitment flexibility to how stable the workload is; cover only the steady baseline and leave bursts on On-Demand/Spot.",
+    "fs": "Recommends Compute Savings Plan for a shifting fleet (auto-applies across families/Fargate/Lambda) over rigid Standard RIs.",
+    "fj": "Buys Standard RIs for a changing fleet and strands the commitment when instance types change.",
+    "level": "Mid"
+  },
+  {
+    "q": "A tagging-free account has a surprise bill and no idea which team owns what. What's the senior cost-governance playbook?",
+    "a": "Start by enforcing a tagging strategy (cost-allocation tags like team, env, project) via tag policies and SCPs that deny resource creation without required tags, then activate those tags in the Billing console so Cost Explorer and Cost and Usage Reports can group by them. Use AWS Budgets with alerts per team/account and anomaly detection to catch spikes early, and consider a multi-account structure (one account per team/env under Organizations) so billing is naturally isolated. Pair this with Compute Optimizer/Trusted Advisor for rightsizing and Savings Plans coverage. The real fix is accountability: untagged, un-isolated accounts make cost everyone's problem and no one's.",
+    "fs": "Enforces required cost-allocation tags via tag policies/SCPs, activates them for Cost Explorer/CUR, and isolates by account.",
+    "fj": "Opens Cost Explorer hoping to see owners, but with no tags or account isolation there's nothing to group by.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "deny untagged creation (SCP)",
+        "lang": "ts",
+        "lines": [
+          "{ Effect: 'Deny',",
+          "  Action: 'ec2:RunInstances',",
+          "  Resource: 'arn:aws:ec2:*:*:instance/*',",
+          "  Condition: { Null: {",
+          "    'aws:RequestTag/team': 'true' } } }",
+          "// blocks launches missing a team tag"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Name three non-obvious AWS data-transfer cost traps and how you avoid each.",
+    "a": "First, cross-AZ traffic: chatty services or a database and its clients split across AZs pay per-GB in both directions, so co-locate tightly-coupled components in one AZ (balancing against HA). Second, NAT Gateway egress: routing S3/DynamoDB or large public pulls through NAT incurs per-GB processing — use free VPC Gateway Endpoints for S3/DynamoDB and Interface endpoints for other services. Third, internet egress and cross-region replication: data out to the internet and S3 cross-region replication are billed per-GB, so cache at CloudFront (cheaper egress) and only replicate what compliance truly requires. The meta-lesson: data transfer is often invisible until the bill, so trace it with Cost Explorer's transfer dimension.",
+    "fs": "Calls out cross-AZ, NAT egress (fix with endpoints), and internet/cross-region transfer (fix with CloudFront/selective replication).",
+    "fj": "Assumes data transfer is free or trivial and only looks at compute/storage line items.",
+    "level": "Sr"
+  },
+  {
+    "q": "How do the Well-Architected Reliability and Cost pillars pull against each other in a multi-AZ data platform, and how do you decide?",
+    "a": "Reliability pushes toward redundancy that costs money: multi-AZ RDS/Aurora, a NAT Gateway per AZ, cross-AZ replicas, and DLQs with retries. Cost Optimization pushes the opposite: single-AZ where tolerable, Spot for interruptible compute, lifecycle tiering, and avoiding cross-AZ chatter. The senior move is to set the tradeoff per workload against an explicit RTO/RPO and business impact: a payments path justifies multi-AZ everything, while a nightly batch that can rerun can ride single-AZ Spot. Make the tradeoff visible and reversible (IaC, tags, budgets) rather than reflexively maxing one pillar. Well-Architected's value is forcing that conversation, not prescribing one answer.",
+    "fs": "Sets redundancy spend against explicit RTO/RPO and business impact per workload instead of maxing one pillar.",
+    "fj": "Either makes everything multi-AZ 'for safety' or cuts all redundancy to save money, with no RTO/RPO reasoning.",
+    "level": "Sr"
+  },
+  {
+    "q": "What does Amazon Athena Federated Query let you do, and when is it the wrong tool?",
+    "a": "Athena Federated Query uses Lambda-based connectors to run SQL across non-S3 sources — DynamoDB, RDS/Aurora, Redshift, CloudWatch, JDBC databases — and even join them with S3 data in one query, without first ETL-ing everything into the lake. It's great for ad-hoc cross-source exploration and avoiding a pipeline for occasional questions. It's the wrong tool for high-frequency or latency-sensitive queries: each connector invocation pulls data through Lambda with limited pushdown, so it can be slow and load the source database. For repeated heavy analytics, materialize the data into partitioned Parquet in S3 instead and query that.",
+    "fs": "Knows federated query joins external sources via Lambda connectors but warns of weak pushdown/source load for hot paths.",
+    "fj": "Points federated query at a production OLTP database for frequent dashboards and hammers the source.",
+    "level": "Sr"
+  },
+  {
+    "q": "A junior asks 'what's the simplest way to get started with AI on AWS without training a model?' Give the honest framing.",
+    "a": "For most teams the entry point is Amazon Bedrock: a serverless API over hosted foundation models (Claude, Llama, Titan, and others) where you call an endpoint, scale to zero when idle, and add managed RAG via Knowledge Bases — no GPUs, training, or model hosting. For ready-made capabilities you can also use the AI services (Comprehend, Textract, Transcribe, Rekognition) that wrap pretrained models behind a simple API. You only need SageMaker when you must train, fine-tune deeply, or host custom models on your own infrastructure. Start with Bedrock or an AI service; reach for SageMaker when managed inference genuinely can't meet the requirement.",
+    "fs": "Routes 'AI without training' to Bedrock/managed AI services and reserves SageMaker for custom train/fine-tune/host.",
+    "fj": "Assumes any AI feature requires standing up SageMaker and training a model from scratch.",
+    "level": "Jr"
+  }
+]

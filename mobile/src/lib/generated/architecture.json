@@ -1,0 +1,450 @@
+[
+  {
+    "q": "Name the pillars of the AWS Well-Architected Framework and what each optimizes for.",
+    "a": "There are six pillars: Operational Excellence (run and improve workloads), Security (protect data and systems), Reliability (recover from failure and meet demand), Performance Efficiency (use resources well as needs change), Cost Optimization (avoid unnecessary spend), and Sustainability (minimize environmental impact). Sustainability was added in 2021 as the sixth pillar. The point is they are tradeoffs you balance, not boxes you check.",
+    "fs": "Lists all six including Sustainability and frames them as explicit tradeoffs, not a checklist.",
+    "fj": "Says 'scalability, security, and cost' as if from memory and misses Operational Excellence, Reliability, and Sustainability.",
+    "level": "Jr"
+  },
+  {
+    "q": "What is the difference between RTO and RPO, and why does it matter for DR design?",
+    "a": "RTO (Recovery Time Objective) is the maximum acceptable time to restore service after an outage; RPO (Recovery Point Objective) is the maximum acceptable amount of data loss measured in time. RPO drives your replication/backup frequency (a 5-minute RPO needs replication at least every 5 minutes), while RTO drives how much standby capacity must be pre-provisioned. They are independent: you can have a tight RPO with continuous replication but a loose RTO if you still have to spin up infrastructure.",
+    "fs": "Separates RPO (data loss, drives replication cadence) from RTO (downtime, drives pre-provisioning) and treats them independently.",
+    "fj": "Uses RTO and RPO interchangeably as 'how fast we recover' and can't map either to a concrete design lever.",
+    "level": "Jr"
+  },
+  {
+    "q": "Walk through the four AWS DR strategies from cheapest to costliest and their rough RTO/RPO.",
+    "a": "Backup & Restore: backups in S3/Glacier, RPO in hours and RTO up to 24h, cheapest. Pilot Light: data replicated and core infra always-on but app servers off, RPO/RTO in minutes to tens of minutes. Warm Standby: a scaled-down but live copy that already serves reduced traffic, RPO/RTO in seconds to minutes. Multi-Site Active-Active: full capacity in multiple regions serving live, lowest RTO/RPO but highest cost and complexity. Each step down in RTO/RPO costs more.",
+    "fs": "Knows Pilot Light cannot serve traffic until activated while Warm Standby already can, and ties each tier to cost.",
+    "fj": "Conflates Pilot Light and Warm Standby, or thinks active-active is always 'best' ignoring its cost and consistency complexity.",
+    "level": "Mid"
+  },
+  {
+    "q": "State the CAP theorem precisely. What does 'consistency' mean in CAP?",
+    "a": "CAP says that when a network partition occurs, a distributed system can guarantee at most one of Consistency or Availability, not both. Consistency in CAP specifically means linearizability: every read sees the most recent write as if there were a single copy of the data. The common phrasing 'pick two of three' is misleading because partition tolerance is not optional in a real distributed system, so the real choice is C vs A only during a partition.",
+    "fs": "Pins CAP's C to linearizability and notes you only trade C-vs-A during a partition, not 'two of three' always.",
+    "fj": "Recites 'pick two of three' and treats P as a design choice you can drop.",
+    "level": "Mid"
+  },
+  {
+    "q": "Why is PACELC often preferred over CAP for real database decisions?",
+    "a": "PACELC extends CAP: during a Partition you trade Availability vs Consistency (the CAP case), but Else (normal operation) you trade Latency vs Consistency. This matters because partitions are rare while the latency-vs-consistency tradeoff is paid on every request. For example DynamoDB and Cassandra are PA/EL by default (available and low-latency, eventually consistent), while a system doing synchronous quorum reads is PC/EC, trading latency for strong consistency even when healthy.",
+    "fs": "Frames the latency-vs-consistency tradeoff as the one paid on every request, and classifies real stores as PA/EL vs PC/EC.",
+    "fj": "Never gets past CAP and assumes consistency only costs something during failures.",
+    "level": "Sr"
+  },
+  {
+    "q": "A user updates their profile and immediately reloads but sees the old value on an eventually-consistent store. Which consistency model fixes this minimally, and how?",
+    "a": "You want read-your-writes (read-after-write) consistency, which is weaker than full linearizability so it's cheaper. Achieve it by routing that user's reads to the primary/leader for a short window, or pinning the session to a replica that has applied the write (e.g. by passing the write's version/LSN and waiting for the replica to catch up). DynamoDB exposes this as an opt-in strongly consistent read on the specific GetItem rather than making the whole table strongly consistent.",
+    "fs": "Names read-your-writes as the minimal model and pins reads via session/version rather than upgrading the whole system.",
+    "fj": "Jumps straight to 'make everything strongly consistent', paying global latency for a per-session need.",
+    "level": "Sr"
+  },
+  {
+    "q": "Compare cache-aside, read-through, write-through, and write-behind. When does each apply?",
+    "a": "Cache-aside: app reads cache, on miss loads from DB and populates cache; simple and the most common, but cache logic lives in the app and stale data is possible. Read-through: the cache library itself loads from DB on miss, keeping app code clean. Write-through: writes go to cache and DB synchronously, keeping them consistent at the cost of write latency. Write-behind (write-back): writes hit cache and flush to DB asynchronously, fastest writes but risks data loss if the cache dies before flush. Most read-heavy systems use cache-aside; write-behind suits high write throughput that can tolerate small loss windows.",
+    "fs": "Distinguishes who owns the load/store (app vs cache) and calls out write-behind's durability risk on cache failure.",
+    "fj": "Treats all caching as 'just put Redis in front' and can't articulate the write-path differences or staleness.",
+    "level": "Mid"
+  },
+  {
+    "q": "What is a cache stampede (thundering herd) and how do you prevent it?",
+    "a": "A stampede happens when a hot key expires and many concurrent requests all miss and hit the database at once, potentially overloading it. Mitigations: a per-key lock/single-flight so only one request recomputes while others wait or get stale data; stale-while-revalidate to serve the old value during async refresh; probabilistic early expiration (refresh before TTL with a random jitter); and jittered TTLs so keys don't all expire at the same instant. These are often combined.",
+    "fs": "Names single-flight/locking plus stale-while-revalidate and jittered/probabilistic early expiry, not just 'raise the TTL'.",
+    "fj": "Suggests only increasing the TTL, which delays but does not prevent the synchronized-miss stampede.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "single-flight refresh",
+        "lang": "python",
+        "lines": [
+          "val = cache.get(key)",
+          "if val is not None:",
+          "    return val",
+          "# only one worker rebuilds the key",
+          "if cache.set(lock, 1, nx=True, ex=10):",
+          "    val = db_load(key)",
+          "    cache.set(key, val, ex=300)",
+          "    cache.delete(lock)",
+          "    return val",
+          "# others briefly wait or serve stale",
+          "return wait_or_stale(key)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you keep a cache consistent with the database on writes, and why is 'write then delete cache' usually preferred over 'write then update cache'?",
+    "a": "The standard pattern is cache-aside with invalidation: write the DB, then delete the cache key so the next read repopulates from the source of truth. Deleting (rather than updating) avoids a race where two concurrent writers each compute a value and write them back out of order, leaving a stale value cached. Even delete-after-write has a small race window, so for stricter needs people use short TTLs, versioned keys, or capture DB changes via CDC to invalidate. There is no perfectly atomic cache+DB write without a transaction across both.",
+    "fs": "Prefers delete-on-write to dodge out-of-order overwrites and admits the residual race needs TTL/CDC, not 'it's solved'.",
+    "fj": "Updates the cache in place on every write and assumes cache and DB can be kept perfectly in sync for free.",
+    "level": "Sr"
+  },
+  {
+    "q": "Compare token bucket, leaky bucket, fixed window, and sliding window rate limiting. Which is the best general default for an API?",
+    "a": "Token bucket adds tokens at a steady rate up to a capacity; each request spends one, so it allows short bursts up to the bucket size while bounding the average rate. Leaky bucket drains a queue at a fixed rate, smoothing output but allowing no bursts. Fixed window counts per discrete interval but allows a 2x spike at the window boundary. Sliding window (log or weighted counter) tracks a rolling interval for accurate limiting with modest memory. Token bucket is the strongest general-purpose default because it tolerates bursts while bounding the long-run rate.",
+    "fs": "Calls out the fixed-window boundary 2x burst and picks token bucket for burst tolerance with a bounded average.",
+    "fj": "Defaults to a fixed-window counter without realizing requests can double up across the window edge.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "fixed-window boundary burst",
+        "lang": "python",
+        "lines": [
+          "# limit = 100 / 60s",
+          "# 100 req at 00:00:59  (window A)",
+          "# 100 req at 00:01:01  (window B)",
+          "# => 200 req in ~2s, limit bypassed",
+          "# token bucket caps the burst"
+        ],
+        "accent": "bug"
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a rate limiter across a fleet of stateless API servers?",
+    "a": "Keep the counters in a shared store (typically Redis) rather than in each process, so all servers see one limit per key. Use an atomic operation to avoid races, e.g. a Lua script or a single INCR with EXPIRE for a window counter, or a token-bucket script that computes refill from the last timestamp. Account for clock skew and Redis latency; for very high scale, use local token buckets that periodically sync with the central store to cut hot-key pressure. Always return 429 with a Retry-After header.",
+    "fs": "Puts counters in a shared store with atomic Lua/INCR and mentions local buckets syncing centrally at high scale.",
+    "fj": "Keeps an in-memory counter per server, so the real limit becomes N times the intended limit.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "atomic window counter (Redis)",
+        "lang": "python",
+        "lines": [
+          "n = redis.incr(key)",
+          "if n == 1:",
+          "    redis.expire(key, window_secs)",
+          "if n > limit:",
+          "    raise TooManyRequests(retry_after)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does it mean for an API to be idempotent, and which HTTP methods are idempotent?",
+    "a": "An operation is idempotent if performing it multiple times has the same effect as performing it once. By the HTTP spec GET, HEAD, PUT, and DELETE are idempotent, and GET/HEAD are also safe (no side effects); POST is generally not idempotent. This matters because clients and proxies retry on timeouts, so a non-idempotent endpoint can double-charge or double-create. PATCH is not guaranteed idempotent unless you design it to be.",
+    "fs": "Knows PUT/DELETE are idempotent but POST is not, and ties it to safe retries on timeout.",
+    "fj": "Thinks idempotent just means 'read-only' or assumes all REST calls are safe to retry.",
+    "level": "Jr"
+  },
+  {
+    "q": "Design an idempotent 'create payment' POST endpoint so a client retry never double-charges.",
+    "a": "Have the client send a unique Idempotency-Key header. On the server, in one DB transaction insert the key with INSERT ... ON CONFLICT DO NOTHING (or Redis SET NX) before doing the work; if the insert wins, perform the charge and store the response against the key; if it loses, return the already-stored response. The atomic check-and-set is what prevents two concurrent retries from both charging. Keys are scoped per endpoint and expired after a retention window.",
+    "fs": "Uses a client idempotency key plus an atomic INSERT ON CONFLICT / SET NX and returns the stored response on replay.",
+    "fj": "Just does 'SELECT then INSERT' to check existence, leaving a race where two concurrent retries both charge.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "atomic claim of the key",
+        "lang": "sql",
+        "lines": [
+          "INSERT INTO idempotency_keys (key)",
+          "VALUES (:key)",
+          "ON CONFLICT (key) DO NOTHING",
+          "RETURNING key;",
+          "-- no row back => replay,",
+          "-- return the saved response"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "Why is exactly-once delivery impossible, and how do real systems get exactly-once effects?",
+    "a": "True exactly-once delivery is impossible because the network can fail between the work and the acknowledgement, so the sender can't tell if a message was lost or just its ack was, forcing a retry. Systems instead combine at-least-once delivery with idempotent processing (dedup by message ID / idempotency key) to get exactly-once effects. Some platforms like Kafka offer 'exactly-once semantics' within their boundary via idempotent producers and transactions, but the consumer's downstream side effects still need to be idempotent.",
+    "fs": "Says exactly-once delivery is impossible and reframes the goal as at-least-once plus idempotent (effectively-once) processing.",
+    "fj": "Claims a queue or Kafka gives true exactly-once end to end and skips consumer-side dedup.",
+    "level": "Sr"
+  },
+  {
+    "q": "What is the dual-write problem in event-driven systems, and how does the outbox pattern solve it?",
+    "a": "The dual-write problem is needing to both update the database and publish an event, where a crash between the two leaves the system inconsistent (data saved but event lost, or vice versa) because there's no transaction spanning DB and broker. The transactional outbox writes the event into an 'outbox' table in the same local DB transaction as the state change, so both commit or neither does. A separate relay (poller or CDC like Debezium reading the log) then publishes outbox rows to the broker at least once, and consumers dedup.",
+    "fs": "Names the no-cross-system-transaction root cause and uses an outbox table committed with the state, relayed via CDC.",
+    "fj": "Says 'just publish the event after saving' or wrap both in a try/catch, which still loses or duplicates on crash.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "one transaction, two rows",
+        "lang": "sql",
+        "lines": [
+          "BEGIN;",
+          "  UPDATE orders SET status='paid'",
+          "  WHERE id = :id;",
+          "  INSERT INTO outbox(topic, payload)",
+          "  VALUES ('order.paid', :json);",
+          "COMMIT;",
+          "-- relay/CDC publishes outbox rows",
+          "-- consumers dedup on event id"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "When would you choose saga choreography vs orchestration for a distributed transaction?",
+    "a": "A saga replaces a distributed ACID transaction with a sequence of local transactions plus compensating actions to undo on failure. Choreography is decentralized: each service reacts to events with no coordinator, which is great for simple 2-4 step flows but gets hard to trace and reason about as it grows. Orchestration uses a central coordinator that drives steps and invokes compensations, giving visibility and easier branching logic, better for 5+ step or conditional flows. Durable execution engines like Temporal implement orchestration-style sagas as crash-safe workflows.",
+    "fs": "Picks choreography for short event flows and orchestration for long/branching ones, and knows compensations replace rollback.",
+    "fj": "Assumes you can just use a distributed 2PC transaction across microservices, or thinks any saga 'rolls back' like SQL.",
+    "level": "Sr"
+  },
+  {
+    "q": "What are the tradeoffs of event-driven (async) architecture versus synchronous request/response?",
+    "a": "Async/event-driven decouples producers from consumers, absorbs traffic spikes via the queue (load leveling), and lets you scale and deploy services independently, improving resilience. The costs are eventual consistency, harder end-to-end debugging and tracing, out-of-order and duplicate delivery you must handle, and no immediate response to the caller. Use it when work can be deferred or fanned out; keep it synchronous when the client genuinely needs the result inline (e.g. a read it will render immediately).",
+    "fs": "Trades decoupling and load-leveling against eventual consistency, ordering, and tracing pain, and picks per use case.",
+    "fj": "Treats 'add a queue' as universally better and ignores the eventual-consistency and observability costs.",
+    "level": "Mid"
+  },
+  {
+    "q": "How do you achieve high availability for a stateless web tier in a single region?",
+    "a": "Run multiple instances across at least two Availability Zones behind a load balancer, with health checks that drain and replace unhealthy instances, and an auto-scaling group to maintain capacity. Because the tier is stateless, any instance can serve any request, so losing a node or a whole AZ just reroutes traffic. Pair this with rolling or blue/green deploys so releases don't cause downtime. The single-region failure domain is the AZ, so spreading across AZs is the core HA move.",
+    "fs": "Spreads stateless instances across multiple AZs behind an LB with health checks and autoscaling as the failure domain.",
+    "fj": "Adds a second server in the same AZ/datacenter and calls it highly available, missing the AZ failure domain.",
+    "level": "Jr"
+  },
+  {
+    "q": "Why put a cache in front of a database, and what's the main risk you take on?",
+    "a": "A cache serves hot reads from fast memory (e.g. Redis) instead of hitting the database, cutting latency and offloading the DB so it scales for read-heavy workloads. The main risk is staleness: the cached copy can lag the source of truth, so you need a TTL or an invalidation strategy to bound how wrong a read can be. Caching helps reads, not writes, and only pays off when the same data is read far more often than it changes.",
+    "fs": "Frames caching as a read-latency/DB-offload win bounded by a TTL/invalidation staleness budget.",
+    "fj": "Adds a cache reflexively for all data including write-heavy or rarely-reread keys, ignoring staleness.",
+    "level": "Jr"
+  },
+  {
+    "q": "What is horizontal vs vertical scaling, and why do architects usually prefer horizontal for web tiers?",
+    "a": "Vertical scaling (scale up) means a bigger machine: more CPU/RAM on one node, simple but capped by the largest instance and a single point of failure. Horizontal scaling (scale out) means adding more nodes behind a load balancer, which has no hard ceiling and gives redundancy. Architects prefer scale-out for stateless web tiers because it provides both elasticity and availability; the catch is you must keep the tier stateless (push session/state to a shared store) for it to work.",
+    "fs": "Notes scale-out needs statelessness (state pushed to a shared store) and gives both elasticity and redundancy.",
+    "fj": "Defaults to 'buy a bigger box' or assumes you can scale out without removing in-process session state.",
+    "level": "Jr"
+  },
+  {
+    "q": "Estimate the storage needed to keep 5 years of events for a service taking 10,000 writes/sec, each event ~1 KB, replicated 3x.",
+    "a": "10,000 events/sec x 1 KB = 10 MB/sec. Per day that's about 10 MB x 86,400 s = ~864 GB/day, roughly 315 TB/year. Over 5 years that's ~1.5 PB of raw data, and with 3x replication ~4.5 PB. That order of magnitude immediately tells you to tier old data to cheaper object storage and likely compress, rather than keeping it all hot.",
+    "fs": "Carries units cleanly (MB/s -> TB/yr), multiplies by replication, and lands on the right order of magnitude plus a tiering implication.",
+    "fj": "Guesses a number with no unit chain, or forgets to multiply by the replication factor and time horizon.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "the unit chain",
+        "lang": "python",
+        "lines": [
+          "rate = 10_000          # ev/s",
+          "size = 1_000          # bytes",
+          "bps  = rate * size    # 10 MB/s",
+          "yr   = bps * 86400*365",
+          "      # ~315 TB/yr raw",
+          "total = yr * 5 * 3    # ~4.5 PB"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A read-heavy API serves 50M daily active users, ~20 requests each, peaking at 3x average. What peak QPS should you plan for, and how many app servers if one handles ~500 QPS?",
+    "a": "50M x 20 = 1B requests/day. Average QPS = 1e9 / 86,400 ~= 11,600 QPS. Peak at 3x ~= 35,000 QPS. At 500 QPS per server that's ~70 servers just for peak, so you'd provision ~80-90 with headroom and autoscaling, across multiple AZs. The key moves are converting daily to per-second, applying a peak multiplier (never size to the average), and adding headroom.",
+    "fs": "Divides by 86,400, applies a 2-3x peak multiplier, sizes to peak not average, and adds headroom and AZ spread.",
+    "fj": "Sizes capacity to average QPS, so the system falls over at peak, and forgets the peak multiplier entirely.",
+    "level": "Mid"
+  },
+  {
+    "q": "Engineering wants to move a batch ETL job from a 24/7 cluster to on-demand. How do you reason about the cost tradeoff?",
+    "a": "Compare always-on cost (instance-hours x 24 x 30) against on-demand: only pay for the hours the job actually runs plus startup overhead. If the job runs 2 hours/day, an ephemeral cluster is roughly 1/12 the compute cost, and spot/preemptible instances can cut it further for fault-tolerant batch work. The tradeoffs are cold-start latency, spot interruption handling, and operational complexity; for predictable steady load, reserved/savings-plan pricing on always-on can actually beat on-demand. Cost-optimize by matching the pricing model to the workload's shape.",
+    "fs": "Quantifies idle waste, matches pricing model (spot for batch, reserved for steady) to the workload's duty cycle.",
+    "fj": "Picks 'always cheaper in the cloud' or 'always on-demand' without computing the duty cycle or considering spot/reserved.",
+    "level": "Mid"
+  },
+  {
+    "q": "Your team proposes multi-region active-active to improve availability. What hidden costs and risks should you raise?",
+    "a": "Active-active doubles (or more) your infra spend and cross-region data-transfer egress charges, and it forces you to solve multi-master write conflicts and replication lag, which is a hard consistency problem (PACELC: you pay latency or consistency on every cross-region write). It also multiplies operational surface: deploys, schema migrations, and incident response must be coordinated across regions. Often a cheaper active-passive (warm standby) meets the actual RTO/RPO, so demand the real availability target before paying for active-active.",
+    "fs": "Surfaces egress cost, multi-master conflict resolution, and op complexity, and asks whether the RTO/RPO even requires active-active.",
+    "fj": "Treats active-active as pure upside ('more nines') and ignores write-conflict, egress, and operational cost.",
+    "level": "Sr"
+  },
+  {
+    "q": "A pipeline must process each Kafka message and write to a downstream DB. Consumers can crash and restart. How do you avoid duplicate side effects?",
+    "a": "Kafka gives at-least-once delivery, so on a crash before the offset commits the message is redelivered; to make the effect happen once, make the write idempotent. Use the message key or an event ID as a natural idempotency key and write with an upsert (INSERT ... ON CONFLICT DO NOTHING / DO UPDATE) so reprocessing the same event is a no-op. Commit the consumer offset only after the downstream write succeeds (process-then-commit), and keep the dedup key for at least the redelivery window.",
+    "fs": "Combines at-least-once + idempotent upsert keyed on event ID, and commits offsets after the write, not before.",
+    "fj": "Commits the offset first or assumes Kafka won't redeliver, so a crash silently drops or duplicates records.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "idempotent downstream write",
+        "lang": "sql",
+        "lines": [
+          "INSERT INTO events(event_id, data)",
+          "VALUES (:id, :data)",
+          "ON CONFLICT (event_id)",
+          "DO NOTHING;",
+          "-- safe to replay the same",
+          "-- message after a crash"
+        ],
+        "accent": "fix"
+      }
+    ]
+  },
+  {
+    "q": "What problem does layered (n-tier) architecture solve, and what's its most common failure mode?",
+    "a": "Layered architecture splits a system into horizontal tiers — typically presentation, business/application, and data-access — where each layer only talks to the one directly below it, so concerns are separated and you can swap an implementation in one layer without touching the others. It's the default for most line-of-business apps because it's simple to reason about and onboard onto. The classic failure mode is the 'architecture sinkhole': requests pass straight through every layer doing nothing but forwarding, adding indirection with no value. The other risk is the data layer becoming a shared coupling point that every feature reaches into.",
+    "fj": "Describes layers as just 'folders for files' with no rule about dependency direction or its costs.",
+    "fs": "Names the strict downward dependency rule and calls out the sinkhole anti-pattern of pass-through layers.",
+    "level": "Jr",
+    "asked": 14
+  },
+  {
+    "q": "Explain hexagonal (ports and adapters) architecture. What is a 'port' versus an 'adapter'?",
+    "a": "Hexagonal architecture, coined by Alistair Cockburn, puts your domain logic at the center and isolates it from the outside world behind ports. A port is an interface the core defines for something it needs or offers (e.g. a PaymentGateway port or an OrderRepository port); an adapter is a concrete implementation that connects a real technology to that port (a Stripe adapter, a Postgres adapter, an HTTP controller). The dependency rule points inward: the domain depends on its own port interfaces, and adapters depend on the domain, never the reverse. This lets you swap the database or transport, and test the core with in-memory fakes, without touching business rules.",
+    "fj": "Treats 'hexagonal' as a buzzword for layers and can't say which side owns the interface.",
+    "fs": "Pins port = core-owned interface, adapter = tech-specific impl, with dependencies pointing inward toward the domain.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "label": "core owns the port",
+        "lang": "ts",
+        "lines": [
+          "// port: defined by the domain",
+          "interface OrderRepo {",
+          "  save(o: Order): Promise<void>;",
+          "}",
+          "// adapter: tech-specific impl",
+          "class PgOrderRepo",
+          "  implements OrderRepo { /* ... */ }",
+          "// domain depends on OrderRepo, not Pg"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When should a team pick a modular monolith over microservices?",
+    "a": "Default to a modular monolith for most new products: one deployable, but internally split into modules with explicit boundaries and no cross-module database access, so you get logical separation without distributed-systems tax. It keeps transactions local, debugging in one process, and refactoring across boundaries cheap while the domain is still being discovered. Reach for microservices when you have a concrete forcing function — independent scaling of a hot component, teams that must deploy on separate cadences, or differing tech/compliance needs — not because micro is 'modern'. The honest path is a well-modularized monolith first, extracting a service only when a boundary has proven stable and a real driver appears.",
+    "fj": "Starts with microservices for greenfield 'to scale later', taking on network, data, and ops cost with no driver.",
+    "fs": "Picks modular monolith by default and names concrete drivers (independent scaling, team cadence) before splitting.",
+    "level": "Mid",
+    "asked": 22
+  },
+  {
+    "q": "Explain CQRS. What problem does separating the command and query models actually solve?",
+    "a": "CQRS (Command Query Responsibility Segregation) uses separate models for writes (commands that change state) and reads (queries that return data), instead of forcing one ORM model to serve both. The win is that read and write workloads have different shapes: writes need validation and a normalized, consistent model, while reads often want denormalized, query-optimized projections you can scale and cache independently. It shines for read-heavy systems, complex domains, or when the UI needs many different views of the same data. The cost is more moving parts and usually eventual consistency between the write side and the read projections, so don't apply it to simple CRUD.",
+    "fj": "Thinks CQRS just means 'use a read replica' or applies it to plain CRUD, paying complexity for no benefit.",
+    "fs": "Separates write vs read models for differing workloads/shapes and accepts eventual consistency on the read side.",
+    "level": "Sr",
+    "asked": 18
+  },
+  {
+    "q": "What is event sourcing, and what are its two biggest operational pitfalls?",
+    "a": "Event sourcing persists state as an append-only log of immutable domain events (OrderPlaced, ItemShipped) and derives current state by replaying them, rather than storing only the latest row. You get a full audit trail, time-travel to any past state, and a natural fit with CQRS where events build read projections. The first big pitfall is schema/versioning: events live forever, so you must handle old event shapes (upcasting) as the model evolves. The second is replay cost — rebuilding state from a long log is slow — which forces snapshots at intervals. It also makes 'just query the current value' harder, so it's reserved for domains where history and auditability are genuinely valuable.",
+    "fj": "Sells event sourcing as free audit logging and ignores versioning of forever-stored events and replay performance.",
+    "fs": "Names event versioning/upcasting and replay cost (needing snapshots) as the real operational pitfalls.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "label": "state is a fold over events",
+        "lang": "python",
+        "lines": [
+          "events = load_events(order_id)",
+          "state = snapshot or EMPTY",
+          "for e in events_after(snapshot):",
+          "    state = apply(state, e)",
+          "# current state = fold(apply, events)",
+          "# snapshot periodically to cap replay"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "In domain-driven design, what is a bounded context and why does it matter for service boundaries?",
+    "a": "A bounded context is an explicit boundary within which a domain model and its ubiquitous language are consistent and unambiguous — the word 'Customer' can mean different things in Billing versus Support, and each context owns its own definition. It matters because bounded contexts are the strongest natural seams for splitting a system into services: aligning a service to one context keeps its model coherent and avoids one giant shared model that no team fully owns. Contexts integrate through well-defined contracts mapped on a context map (e.g. customer/supplier, anti-corruption layer). Carving microservices by technical layers or database tables instead of by bounded context is a leading cause of chatty, tightly coupled services.",
+    "fj": "Splits services by database tables or CRUD entities and has no notion of a model boundary or context map.",
+    "fs": "Defines a context as a model/language boundary and uses it as the seam for service splits, not tables or layers.",
+    "level": "Sr",
+    "asked": 17
+  },
+  {
+    "q": "In DDD, what is an aggregate, and what is the aggregate root's job?",
+    "a": "An aggregate is a cluster of related entities and value objects treated as a single consistency boundary — for example an Order with its OrderLines. The aggregate root is the one entity that is the sole entry point: outside code may only hold a reference to the root, and all changes to anything inside the aggregate go through the root, which enforces the invariants (e.g. order total equals the sum of lines). The aggregate is also the transactional unit — you load, save, and lock it as a whole — so you keep aggregates small to avoid contention. Cross-aggregate consistency is handled with eventual consistency via domain events, not by stretching one transaction across many aggregates.",
+    "fj": "Lets callers mutate child entities directly and tries to wrap multiple aggregates in one big transaction.",
+    "fs": "Makes the root the only entry point that enforces invariants, treats the aggregate as the transaction/consistency unit.",
+    "level": "Sr",
+    "asked": 13
+  },
+  {
+    "q": "What's the difference between an API gateway and a Backend-for-Frontend (BFF)?",
+    "a": "An API gateway is a single shared entry point in front of your services that handles cross-cutting concerns — TLS termination, auth, rate limiting, routing, and request aggregation — so each service doesn't reimplement them. A BFF is a more specific pattern: one tailored backend per client type (web, iOS, Android), each shaping and aggregating downstream calls into exactly what that frontend needs. The distinction is generality versus specialization: the gateway is one general edge for everyone, while BFFs avoid a single generic API getting bloated with conditionals to serve very different clients. They compose — you can run BFFs behind a shared gateway.",
+    "fj": "Uses 'API gateway' and 'BFF' interchangeably and can't explain why you'd want a separate backend per client.",
+    "fs": "Frames gateway as one general edge for cross-cutting concerns and BFF as a per-client tailored backend; notes they compose.",
+    "level": "Mid",
+    "asked": 16
+  },
+  {
+    "q": "What does a service mesh do, and what's the role of the sidecar proxy?",
+    "a": "A service mesh handles service-to-service networking concerns — mutual TLS, retries, timeouts, load balancing, traffic splitting, and rich telemetry — as infrastructure, so application code doesn't carry that logic. It works by injecting a sidecar proxy (e.g. Envoy) next to each service instance; all inbound and outbound traffic flows through the proxy, which is configured by a central control plane. This moves resilience and observability out of per-language libraries into a uniform data plane, which is the main appeal in polyglot fleets. The cost is real: extra latency per hop, more moving parts, and operational complexity, so it's overkill for a handful of services.",
+    "fj": "Describes a mesh as 'just an API gateway' or thinks it's free, ignoring the per-hop proxy latency and ops burden.",
+    "fs": "Puts mTLS/retries/telemetry in sidecar proxies driven by a control plane, and names the latency/complexity cost.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "How does the strangler fig pattern let you migrate off a legacy monolith safely?",
+    "a": "Named after a vine that grows around a tree until it replaces it, the strangler fig pattern incrementally rebuilds functionality as new services while the legacy system keeps running, instead of a risky big-bang rewrite. You put a facade or routing layer (often the API gateway or a proxy) in front of the old system, then redirect one capability at a time to its new implementation, leaving everything else untouched. Each slice can be tested, released, and rolled back independently, so risk is bounded and value ships continuously. Over time more routes point to new code until the legacy system handles nothing and is decommissioned. The hard part is usually the shared database, which often must be split out per migrated slice.",
+    "fj": "Proposes a big-bang rewrite or a frozen 'parallel build' with no incremental cutover or rollback path.",
+    "fs": "Describes a routing facade redirecting one capability at a time with independent rollback, and flags the shared DB as the hard part.",
+    "level": "Mid",
+    "asked": 14
+  },
+  {
+    "q": "Explain the circuit breaker pattern and how bulkheads and retries complement it.",
+    "a": "A circuit breaker wraps calls to a dependency and tracks failures: in the closed state calls pass through normally; once failures cross a threshold it trips to open and fails fast (returning an error or fallback without calling the dependency), giving the struggling service room to recover; after a cooldown it goes half-open and lets a few trial calls through, closing again if they succeed. This stops a slow dependency from cascading into thread exhaustion upstream. Bulkheads complement it by isolating resources — separate thread/connection pools per dependency — so one saturated dependency can't starve the rest. Retries (with exponential backoff and jitter, ideally only on idempotent calls) handle transient blips, but unbounded retries amplify an outage, which is exactly why you gate them behind a breaker.",
+    "fj": "Confuses the breaker states or recommends naive unlimited retries that amplify the outage they're meant to ride out.",
+    "fs": "Walks closed/open/half-open correctly, uses bulkheads for resource isolation, and bounds retries with backoff behind the breaker.",
+    "level": "Sr",
+    "asked": 19,
+    "code": [
+      {
+        "label": "fail fast when open",
+        "lang": "python",
+        "lines": [
+          "if breaker.state == 'open':",
+          "    return fallback()  # don't call",
+          "try:",
+          "    r = call_dependency()",
+          "    breaker.record_success()",
+          "    return r",
+          "except Exception:",
+          "    breaker.record_failure(); raise"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are the four principles of data mesh, and what organizational problem is it trying to fix?",
+    "a": "Data mesh, introduced by Zhamak Dehghani, rests on four principles: domain-oriented ownership (the domain teams that produce data own and serve it, not a central data team), data as a product (each dataset is a discoverable, trustworthy, well-documented product with SLAs), a self-serve data platform (infrastructure that lets domain teams build and publish data products without deep platform expertise), and federated computational governance (global interoperability and policy enforced automatically across autonomous domains). It targets the bottleneck of a single centralized data team that becomes the constraint as an org scales, by decentralizing ownership to the domains while keeping standards consistent. It's an organizational and operating-model shift more than a specific technology.",
+    "fj": "Calls data mesh 'just a bunch of data lakes' or a tool you buy, missing domain ownership and federated governance.",
+    "fs": "Lists all four principles and frames the problem as the central-data-team bottleneck, decentralizing to domains.",
+    "level": "Mid",
+    "asked": 15
+  },
+  {
+    "q": "Explain the medallion (bronze/silver/gold) architecture in a lakehouse.",
+    "a": "Medallion, popularized by Databricks, organizes lakehouse data into progressively refined layers. Bronze holds raw ingested data landed as-is from sources (files, Kafka, CDC), preserving history and enabling reprocessing. Silver is cleaned, deduplicated, conformed, and joined into a validated, queryable model — the trustworthy enterprise view. Gold is business-level, aggregated, and feature/metric-ready tables shaped for specific analytics, dashboards, or ML consumers. Data quality and structure improve at each hop (hence 'multi-hop'), and because raw bronze is retained you can always rebuild silver and gold by reprocessing. The pattern gives clear ownership and quality contracts per layer rather than one undifferentiated swamp.",
+    "fj": "Mixes up the layers (e.g. 'gold is raw') or treats the lake as one undifferentiated dumping ground with no quality tiers.",
+    "fs": "Maps bronze=raw, silver=cleaned/conformed, gold=business aggregates, and notes retained bronze enables reprocessing.",
+    "level": "Jr",
+    "asked": 13
+  },
+  {
+    "q": "What's the architectural difference between ETL and ELT, and why did ELT win for cloud warehouses?",
+    "a": "In ETL you Extract, then Transform on a separate processing tier, then Load only the finished data into the warehouse — the historical choice when warehouse storage and compute were scarce and expensive. In ELT you Extract and Load raw data into the warehouse first, then Transform in-place using the warehouse's own scalable compute (typically SQL, e.g. with dbt). ELT won for cloud platforms like Snowflake and BigQuery because storage is cheap and compute is elastic and separable, so loading raw and transforming on demand is both cost-effective and flexible. ELT also keeps the untransformed source available for re-deriving new models later, whereas ETL discards anything it didn't transform up front. ETL still fits when you must mask/strip sensitive data before it lands, or transform outside the warehouse for compliance.",
+    "fj": "Thinks ETL vs ELT is just word order, with no grasp of where transformation runs or why cheap storage flipped the default.",
+    "fs": "Notes ELT transforms in-warehouse on elastic compute and keeps raw for re-derivation; keeps ETL for pre-load masking/compliance.",
+    "level": "Jr",
+    "asked": 17
+  },
+  {
+    "q": "Contrast lambda and kappa architectures for processing data. When would you still choose lambda?",
+    "a": "Lambda architecture runs two parallel paths over the same immutable input: a batch layer that recomputes accurate, complete views slowly, and a speed layer that produces approximate low-latency views, merged at a serving layer. Its core weakness, as Jay Kreps argued when proposing kappa, is maintaining the same logic twice in two different systems, which is costly and bug-prone. Kappa collapses this to a single streaming pipeline: everything is a stream, and to 'reprocess' you simply replay the log through the same code, eliminating the duplicate batch path. Default to kappa for new streaming-first systems with one codebase. Lambda can still earn its place when batch and real-time genuinely need different engines or algorithms, or heavy historical recomputation is far cheaper in a batch system than replaying an enormous stream.",
+    "fj": "Treats lambda as strictly obsolete or can't articulate the duplicate-logic problem kappa was created to remove.",
+    "fs": "Identifies lambda's dual-codebase cost, explains kappa as single-stream replay, and names when batch separation still wins.",
+    "level": "Mid",
+    "asked": 14
+  }
+]

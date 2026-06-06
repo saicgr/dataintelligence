@@ -1,0 +1,757 @@
+[
+  {
+    "q": "What is a Kafka topic, a partition, and a consumer group? How do they fit together?",
+    "a": "A topic is a named, durable log; a partition is an ordered, append-only sub-log within it, so a topic with N partitions is N parallel ordered logs rather than one global ordered log. A consumer group is a set of consumers that collectively read a topic, with each partition assigned to at most one consumer in the group, which caps consumer parallelism at the partition count. Offsets are per-group-per-partition bookmarks owned and advanced by the consumer, stored in the internal __consumer_offsets topic. Kafka never deletes messages on consumption; retention is time- or size-based and decoupled from consumption.",
+    "fj": "Kafka keeps all messages in a single ordered queue.",
+    "fs": "Ordering is per-partition only. A topic with multiple partitions is multiple independent ordered logs — global order requires a single partition.",
+    "level": "Jr",
+    "asked": 28
+  },
+  {
+    "q": "Walk me through what happens when a producer sends a message to Kafka. What is the role of the partition key, and how does Kafka route the message?",
+    "a": "The producer picks the target partition before sending: with a key it uses partition = hash(key) % numPartitions so same-key messages land on one partition and stay ordered, and without a key it distributes round-robin or with sticky batching in recent versions. The message goes to the partition leader, which writes it to the log and acknowledges per the acks setting while replicas follow. The key is the most consequential producer decision because it controls both ordering and load distribution simultaneously. A skewed key (one whale customer with most of the traffic) creates a hot partition that one consumer handles alone.",
+    "fj": "The key is just metadata attached to the message.",
+    "fs": "The key is the partition routing function — hash(key) % numPartitions. It directly controls which partition the message lands on, which controls ordering and load balance.",
+    "level": "Jr",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Key routes the partition",
+        "lines": [
+          "from confluent_kafka import Producer",
+          "p = Producer({'bootstrap.servers':'b'})",
+          "# same key -> one partition, ordered",
+          "p.produce('orders', key='cust-42',",
+          "          value=b'paid')",
+          "# null key -> round-robin / sticky",
+          "p.produce('orders', value=b'log')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are the three Kafka delivery semantics — at-most-once, at-least-once, and exactly-once — and what do you get by default?",
+    "a": "At-most-once sends without waiting for acknowledgment (or commits the offset before processing), so messages may be lost but never duplicated. At-least-once retries on failure so messages are never lost but a retry can write a duplicate, making it the common production default that requires idempotent consumers or downstream deduplication. Exactly-once needs the idempotent producer plus the transactional API, where the broker deduplicates retried batches via producer ID and sequence number and reads-process-writes are atomic across partitions. In Kafka 3.0+ the idempotent producer is on by default, but full exactly-once for a consume-transform-produce loop still requires transactions.",
+    "fj": "Kafka guarantees exactly-once by default.",
+    "fs": "By default (Kafka 3.0+) the producer is idempotent, which prevents retry duplicates per session — but full exactly-once across a consume-process-produce loop requires explicit transactions.",
+    "level": "Jr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Idempotent (default) vs EOS",
+        "lines": [
+          "# 3.0+: dedupes retries per session",
+          "conf = {'enable.idempotence': True,",
+          "        'acks': 'all'}",
+          "# full exactly-once also needs:",
+          "conf['transactional.id'] = 'svc-1'"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide what to use as the partition key for a new Kafka topic?",
+    "a": "First ask which records must stay ordered relative to each other and how traffic is distributed across key values. The key should be the ordering unit (user_id or order_id), and it must have high cardinality and even distribution so traffic does not concentrate into a few partitions or create a hot partition from a skewed value. Leave the key null when ordering is irrelevant and you only want even distribution. If the natural ordering key is skewed, consider a compound key like user_id plus a bucket, and remember that changing the key later is painful because it reroutes producers and breaks in-flight ordering.",
+    "fj": "I'd just key on whatever field is most convenient.",
+    "fs": "I'd key on the ordering unit and check that it has high cardinality and even distribution — a skewed key creates a hot partition that one consumer handles alone.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Compound key for a skewed value",
+        "lines": [
+          "# whale user_id -> one hot partition",
+          "p.produce('t', key=user_id, value=v)",
+          "# spread it: user_id + bucket",
+          "b = hash(order_id) % 8",
+          "key = f'{user_id}:{b}'",
+          "p.produce('t', key=key, value=v)",
+          "# now per-(user,bucket) ordering only"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When would you use a compacted topic versus a retention-based topic in Kafka?",
+    "a": "Retention-based topics delete messages after a time or size limit and suit event streams where you care about what happened within a window, such as clicks, logs, or sensor readings. Compacted topics retain only the latest message per key indefinitely and suit current-state topics like user profiles, account balances, or Kafka Streams changelogs. To delete a key from a compacted topic you produce a tombstone (a null value for that key), which the compactor eventually removes. A hybrid compact,delete policy keeps current state while purging records older than a retention period.",
+    "fj": "Compaction just removes old messages to save space.",
+    "fs": "Compaction retains the *latest value per key* indefinitely — it's not size reduction, it's a current-state guarantee. Retention deletes by time/size regardless of key.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Compacted topic + tombstone",
+        "lines": [
+          "# topic config: keep latest per key",
+          "# cleanup.policy = compact",
+          "p.produce('profiles', key='u1',",
+          "          value=b'{...}')",
+          "# delete a key: None payload (tombstone)",
+          "p.produce('profiles', key='u1',",
+          "          value=None)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Kafka vs Amazon Kinesis — what are the main differences and when would you choose each?",
+    "a": "Kafka is open-source and self-managed (or managed via Confluent/MSK), giving maximum control, lowest latency, highest throughput, and a rich ecosystem of Connect, Streams, and Schema Registry, but it demands operational expertise. Kinesis is fully managed with zero broker ops and native AWS integration, but scaling via shards is coarser and resharding is slow and disruptive, retention is capped, and cost grows with shard-hours at high throughput. Both guarantee per-partition or per-shard ordering with similar key routing. Choose Kafka for high throughput, low latency, or ecosystem needs, and Kinesis when deep AWS integration matters and ops burden is unacceptable — though MSK offers Kafka on AWS as a middle ground.",
+    "fj": "We're on AWS so we should use Kinesis.",
+    "fs": "AWS doesn't require Kinesis — MSK gives Kafka on AWS. I'd choose based on throughput needs, ecosystem requirements, ops budget, and whether Kinesis's scaling model fits the traffic pattern.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "How does Kafka partitioning interact with ordering guarantees and consumer parallelism? What breaks when you add partitions to a live topic?",
+    "a": "Ordering is per-partition, not per-topic, so a 12-partition topic is 12 independent ordered logs, and parallelism is bounded by partition count since at most one consumer per partition can be active. The key determines the partition via hash(key) % numPartitions, keeping same-key messages ordered on one partition. Adding partitions to a live topic changes numPartitions and remaps the hash function, so a key that hashed to partition 3 may now hash to partition 7, splitting in-flight messages across partitions and breaking ordering for any keyed consumer. Because of this, partition count is an up-front capacity decision — over-provision 2-3x anticipated parallelism rather than remap later.",
+    "fj": "Just add partitions whenever you need more throughput.",
+    "fs": "Adding partitions remaps the hash function and breaks ordering for in-flight keyed messages — it's an up-front decision, not a live knob.",
+    "level": "Sr",
+    "asked": 26,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Adding partitions remaps the hash",
+        "lines": [
+          "h = hash('cust-42')   # fixed per key",
+          "h % 12   # -> partition 3",
+          "# grow topic 12 -> 16 partitions:",
+          "h % 16   # -> partition 7  (moved!)",
+          "# in-flight order for cust-42 splits"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is consumer lag, how do you monitor it, and how do you diagnose whether it is a consumer problem or a producer problem?",
+    "a": "Consumer lag is the log end offset minus the consumer group's last committed offset for a partition, measuring how many messages remain unprocessed. Monitor it with kafka-consumer-groups.sh --describe, the records-lag-max JMX metric, or tools like Burrow, Confluent Control Center, or Datadog. If lag grows uniformly the consumer is simply slower than the producer, but if it grows on one partition only that is a hot partition from key skew that adding consumers cannot fix; spiky lag points to bursty producers or GC pauses. Compare the topic's bytes-in-per-second before and during the event to distinguish a slower consumer from a producer spike.",
+    "fj": "Just add more consumers to reduce lag.",
+    "fs": "Adding consumers helps if lag is uniform across partitions. If it's isolated to one partition, that's key skew — more consumers can't help because only one consumer can read that partition.",
+    "level": "Sr",
+    "asked": 21,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Inspect per-partition lag",
+        "lines": [
+          "# kafka-consumer-groups.sh --describe \\",
+          "#   --group g1 --bootstrap-server b:9092",
+          "# PARTITION CURRENT  LOG-END  LAG",
+          "#   0        980     1000     20",
+          "#   3        100     5000   4900  <- hot"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a consumer group rebalance, what triggers one, and how does it impact your pipeline? What is cooperative sticky rebalancing?",
+    "a": "A rebalance redistributes partition assignments across a group's consumers, and in the eager protocol all consumers stop processing, revoke their partitions, and wait for the coordinator to reassign — a stop-the-world event. It is triggered when a consumer joins or leaves, fails to poll within max.poll.interval.ms, heartbeats late enough to be considered dead, or a partition is added. Cooperative sticky rebalancing (default in 3.0+) revokes only the partitions that must move so unaffected consumers keep processing, at the cost of a few extra incremental rounds. Minimize rebalances by tuning session and heartbeat timeouts, setting max.poll.interval.ms above worst-case processing, and reducing max.poll.records.",
+    "fj": "Rebalancing is just Kafka redistributing partitions — it's automatic and fine.",
+    "fs": "Eager rebalancing is a stop-the-world event for the whole group — I tune session/poll timeouts and use cooperative sticky rebalancing to minimize the impact.",
+    "level": "Sr",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Minimize rebalance impact",
+        "lines": [
+          "conf = {",
+          " 'partition.assignment.strategy':",
+          "     'cooperative-sticky',",
+          " 'max.poll.interval.ms': 600000,",
+          " 'session.timeout.ms': 45000,",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you choose the right Kafka delivery semantic for a new pipeline — at-least-once vs exactly-once? Walk me through the decision.",
+    "a": "Start from the cost of duplicates downstream: if the destination is idempotent (a database UPSERT on a unique key) use at-least-once, which is simpler and cheaper and covers most pipelines, but if duplicates are impossible to handle (money movement, audit logs) use exactly-once. The at-least-once recipe is acks=all, high retries, enable.idempotence=true, and idempotent consumers via UPSERT on a business key. Exactly-once adds a transactional.id and commits output messages and the consumer offset atomically inside a transaction. Critically, Kafka transactions are Kafka-to-Kafka only — if the sink is a database you need an idempotent write, outbox/CDC pattern, or 2PC.",
+    "fj": "Always use exactly-once to be safe.",
+    "fs": "EOS has a 15-30% throughput cost at short commit intervals — I use it only when the downstream truly can't tolerate duplicates. At-least-once + idempotent destination covers most cases.",
+    "level": "Sr",
+    "asked": 19,
+    "code": [
+      {
+        "lang": "python",
+        "label": "At-least-once + idempotent sink",
+        "lines": [
+          "conf = {'acks': 'all',",
+          "        'enable.idempotence': True,",
+          "        'retries': 2147483647}",
+          "# sink dedupes on a business key:",
+          "# INSERT ... ON CONFLICT (id)",
+          "#   DO UPDATE SET ..."
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide how many partitions a new Kafka topic should have? Walk me through the math and the trade-offs.",
+    "a": "Use a throughput formula: partitions = ceil(target_MB_per_second / single_partition_throughput), where a single partition handles roughly 10-20 MB/s depending on message size, compression, and consumer speed, and partitions must also be at least the number of concurrent consumers you want. Over-provision to 2-3x anticipated parallelism because adding partitions later remaps the hash function and breaks ordering for keyed topics. The upper bound matters too: each partition costs a file descriptor, lengthens leader election and rebalances, and can raise latency. A common mistake is setting partitions equal to the current consumer count, leaving no headroom to scale out.",
+    "fj": "I'd set partitions to however many consumers I have.",
+    "fs": "I'd over-provision 2-3x for headroom. Partitions = consumers is too tight — adding one consumer triggers a repartition if you've left no room.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Partition count from throughput",
+        "lines": [
+          "import math",
+          "target = 200   # MB/s",
+          "per_part = 15  # MB/s/partition",
+          "n = math.ceil(target / per_part)  # 14",
+          "n = max(n, consumers)  # >= parallelism",
+          "n *= 2  # 2-3x headroom, no remap later"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "acks=all vs acks=1 in Kafka — what is the durability difference, and when do you choose each?",
+    "a": "With acks=1 the leader acknowledges after writing to its own log before followers replicate, so a leader failure right after acknowledgment loses the message, but latency is lower. With acks=all the leader waits until all in-sync replicas have written, surviving any single-broker loss for the highest durability. acks=all alone can silently degrade to leader-only if the ISR shrinks to one, so pair it with min.insync.replicas=2 to fail-fast with NotEnoughReplicasException; the production standard is acks=all plus min.insync.replicas=2 plus replication factor 3. Reserve acks=0 fire-and-forget for high-volume loss-tolerant telemetry.",
+    "fj": "acks=all means messages can never be lost.",
+    "fs": "acks=all waits for the ISR, but if the ISR shrinks to 1 without min.insync.replicas set, you silently get leader-only durability. The full safe config is acks=all + min.insync.replicas=2 + replication factor 3.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "python",
+        "accent": "bug",
+        "label": "Unsafe: ISR can degrade silently",
+        "lines": [
+          "# ISR can shrink to 1 -> silent",
+          "# leader-only durability",
+          "conf = {'acks': 'all'}"
+        ]
+      },
+      {
+        "lang": "python",
+        "accent": "fix",
+        "label": "Safe: fail-fast on too few ISRs",
+        "lines": [
+          "conf = {'acks': 'all'}  # producer",
+          "# broker/topic side, RF=3:",
+          "# min.insync.replicas = 2",
+          "# now fewer ISRs -> write fails fast"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Walk me through how Kafka achieves exactly-once semantics end-to-end. When does the guarantee hold, and where does it break down?",
+    "a": "EOS layers an idempotent producer with the transactional API: the idempotent producer assigns a Producer ID and per-partition sequence numbers so the broker discards duplicate retried batches, and transactions extend this to atomic multi-partition writes plus the consumer offset commit via a transaction coordinator running a two-phase commit. Zombie fencing increments the producer epoch on restart so the broker rejects writes from stale lower-epoch instances. The guarantee holds for Kafka-to-Kafka pipelines, where a crash produces no output-topic duplicate and resumes at the right offset. It breaks down when the sink is external (Postgres, S3, a REST API), so that sink must be idempotent or use an outbox/CDC pattern.",
+    "fj": "enable.idempotence=true gives exactly-once for my full pipeline.",
+    "fs": "Idempotence deduplicates retries within a session per partition — it does not make a consume-process-produce loop atomic. That requires transactions.",
+    "level": "Sr",
+    "asked": 23,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Atomic consume-process-produce",
+        "lines": [
+          "p.init_transactions()",
+          "p.begin_transaction()",
+          "p.produce('out', value=transform(msg))",
+          "# offsets committed inside the txn:",
+          "p.send_offsets_to_transaction(",
+          "    offsets, c.consumer_group_metadata())",
+          "p.commit_transaction()"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A single Kafka partition is becoming a hot partition, causing consumer lag on that partition while others are idle. Walk me through diagnosing and mitigating it without breaking downstream ordering guarantees.",
+    "a": "Diagnose with per-partition consumer lag and broker-side BytesInPerSec — one partition dominating both confirms a hot partition caused by a skewed key, since hash(key) % N sends all of one key's messages to one partition and adding consumers cannot help because only one consumer reads a partition. The most production-viable fix is a compound or sub-partitioning key (user_id:bucket_0..9) that spreads load across more partitions, with the trade-off that strict per-entity ordering becomes per-sub-key ordering. Other options are a custom partitioner for hot keys, producer-side salting when ordering for that key is unneeded, or back-pressure as a band-aid. Always state the ordering trade-off explicitly.",
+    "fj": "I'd add more consumers to handle the hot partition.",
+    "fs": "More consumers don't fix a hot partition — only one consumer can read that partition. The fix is upstream: change the key to distribute load, at the cost of defining the ordering trade-off.",
+    "level": "Sr",
+    "asked": 19,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Sub-partition the hot key",
+        "lines": [
+          "# all of one key -> one partition",
+          "# add a bucket to spread the load",
+          "bucket = hash(event_id) % 10",
+          "key = f'{user_id}:{bucket}'",
+          "p.produce('events', key=key,",
+          "          value=v)",
+          "# trade: per-(user,bucket) order only"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do ISR, acks, min.insync.replicas, and unclean leader election interact to determine Kafka's durability and availability trade-offs? Give me a concrete failure scenario.",
+    "a": "The ISR is the set of replicas caught up within replica.lag.time.max.ms, and only ISR members can be elected leader; acks=all waits for all ISR members but silently degrades to acks=1 if the ISR shrinks to just the leader. min.insync.replicas=2 makes the broker reject writes with NotEnoughReplicasException when fewer replicas are in sync, failing fast instead of degrading silently. Unclean leader election (default false) can elect an out-of-sync replica to restore availability at the cost of losing acknowledged messages. Concretely with RF=3, minISR=2, acks=all: losing one broker keeps writes flowing, but losing a second shrinks the ISR to one so writes fail while consumers still read and no data is lost.",
+    "fj": "acks=all is enough for zero data loss.",
+    "fs": "acks=all waits for the ISR, but ISR can shrink to 1 without minISR protecting it. The full safe config is acks=all + minISR=2 + RF=3 + unclean.leader.election.enable=false.",
+    "level": "Sr",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Fail-fast, no acknowledged loss",
+        "lines": [
+          "# producer",
+          "conf = {'acks': 'all'}",
+          "# broker / topic:",
+          "# replication.factor = 3",
+          "# min.insync.replicas = 2",
+          "# unclean.leader.election.enable=false"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When is log compaction the right choice over time-based retention, and what are the operational gotchas of compacted topics?",
+    "a": "Use compaction when the topic represents current state keyed by an entity (user profile, account balance, feature flag, Kafka Streams changelog) and consumers replay to rebuild the latest value per key, versus retention for event streams where every event matters within a window. The hybrid compact,delete keeps current state while purging keys not updated in N days. The main gotchas: compaction is eventually consistent so old values linger until the cleaner runs, and tombstones are retained only for delete.retention.ms (default 24h), so a consumer offline longer than that misses the delete and keeps a stale value. Large high-cardinality topics also compact slowly, and an overwhelmed log cleaner lets old values accumulate.",
+    "fj": "Compaction is just a way to save disk space.",
+    "fs": "Compaction provides a per-key current-state guarantee — it's a semantic choice, not a storage optimization. Retention deletes by time regardless of key; compaction keeps the latest value per key indefinitely.",
+    "level": "Sr",
+    "asked": 15
+  },
+  {
+    "q": "How do you approach capacity planning for a new Kafka cluster? What are the key variables and how do they interact?",
+    "a": "The key inputs are target throughput, message size, replication factor, retention period, and partition count. Broker disk is throughput times retention times replication factor plus 20-30% headroom, and forgetting the RF multiplier badly underestimates storage. Network must cover producer ingress, replication traffic, and consumer egress across all consumer groups, since replication shares the same NIC and can saturate it and shrink the ISR. Keep under roughly 4,000 partitions per broker to avoid slow leader election and JVM GC pressure, and derive broker count from throughput-per-broker (minimum three for RF=3). Monitor disk fill rate, ISR shrink, network saturation, leader imbalance, and log cleaner lag.",
+    "fj": "I'd size for the producer throughput times the retention period.",
+    "fs": "Disk = throughput * retention * replication factor. Forgetting the RF multiplier dramatically underestimates storage — a RF=3 cluster needs 3x the raw produce throughput in disk.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Disk must include the RF multiplier",
+        "lines": [
+          "tput = 100      # MB/s produced",
+          "days = 7",
+          "sec = days*24*3600",
+          "raw = tput*sec/1e6  # ~60 TB (no RF!)",
+          "disk = raw*3*1.25   # RF=3 +25% -> 227 TB"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "You are designing a Kafka-based event streaming platform for a financial institution. Walk me through how you would set delivery semantics, durability, partition strategy, and monitoring from first principles.",
+    "a": "Use exactly-once for core transaction topics (idempotent producer plus transactions, read_committed consumers) and at-least-once with idempotent UPSERTs for derived analytics topics, avoiding over-engineering EOS everywhere. Set acks=all, min.insync.replicas=2, replication factor 3, and unclean leader election disabled so fail-fast beats silent data loss. Key on account_id for per-account ordering, using a compound key if high-volume accounts create hot partitions, and over-provision partitions 2-3x. For the database sink use an outbox pattern with CDC since Kafka transactions are Kafka-native, retain 7 years via tiered storage to S3, and monitor per-partition lag, ISR shrink (immediate page), producer errors, end-to-end latency SLO, and disk fill.",
+    "fj": "I'd use exactly-once for everything to be safe.",
+    "fs": "EOS has cost and complexity. I'd use it for the transaction topics where duplicates are financially harmful. Analytics/derived topics can use at-least-once + idempotent UPSERT — simpler and faster.",
+    "level": "Sr",
+    "asked": 18
+  },
+  {
+    "q": "How do you decide between using Kafka Streams, Apache Flink, or Spark Structured Streaming for a new stream processing job?",
+    "a": "Kafka Streams is a JVM library, not a cluster, tightly coupled to Kafka with zero additional infrastructure and native EOS via Kafka transactions, best for Kafka-to-Kafka transforms and simple stateful aggregations. Flink is a dedicated streaming cluster with rich stateful processing, very low latency, and exactly-once via checkpointing to external storage, best for complex event processing and multi-source fan-in at the cost of more ops overhead. Spark Structured Streaming suits teams already on Spark/Databricks who want batch-and-streaming parity and can tolerate seconds-level micro-batch latency. The deciding factors are the operational complexity gradient (Kafka Streams < Spark < Flink) and the team's existing context.",
+    "fj": "Always use Flink for streaming — it's the most powerful.",
+    "fs": "Flink is operationally heavy. For Kafka-to-Kafka with simple logic, Kafka Streams is zero additional infrastructure and natively EOS. I'd only add Flink for complex stateful processing or sub-100ms latency requirements.",
+    "level": "Sr",
+    "asked": 13
+  },
+  {
+    "q": "Kafka vs Apache Pulsar — what are the architectural differences, and when would you actually choose Pulsar over Kafka?",
+    "a": "Kafka uses monolithic brokers that handle both compute and storage, while Pulsar separates stateless brokers from durable storage in Apache BookKeeper, so brokers scale and restart without moving data. This makes Pulsar scaling instant (adding brokers needs no partition reassignment, unlike Kafka which must migrate data), and Pulsar offers native multi-tenancy, geo-replication, and tiered storage as core features. However Kafka's ecosystem of Connect, Streams, Schema Registry, and connectors is far more mature and widely deployed. Choose Pulsar for true elastic scaling, native multi-tenancy, or cloud-native SaaS messaging, and Kafka for ecosystem maturity, tooling, and existing investment — which covers most data engineering contexts.",
+    "fj": "Pulsar is just a newer Kafka — it's better in every way.",
+    "fs": "Pulsar has architectural advantages for elastic scaling and native multi-tenancy, but Kafka's ecosystem and operational tooling are significantly more mature. I'd choose Pulsar for cloud-native SaaS messaging; Kafka for most data engineering stacks.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "What is Kafka Connect, when do you reach for it instead of writing a producer/consumer, and what does running it in distributed mode buy you?",
+    "a": "Kafka Connect is a framework for streaming data between Kafka and external systems using reusable, declarative connectors (source connectors pull data in, sink connectors push data out) configured with JSON rather than code, so you don't hand-roll producer/consumer apps for every integration. Reach for it for standard integrations like Debezium CDC from Postgres, JDBC, S3, or Elasticsearch, where it handles offset tracking, retries, scaling, and schema handling for you. Distributed mode runs a cluster of workers sharing a group.id that automatically balance connector tasks and fail over, storing config, offsets, and status in internal Kafka topics. Write a custom app only when no connector exists or you need processing logic Connect's Single Message Transforms can't express.",
+    "fj": "Kafka Connect is just a library for writing producers and consumers.",
+    "fs": "Connect is config-driven integration, not code — distributed-mode workers share a group.id, rebalance tasks, and persist offsets/config/status in internal Kafka topics. I write a custom app only when no connector fits.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Sink connector config (JSON)",
+        "lines": [
+          "{",
+          " \"connector.class\":",
+          "   \"io.confluent.connect.s3",
+          "    .S3SinkConnector\",",
+          " \"topics\": \"orders\",",
+          " \"tasks.max\": \"4\",",
+          " \"errors.tolerance\": \"all\",",
+          " \"errors.deadletterqueue.topic.name\":",
+          "   \"orders-dlq\"",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A Kafka Connect sink connector keeps dying on a few malformed records. How do you make it resilient, and what is the trade-off?",
+    "a": "By default errors.tolerance is none, so any deserialization, SMT, or conversion error stops the task — the fix is errors.tolerance=all plus a dead letter queue (errors.deadletterqueue.topic.name) so bad records are routed to a separate topic instead of crashing the connector. Enable errors.deadletterqueue.context.headers.enable=true so each DLQ record carries headers with the original topic, partition, offset, and exception for triage and replay. The trade-off is that tolerate-all can silently swallow a systemic problem (e.g. a wrong converter), so you must alert on DLQ throughput, not just let records pile up. Note the DLQ is a sink-connector feature only; source connector errors are handled differently.",
+    "fj": "I'd add a try/catch in the connector to skip bad messages.",
+    "fs": "errors.tolerance=all + a DLQ topic with context headers, and I alert on DLQ rate — tolerate-all without monitoring just hides a systemic converter/schema bug.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Route failures to a DLQ",
+        "lines": [
+          "{",
+          " \"errors.tolerance\": \"all\",",
+          " \"errors.deadletterqueue.topic.name\":",
+          "   \"orders-dlq\",",
+          " \"errors.deadletterqueue",
+          "  .context.headers.enable\": \"true\",",
+          " \"errors.retry.timeout\": \"60000\"",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What problem does a Schema Registry solve, how does the wire format work, and what does BACKWARD vs FORWARD vs FULL compatibility mean?",
+    "a": "A Schema Registry centralizes Avro/Protobuf/JSON-Schema definitions so producers and consumers agree on data shape without embedding the full schema in every message: the serializer writes a 1-byte magic byte (0x00) plus a 4-byte schema ID, then the payload, and the consumer fetches that schema ID to deserialize. Schemas live under a subject (by default <topic>-value via TopicNameStrategy) and the registry enforces a compatibility rule on each new version. BACKWARD (the default) means new schema can read data written by the old one, so you upgrade consumers first and may only add optional/defaulted fields or delete fields; FORWARD means old schema can read new data, so you upgrade producers first; FULL means both. The *_TRANSITIVE variants check against all prior versions, not just the last.",
+    "fj": "The schema registry just stores schemas so you have them in one place.",
+    "fs": "It enforces compatibility on register and ships only a 5-byte magic-byte + schema-id header on the wire. BACKWARD (default) = upgrade consumers first, add-only/defaulted fields; FORWARD = upgrade producers first; FULL = both.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Wire format: 1 magic + 4 id bytes",
+        "lines": [
+          "# byte 0   : magic byte = 0x00",
+          "# bytes 1-4: schema id (int32 BE)",
+          "# bytes 5+ : Avro/Proto payload",
+          "from confluent_kafka.schema_registry \\",
+          "  .avro import AvroSerializer",
+          "# producer auto-registers under",
+          "# subject  '<topic>-value'"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does the next-generation consumer rebalance protocol (KIP-848, default-eligible in Kafka 4.x) change rebalancing, and why does it matter operationally?",
+    "a": "Classic rebalancing is client-driven: a designated consumer (the group leader) computes the assignment and the whole group synchronizes through a global barrier, so large groups stall for tens of seconds when membership changes. KIP-848 moves assignment to the broker-side group coordinator and makes it fully incremental via a continuous ConsumerGroupHeartbeat API — the coordinator tells each member which partitions to revoke and acquire without a stop-the-world barrier, cutting rebalance time dramatically (Confluent cites a 10-consumer/900-partition case dropping from ~103s to ~5s). It is opt-in per consumer with group.protocol=consumer and removes reliance on session.timeout/heartbeat client tuning. Operationally it shrinks the blast radius of scaling, deploys, and pod restarts that previously caused lag spikes.",
+    "fj": "Kafka 4 just made the old rebalance faster.",
+    "fs": "KIP-848 shifts assignment to the broker coordinator and goes fully incremental — no global sync barrier. Enable with group.protocol=consumer; it collapses the multi-second stalls that scaling/restarts used to cause.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Opt into the new protocol",
+        "lines": [
+          "conf = {",
+          " 'group.id': 'g1',",
+          " # broker-side, incremental",
+          " 'group.protocol': 'consumer',",
+          "}",
+          "# no session/heartbeat tuning needed;",
+          "# coordinator drives revoke/acquire"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why is Kafka able to sustain such high write throughput on commodity disks? What is the role of the page cache and zero-copy?",
+    "a": "Kafka writes every message by appending to the end of a partition's log file, so the disk does sequential I/O rather than random seeks, which is close to memory speed even on spinning disks. It does not maintain its own in-process cache; it relies on the OS page cache, so recently written data is served to consumers straight from memory without a JVM heap copy. On the read path the broker uses the sendfile zero-copy path, transferring bytes from page cache directly to the socket without copying through user space. The result is that a single broker can push hundreds of MB/s, and lagging consumers that fall out of the page cache are the main thing that forces slow random disk reads.",
+    "fj": "Kafka is fast because it keeps everything in a big JVM cache.",
+    "fs": "Kafka leans on sequential append-only writes, the OS page cache, and zero-copy sendfile — it deliberately does not manage its own heap cache, which is why huge heaps actually hurt it.",
+    "level": "Jr",
+    "asked": 12
+  },
+  {
+    "q": "What does Kafka replication actually do, and what is the ISR?",
+    "a": "Each partition has one leader and N-1 follower replicas, where the replication factor sets N; all reads and writes go through the leader and followers continuously fetch from it to stay current. The in-sync replica set (ISR) is the leaders plus followers that are caught up within replica.lag.time.max.ms — only ISR members are eligible to be elected leader if the current leader fails. A follower that falls behind (slow disk, network, GC) drops out of the ISR and rejoins once it catches up. Replication factor 3 is the production norm because it tolerates one broker loss while still keeping two in-sync copies.",
+    "fj": "Replicas are read replicas that consumers can load-balance across.",
+    "fs": "By default all reads and writes go through the partition leader; followers exist for failover, not read scaling. The ISR is the set of replicas caught up enough to be promoted to leader.",
+    "level": "Jr",
+    "asked": 14
+  },
+  {
+    "q": "How does log retention work in Kafka, and what configs control when a message is deleted?",
+    "a": "With the default cleanup.policy=delete, Kafka retains messages independent of whether they were consumed and removes them by age or size: log.retention.ms (or hours/minutes) sets the time bound and log.retention.bytes sets a per-partition size cap, whichever triggers first. Deletion happens at the granularity of whole log segments, not individual messages, so a message can live a bit past its retention until its segment rolls (log.segment.bytes / log.roll.ms) and is eligible for cleanup. Retention can be set per topic, overriding the broker default. This is why a consumer that is offline longer than retention can permanently miss data — retention is not tied to consumption.",
+    "fj": "Kafka deletes a message once every consumer has read it.",
+    "fs": "Retention is decoupled from consumption — messages are deleted by time/size at the segment level, so an offline consumer can lose data even though nobody read it.",
+    "level": "Jr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Per-topic retention override",
+        "lines": [
+          "# keep 7 days OR 50GB/partition",
+          "kafka-configs.sh --alter \\",
+          " --topic events \\",
+          " --add-config \\",
+          " retention.ms=604800000,\\",
+          " retention.bytes=53687091200"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain Kafka consumer offset commit semantics. What is the difference between auto-commit, commitSync, and commitAsync, and how does it affect delivery?",
+    "a": "With enable.auto.commit=true (the default) the consumer commits the last polled offsets periodically inside poll() every auto.commit.interval.ms, which is convenient but commits offsets for records you may not have finished processing — a crash mid-batch can drop those records (at-most-once-ish) or, after a rebalance, reprocess them. For at-least-once you set enable.auto.commit=false and commit manually only after processing succeeds: commitSync blocks and retries until the commit lands (safe but adds latency), while commitAsync returns immediately for throughput but can leave a gap if the last async commit is lost on crash. The common pattern is commitAsync in the loop for speed plus a final commitSync on shutdown.",
+    "fj": "Auto-commit means each message is committed right after I process it.",
+    "fs": "Auto-commit fires on a timer inside poll(), not per processed record — so it can commit unprocessed messages. For at-least-once I disable it and commitSync after the work is done.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Manual at-least-once commit",
+        "lines": [
+          "c = Consumer({'enable.auto.commit': False,",
+          "              'group.id': 'g1'})",
+          "while True:",
+          "    msg = c.poll(1.0)",
+          "    if msg: process(msg)",
+          "    c.commit(msg, asynchronous=False)",
+          "# commit only AFTER process() succeeds"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A producer is healthy but throughput is low and broker CPU is fine. Which producer configs do you tune, and what is the trade-off?",
+    "a": "Low throughput with idle brokers usually means the producer is sending tiny, poorly-batched requests. The main levers are batch.size (default 16KB, raise to 64-128KB so more records pack into one request) and linger.ms (default 0, set to 5-50ms so the producer briefly waits to fill a batch instead of firing per record). Add compression.type=lz4 or zstd to shrink requests and disk writes, trading a little producer CPU for far higher effective throughput. The trade-off is latency: linger.ms intentionally delays sends, so for a latency-sensitive path keep it small, and for a throughput firehose accept the extra few milliseconds. These three settings together can be a 10x-plus difference versus an untuned producer.",
+    "fj": "To send faster I'd just add more producer threads.",
+    "fs": "The bottleneck is usually batching, not threads. I raise batch.size and linger.ms so records coalesce into larger requests, add lz4/zstd compression, and accept a few ms of latency for the throughput.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Throughput-tuned producer",
+        "lines": [
+          "conf = {",
+          " 'batch.size': 131072,    # 128KB",
+          " 'linger.ms': 20,         # wait to fill",
+          " 'compression.type': 'lz4',",
+          "}",
+          "# trade: +~20ms latency per send"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "In Kafka Streams, what is the difference between a KStream and a KTable, and how is state kept fault-tolerant?",
+    "a": "A KStream models an unbounded stream of independent events where every record is an insert (append), so aggregations sum across all events. A KTable models a changelog where each record is an upsert keyed by the record key, so a new value for a key replaces the previous one — it represents the latest state per key, like a materialized view. Stateful operations (aggregations, joins, windows) keep their state in a local RocksDB-backed state store on each instance for fast, network-free lookups. That store is made fault-tolerant by a compacted changelog topic in Kafka: every state update is also written there, so if an instance dies the state store is rebuilt by replaying the changelog. A GlobalKTable instead replicates the full table to every instance to avoid co-partitioning for joins.",
+    "fj": "A KStream and a KTable are just two names for a stream of records.",
+    "fs": "A KStream is insert-semantics (every event counts); a KTable is upsert-semantics (latest value per key). KTable state lives in a local RocksDB store backed by a compacted changelog topic for recovery.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Stream vs table semantics",
+        "lines": [
+          "// KStream: each record is an INSERT",
+          "builder.stream('clicks')",
+          "  .groupByKey().count();  // counts all",
+          "// KTable: each record is an UPSERT",
+          "builder.table('profiles');  // latest/key",
+          "// state -> RocksDB + compacted",
+          "// changelog topic for recovery"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is ksqlDB, and what is the difference between a push query and a pull query?",
+    "a": "ksqlDB is a streaming SQL engine built on Kafka Streams that lets you define STREAMs and TABLEs over topics and run continuous SQL instead of writing Java. A push query (SELECT ... EMIT CHANGES) subscribes to a stream or materialized table and stays open, pushing every new update to the client as events arrive — good for asynchronous, event-driven flows. A pull query (a plain SELECT against a materialized table) returns the current state for a key and terminates immediately, like a lookup on a regular database, with predictably low latency because the view is incrementally maintained. Persistent queries (CREATE TABLE AS SELECT) run server-side forever to keep materialized views updated. ksqlDB is the right tool for declarative transforms and aggregations; drop to Kafka Streams or Flink when you need full programmatic control.",
+    "fj": "ksqlDB is just a SQL console for browsing Kafka topics.",
+    "fs": "ksqlDB runs continuous SQL on Kafka Streams. A push query (EMIT CHANGES) streams every update forever; a pull query reads the current state of a materialized table once and returns, like a key lookup.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Push vs pull query",
+        "lines": [
+          "-- push: streams updates forever",
+          "SELECT * FROM orders EMIT CHANGES;",
+          "-- materialized view (persistent query)",
+          "CREATE TABLE totals AS",
+          "  SELECT user, COUNT(*) c FROM orders",
+          "  GROUP BY user;",
+          "-- pull: current state, then ends",
+          "SELECT c FROM totals WHERE user='u1';"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are Single Message Transforms (SMTs) in Kafka Connect, and where do they fit versus Kafka Streams?",
+    "a": "SMTs are lightweight, per-record transformations configured declaratively in a connector's config that run inline as each message passes through Connect — applied after a source connector produces a record but before it hits Kafka, or after reading from Kafka but before a sink writes it. Built-ins cover common reshaping: InsertField to add metadata, ReplaceField to rename or drop fields, MaskField to redact PII, ExtractField, and routing transforms to rewrite the target topic. You chain multiple SMTs in order and each feeds the next. They are stateless and single-message only, so they cannot aggregate, join across records, or do lookups — for that you move up to Kafka Streams or ksqlDB. SMTs are ideal for cheap field-level cleanup that avoids standing up a separate stream processor.",
+    "fj": "SMTs are how you do joins and aggregations inside Kafka Connect.",
+    "fs": "SMTs are stateless, single-message transforms — rename/drop/mask/route fields inline. Anything stateful (joins, aggregations, lookups) belongs in Kafka Streams or ksqlDB, not an SMT.",
+    "level": "Mid",
+    "asked": 10,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Chained SMTs in connector config",
+        "lines": [
+          "{",
+          " \"transforms\": \"mask,route\",",
+          " \"transforms.mask.type\":",
+          "   \"...transforms.MaskField$Value\",",
+          " \"transforms.mask.fields\": \"ssn\",",
+          " \"transforms.route.type\":",
+          "   \"...transforms.RegexRouter\"",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you implement dead-letter handling in a plain Kafka consumer (not Kafka Connect) for poison messages?",
+    "a": "Kafka has no built-in consumer DLQ — that is a Connect feature — so in an application consumer you build it yourself. Wrap per-record processing in a try/catch; on a non-retriable error (deserialization failure, schema mismatch, business-rule rejection) produce the raw record to a separate <topic>-dlq topic with headers carrying the original topic, partition, offset, and exception, then commit the offset so the consumer advances instead of stalling. Distinguish transient failures (downstream timeout) which you retry with backoff from permanent ones which go straight to the DLQ, otherwise a single poison pill blocks the whole partition forever. Crucially, alert on DLQ throughput rather than letting it silently accumulate, and build a replay path to reprocess DLQ records after a fix.",
+    "fj": "I'd just skip the bad message and move on.",
+    "fs": "Silently skipping loses data and hides bugs. I route poison messages to a <topic>-dlq with context headers, commit past them so the partition isn't blocked, alert on DLQ rate, and keep a replay path.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "python",
+        "label": "App-level DLQ pattern",
+        "lines": [
+          "try:",
+          "    handle(msg)",
+          "except PermanentError as e:",
+          "    dlq.produce('orders-dlq',",
+          "       value=msg.value(),",
+          "       headers={'err': str(e),",
+          "                'off': str(msg.offset())})",
+          "c.commit(msg)  # advance past poison"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you reprocess or replay data in Kafka — and what is the difference between seeking offsets and resetting a consumer group?",
+    "a": "Because Kafka retains messages independent of consumption, you can reprocess simply by reading from an earlier position as long as the data is still within retention. For an ad-hoc replay you seek the consumer to a specific offset or timestamp (offsetsForTimes) at startup, which does not touch committed offsets. To replay a whole group you reset its committed offsets in __consumer_offsets with kafka-consumer-groups.sh --reset-offsets (--to-earliest, --to-datetime, --shift-by), but the group must be inactive or the reset is refused. A clean alternative for a fresh full reprocess is to start a brand-new group.id, which begins from auto.offset.reset (earliest/latest). Replay assumes downstream effects are idempotent, since reprocessing re-emits everything in the range.",
+    "fj": "To reprocess I'd just re-publish all the old messages again.",
+    "fs": "No need to republish — the data is still in the log. I seek the consumer to an earlier offset/timestamp, reset the group's committed offsets (group must be idle), or spin up a new group.id from earliest.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Reset a group's offsets",
+        "lines": [
+          "# group must be inactive",
+          "kafka-consumer-groups.sh \\",
+          " --bootstrap-server b:9092 \\",
+          " --group g1 --topic orders \\",
+          " --reset-offsets --to-datetime \\",
+          " 2026-06-01T00:00:00.000 \\",
+          " --execute"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why can having too many partitions hurt a Kafka cluster? Walk me through the costs.",
+    "a": "Partitions are not free, so over-provisioning by orders of magnitude backfires. Each partition replica is open files and memory on the broker, and metadata for every partition is tracked by the controller, so very high partition counts slow leader election and metadata propagation — historically the pain point with ZooKeeper, much improved under KRaft but still bounded. More partitions mean more concurrent fetch/produce requests and more end-to-end latency, and on an unclean broker failure the controller must elect new leaders for every partition that broker led, lengthening recovery and the unavailability window. There are also producer memory effects since buffers are per-partition. The guidance is to size partitions for real throughput and parallelism with sane headroom, not to set thousands per topic speculatively.",
+    "fj": "More partitions are always better — they just add parallelism.",
+    "fs": "Each partition costs files, memory, controller metadata, and recovery time. Excess partitions slow leader election and lengthen failover; I size for actual throughput plus headroom, not thousands speculatively.",
+    "level": "Sr",
+    "asked": 13
+  },
+  {
+    "q": "Explain how KRaft replaces ZooKeeper in Kafka. What changed architecturally and why does it matter?",
+    "a": "Before KRaft, Kafka kept all cluster metadata — topics, partitions, configs, ACLs, ISR — in an external ZooKeeper ensemble, and a single controller broker watched ZooKeeper and pushed changes to brokers, which made metadata a separate system to operate and a scaling bottleneck. KRaft (KIP-500) removes ZooKeeper and stores metadata in an internal Raft-replicated log (__cluster_metadata) managed by a controller quorum of dedicated/co-located nodes that elect a leader via Raft. Brokers now consume metadata as an event log and cache it locally, so failover and propagation are faster and the cluster supports far more partitions. KRaft is production-ready since 3.3, default since 3.5, and ZooKeeper was fully removed in Kafka 4.0, so all new and upgraded clusters run KRaft.",
+    "fj": "Kafka still needs a ZooKeeper ensemble running alongside the brokers.",
+    "fs": "As of Kafka 4.0 ZooKeeper is gone. KRaft keeps metadata in an internal Raft-replicated log (__cluster_metadata) driven by a controller quorum — one fewer system to run, faster failover, and far higher partition scale.",
+    "level": "Sr",
+    "asked": 18
+  },
+  {
+    "q": "With the idempotent producer, what does max.in.flight.requests.per.connection control, and how does it relate to ordering and throughput?",
+    "a": "max.in.flight.requests.per.connection is how many unacknowledged produce requests the client allows in flight per broker connection before it blocks. Historically, retries with more than one in-flight request could reorder messages, so people set it to 1 to preserve order at the cost of throughput. The idempotent producer fixes this: the broker tracks producer ID plus per-partition sequence numbers and rejects out-of-order or duplicate batches, so Kafka guarantees both ordering and dedup-on-retry as long as max.in.flight is at most 5. Enabling idempotence (default in 3.0+) auto-sets acks=all, retries effectively to max, and caps in-flight at 5 — giving you ordered, exactly-once-per-session delivery without dropping to a single in-flight request.",
+    "fj": "To keep messages ordered I have to set max.in.flight to 1.",
+    "fs": "Only without idempotence. The idempotent producer (default 3.0+) preserves order and dedups retries with up to 5 in-flight requests via producer-id + sequence numbers — so I keep throughput and ordering.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Ordered + dedup at in-flight=5",
+        "lines": [
+          "conf = {",
+          " 'enable.idempotence': True,  # 3.0+",
+          " # implied: acks=all, retries=MAX",
+          " 'max.in.flight.requests'",
+          "   '.per.connection': 5,",
+          "}",
+          "# ordered + dedup retries, full speed"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is Kafka tiered storage (KIP-405), and what problem does it solve?",
+    "a": "Traditionally a partition's entire log lives on local broker disk, so long retention forces big, expensive disks and makes brokers slow to rebalance because moving a replica copies all its data. Tiered storage splits the log into a local tier (recent segments on broker disk) and a remote tier (older closed segments offloaded to object storage like S3/GCS), controlled by local.retention.ms/bytes for local and the normal retention.ms/bytes for total. This lets you keep hours locally for hot reads while retaining months or years cheaply in object storage, and it shrinks broker disk so failover and reassignment move far less data. It was early-access in 3.6 and has matured since; the trade-off is that reads of cold historical data fetch from remote storage with higher latency, so it suits append-and-occasionally-replay workloads.",
+    "fj": "Long retention in Kafka just means buying bigger broker disks.",
+    "fs": "Tiered storage (KIP-405) offloads old segments to S3/GCS while keeping recent data local — cheap long retention and faster rebalancing, at the cost of higher-latency reads for cold historical data.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Local vs remote retention",
+        "lines": [
+          "# topic configs",
+          "remote.storage.enable=true",
+          "# keep 4h on broker disk...",
+          "local.retention.ms=14400000",
+          "# ...but 90 days total in S3",
+          "retention.ms=7776000000"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is rack awareness in Kafka, and how does follower fetching reduce cross-AZ cost?",
+    "a": "Setting broker.rack (where a rack is any failure domain — a physical rack, an availability zone, a region) makes Kafka spread a partition's replicas across different racks so a whole-rack/AZ outage cannot take out every copy. By default consumers always read from the partition leader, which in a multi-AZ cluster often means cross-AZ network traffic and real cloud egress cost. Follower fetching fixes this: set the broker replica.selector.class to RackAwareReplicaSelector and set client.rack on consumers, and a consumer will fetch from an in-sync replica in its own rack/AZ instead of the (possibly remote) leader. This cuts cross-AZ data-transfer charges and network load, at the cost of slightly staler reads since a follower may lag the leader within the ISR bound.",
+    "fj": "Rack awareness is only about surviving a rack failure.",
+    "fs": "Replica placement is one half; the other is follower fetching — with RackAwareReplicaSelector + client.rack, consumers read from a same-AZ in-sync replica instead of the leader, cutting cross-AZ egress cost.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "ts",
+        "label": "Enable follower fetching",
+        "lines": [
+          "# broker:",
+          "broker.rack=us-east-1a",
+          "replica.selector.class=org.apache.kafka",
+          " .common.replica.RackAwareReplicaSelector",
+          "# consumer:",
+          "client.rack=us-east-1a",
+          "# now reads stay in-AZ -> less egress $"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are Schema Registry subject naming strategies, and why would you move off the default TopicNameStrategy?",
+    "a": "The Schema Registry versions schemas under a subject, and the subject naming strategy decides what that subject is. The default TopicNameStrategy uses <topic>-key and <topic>-value, which assumes one schema type per topic and enforces compatibility per topic — simple and correct for most pipelines. RecordNameStrategy uses the record's fully-qualified name as the subject, so the same schema evolves consistently across many topics and a single topic can carry multiple event types. TopicRecordNameStrategy combines both (<topic>-<recordName>), giving multiple event types per topic while still scoping compatibility per topic. You move off the default mainly to put heterogeneous event types on one topic (e.g. an event-sourcing or outbox stream) while keeping each type's compatibility enforced independently.",
+    "fj": "Each topic can only ever hold one schema, so the subject is always just the topic.",
+    "fs": "That's only TopicNameStrategy. RecordNameStrategy / TopicRecordNameStrategy key the subject on the record type, letting one topic carry multiple event types with per-type compatibility — useful for event-sourcing/outbox streams.",
+    "level": "Sr",
+    "asked": 10
+  }
+]

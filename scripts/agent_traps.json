@@ -1,0 +1,128 @@
+[
+ {
+  "id": "meta-ad-segment-efficiency",
+  "name": "Defensive WHERE filter silently drops zero-conversion rows",
+  "explanation": "A candidate who distrusts data quality often adds WHERE conversions > 0 to 'guard against bad rows'. On the public sample every row has at least one conversion, so the filter is a no-op and the output is identical. On the hidden dataset a new Custom row carries 2 000 spend but 0 conversions; the naive excludes it from both SUM(conversions) and SUM(spend), inflating conv_per_dollar for Custom from 0.0132 to 0.0278 \u2014 the reference correctly dilutes the denominator.",
+  "naive": "SELECT segment_type,\n       SUM(conversions) AS conversions,\n       ROUND(SUM(conversions) * 1.0 / SUM(spend), 4) AS conv_per_dollar\nFROM ad_segments\nWHERE conversions > 0\nGROUP BY segment_type\nORDER BY conv_per_dollar DESC;",
+  "hidden_setup": "CREATE TABLE ad_segments (id INTEGER, segment_type VARCHAR, acquisitions INTEGER, conversions INTEGER, spend DOUBLE);\nINSERT INTO ad_segments VALUES\n (1,'Custom',50,30,1000.0),\n (2,'Custom',40,20,800.0),\n (3,'Lookalike',90,40,3000.0),\n (4,'Lookalike',60,25,2000.0),\n (5,'Broad',20,5,1500.0),\n (6,'Custom',100,0,2000.0);"
+ },
+ {
+  "id": "netflix-emerging-market-cac",
+  "name": "Defensive WHERE filter on new_subscribers skews CAC denominator",
+  "explanation": "A cautious candidate adds WHERE new_subscribers > 0 to avoid dividing by zero. On the public sample all rows have positive subscriber counts, so the filter changes nothing. The hidden dataset adds an India row with 5 000 spend but 0 new_subscribers; the naive drops that row entirely, computing India's CAC as 80 000/37 000 = 2.16, while the reference correctly includes the spend in the numerator, raising India's CAC to 85 000/37 000 = 2.30.",
+  "naive": "SELECT market,\n       SUM(spend) AS spend,\n       SUM(new_subscribers) AS new_subscribers,\n       ROUND(SUM(spend) / SUM(new_subscribers), 2) AS cac\nFROM marketing\nWHERE new_subscribers > 0\nGROUP BY market\nORDER BY cac ASC;",
+  "hidden_setup": "CREATE TABLE marketing (id INTEGER, market VARCHAR, spend DOUBLE, new_subscribers INTEGER);\nINSERT INTO marketing VALUES\n (1,'India',50000.0,25000),\n (2,'India',30000.0,12000),\n (3,'Brazil',40000.0,8000),\n (4,'Brazil',20000.0,5000),\n (5,'Nigeria',15000.0,10000),\n (6,'India',5000.0,0);"
+ },
+ {
+  "id": "stripe-payout-fee-burden",
+  "name": "Phantom HAVING filter silently drops low-fee platform types",
+  "explanation": "A candidate trying to focus on 'significant' platform types adds HAVING SUM(fee) > 100. On the public sample every segment (Marketplace 370, SaaS 240, On-demand 210) clears that threshold, so the output is unchanged. The hidden dataset introduces a Freelance segment with total fee of 80, which the HAVING clause silently discards; the reference correctly includes it with fee_pct = 2.00 %, changing the result set from 3 rows to 4.",
+  "naive": "SELECT platform_type,\n       SUM(payout_amount) AS total_payout,\n       ROUND(100.0 * SUM(fee) / SUM(payout_amount), 2) AS fee_pct,\n       ROUND(100.0 * SUM(compliance_cost) / SUM(payout_amount), 2) AS compliance_pct\nFROM payouts\nGROUP BY platform_type\nHAVING SUM(fee) > 100\nORDER BY fee_pct DESC;",
+  "hidden_setup": "CREATE TABLE payouts (id INTEGER, platform_type VARCHAR, payout_amount DOUBLE, fee DOUBLE, compliance_cost DOUBLE);\nINSERT INTO payouts VALUES\n (1,'Marketplace',10000.0,250.0,100.0),\n (2,'Marketplace',5000.0,120.0,60.0),\n (3,'SaaS',8000.0,160.0,200.0),\n (4,'SaaS',4000.0,80.0,120.0),\n (5,'On-demand',6000.0,210.0,30.0),\n (6,'Freelance',4000.0,80.0,50.0);"
+ },
+ {
+  "id": "x-advertiser-segment-funnel",
+  "name": "RANK by CTR instead of CVR",
+  "explanation": "On the public sample, CTR and CVR happen to rank the three audience segments in the same order (Finance > Tech > Sports for both metrics). A candidate who writes RANK() OVER (ORDER BY ctr DESC) instead of ORDER BY cvr DESC gets identical output. The hidden dataset reverses the relationship: Tech has the highest CTR (0.08) but only the 2nd-best CVR (0.05), while Sports has the lowest CTR (0.015) but the best CVR (0.20). The naive query ranks Tech first; the reference ranks Sports first.",
+  "naive": "\nWITH agg AS (\n  SELECT audience_segment,\n         ROUND(SUM(clicks) * 1.0 / SUM(impressions), 3) AS ctr,\n         ROUND(SUM(conversions) * 1.0 / SUM(clicks), 3) AS cvr\n  FROM campaigns\n  GROUP BY audience_segment\n)\nSELECT audience_segment, ctr, cvr,\n       RANK() OVER (ORDER BY ctr DESC) AS rank\nFROM agg\nORDER BY rank;\n",
+  "hidden_setup": "\nCREATE TABLE campaigns (id INTEGER, audience_segment VARCHAR, impressions INTEGER, clicks INTEGER, conversions INTEGER);\nINSERT INTO campaigns VALUES\n (1,'Tech',100000,8000,400),\n (2,'Sports',200000,3000,600),\n (3,'Finance',50000,1000,40);\n"
+ },
+ {
+  "id": "meta-creator-followers-per-engagement",
+  "name": "DENSE_RANK instead of RANK",
+  "explanation": "The reference uses RANK() which skips rank numbers after ties (e.g., two rows tied at rank 2 make the next row rank 4). DENSE_RANK() never skips. On the public sample every content type has a unique followers_per_eng ratio, so RANK and DENSE_RANK produce identical integers. The hidden dataset gives Reels and Photos the same ratio (0.1000), creating a tie at rank 2. With RANK, Stories gets rank=4; with DENSE_RANK it gets rank=3. The single-column difference in the Stories row makes the result sets differ as a set.",
+  "naive": "\nWITH agg AS (\n  SELECT content_type,\n         SUM(engagement) AS total_engagement,\n         SUM(new_followers) AS total_followers,\n         ROUND(SUM(new_followers) * 1.0 / SUM(engagement), 4) AS followers_per_eng\n  FROM posts\n  GROUP BY content_type\n)\nSELECT content_type, total_engagement, total_followers, followers_per_eng,\n       DENSE_RANK() OVER (ORDER BY followers_per_eng DESC) AS rank\nFROM agg\nORDER BY rank;\n",
+  "hidden_setup": "\nCREATE TABLE posts (id INTEGER, creator_id INTEGER, content_type VARCHAR, engagement INTEGER, new_followers INTEGER);\nINSERT INTO posts VALUES\n (1,1,'Live',1000,200),\n (2,2,'Reels',1000,100),\n (3,3,'Photos',2000,200),\n (4,4,'Stories',1000,50);\n"
+ },
+ {
+  "id": "uber-driver-earnings-per-hour",
+  "name": "Intermediate ROUND of active_hours before division",
+  "explanation": "The reference computes earnings_per_hour as ROUND(SUM(earnings) / (SUM(epoch_diff)/3600.0), 2), keeping full floating-point precision in the denominator. A naive candidate writes ROUND(SUM(earnings) / ROUND(SUM(epoch_diff)/3600.0, 2), 2), rounding active_hours to 2 decimals before using it as the divisor. On the public sample both drivers have trip durations summing to exact two-decimal-place hour values (1.25h and 1.50h), so the intermediate rounding is a no-op. In the hidden dataset driver 1 works 49 minutes = 0.81666...h, which rounds to 0.82h. The reference gives EPH = ROUND(10/0.81666, 2) = 12.24; the naive gives ROUND(10/0.82, 2) = 12.20. Driver 2 earns 12.22 over exactly 1.0h (EPH=12.22 in both). The reference ranks driver 1 first (12.24 > 12.22); the naive ranks driver 2 first (12.22 > 12.20). Both the rank order and the EPH value for driver 1 differ.",
+  "naive": "\nSELECT driver_id,\n       SUM(earnings) AS total_earnings,\n       ROUND(SUM(epoch(end_time) - epoch(start_time)) / 3600.0, 2) AS active_hours,\n       ROUND(SUM(earnings) / ROUND(SUM(epoch(end_time) - epoch(start_time)) / 3600.0, 2), 2) AS earnings_per_hour\nFROM trips\nGROUP BY driver_id\nORDER BY earnings_per_hour DESC;\n",
+  "hidden_setup": "\nCREATE TABLE trips (id INTEGER, driver_id INTEGER, start_time TIMESTAMP, end_time TIMESTAMP, earnings DOUBLE);\nINSERT INTO trips VALUES\n (1,1,TIMESTAMP '2026-05-01 08:00:00',TIMESTAMP '2026-05-01 08:49:00',10.0),\n (2,2,TIMESTAMP '2026-05-01 10:00:00',TIMESTAMP '2026-05-01 11:00:00',12.22);\n"
+ },
+ {
+  "id": "apple-top-supplier-per-region",
+  "name": "Wrong ranking column: on_time instead of deliveries",
+  "explanation": "A candidate who notices 'deliveries' and 'on_time' are correlated in the sample data might accidentally ORDER BY on_time DESC instead of deliveries DESC inside the window function. On the public sample every supplier that leads in deliveries also leads in on_time within its region, so the naive returns the identical result set. The hidden dataset introduces a new Asia supplier (TSMC) with fewer deliveries than Foxconn (4500 vs 5000) but a higher on_time count (4900 vs 4800). The naive then promotes TSMC as Asia's top supplier while the correct answer remains Foxconn. No ties exist in either metric column across the hidden data.",
+  "naive": "WITH ranked AS (\n  SELECT region, supplier_name, deliveries,\n         ROW_NUMBER() OVER (PARTITION BY region ORDER BY on_time DESC) AS rn\n  FROM suppliers\n)\nSELECT region, supplier_name, deliveries\nFROM ranked\nWHERE rn = 1\nORDER BY region;",
+  "hidden_setup": "CREATE TABLE suppliers (id INTEGER, supplier_name VARCHAR, region VARCHAR, deliveries INTEGER, on_time INTEGER);\nINSERT INTO suppliers VALUES\n (1,'Foxconn','Asia',5000,4800),\n (2,'Pegatron','Asia',3000,2900),\n (3,'TSMC','Asia',4500,4900),\n (4,'Flex','Americas',1200,1100),\n (5,'Jabil','Americas',900,850),\n (6,'Bosch','Europe',700,690),\n (7,'Celestica','Europe',500,495);"
+ },
+ {
+  "id": "walmart-checkout-peak-hour",
+  "name": "Wrong ORDER BY column: hour number instead of avg_wait",
+  "explanation": "A candidate might sort by the hour column descending (assuming 'later hours are busier') instead of by avg_wait descending. On the public sample, each store's peak-wait hour (18 for store 1, 17 for store 2) also happens to be the latest hour, so the naive and reference return identical rows with identical avg_wait values. The hidden dataset adds a store 3 whose highest-wait hour is the morning (hour 8, avg_wait=25.0) while the latest hour (hour 14, avg_wait=13.0) has much lower waits. The naive picks hour 14 for store 3 while the reference correctly picks hour 8. No ties exist in avg_wait per store in the hidden data.",
+  "naive": "WITH hourly AS (\n  SELECT store_id, hour, AVG(wait_minutes) AS avg_wait\n  FROM checkouts\n  GROUP BY store_id, hour\n),\nranked AS (\n  SELECT store_id, hour, avg_wait,\n         ROW_NUMBER() OVER (PARTITION BY store_id ORDER BY hour DESC) AS rn\n  FROM hourly\n)\nSELECT store_id, hour, ROUND(avg_wait, 1) AS avg_wait\nFROM ranked\nWHERE rn = 1\nORDER BY store_id;",
+  "hidden_setup": "CREATE TABLE checkouts (id INTEGER, store_id INTEGER, hour INTEGER, wait_minutes INTEGER);\nINSERT INTO checkouts VALUES\n (1,1,12,5),(2,1,12,7),(3,1,18,15),(4,1,18,17),\n (5,2,9,3),(6,2,9,4),(7,2,17,20),(8,2,17,22),\n (9,3,8,24),(10,3,8,26),(11,3,14,12),(12,3,14,14);"
+ },
+ {
+  "id": "netflix-mobile-top-resume-show",
+  "name": "COUNT(DISTINCT user_id) instead of COUNT(*) for resume events",
+  "explanation": "A candidate focused on 'which show has the most engaged users' might write COUNT(DISTINCT user_id) instead of COUNT(*). On the public sample every user appears exactly once, so both counts are identical per (platform, show_id) group and the naive returns the same winner. The hidden dataset introduces a single power-user (user 1) who resumes show 100 on iOS three separate times (three distinct resumed_at dates). Show 100 then has COUNT(*)=3 vs show 101's COUNT(*)=2, so the reference correctly selects show 100. But show 100 has only 1 distinct user while show 101 has 2, so the naive incorrectly selects show 101 with resume_count=2. No ties exist in either count metric per platform in the hidden data.",
+  "naive": "WITH counts AS (\n  SELECT platform, show_id, COUNT(DISTINCT user_id) AS resume_count\n  FROM resume_events\n  GROUP BY platform, show_id\n),\nranked AS (\n  SELECT platform, show_id, resume_count,\n         ROW_NUMBER() OVER (PARTITION BY platform ORDER BY resume_count DESC) AS rn\n  FROM counts\n)\nSELECT platform, show_id, resume_count\nFROM ranked\nWHERE rn = 1\nORDER BY platform;",
+  "hidden_setup": "CREATE TABLE resume_events (id INTEGER, user_id INTEGER, show_id INTEGER, platform VARCHAR, resumed_at DATE);\nINSERT INTO resume_events VALUES\n (1,1,100,'iOS',DATE '2026-05-01'),\n (2,1,100,'iOS',DATE '2026-05-02'),\n (3,1,100,'iOS',DATE '2026-05-03'),\n (4,2,101,'iOS',DATE '2026-05-04'),\n (5,3,101,'iOS',DATE '2026-05-05'),\n (6,4,200,'Android',DATE '2026-05-01'),\n (7,5,200,'Android',DATE '2026-05-02'),\n (8,6,200,'Android',DATE '2026-05-03'),\n (9,7,201,'Android',DATE '2026-05-03');"
+ },
+ {
+  "id": "amazon-seller-cumulative-txns",
+  "name": "COUNT(column) vs COUNT(*) in window function",
+  "explanation": "The candidate uses COUNT(amount) OVER (...) instead of COUNT(*) OVER (...). When all amounts are non-NULL (as in the public sample), both produce identical cumulative counts. However, when a transaction has a NULL amount \u2014 a realistic edge case when a refund or pending transaction has no recorded amount \u2014 COUNT(amount) skips that row in the running tally, producing an undercount for that seller from that point onward.",
+  "naive": "SELECT seller_id,\n       txn_date,\n       ROUND(amount * fee_pct, 2) AS fee,\n       COUNT(amount) OVER (PARTITION BY seller_id ORDER BY txn_date\n                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_txns\nFROM transactions\nORDER BY seller_id, txn_date;",
+  "hidden_setup": "\nCREATE TABLE transactions (id INTEGER, seller_id INTEGER, amount DOUBLE, fee_pct DOUBLE, txn_date DATE);\nINSERT INTO transactions VALUES\n (1,1,100.0,0.10,DATE '2026-01-01'),\n (2,1,200.0,0.10,DATE '2026-01-03'),\n (3,1,NULL,0.08,DATE '2026-01-05'),\n (4,2,500.0,0.05,DATE '2026-01-02'),\n (5,2,300.0,0.05,DATE '2026-01-04');\n"
+ },
+ {
+  "id": "microsoft-teams-daily-delta",
+  "name": "COUNT(DISTINCT user_id) instead of COUNT(*) for daily message volume",
+  "explanation": "The candidate counts distinct users per day instead of total messages, reasoning that the question is about 'daily activity' and conflating unique senders with message volume. When each user sends exactly one message per day (as in the public sample), COUNT(DISTINCT user_id) equals COUNT(*) and produces identical results. However, when a user sends multiple messages in a day \u2014 a common real-world pattern \u2014 the distinct-user count undercounts total messages, causing the delta values to diverge from the correct day-over-day message change.",
+  "naive": "WITH daily AS (\n  SELECT sent_at AS day, COUNT(DISTINCT user_id) AS messages\n  FROM messages\n  GROUP BY sent_at\n)\nSELECT day,\n       messages,\n       messages - LAG(messages) OVER (ORDER BY day) AS delta\nFROM daily\nORDER BY day;",
+  "hidden_setup": "\nCREATE TABLE messages (id INTEGER, user_id INTEGER, channel VARCHAR, sent_at DATE);\nINSERT INTO messages VALUES\n (1,1,'general',DATE '2026-05-01'),\n (2,2,'general',DATE '2026-05-01'),\n (3,3,'random',DATE '2026-05-01'),\n (4,1,'general',DATE '2026-05-02'),\n (5,1,'random',DATE '2026-05-02'),\n (6,2,'general',DATE '2026-05-02'),\n (7,3,'random',DATE '2026-05-02'),\n (8,1,'general',DATE '2026-05-03'),\n (9,2,'random',DATE '2026-05-03');\n"
+ },
+ {
+  "id": "amazon-prime-video-genres",
+  "name": "SUM(DISTINCT) Deduplication Collapse",
+  "explanation": "A candidate worried about double-counting might write SUM(DISTINCT views) and SUM(DISTINCT watch_minutes) to 'deduplicate'. On the public sample every (category, views) pair happens to be unique, so SUM(DISTINCT) == SUM. On the hidden dataset two rows per category share the same views value (e.g., two Drama rows both have views=5000), so SUM(DISTINCT) drops one, giving a lower total than SUM and producing wrong totals for Drama and Comedy.",
+  "naive": "SELECT category,\n       SUM(DISTINCT views) AS total_views,\n       SUM(DISTINCT watch_minutes) AS total_minutes\nFROM content\nGROUP BY category\nORDER BY total_views DESC;",
+  "hidden_setup": "CREATE TABLE content (id INTEGER, category VARCHAR, views INTEGER, watch_minutes INTEGER);\nINSERT INTO content VALUES\n (1,'Drama',5000,420000),\n (2,'Drama',3000,250000),\n (3,'Comedy',8000,300000),\n (4,'Documentary',1500,90000),\n (5,'Comedy',2000,80000),\n (6,'Drama',5000,180000),\n (7,'Comedy',8000,120000);"
+ },
+ {
+  "id": "meta-events-category-share",
+  "name": "Premature NULL Filter Hides a Category",
+  "explanation": "A candidate who defensively adds WHERE clicks IS NOT NULL before grouping produces identical results on the public sample (which has no NULL clicks rows). On the hidden dataset a new category 'Gaming' has a single row with clicks=NULL. The reference correctly includes it as (Gaming, NULL, NULL) in the output. The naive query silently drops the entire Gaming category, returning one fewer row and a different result set.",
+  "naive": "SELECT event_category,\n       SUM(clicks) AS total_clicks,\n       ROUND(100.0 * SUM(clicks) / SUM(SUM(clicks)) OVER (), 1) AS pct_of_total\nFROM event_clicks\nWHERE clicks IS NOT NULL\nGROUP BY event_category\nORDER BY total_clicks DESC;",
+  "hidden_setup": "CREATE TABLE event_clicks (id INTEGER, event_category VARCHAR, clicks INTEGER);\nINSERT INTO event_clicks VALUES\n (1,'Music',500),(2,'Music',300),\n (3,'Sports',400),(4,'Sports',200),\n (5,'Food',100),(6,'Tech',150),\n (7,'Gaming',NULL);"
+ },
+ {
+  "id": "amazon-device-prime-video-share",
+  "name": "LIKE '%Prime%' Over-Inclusive Service Match",
+  "explanation": "A candidate might use LIKE '%Prime%' instead of = 'Prime Video' thinking it is a safer or more readable match. On the public sample the only service starting with 'Prime' is 'Prime Video', so both forms return identical results. On the hidden dataset a 'Prime Music' service row is added to Fire TV (100 minutes). The naive LIKE query counts those 100 minutes as prime_min (640 instead of 540) and reports prime_pct=91.4% instead of the correct 77.1%.",
+  "naive": "SELECT device_type,\n       SUM(minutes) AS total_min,\n       SUM(minutes) FILTER (WHERE service LIKE '%Prime%') AS prime_min,\n       ROUND(100.0 * SUM(minutes) FILTER (WHERE service LIKE '%Prime%') / SUM(minutes), 1) AS prime_pct\nFROM device_usage\nGROUP BY device_type\nORDER BY total_min DESC;",
+  "hidden_setup": "CREATE TABLE device_usage (id INTEGER, device_type VARCHAR, service VARCHAR, minutes INTEGER);\nINSERT INTO device_usage VALUES\n (1,'Fire TV','Prime Video',300),\n (2,'Fire TV','Amazon Music',60),\n (3,'Echo','Amazon Music',200),\n (4,'Echo','Alexa',150),\n (5,'Kindle','Reading',400),\n (6,'Fire TV','Prime Video',240),\n (7,'Fire TV','Prime Music',100);"
+ },
+ {
+  "id": "second-highest-salary",
+  "name": "Spurious row-count guard: AND cnt >= 3",
+  "explanation": "A candidate who reasons 'you need at least 3 employees to have a second-highest salary' adds AND COUNT(*) OVER (PARTITION BY dept) >= 3 inside the DENSE_RANK CTE. On the public sample every dept that has a rank-2 row also has >=3 employees, so the extra guard is silent. On the hidden dataset the Analytics dept has exactly 2 employees (Ivy=130k, Jay=100k): the reference correctly returns Jay as the second-highest earner, but the naive query discards Analytics entirely.",
+  "naive": "WITH ranked AS (\n  SELECT name, dept, salary,\n         DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rk,\n         COUNT(*) OVER (PARTITION BY dept) AS cnt\n  FROM employees\n)\nSELECT dept, name, salary\nFROM ranked\nWHERE rk = 2 AND cnt >= 3\nORDER BY dept, name;",
+  "hidden_setup": "CREATE TABLE employees (id INTEGER, name VARCHAR, dept VARCHAR, salary INTEGER);\nINSERT INTO employees VALUES\n (1,'Ada','Data',180000),\n (2,'Bo','Data',180000),\n (3,'Cy','Data',150000),\n (4,'Di','Data',140000),\n (5,'Ed','Platform',200000),\n (6,'Fi','Platform',170000),\n (7,'Gus','Platform',170000),\n (8,'Ha','Ops',90000),\n (9,'Ivy','Analytics',130000),\n (10,'Jay','Analytics',100000);"
+ },
+ {
+  "id": "login-streak",
+  "name": "Omit SELECT DISTINCT \u2014 phantom-streak from duplicate login dates",
+  "explanation": "A candidate skips the SELECT DISTINCT deduplication and applies the ROW_NUMBER gaps-and-islands formula directly on the raw logins table. On the public sample user 2 has a duplicate 2026-02-01 entry; the two 02-01 rows get consecutive ROW_NUMBERs so one of them shares its grp value with the 02-02 row, accidentally yielding the correct max_streak of 2. On the hidden dataset user 4 logs in on 2026-02-01 (duplicated) and 2026-02-03 (a one-day gap). Without DISTINCT the third ROW_NUMBER shifts 02-03 into the same grp as the first 02-01 occurrence, making the naive query report a streak of 2 when the true longest streak is 1.",
+  "naive": "WITH grouped AS (\n  SELECT user_id, login_date,\n         (login_date - DATE '2000-01-01')\n           - ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_date) AS grp\n  FROM logins\n),\nstreaks AS (\n  SELECT user_id, grp, COUNT(*) AS streak\n  FROM grouped GROUP BY user_id, grp\n)\nSELECT user_id, MAX(streak) AS longest_streak\nFROM streaks GROUP BY user_id ORDER BY user_id;",
+  "hidden_setup": "CREATE TABLE logins (user_id INTEGER, login_date DATE);\nINSERT INTO logins VALUES\n (1, DATE '2026-02-01'),(1, DATE '2026-02-02'),(1, DATE '2026-02-03'),\n (1, DATE '2026-02-05'),(1, DATE '2026-02-06'),\n (2, DATE '2026-02-01'),(2, DATE '2026-02-01'),(2, DATE '2026-02-02'),\n (3, DATE '2026-02-10'),(3, DATE '2026-02-12'),(3, DATE '2026-02-13'),(3, DATE '2026-02-14'),\n (4, DATE '2026-02-01'),(4, DATE '2026-02-01'),(4, DATE '2026-02-03');"
+ },
+ {
+  "id": "apple-mac-creative-tools",
+  "name": "Defensive WHERE minutes IS NOT NULL erases a real user from the denominator",
+  "explanation": "A candidate who defensively filters WHERE minutes IS NOT NULL to 'sanitize' data produces correct results when every session has a recorded duration. On the hidden dataset user 6 opened Logic but the session was never closed, leaving minutes as NULL. The reference counts user 6 in COUNT(DISTINCT user_id)=3 and SUM naturally ignores the NULL, giving Logic avg_per_user=150.0. The naive query silently drops user 6's row entirely, counts only 2 Logic users, and reports avg_per_user=225.0.",
+  "naive": "SELECT tool,\n       COUNT(DISTINCT user_id) AS users,\n       SUM(minutes) AS total_min,\n       ROUND(SUM(minutes) * 1.0 / COUNT(DISTINCT user_id), 1) AS avg_per_user\nFROM usage\nWHERE minutes IS NOT NULL\nGROUP BY tool\nORDER BY total_min DESC;",
+  "hidden_setup": "CREATE TABLE usage (id INTEGER, user_id INTEGER, tool VARCHAR, minutes INTEGER);\nINSERT INTO usage VALUES\n (1,1,'Final Cut',120),(2,1,'Final Cut',80),\n (3,2,'Final Cut',200),(4,3,'Logic',300),\n (5,4,'Logic',150),(6,5,'Motion',60),\n (7,6,'Logic',NULL);"
+ },
+ {
+  "id": "apple-csr-program-share",
+  "name": "ROW_NUMBER breaks ties arbitrarily",
+  "explanation": "ROW_NUMBER() forces a 1,2,3 sequence, so two programs tied on participants get different ranks \u2014 an arbitrary winner. The prompt ranks by participants, so tied programs must share a rank: use RANK() (or DENSE_RANK()), not ROW_NUMBER().",
+  "naive": "SELECT community,\n       program,\n       participants,\n       ROUND(100.0 * participants / SUM(participants) OVER (PARTITION BY community), 1) AS pct_of_community,\n       ROW_NUMBER() OVER (PARTITION BY community ORDER BY participants DESC) AS rank\nFROM participation\nORDER BY community, rank;",
+  "hidden_setup": "CREATE TABLE participation (id INTEGER, community VARCHAR, program VARCHAR, participants INTEGER);\nINSERT INTO participation VALUES\n (1,'Austin','Coding Camp',200),\n (2,'Austin','Mentorship',100),\n (3,'Austin','Grants',50),\n (4,'Detroit','Coding Camp',120),\n (5,'Detroit','Mentorship',180);\nINSERT INTO participation VALUES (6,'Portland','Trail Camp',150),(7,'Portland','River Mentor',150);"
+ }
+]

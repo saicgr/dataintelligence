@@ -1,0 +1,320 @@
+[
+  {
+    "q": "What is Amazon Bedrock, and how is it different from self-hosting a model or using SageMaker?",
+    "a": "Bedrock is a fully managed, serverless API over hosted foundation models from Anthropic (Claude), Amazon (Nova, Titan), Meta (Llama), Mistral, Cohere and others, so you call a model with an API key and no GPUs to provision. It scales to zero between calls and bills per token, versus self-hosting where you rent GPU instances 24/7 and own the serving stack. SageMaker is the control plane for training, deep fine-tuning, and hosting your own model artifacts on dedicated infra. The common split is Bedrock for the GenAI app layer (inference, RAG, agents) and SageMaker when you need to own the model and training loop.",
+    "fj": "Bedrock and SageMaker are competing products for the same job.",
+    "fs": "Bedrock is managed FM inference plus RAG/agents; SageMaker is train/fine-tune/host-your-own. They compose, not compete.",
+    "level": "Jr",
+    "asked": 24
+  },
+  {
+    "q": "How do you actually pick a model in Bedrock's catalog? Walk me through the decision.",
+    "a": "Anchor on the task: reasoning-heavy or agentic work leans to Claude Opus/Sonnet, cheap high-volume classification or extraction to Nova Micro/Lite or Llama, and embeddings to Titan or Nova Multimodal Embeddings. Then weigh cost per million tokens, context window, latency tier, and whether multimodal (image/video) input is needed. Prototype two or three candidates against your own eval set rather than trusting leaderboards, because the Converse API lets you swap model IDs without rewriting code. Finally check the model is available in your Region (or via an inference profile) and that its license fits your use.",
+    "fj": "Always pick the biggest, most capable model.",
+    "fs": "Match model to task, then cost/latency/context. A 5-word classification on Opus burns money; Nova Micro does it for cents.",
+    "level": "Jr",
+    "asked": 21
+  },
+  {
+    "q": "InvokeModel vs the Converse API in Bedrock — what's the difference and which should you reach for?",
+    "a": "InvokeModel sends a raw request body whose JSON shape is model-specific, so switching providers means rewriting the payload and parsing logic. The Converse API gives one unified schema — messages, system, inferenceConfig — that works across all message-based models, plus built-in multi-turn handling, streaming (ConverseStream), and tool use. AWS recommends Converse as the default; reach for InvokeModel only for a model or parameter Converse doesn't yet expose. Both authorize on the bedrock:InvokeModel action, so the API choice is about portability, not permissions.",
+    "fj": "Converse is a different, more expensive product than InvokeModel.",
+    "fs": "Converse is a unified wrapper over the same inference; it's portable across models and authorizes on the same action. Default to it.",
+    "level": "Jr",
+    "asked": 19,
+    "code": [
+      {
+        "label": "Portable Converse call",
+        "lang": "python",
+        "lines": [
+          "br = boto3.client('bedrock-runtime')",
+          "r = br.converse(",
+          "  modelId='anthropic.claude-...',",
+          "  messages=[{'role':'user',",
+          "    'content':[{'text':'hi'}]}],",
+          "  inferenceConfig={'maxTokens':512})",
+          "print(r['output']['message'])"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does a Bedrock Knowledge Base handle for managed RAG, and what do you still have to engineer?",
+    "a": "A Knowledge Base manages the RAG plumbing: it ingests documents from S3 (or other connectors), chunks them, embeds the chunks with a model like Titan or Cohere, writes vectors to a backing store, and at query time retrieves top-k chunks and returns them with citations. You still own data quality and source access control, the chunking strategy and metadata, ingestion/refresh scheduling, retrieval config (top-k, filters), and — most importantly — evaluation of answer quality and hallucination. 'Point it at S3 and you're done' ignores that chunking and freshness drive retrieval quality more than anything.",
+    "fj": "The Knowledge Base is fully turnkey — no engineering left.",
+    "fs": "It owns chunk/embed/retrieve/cite; you own chunking strategy, metadata, refresh, source ACLs, and eval.",
+    "level": "Mid",
+    "asked": 23
+  },
+  {
+    "q": "Which vector store do you choose for a Bedrock Knowledge Base, and what drives the call?",
+    "a": "Bedrock supports OpenSearch Serverless, Aurora PostgreSQL with pgvector, Neptune Analytics, S3 Vectors, plus third parties like Pinecone, MongoDB Atlas, and Redis. OpenSearch Serverless is the default and scales well but has a hard minimum capacity floor (a few OCUs always on), making it expensive for small workloads. Aurora Serverless v2 with pgvector is dramatically cheaper at small-to-medium scale and lets you co-locate vectors with relational data. S3 Vectors (GA late 2025) gives near-zero idle cost, which suits dev/test or spiky retrieval. Drive the choice on scale, idle-cost tolerance, and whether you already run one of these stores.",
+    "fj": "Just use OpenSearch Serverless; it's the only real option.",
+    "fs": "OpenSearch Serverless has a costly always-on floor. For small scale I use Aurora pgvector or S3 Vectors to avoid paying for idle capacity.",
+    "level": "Mid",
+    "asked": 16
+  },
+  {
+    "q": "Bedrock Knowledge Bases offer fixed, semantic, and hierarchical chunking. When do you use each?",
+    "a": "Fixed-size chunking splits on a token count with an overlap percentage — simple, predictable, and fine for uniform prose. Semantic chunking uses embedding distance between sentences to break at meaning boundaries, so related ideas stay together; it costs more to ingest but helps retrieval on heterogeneous documents. Hierarchical chunking stores small child chunks for precise matching but returns the larger parent chunk to the model, giving tight retrieval with broad context — strong for long technical docs and manuals. Match the strategy to document structure, then validate with a retrieval eval rather than assuming.",
+    "fj": "Bigger chunks are always better because they give more context.",
+    "fs": "Huge chunks dilute the embedding and hurt matching. Hierarchical (small child match, parent context) usually beats one big fixed chunk for technical docs.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "label": "Hierarchical chunking config",
+        "lang": "python",
+        "lines": [
+          "chunkingConfiguration={",
+          " 'chunkingStrategy':'HIERARCHICAL',",
+          " 'hierarchicalChunkingConfiguration':{",
+          "  'levelConfigurations':[",
+          "   {'maxTokens':1500}, # parent",
+          "   {'maxTokens':300}], # child",
+          "  'overlapTokens':60}}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do Agents for Bedrock work? Explain action groups, orchestration, and tool use.",
+    "a": "An agent pairs a foundation model with instructions, optional Knowledge Bases, and action groups — the tools it can call. Each action group declares functions via an OpenAPI schema or a function schema, and is backed by a Lambda (or returns control to your app to execute). The default orchestration is a ReAct loop: the model reasons about the user request, decides whether to call an action or query a KB, the result is fed back, and it iterates until it can answer. You can override this with custom orchestration (your own Lambda) when the default loop doesn't fit your control flow.",
+    "fj": "An agent is just one big prompt that does everything in a single call.",
+    "fs": "It's a ReAct loop: the model plans, calls action-group Lambdas / KBs as tools, feeds results back, and iterates. Action groups are the tool definitions.",
+    "level": "Mid",
+    "asked": 18
+  },
+  {
+    "q": "Your Bedrock agent keeps calling the wrong tool or hallucinating parameters. How do you debug it?",
+    "a": "Most tool-selection failures are schema and instruction problems, not model problems. Tighten the OpenAPI/function schema so each action's description, parameter names, and required fields unambiguously state when to use it, and sharpen the agent instructions to set boundaries. Turn on trace in InvokeAgent to see the model's rationale, which action it picked, and the exact parameters it passed, so you can pinpoint where it went wrong. Validate inputs in the Lambda and return structured errors the agent can recover from rather than letting it guess.",
+    "fj": "Swap to a bigger model and hope it picks the right tool.",
+    "fs": "I read the InvokeAgent trace, then fix the action-group schema descriptions and agent instructions — most mis-calls are ambiguous tool specs, not model weakness.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Trace reveals tool choice",
+        "lang": "python",
+        "lines": [
+          "r = agent.invoke_agent(",
+          "  agentId=aid, agentAliasId=al,",
+          "  sessionId=sid, inputText=q,",
+          "  enableTrace=True)",
+          "for e in r['completion']:",
+          "  if 'trace' in e:",
+          "    print(e['trace']['trace'])"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What do Bedrock Guardrails give you, and why apply them even with a well-aligned model?",
+    "a": "Guardrails are a model-agnostic policy layer you attach to inference: content filters (hate, violence, sexual, misconduct, prompt-attack), denied topics defined in natural language, word filters, sensitive-information filters that block or mask PII, and contextual grounding checks that score whether a response is grounded in the provided source. They apply uniformly across any Bedrock model, agent, or Knowledge Base, so policy lives outside the prompt and survives a model swap. Even a well-aligned model needs them because your business rules (no investment advice, redact SSNs) are app-specific and must be enforced deterministically, with an audit trail.",
+    "fj": "If the model is aligned, guardrails are redundant.",
+    "fs": "Guardrails enforce app-specific policy (denied topics, PII masking) deterministically and uniformly across models — independent of whatever the base model happens to do.",
+    "level": "Mid",
+    "asked": 17
+  },
+  {
+    "q": "What is a contextual grounding check in Bedrock Guardrails, and what does it actually catch?",
+    "a": "It's a Guardrails policy that scores a model response against a reference source and the user query along two axes — grounding (is the answer supported by the source?) and relevance (does it address the question?) — and blocks or flags responses below thresholds you set. It targets RAG and summarization hallucinations: the model inventing facts not in the retrieved passages, or drifting off-topic. You tune the thresholds against your tolerance for false blocks, and AWS reports it filters a large majority of ungrounded RAG responses. It's a safety net on top of good retrieval, not a substitute for it.",
+    "fj": "Grounding checks make hallucination impossible.",
+    "fs": "It scores grounding and relevance against the source and blocks below a threshold — it sharply reduces RAG hallucinations but doesn't eliminate them, and bad retrieval still upstream-poisons it.",
+    "level": "Mid",
+    "asked": 13
+  },
+  {
+    "q": "You need RAG-quality answers but PII must never leak to logs or users. How do you wire Guardrails in?",
+    "a": "Configure a guardrail with sensitive-information filters set to MASK (or BLOCK) for the relevant PII entities, plus any denied topics, then pass its guardrailIdentifier and version on every Converse/InvokeModel call so input and output are both screened. Mask on input to keep PII out of model context and logs, and mask on output to protect responses. Layer a contextual grounding check to keep answers tied to retrieved sources. Version the guardrail and pin a specific version in production so a policy edit can't silently change behavior, and review blocked-event metrics.",
+    "fj": "Just tell the model in the prompt not to reveal PII.",
+    "fs": "A prompt instruction isn't enforcement. I attach a versioned guardrail with PII filters set to MASK on input and output, applied at the API call, plus grounding checks.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "label": "Guardrail on the call",
+        "lang": "python",
+        "lines": [
+          "br.converse(",
+          "  modelId=mid, messages=msgs,",
+          "  guardrailConfig={",
+          "    'guardrailIdentifier':gid,",
+          "    'guardrailVersion':'3',",
+          "    'trace':'enabled'})",
+          "# PII masked in/out per policy"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Which Bedrock embedding model do you choose, and what's the dimension tradeoff?",
+    "a": "Titan Text Embeddings V2 is the text workhorse: up to 8,192 input tokens and a selectable output size of 256, 512, or 1,024 dimensions, so you can trade a little accuracy for cheaper storage and faster search. Nova Multimodal Embeddings handles text, images, video, and audio in one model with 256/384/1,024/3,072 options via Matryoshka representation learning, for crossmodal retrieval. Cohere embeddings are also available and strong multilingually. Smaller dimensions shrink the vector index and speed similarity search but lose some recall, so benchmark on your corpus before committing — and keep query and document embeddings on the same model and dimension.",
+    "fj": "Always use the largest embedding dimension for best results.",
+    "fs": "Bigger dims cost more storage and slower search for marginal recall. Titan V2 lets me pick 256/512/1024; I benchmark and often 512 is plenty.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "Fine-tuning vs continued pre-training in Bedrock — when do you use which?",
+    "a": "Fine-tuning trains on labeled prompt-completion pairs to teach a task, format, or tone (e.g. your support-ticket style), and needs only hundreds to thousands of good examples. Continued pre-training feeds large volumes of unlabeled domain text to shift the model's base knowledge toward a specialized domain like legal or biomedical, and needs far more data. Both produce a custom model that you can only serve via Provisioned Throughput, adding training, storage, and hosting cost. Before either, exhaust prompt engineering and RAG, since most 'the model doesn't know our stuff' problems are retrieval problems, not weight problems.",
+    "fj": "Fine-tune the model so it knows our internal documents.",
+    "fs": "Knowledge belongs in RAG, not weights — fine-tuning teaches task/format/tone on labeled pairs. For domain knowledge I reach for a Knowledge Base first.",
+    "level": "Sr",
+    "asked": 15
+  },
+  {
+    "q": "Provisioned Throughput vs on-demand in Bedrock — how do you decide, and what's the catch with custom models?",
+    "a": "On-demand bills per token with no commitment and scales to zero, ideal for variable or unpredictable traffic and early development. Provisioned Throughput reserves capacity in model units at a fixed hourly rate (with 1- or 6-month commitments that discount the rate), giving guaranteed throughput and stable latency for large, steady workloads — and it's the cheaper unit economics once you're consistently busy. The catch: custom (fine-tuned or continued-pretrained) models can't run on-demand at all; you must buy Provisioned Throughput to serve them, so factor that hourly floor into any customization decision.",
+    "fj": "Provisioned Throughput is just a discount you can toggle on anytime.",
+    "fs": "It's a reserved hourly commitment for steady high volume — and the only way to serve a custom model, so fine-tuning carries a standing PT cost.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "What are cross-Region inference profiles in Bedrock, and why would you use one?",
+    "a": "An inference profile is an ARN you invoke instead of a bare model ID; a cross-Region profile lets Bedrock route a request across a set of Regions to absorb traffic bursts and raise effective throughput and availability without you managing failover. Geo profiles route within a geography (e.g. US or EU) for data-residency alignment, while global profiles let Bedrock pick the optimal commercial Region. Many newer models are only addressable through a profile, so 'pick a model' increasingly means model ID plus Region plus profile prefix. Use them for higher throughput ceilings and resilience to single-Region capacity limits.",
+    "fj": "You always just pass the plain model ID to invoke a model.",
+    "fs": "Many models are only reachable via an inference profile ARN. Cross-Region profiles spread load across Regions for throughput and resilience; geo profiles keep it in-region for residency.",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Invoke via profile ARN",
+        "lang": "python",
+        "lines": [
+          "# region-prefixed profile, not bare id",
+          "br.converse(",
+          "  modelId='us.anthropic.claude-...',",
+          "  messages=msgs)",
+          "# Bedrock routes across US regions",
+          "# to absorb bursts / capacity limits"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does prompt caching work in Bedrock, and when does it pay off?",
+    "a": "Prompt caching lets you mark stable prefixes of a request — a long system prompt, tool definitions, or retrieved context reused across turns — with cache checkpoints, so the model skips recomputing them on later calls within a short TTL (around five minutes). Cached input tokens are billed at a steep discount and latency drops sharply, since the expensive prefill is reused. It pays off for chat with a big fixed system prompt, agents with large tool specs, or document Q&A where the same document is queried repeatedly. It does nothing for one-off, fully unique prompts, and the cache expires quickly, so it's for hot, repeated context.",
+    "fj": "Caching stores the model's answers so identical questions are free.",
+    "fs": "It caches the input prefix (system prompt, tools, context) to skip prefill — not the output. Big reusable prefix wins; unique one-off prompts get nothing.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Cache a reused prefix",
+        "lang": "python",
+        "lines": [
+          "messages=[{'role':'user','content':[",
+          "  {'text': big_context},",
+          "  {'cachePoint':{'type':'default'}},",
+          "  {'text': user_question}]}]",
+          "# big_context reused -> cached,",
+          "# billed at ~discounted token rate"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate model and RAG quality on Bedrock instead of eyeballing outputs?",
+    "a": "Use Bedrock Evaluations. Automatic model evaluation runs curated or your-own datasets and scores predefined metrics like accuracy, robustness, and toxicity; an LLM-as-a-judge option scores quality dimensions at scale without humans; and human evaluation workflows route subjective judgments to reviewers. For RAG, Knowledge Base evaluation scores retrieval (are the right chunks pulled?) and generation (is the answer grounded and correct?) separately, which is key because a bad answer is usually a retrieval miss, not a generation miss. Build a representative gold set early and re-run it on every prompt, model, or chunking change to catch regressions.",
+    "fj": "Read a few sample answers and ship if they look good.",
+    "fs": "I run Bedrock Evaluations on a gold set — separating retrieval from generation metrics for RAG — and re-run on every change. Spot-checking hides regressions.",
+    "level": "Sr",
+    "asked": 14
+  },
+  {
+    "q": "A security review asks: is our data sent to Anthropic, and how is it isolated on Bedrock?",
+    "a": "No — Bedrock does not share your inputs or outputs with the model providers, and your data is never used to train the base foundation models; the model weights run inside AWS's Bedrock boundary. Data is encrypted in transit and at rest, and you can supply your own KMS customer-managed keys for custom-model artifacts and agent/session state. For network isolation, use VPC interface endpoints via AWS PrivateLink so traffic to Bedrock never traverses the public internet. Combine that with least-privilege IAM on the bedrock:InvokeModel action and CloudTrail logging for an auditable, isolated posture.",
+    "fj": "Using Bedrock means our prompts train Claude and leak to Anthropic.",
+    "fs": "Inputs/outputs aren't shared with providers or used to train base models. I add PrivateLink for private networking, KMS CMKs, and least-privilege IAM.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "label": "Private Bedrock endpoint",
+        "lang": "ts",
+        "lines": [
+          "{ Type:",
+          "  'AWS::EC2::VPCEndpoint',",
+          "  Properties: {",
+          "   ServiceName:",
+          "    'com.amazonaws.us-east-1",
+          "      .bedrock-runtime',",
+          "   VpcEndpointType: 'Interface' }}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you monitor and control Bedrock token spend before it surprises you?",
+    "a": "Cost on Bedrock is driven by input plus output tokens (output is typically several times pricier), so instrument first: every Converse/InvokeModel response returns a usage block with input, output, and cached token counts — log it per request, tagged by feature and user. Aggregate that with CloudWatch metrics and Cost Explorer, and set budgets and alarms. Then pull the obvious levers: route cheap tasks to Nova Micro/Lite, cap maxTokens, use prompt caching for reused prefixes, batch where latency allows, and Provisioned Throughput once volume is steady. The expensive surprise is usually an agent looping or an unbounded output, so alarm on tokens-per-request.",
+    "fj": "Cost scales with the number of API calls, so just cap request count.",
+    "fs": "Cost is tokens, not calls, and output tokens dominate. I log the per-response usage block, alarm on tokens/request, cap maxTokens, and route cheap tasks to small models.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Log the usage block",
+        "lang": "python",
+        "lines": [
+          "r = br.converse(modelId=mid,",
+          "  messages=msgs)",
+          "u = r['usage']",
+          "log.info('in=%s out=%s cache=%s',",
+          "  u['inputTokens'],",
+          "  u['outputTokens'],",
+          "  u.get('cacheReadInputTokens'))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you use a Bedrock Agent versus orchestrating tool use yourself in application code?",
+    "a": "A Bedrock Agent is worth it when you want AWS to manage the ReAct loop, session state, tracing, and the wiring of Knowledge Bases plus action-group Lambdas behind one InvokeAgent call — less glue code and a managed runtime. Rolling your own with the Converse API tool-use blocks gives full control over the loop, custom retry and fallback logic, multi-model routing, and tighter latency tuning, at the cost of writing and owning that orchestration. Choose the managed agent for standard tool-and-RAG assistants; choose hand-rolled orchestration (or a framework on Converse) when you need bespoke control flow the agent's loop can't express.",
+    "fj": "Always use Bedrock Agents because hand-writing the loop is reinventing the wheel.",
+    "fs": "Managed agents trade control for convenience. For bespoke retry/routing/loops I orchestrate Converse tool-use myself; for standard tool+RAG assistants the agent saves glue.",
+    "level": "Sr",
+    "asked": 11
+  },
+  {
+    "q": "Implement tool use with the Converse API directly. What does the loop look like?",
+    "a": "You pass a toolConfig listing each tool's name, description, and JSON input schema. The model replies with stopReason 'tool_use' and a toolUse block naming the tool and arguments; you execute it in your code, then send the result back as a toolResult content block referencing the same toolUseId, and call Converse again so the model can incorporate it. You loop until stopReason is 'end_turn'. This is the same ReAct pattern a Bedrock Agent runs, but you own every step — error handling, parallel tool calls, and when to stop.",
+    "fj": "The model executes the tool itself once you describe it.",
+    "fs": "The model only emits a toolUse request; my code runs it and returns a toolResult with the matching toolUseId, then I re-call Converse. I own the loop.",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Return tool result",
+        "lang": "python",
+        "lines": [
+          "# model replied stopReason=tool_use",
+          "out = run_tool(tu['name'], tu['input'])",
+          "msgs.append({'role':'user','content':[",
+          " {'toolResult':{",
+          "   'toolUseId':tu['toolUseId'],",
+          "   'content':[{'json':out}]}}]})",
+          "br.converse(modelId=mid,",
+          "  messages=msgs, toolConfig=tc)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Architect a production support assistant on Bedrock: grounded answers, safe, observable. What are the pieces?",
+    "a": "Ground answers with a Knowledge Base over your S3 docs (hierarchical chunking, Titan V2 embeddings, Aurora pgvector or OpenSearch Serverless by scale) and use RetrieveAndGenerate or an agent so retrieval and citation are managed. Wrap every model call in a versioned Guardrail — PII masking, denied topics, and a contextual grounding check — and pin the model via an inference profile for throughput and residency. For safety on actions, give the agent narrow action-group Lambdas with validated inputs and least-privilege IAM. Make it observable: log the usage block and InvokeAgent traces, alarm on tokens-per-request and blocked-guardrail events, and gate releases on a Bedrock Evaluations gold set. Use PrivateLink and KMS to keep it inside your network and key boundary.",
+    "fj": "Just call the model with a good prompt and ship it.",
+    "fs": "Production needs grounding (KB + citations), a versioned guardrail, an inference profile, traced/usage logging with alarms, eval gating, and PrivateLink/KMS isolation — the prompt is the smallest part.",
+    "level": "Sr",
+    "asked": 17
+  },
+  {
+    "q": "Bedrock vs SageMaker: give me the decision framework, not a one-liner.",
+    "a": "Choose Bedrock when the job is consuming foundation models — inference, managed RAG via Knowledge Bases, agents, guardrails — and you want serverless scaling, fast time-to-value, and access to proprietary models you can't self-host. Choose SageMaker when you need control AWS Bedrock abstracts away: training from scratch or deep custom fine-tuning, novel architectures, your own model artifacts, classic ML pipelines, or specific hardware and serving configs. The boundary is ownership of the model and training loop: rent-and-call leans Bedrock, build-and-own leans SageMaker. A very common production shape is Bedrock for the GenAI app layer with SageMaker handling bespoke training or classic ML behind it.",
+    "fj": "SageMaker is the old way and Bedrock replaces it.",
+    "fs": "They serve different layers — Bedrock for consuming FMs (inference/RAG/agents), SageMaker for owning the model/training loop. Most stacks use both.",
+    "level": "Sr",
+    "asked": 18
+  }
+]

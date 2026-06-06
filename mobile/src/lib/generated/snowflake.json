@@ -1,0 +1,1037 @@
+[
+  {
+    "q": "Explain the difference between a virtual warehouse and storage in Snowflake. Why does separating them matter?",
+    "a": "Storage holds the actual table data as compressed micro-partitions on cloud object storage and exists independently of any compute. A virtual warehouse is a cluster of compute nodes that executes queries by reading from storage on demand. Because they are separate, you can suspend a warehouse and pay nothing for compute while your data stays intact, and you can run multiple warehouses against the same data without copying it. Scaling compute is immediate, with no data migration.",
+    "fj": "Suspending a warehouse deletes your data.",
+    "fs": "Suspension stops compute billing only — data in object storage is unaffected.",
+    "level": "Jr",
+    "asked": 28
+  },
+  {
+    "q": "What is a micro-partition in Snowflake and how does pruning work?",
+    "a": "Snowflake automatically splits every table into micro-partitions: immutable, compressed, columnar files of roughly 50 to 500 MB uncompressed, each storing column-level min/max, distinct count, and null count metadata. At query time the optimizer uses this metadata to skip partitions whose min/max range cannot satisfy the WHERE clause — partition pruning — with no explicit index needed. Pruning works best when data has natural clustering, such as an append-only table loaded by date; randomly inserted data causes high partition overlap and poor pruning.",
+    "fj": "Snowflake has no way to optimize queries without indexes.",
+    "fs": "Micro-partition metadata enables pruning — Snowflake skips partitions whose min/max can't satisfy the WHERE clause.",
+    "level": "Jr",
+    "asked": 19,
+    "code": [
+      {
+        "label": "Pruning via min/max metadata",
+        "lang": "sql",
+        "lines": [
+          "-- table loaded append-only by day",
+          "SELECT sum(amt) FROM sales",
+          "WHERE day = '2026-06-01';",
+          "-- skips partitions whose [min,max]",
+          "-- for DAY excludes that date",
+          "-- Query Profile: partitions",
+          "-- scanned << partitions total"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does data loading work in Snowflake? Walk me through getting a CSV from S3 into a table.",
+    "a": "Create a stage that references the cloud storage location, create the target table, then run COPY INTO with the appropriate file format to bulk load the data. Snowflake loads in parallel across the warehouse's nodes, and COPY INTO is idempotent by default, tracking loaded files and skipping already-loaded ones unless you pass FORCE=TRUE. For continuous ingestion, Snowpipe automates COPY INTO when new files arrive using cloud event notifications.",
+    "fj": "I'd INSERT one row at a time from my application.",
+    "fs": "Bulk load via COPY INTO from a stage — row-by-row INSERT is extremely slow and costly in Snowflake.",
+    "level": "Jr",
+    "asked": 16,
+    "code": [
+      {
+        "label": "Stage then bulk COPY INTO",
+        "lang": "sql",
+        "lines": [
+          "CREATE STAGE s3_stage",
+          "  STORAGE_INTEGRATION = s3_int",
+          "  URL = 's3://bucket/sales/';",
+          "COPY INTO sales",
+          "  FROM @s3_stage",
+          "  FILE_FORMAT =",
+          "    (TYPE=CSV SKIP_HEADER=1);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When would you use a transient table vs a permanent table vs a temporary table in Snowflake?",
+    "a": "Permanent tables are the default, with Time Travel up to 90 days and 7-day Fail-safe, for production data needing recovery at higher storage cost. Transient tables drop Fail-safe and limit Time Travel to 0 to 1 day, making them ideal for staging or intermediate tables that are rebuilt every run and don't need recovery. Temporary tables are session-scoped and dropped when the session ends, suited to in-session scratch work. The decision driver is how much recovery you need versus how much you're willing to pay for storage.",
+    "fj": "Use permanent tables for everything to be safe.",
+    "fs": "Permanent tables on high-churn staging data waste money on Fail-safe. Use transient for anything rebuilt by the pipeline.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Three table types",
+        "lang": "sql",
+        "lines": [
+          "-- prod: Time Travel + Fail-safe",
+          "CREATE TABLE prod_t (...);",
+          "-- staging: no Fail-safe, 1d TT",
+          "CREATE TRANSIENT TABLE stg_t (...)",
+          "  DATA_RETENTION_TIME_IN_DAYS=1;",
+          "-- session scratch, auto-dropped",
+          "CREATE TEMPORARY TABLE scratch (...);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "We're migrating from Redshift to Snowflake. What are the biggest operational differences a junior engineer should know?",
+    "a": "Snowflake warehouses auto-suspend and bill per second, so idle time is free, whereas Redshift clusters run and bill continuously. Snowflake resizes in seconds without moving data and handles concurrency with multi-cluster warehouses, while Redshift queues queries when WLM slots fill. Snowflake requires almost no DBA maintenance — no VACUUM or ANALYZE — and natively stores semi-structured data in VARIANT columns. Loading is similar via COPY from S3, but Snowflake's is simpler with no SORTKEYS or COMPUPDATE to manage.",
+    "fj": "They're basically the same, just different syntax.",
+    "fs": "Completely different billing and compute model — Snowflake's auto-suspend changes how you architect warehouses entirely.",
+    "level": "Mid",
+    "asked": 11
+  },
+  {
+    "q": "How do Snowflake Streams and Tasks work together to implement CDC, and what are the gotchas?",
+    "a": "A Stream is a CDC object that stores an offset into a table's versioned history and returns rows changed since it was last consumed, while a Task is the built-in scheduler that runs SQL or stored procedures on a cron or when a stream has data. The pattern is source table to stream to a task that MERGEs into the target, advancing the stream's offset. Key gotchas: the offset only advances when consumed in a committed DML transaction, not a plain SELECT, and streams go stale if not consumed within the source's data retention window. Append-only streams skip updates and deletes and are much cheaper for insert-only pipelines.",
+    "fj": "I SELECT from the stream to process changes.",
+    "fs": "A plain SELECT doesn't advance the offset — the stream must be consumed in a committed DML transaction to move forward.",
+    "level": "Sr",
+    "asked": 24,
+    "code": [
+      {
+        "label": "Stream -> Task -> MERGE CDC",
+        "lang": "sql",
+        "lines": [
+          "CREATE STREAM s ON TABLE src;",
+          "CREATE TASK t WAREHOUSE=wh",
+          " SCHEDULE='1 minute'",
+          " WHEN SYSTEM$STREAM_HAS_DATA('s')",
+          "AS MERGE INTO tgt USING s",
+          " ON tgt.id=s.id WHEN MATCHED",
+          " THEN UPDATE SET tgt.v=s.v;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain how Snowflake's three caching layers work and when each one helps — or fails to help.",
+    "a": "The result cache returns an identical prior query's result instantly with no compute if it ran within 24 hours and the underlying data hasn't changed, broken by any DML, query text change, or expiry. The local disk (warehouse) cache holds recently read micro-partitions on each node's SSD, making a warm warehouse 10 to 100x faster, but it clears on suspend — so auto-suspend timing is a tradeoff. The remote disk/metadata cache in the cloud services layer caches metadata and plans and isn't directly tuned. Always benchmark on the second run to separate cold-start IO from steady-state performance.",
+    "fj": "Result cache is indefinite.",
+    "fs": "Result cache is 24 hours max, and any DML on the queried tables invalidates it immediately.",
+    "level": "Sr",
+    "asked": 21,
+    "code": [
+      {
+        "label": "Result cache invalidation",
+        "lang": "sql",
+        "lines": [
+          "SELECT count(*) FROM t; -- runs",
+          "SELECT count(*) FROM t; -- cache",
+          "-- ^ 0 credits, served < 24h",
+          "INSERT INTO t VALUES (1);",
+          "SELECT count(*) FROM t;",
+          "-- DML invalidated cache -> recompute"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is Time Travel in Snowflake, how far back can you go, and what are the storage implications?",
+    "a": "Time Travel lets you query, clone, or restore a table as it existed at a past point using AT clauses with TIMESTAMP, OFFSET, or STATEMENT, defaulting to 1 day of retention and extendable to 90 days on Enterprise. Snowflake stores all changed and deleted micro-partitions during the retention window, so heavy DML with long retention significantly increases storage cost. After Time Travel ends, permanent tables enter a 7-day Fail-safe period recoverable only by Snowflake Support. Most teams set long retention only on critical production tables and use 1 day or 0 for high-churn staging.",
+    "fj": "Time Travel is free and unlimited.",
+    "fs": "Time Travel storage costs scale with retention period and change volume — I set 90 days only on critical production tables.",
+    "level": "Mid",
+    "asked": 18,
+    "code": [
+      {
+        "label": "Query and restore past state",
+        "lang": "sql",
+        "lines": [
+          "-- table as of 1 hour ago",
+          "SELECT * FROM t",
+          "  AT(OFFSET => -3600);",
+          "-- restore by cloning pre-mistake",
+          "CREATE TABLE t_fixed CLONE t",
+          "  BEFORE(STATEMENT => '<bad_id>');"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain zero-copy cloning in Snowflake: what it is, how it works, and the production use cases where it actually matters.",
+    "a": "CLONE creates an independent copy that shares the original's underlying micro-partitions, so creation costs essentially nothing beyond a metadata entry; storage is only charged as the clone and original diverge on write. This works because micro-partitions are immutable, so both can safely reference the same physical files. Real use cases include instant dev/test environments, safe pre-migration backups before a risky MERGE or schema change, CI/CD integration testing on production-scale data, and point-in-time snapshots when combined with Time Travel. You can clone tables, schemas, or entire databases.",
+    "fj": "Cloning duplicates the data, so it's expensive.",
+    "fs": "Zero-copy cloning shares micro-partitions — storage cost is negligible at creation and only accrues as clone and original diverge.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "label": "Metadata-only clone",
+        "lang": "sql",
+        "lines": [
+          "-- instant, shares micro-partitions",
+          "CREATE TABLE dev_orders",
+          "  CLONE prod_orders;",
+          "-- whole DB clone, also instant",
+          "CREATE DATABASE dev",
+          "  CLONE prod;",
+          "-- storage charged only on divergence"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide between a view, a materialized view, and a scheduled table (task + MERGE) for a heavy aggregation in Snowflake?",
+    "a": "A view is always fresh with zero storage but recomputes on every read, so it suits cheap logic or low query volume. A materialized view is kept current automatically and can transparently rewrite queries, but it's limited to a single base table with no joins and restricted aggregates and costs background maintenance credits. A scheduled table built with a task and MERGE gives full control over multi-table joins and refresh cadence, bounded only by staleness, and is best for complex aggregations queried frequently. The decision balances read frequency and compute cost per read against the freshness requirement and maintenance cost.",
+    "fj": "Materialized views are always the answer for slow queries.",
+    "fs": "MVs have a restricted function set and single-table limit. When I need joins or window functions, I use a task-driven table with incremental MERGE.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "label": "MV limit vs task+MERGE",
+        "lang": "sql",
+        "lines": [
+          "-- MV: single base table only",
+          "CREATE MATERIALIZED VIEW mv AS",
+          "  SELECT d, sum(amt) FROM sales",
+          "  GROUP BY d;  -- no joins allowed",
+          "-- need joins? task + MERGE into",
+          "-- a scheduled rollup table instead"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you reach for a separate virtual warehouse, and what's your mental model for warehouse sizing?",
+    "a": "Create separate warehouses per workload type — ETL, BI, and ad-hoc/data science — so a long-running job can't starve a dashboard query, and you also get per-workload billing visibility. For sizing, start smaller than you think and consult the Query Profile: size up one notch only when you see bytes spilled to local or remote disk, which indicates memory pressure. Do not size up for slow pruning, which is a data organization problem rather than a compute problem. For concurrent BI users, use a multi-cluster warehouse that auto-scales out instead of one larger warehouse.",
+    "fj": "Start with XL and tune down.",
+    "fs": "Start small, look at the Query Profile for spilling, then size up one notch at a time. XL for a simple filter query is wasted credit.",
+    "level": "Mid",
+    "asked": 13
+  },
+  {
+    "q": "When would you use Snowflake Streams + Tasks for CDC vs an external streaming system like Kafka + Flink?",
+    "a": "Streams + Tasks is Snowflake-native, zero-infrastructure, SQL-only, and best when source and target are both in Snowflake and the latency SLA is minutes, not seconds. Kafka + Flink offers sub-second latency, high throughput, and multi-target fan-out, making it the choice for real-time products, sources outside Snowflake, or multiple consumers of the same stream. The decision turns on latency SLA, your team's operational capability, the source system, and whether you must fan out to non-Snowflake targets. A common middle path is Kafka plus Snowpipe for ingestion, then Streams + Tasks for in-Snowflake transformation.",
+    "fj": "Streams + Tasks is real-time.",
+    "fs": "Streams + Tasks is near-real-time at best — 30-60 second practical latency floor. For sub-second requirements, use Kafka or Kinesis feeding Snowpipe.",
+    "level": "Mid",
+    "asked": 10
+  },
+  {
+    "q": "A dashboard query on a 4 TB table is slow. Walk me through exactly how you diagnose and fix it in Snowflake.",
+    "a": "Start at the Query Profile, not the warehouse size, and identify the dominant operator: a TableScan with poor pruning, an exploding join, or bytes spilling to disk. Check the pruning ratio of partitions scanned to total — a value near 1.0 suggests a clustering key or pre-aggregation — and check spilling, where local-disk spill means size up one notch and remote-disk spill means reduce the working set first. Separate cold from warm baselines and look for joins whose output rows far exceed input rows. Only after confirming a compute or memory bottleneck do you touch warehouse size.",
+    "fj": "I'd resize the warehouse to XL.",
+    "fs": "I open the Query Profile and identify whether the bottleneck is pruning, spilling, or join shape before touching warehouse size.",
+    "level": "Sr",
+    "asked": 31,
+    "code": [
+      {
+        "label": "Check pruning, not warehouse",
+        "lang": "sql",
+        "lines": [
+          "-- Query Profile TableScan stats:",
+          "-- partitions scanned 9800 / 10000",
+          "-- ratio ~1.0 => pruning is poor",
+          "-- fix data, not warehouse size:",
+          "ALTER TABLE events",
+          "  CLUSTER BY (event_date);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Design the warehouse topology and cost governance model for a 10-team Snowflake account that's spending $50k/month with no visibility into who's responsible.",
+    "a": "Isolate workloads into dedicated warehouses per team and type, set resource monitors with Notify at 80% and Suspend at 100% on a monthly interval plus an account-level backstop, and enable auto-suspend on every warehouse. Add per-warehouse statement timeouts to kill runaway queries before they exhaust the quota. Use object tags on warehouses for cost allocation and query ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY for per-warehouse credit consumption. Distribute a weekly automated cost report by warehouse and tag to team leads and treat overages as incidents — the technical fix is simple, but the real work is creating accountability.",
+    "fj": "Just add a dashboard to see who's spending.",
+    "fs": "Visibility without isolation and resource monitors doesn't reduce spend — you need warehouse-per-workload, monitors with Suspend thresholds, and statement timeouts to create behavioral accountability.",
+    "level": "Sr",
+    "asked": 22,
+    "code": [
+      {
+        "label": "Monitor with suspend thresholds",
+        "lang": "sql",
+        "lines": [
+          "CREATE RESOURCE MONITOR team_a",
+          "  WITH CREDIT_QUOTA = 1000",
+          "  FREQUENCY = MONTHLY TRIGGERS",
+          "    ON 80 PERCENT DO NOTIFY",
+          "    ON 100 PERCENT DO SUSPEND;",
+          "ALTER WAREHOUSE etl_wh SET",
+          "  RESOURCE_MONITOR = team_a;"
+        ]
+      },
+      {
+        "label": "Per-warehouse credit query",
+        "lang": "sql",
+        "lines": [
+          "SELECT warehouse_name,",
+          "  sum(credits_used) AS credits",
+          "FROM snowflake.account_usage",
+          "  .warehouse_metering_history",
+          "GROUP BY 1 ORDER BY credits DESC;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your team is evaluating Snowflake clustering keys for a 5 TB events table. Walk me through the full analysis you'd run and the conditions under which you'd actually define the key.",
+    "a": "Start with SYSTEM$CLUSTERING_INFORMATION to measure average clustering depth and partition overlap, where a depth above 3 to 5 on your filter column signals poor pruning. Validate with QUERY_HISTORY that the most expensive queries consistently filter on that same column, then estimate the reclustering cost, since automatic reclustering charges credits proportional to data rewritten and can exceed the savings on high-churn tables. Define a key only for a large, mostly-append table with a consistent filter column where the Query Profile confirms poor pruning. Skip it for small tables, varied filter columns, high DML churn, or when a pre-aggregated scheduled table solves the access pattern more cheaply.",
+    "fj": "Always add a clustering key on the date column for big tables.",
+    "fs": "Only after SYSTEM$CLUSTERING_INFORMATION confirms poor depth on a consistently-queried column, and after checking that reclustering cost won't exceed query savings on high-churn tables.",
+    "level": "Sr",
+    "asked": 19,
+    "code": [
+      {
+        "label": "Measure depth before clustering",
+        "lang": "sql",
+        "lines": [
+          "SELECT SYSTEM$CLUSTERING_INFORMATION(",
+          "  'events', '(event_date)');",
+          "-- average_depth: 64.07  <- bad",
+          "-- (depth > ~3-5 = poor pruning)",
+          "-- only then, if filter is stable:",
+          "ALTER TABLE events",
+          "  CLUSTER BY (event_date);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you use zero-copy cloning as part of a production deployment pipeline for Snowflake transformations?",
+    "a": "Take a pre-deploy snapshot by cloning the production table before any risky MERGE, schema change, or backfill, at near-zero cost and instantaneously. Clone whole databases to give developers or CI runs full data environments, and use blue-green deployments by building a new table version and swapping it atomically via ALTER TABLE RENAME. In CI, clone prod into a test schema, run transformations and data quality tests against real-scale data, then drop the clone with zero prod impact. If a deployment fails, instantly revert by dropping the new table and renaming the backup clone back into place.",
+    "fj": "I just run the migration directly on prod — if something breaks I restore from backup.",
+    "fs": "Clone prod before any risky change. It's instantaneous and near-free. Restore from traditional backup takes hours and has recovery uncertainty.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "label": "Clone, build, atomic swap",
+        "lang": "sql",
+        "lines": [
+          "-- near-free pre-deploy backup",
+          "CREATE TABLE orders_bak",
+          "  CLONE orders;",
+          "-- build new version, then swap in",
+          "ALTER TABLE orders_next",
+          "  SWAP WITH orders;",
+          "-- rollback = swap orders_bak back"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain how Snowflake Iceberg tables work and when you'd choose them over native Snowflake tables.",
+    "a": "Iceberg tables store data in open Apache Iceberg format as Parquet files in your own cloud storage while Snowflake manages the metadata and catalog, so you own the data files. Snowflake-managed Iceberg supports full DML, whereas external-managed Iceberg reads tables written by Spark/Flink/Trino with more limited write access. Choose Iceberg to avoid vendor lock-in, meet data residency requirements, or enable multi-engine architectures where Spark and Snowflake query the same dataset without ETL. The trade-offs are slightly higher query latency, more operational setup with external volumes and IAM, and not all Snowflake features being supported.",
+    "fj": "Iceberg is just another table format, same as native Snowflake.",
+    "fs": "Iceberg tables store open-format Parquet in your own storage — multiple engines can read them without exporting. The trade-off is slightly higher latency and more operational complexity than native tables.",
+    "level": "Sr",
+    "asked": 16
+  },
+  {
+    "q": "How do you decide whether to vertically scale a warehouse, add clusters (multi-cluster), or restructure the query when a Snowflake workload is underperforming?",
+    "a": "Open the Query Profile first so every decision is evidence-based. Vertically scale to a bigger warehouse when bytes spill to disk or compute-bound operators show high CPU wait, indicating memory or compute pressure. Add clusters with multi-cluster when well-tuned queries are queueing due to concurrent users, visible as high queue time in QUERY_HISTORY — this solves throughput, not per-query latency. Restructure the query or data when pruning is poor, spill won't yield to size-up, or a join is exploding, since those are access-pattern problems that scale can't fix.",
+    "fj": "Just add more clusters — that always helps concurrency.",
+    "fs": "Multi-cluster solves queueing, not per-query latency. If a single query is slow, more clusters won't help — I look at the Query Profile to distinguish memory pressure from pruning from concurrency.",
+    "level": "Sr",
+    "asked": 18
+  },
+  {
+    "q": "How do you design a multi-environment Snowflake account structure (dev/staging/prod) and what are the trade-offs of different approaches?",
+    "a": "One option is a single account with separate databases, which is simple for RBAC but shares account-level resource limits so a runaway dev warehouse can impact prod. Another is separate accounts per environment for full isolation and separate billing, at the cost of higher ops overhead and no cross-account queries without data sharing or replication. A third, recommended for most teams, is a single account using zero-copy clones of prod per developer or per PR at test time, then dropped — minimal standing dev infra with real production-scale data. Size and compliance requirements drive the choice.",
+    "fj": "Just use one account and prefix tables with dev_ or prod_.",
+    "fs": "Prefix-based isolation has no RBAC enforcement — a dev query can accidentally scan a prod-prefixed table. Use separate databases at minimum, separate accounts for strong isolation.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "When do you choose Snowflake Dynamic Tables over Streams + Tasks for pipeline automation?",
+    "a": "Dynamic Tables let you declare a SQL query and a target lag, and Snowflake automatically refreshes the result and manages the dependency DAG when upstream data changes — like a materialized view with full SQL support including joins. Streams + Tasks is an explicit CDC pipeline where you write the MERGE logic, manage the schedule, and handle stream consumption, giving full control with more boilerplate. Choose Dynamic Tables when the transformation is a single SQL query and you want declarative freshness SLAs. Choose Streams + Tasks when you need custom MERGE semantics like SCD Type 2, multi-step logic, or exact control over change application.",
+    "fj": "Dynamic Tables are just materialized views.",
+    "fs": "Dynamic Tables support full SQL including joins and window functions — unlike materialized views which are single-table only. And they have a target lag SLA, not a manual refresh schedule.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "label": "Declarative, joins + lag SLA",
+        "lang": "sql",
+        "lines": [
+          "CREATE DYNAMIC TABLE daily AS",
+          "  -- joins allowed, unlike an MV",
+          "  SELECT o.d, sum(o.amt)",
+          "  FROM orders o JOIN cust c",
+          "    ON o.cid = c.id GROUP BY o.d;",
+          "-- declared above the AS:",
+          "-- TARGET_LAG='10 min' WAREHOUSE=wh"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Snowflake vs Databricks for a new analytics platform — how do you make the call, and what changed in 2024–2025?",
+    "a": "Snowflake wins on SQL analytics and BI with near-zero ops and strong concurrency, while Databricks wins on ML/AI and big data engineering with Spark, notebooks, and MLflow. In 2024 to 2025 the platforms converged: Snowflake added native Iceberg tables and the open-source Polaris Catalog, weakening the lock-in argument, while Databricks improved serverless SQL and Unity Catalog governance. Snowflake bills predictable credits per warehouse-second, whereas Databricks uses DBUs plus your own cloud compute with more cost knobs. The decision anchors on primary workload, team skills, governance and open-format requirements, and total cost of ownership including ops.",
+    "fj": "Databricks is just better / Snowflake is just better.",
+    "fs": "Depends on workload mix and team skills — and in 2025 both platforms have converged significantly. I anchor the decision on primary workload, team skills, and governance requirements.",
+    "level": "Sr",
+    "asked": 26
+  },
+  {
+    "q": "Compare Snowflake Materialized Views, Dynamic Tables, and task-driven scheduled tables. When does each earn its place in a production data platform?",
+    "a": "Materialized Views are single-base-table with restricted SQL, automatically maintained with transparent query rewrite — good for simple single-table pre-aggregations needing zero-config acceleration. Dynamic Tables support full SQL including joins and window functions, offer a target-lag freshness SLA, and manage the dependency DAG automatically — good for complex multi-table transformations with declarative freshness. Task-driven scheduled tables with stream plus MERGE give explicit control and custom mutation logic, best for SCD Type 2 and multi-step branching pipelines. Operational complexity rises from MV to Dynamic Table to scheduled table.",
+    "fj": "Dynamic Tables are just materialized views with a better name.",
+    "fs": "Dynamic Tables support full SQL with joins and have target-lag semantics and DAG dependency management — fundamentally different from the single-table, restricted MVs.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "label": "Before",
+        "lang": "sql",
+        "lines": [
+          "-- MV: single table, no joins",
+          "CREATE MATERIALIZED VIEW mv AS",
+          "  SELECT cid, sum(amt)",
+          "  FROM orders GROUP BY cid;"
+        ]
+      },
+      {
+        "label": "After",
+        "lang": "sql",
+        "lines": [
+          "-- Dynamic Table: joins + lag SLA",
+          "CREATE DYNAMIC TABLE dt",
+          "  TARGET_LAG='5 min' WAREHOUSE=wh",
+          "AS SELECT c.tier, sum(o.amt)",
+          "   FROM orders o JOIN cust c",
+          "     ON o.cid=c.id GROUP BY c.tier;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is Snowpipe and how does it differ from a plain COPY INTO? Walk me through auto-ingest.",
+    "a": "Snowpipe is Snowflake's serverless continuous file ingestion service: it wraps a COPY INTO statement in a PIPE object and runs it automatically when new files land in a stage, using Snowflake-managed compute rather than your own virtual warehouse. With auto-ingest, a cloud event notification (S3 SNS/SQS, GCS Pub/Sub, or Azure Event Grid) tells the pipe a file arrived, so you don't poll. Billing is per-second serverless compute plus a fixed overhead of about 0.06 credits per 1000 files, which is why thousands of tiny files get expensive — aim for 100-250 MB compressed files.",
+    "fj": "Snowpipe runs on my warehouse and I trigger it on a schedule.",
+    "fs": "Snowpipe is serverless (no warehouse) and event-driven via cloud notifications. The cost trap is the per-1000-files overhead, so I batch tiny files before ingest.",
+    "level": "Jr",
+    "asked": 17,
+    "code": [
+      {
+        "label": "Auto-ingest pipe",
+        "lang": "sql",
+        "lines": [
+          "CREATE PIPE sales_pipe",
+          "  AUTO_INGEST = TRUE AS",
+          "COPY INTO sales",
+          "  FROM @s3_stage",
+          "  FILE_FORMAT =",
+          "    (TYPE=CSV SKIP_HEADER=1);",
+          "-- S3 event notify -> SQS -> pipe"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you choose Snowpipe Streaming over file-based Snowpipe, and what changes operationally?",
+    "a": "Snowpipe Streaming uses an SDK (or the Kafka connector in streaming mode) to write rows directly into a table with no intermediate files or stage, giving second-level latency and removing the per-file overhead entirely. File-based Snowpipe is best when data already arrives as files in object storage and minutes of latency are acceptable. Snowpipe Streaming bills per uncompressed GB ingested (roughly 0.0037 credits/GB on the high-performance architecture), so it is far cheaper and faster for high-volume row streams from Kafka, IoT, or app events. The tradeoff is you must run an SDK client instead of just dropping files in a bucket.",
+    "fj": "Snowpipe Streaming is just Snowpipe with a faster schedule.",
+    "fs": "Streaming writes rows directly with no files, so it kills the per-1000-files overhead and hits second-level latency. I use it for Kafka/IoT row streams, file Snowpipe for files-in-a-bucket.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "Explain Snowflake's RBAC model and the system-defined role hierarchy. Why is ACCOUNTADMIN dangerous as a default role?",
+    "a": "Snowflake access control is role-based: privileges are granted to roles, roles are granted to users, and roles can be granted to other roles to form a hierarchy where a parent inherits all children's privileges. The system roles are ACCOUNTADMIN (top, inherits SYSADMIN + SECURITYADMIN), SECURITYADMIN (MANAGE GRANTS, inherits USERADMIN), USERADMIN (CREATE USER/ROLE), and SYSADMIN (creates warehouses, databases, objects). ACCOUNTADMIN can manage billing, account params, and any grant, so using it as a default role means routine objects get owned by it and a single compromised session has full account control. Best practice: custom functional roles roll up to SYSADMIN, ACCOUNTADMIN stays rare with MFA and is never a default.",
+    "fj": "I do everything as ACCOUNTADMIN since it can access everything.",
+    "fs": "Custom roles roll up to SYSADMIN, ACCOUNTADMIN is rare/MFA-only and never a default. Objects created by ACCOUNTADMIN get owned by it, which breaks least-privilege.",
+    "level": "Mid",
+    "asked": 21,
+    "code": [
+      {
+        "label": "Functional role under SYSADMIN",
+        "lang": "sql",
+        "lines": [
+          "USE ROLE USERADMIN;",
+          "CREATE ROLE analyst;",
+          "USE ROLE SECURITYADMIN;",
+          "GRANT USAGE ON DATABASE prod",
+          "  TO ROLE analyst;",
+          "-- roll custom role up to SYSADMIN",
+          "GRANT ROLE analyst",
+          "  TO ROLE SYSADMIN;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is Snowflake Cortex AI and how do you call an LLM directly from SQL? Give a concrete example.",
+    "a": "Cortex AI is Snowflake's built-in, serverless generative-AI layer that exposes LLM and ML capabilities as SQL functions, so the model runs inside Snowflake's governance boundary with no data leaving the account and no infrastructure to manage. The AISQL functions (GA Nov 2025) include AI_COMPLETE for free-form generation, AI_CLASSIFY, AI_FILTER (returns true/false, usable in WHERE/JOIN), AI_AGG to summarize across rows, AI_EMBED for vectors, and AI_PARSE_DOCUMENT / AI_TRANSCRIBE for documents and audio. You pass a model name and a prompt and get results in the query, billed per token of serverless AI compute.",
+    "fj": "I'd export the data to OpenAI's API and load the results back in.",
+    "fs": "Cortex runs the LLM inside Snowflake's governance boundary as a SQL function (AI_COMPLETE, AI_CLASSIFY, AI_FILTER), so no data egress and no infra. Billing is per-token serverless.",
+    "level": "Jr",
+    "asked": 18,
+    "code": [
+      {
+        "label": "LLM call inline in SQL",
+        "lang": "sql",
+        "lines": [
+          "SELECT review_id,",
+          "  AI_COMPLETE('claude-4-sonnet',",
+          "    'Summarize in 5 words: '",
+          "    || review_text) AS summary,",
+          "  AI_CLASSIFY(review_text,",
+          "    ['bug','praise','question'])",
+          "    AS topic",
+          "FROM reviews;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A stakeholder wants a chatbot that answers business questions over Snowflake data. When do you use Cortex Analyst vs Cortex Search?",
+    "a": "Cortex Analyst is a managed text-to-SQL service for structured data: it generates and runs SQL from natural-language questions, grounded in a semantic model (a YAML that defines tables, metrics, and business terms) so it answers questions like 'revenue by region last quarter' accurately. Cortex Search is a managed RAG/retrieval service for unstructured text: it runs hybrid vector-plus-keyword search over a column and auto-maintains the index, used to ground an LLM on documents (support tickets, contracts). The rule: structured metrics and aggregations to Cortex Analyst, document/passage retrieval to Cortex Search — and Cortex Agents can combine both.",
+    "fj": "Just feed the whole database schema to an LLM and let it write SQL.",
+    "fs": "Cortex Analyst needs a semantic model (metrics + business terms), not raw schema, which is why it beats generic text-to-SQL. Cortex Search is the RAG engine for unstructured docs. Structured -> Analyst, documents -> Search.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "label": "Cortex Search service for RAG",
+        "lang": "sql",
+        "lines": [
+          "CREATE CORTEX SEARCH SERVICE",
+          "  docs_svc",
+          "  ON content",
+          "  WAREHOUSE = wh",
+          "  TARGET_LAG = '1 hour'",
+          "AS SELECT doc_id, content",
+          "   FROM support_docs;",
+          "-- hybrid vector+keyword, auto-index",
+          "-- Analyst uses a semantic YAML model"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is Snowflake Secure Data Sharing and why is it cheaper than copying data to a partner?",
+    "a": "Secure Data Sharing grants another Snowflake account live, read-only access to your objects through a Share, which references databases, schemas, and secure views via grants. No data is copied or transferred — the consumer queries your micro-partitions directly through Snowflake's services layer and metadata store, so there is no ETL, no pipeline to maintain, and no staleness. The consumer pays only for the compute they run on their own warehouse; the provider pays only for storage. Sharing is instant and always current because both sides reference the same physical files.",
+    "fj": "I'd export to S3 nightly and have the partner load it.",
+    "fs": "Secure Data Sharing gives live read-only access with no copy — the consumer queries my micro-partitions directly, so there's no ETL and no staleness.",
+    "level": "Jr",
+    "asked": 14,
+    "code": [
+      {
+        "label": "Provider creates a share",
+        "lang": "sql",
+        "lines": [
+          "CREATE SHARE sales_share;",
+          "GRANT USAGE ON DATABASE prod",
+          "  TO SHARE sales_share;",
+          "GRANT SELECT ON VIEW prod.pub.v",
+          "  TO SHARE sales_share;",
+          "ALTER SHARE sales_share ADD",
+          "  ACCOUNTS = partner_acct;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A partner you want to share data with isn't a Snowflake customer. How do reader accounts solve this and who pays?",
+    "a": "A reader account is a managed Snowflake account the provider creates, owns, and administers so a non-Snowflake consumer can query shared data without their own contract or license. It can only consume data from the provider that created it and cannot perform DML like INSERT, UPDATE, or COPY — it is read-only. The provider assumes all compute credit charges incurred by users in the reader account, so cost governance with resource monitors is essential. Use reader accounts for partners who can't onboard to Snowflake quickly, but watch the bill since their queries land on your invoice.",
+    "fj": "The partner signs up for Snowflake and I share to their account.",
+    "fs": "A reader account lets a non-customer query my share with no contract of their own — but I own it and pay for all their compute, so I cap it with a resource monitor.",
+    "level": "Mid",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Create + govern reader account",
+        "lang": "sql",
+        "lines": [
+          "CREATE MANAGED ACCOUNT partner_rdr",
+          "  ADMIN_NAME='padmin'",
+          "  ADMIN_PASSWORD='***'",
+          "  TYPE=READER;",
+          "-- cap their spend (I pay it):",
+          "ALTER WAREHOUSE rdr_wh SET",
+          "  RESOURCE_MONITOR = cap_mon;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the Snowflake Marketplace and how does cross-cloud auto-fulfillment make a dataset available in another region?",
+    "a": "The Marketplace is a catalog of data products published as Listings, letting providers offer free, trial, paid, or personalized datasets that consumers attach as a read-only shared database. Because Secure Data Sharing normally works only within one region and cloud, cross-region or cross-cloud delivery requires the data to physically exist in the consumer's region. Cross-Cloud Auto-Fulfillment automatically replicates the data product to consumer regions on demand, so the provider avoids manual replication and approval, and incurs replication cost only when there's real demand in that region. Free listings can pre-associate a share in remote regions; personalized listings replicate per consumer request.",
+    "fj": "A Marketplace listing is instantly queryable from any region.",
+    "fs": "Plain sharing is single-region — cross-region needs the data replicated there. Cross-Cloud Auto-Fulfillment replicates on demand so I only pay when a consumer region actually has demand.",
+    "level": "Mid",
+    "asked": 7
+  },
+  {
+    "q": "Walk me through Snowflake's business continuity model: database/account replication, failover groups, and Client Redirect.",
+    "a": "You replicate databases and account objects into a secondary account in a different region using replication or failover groups, where a failover group bundles databases plus account objects like roles, users, warehouses, and integrations and refreshes them on a schedule. The secondary is read-only until you promote it; failover makes it the new primary, and failback returns control once the original region recovers. Client Redirect adds a connection object holding a stable secure URL so applications fail over across regions without changing connection strings — it only operates across regions. Together they give cross-region DR with an RPO bounded by your refresh interval. Replication and failover groups require Business Critical edition for full account object coverage.",
+    "fj": "Time Travel and Fail-safe are my disaster recovery plan.",
+    "fs": "Time Travel/Fail-safe are in-region recovery, not DR. Cross-region DR needs replication + failover groups, and Client Redirect so apps don't change connection strings on failover.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "label": "Failover group + redirect",
+        "lang": "sql",
+        "lines": [
+          "CREATE FAILOVER GROUP fg",
+          "  OBJECT_TYPES=(DATABASES,ROLES)",
+          "  ALLOWED_DATABASES=(prod)",
+          "  ALLOWED_ACCOUNTS=(org.dr_acct)",
+          "  REPLICATION_SCHEDULE='10 MINUTE';",
+          "-- on DR: ALTER FAILOVER GROUP fg",
+          "--   PRIMARY;  (promote)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What's the difference between an external function and external network access from a Python UDF? When do you use each?",
+    "a": "An external function is a UDF with no body of its own; it calls a remote service through an API integration that routes via a cloud HTTP proxy such as Amazon API Gateway, so you stand up and secure that proxy and endpoint. External network access lets a Python or Java UDF or stored procedure make outbound calls directly from its handler code using an EXTERNAL ACCESS INTEGRATION plus network rules and secrets — no proxy required. With external network access you own retries, batching, and exception handling in code, whereas external functions push that orchestration to the proxy layer. Use external functions for a stable shared remote service, and external network access when handler code needs to hit an API or fetch a token inline. Private connectivity for either requires Business Critical edition.",
+    "fj": "They're two names for the same outbound-call feature.",
+    "fs": "External functions call a remote service through an API-integration proxy; external network access lets a UDF's own handler code make outbound calls directly via an integration + secret, and I handle retries myself.",
+    "level": "Sr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "External access integration",
+        "lang": "sql",
+        "lines": [
+          "CREATE EXTERNAL ACCESS INTEGRATION ai",
+          "  ALLOWED_NETWORK_RULES=(api_rule)",
+          "  ALLOWED_AUTHENTICATION_SECRETS",
+          "    =(api_key)",
+          "  ENABLED=TRUE;",
+          "-- then on the UDF/proc:",
+          "-- EXTERNAL_ACCESS_INTEGRATIONS=(ai)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain the difference between a UDF, a UDTF, and a stored procedure in Snowflake. When do you reach for each?",
+    "a": "A scalar UDF returns one value per input row and can be written in SQL, Python, Java, JavaScript, or Scala, but it cannot run DML or DDL — it's for pure, set-based computation embedded in a query. A UDTF (table function) returns a set of rows per input and is invoked in the FROM clause, ideal for one-to-many expansion or stateful per-partition logic. A stored procedure runs imperative, multi-statement logic including DML, DDL, transactions, and control flow, and is called with CALL rather than inside a query. The rule: UDF/UDTF to compute inside a SELECT, stored procedure to orchestrate a workflow with side effects.",
+    "fj": "I'll put my MERGE logic inside a UDF.",
+    "fs": "UDFs and UDTFs can't run DML or DDL — they compute inside a query. For a MERGE or multi-step workflow with side effects I use a stored procedure called via CALL.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Python UDF vs UDTF",
+        "lang": "sql",
+        "lines": [
+          "CREATE FUNCTION tax(p FLOAT)",
+          "  RETURNS FLOAT LANGUAGE PYTHON",
+          "  RUNTIME_VERSION='3.11'",
+          "  HANDLER='f' AS $$",
+          "def f(p): return p*0.08",
+          "$$;",
+          "-- UDTF: returns rows, used in FROM"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What's the difference between an owner's rights and a caller's rights stored procedure, and why does it matter for security?",
+    "a": "An owner's rights procedure (EXECUTE AS OWNER, the default) runs with the privileges of the role that owns it, so a caller can perform a task through it that they couldn't perform directly — useful for controlled privilege elevation behind a vetted interface. A caller's rights procedure (EXECUTE AS CALLER) runs with the caller's own privileges, so it can only touch what the caller could touch anyway, and it can see session state like the current role. Owner's rights is the safer default for exposing a narrow capability without granting broad access, but you must audit its body carefully since it amplifies privilege. RESTRICTED CALLER is a hardened caller mode that limits which of the caller's privileges apply.",
+    "fj": "Stored procedures always run with the caller's permissions.",
+    "fs": "Default is owner's rights — it runs with the owner's privileges, letting a low-privilege caller do something they can't do directly. Caller's rights restricts it to the caller's own grants.",
+    "level": "Sr",
+    "asked": 9
+  },
+  {
+    "q": "What is Snowpark and how does its lazy DataFrame execution differ from pulling data into pandas on your laptop?",
+    "a": "Snowpark is a set of client libraries (Python, Java, Scala) whose DataFrame API builds a query lazily: transformations like filter, join, and groupBy accumulate as an unevaluated plan and nothing runs until an action like collect, show, or write triggers it. That plan is compiled to SQL and executed inside Snowflake's engine on a virtual warehouse, so the computation and data stay server-side and only the final result crosses the wire. This pushdown avoids egressing a whole table to a client and lets Snowflake's optimizer fuse operations. Contrast with pandas, which pulls all rows to local memory and is bounded by one machine's RAM.",
+    "fj": "Snowpark just downloads the table so I can use pandas on it.",
+    "fs": "Snowpark DataFrames are lazy and compile to SQL that runs inside Snowflake — only the final result is returned. pandas pulls every row to one machine's RAM; Snowpark pushes compute down to the warehouse.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Lazy until an action",
+        "lang": "python",
+        "lines": [
+          "df = session.table('orders')",
+          "df = df.filter(col('amt') > 100)",
+          "df = df.group_by('region').agg(",
+          "        sum_('amt').alias('t'))",
+          "# nothing ran yet (lazy plan)",
+          "df.collect()  # NOW it executes",
+          "# compiles to SQL, runs in-warehouse"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you need a Snowpark-optimized warehouse instead of a standard one?",
+    "a": "A Snowpark-optimized warehouse provides much more memory per node — the default configuration gives 16x the memory of a standard warehouse — for workloads that load a large dataset into a single node's memory, such as training an ML model with custom Python in a stored procedure. Use it when standard-warehouse jobs hit out-of-memory errors or spill heavily during single-node, memory-bound Snowpark work, not for ordinary SQL or distributed scans where a standard warehouse is cheaper. The RESOURCE_CONSTRAINT clause now lets you pick specific memory sizes and CPU architecture. It's a targeted tool for memory-intensive single-node compute, not a general speed-up.",
+    "fj": "I use a Snowpark-optimized warehouse for all my Snowpark queries.",
+    "fs": "It's for memory-bound single-node work like in-warehouse ML training (16x memory/node). For normal Snowpark SQL a standard warehouse is cheaper — I only switch when I'm hitting OOM.",
+    "level": "Mid",
+    "asked": 7
+  },
+  {
+    "q": "What is Snowpark Container Services and what kind of workload would push you to it over a Python UDF or stored procedure?",
+    "a": "Snowpark Container Services (SPCS) is a managed container platform inside Snowflake that runs your OCI images on compute pools — collections of VM nodes you size and auto-scale — using a built-in OCI-compliant image registry. You deploy long-running services (with optional service functions callable from SQL) or batch job services, and GPU node types are available for inference and training. Reach for SPCS when you need full control over the runtime, custom system libraries, a third-party server, a model-serving API, or GPUs — things a sandboxed UDF or stored procedure can't host. Data stays inside Snowflake's governance boundary, unlike shipping it to an external Kubernetes cluster.",
+    "fj": "I'd spin up a separate Kubernetes cluster and pull data out of Snowflake.",
+    "fs": "SPCS runs my container on a Snowflake compute pool (with GPU options) inside the governance boundary, so data doesn't leave. I use it when a sandboxed UDF can't host the runtime I need.",
+    "level": "Sr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Compute pool + service",
+        "lang": "sql",
+        "lines": [
+          "CREATE COMPUTE POOL pool1",
+          "  MIN_NODES=1 MAX_NODES=3",
+          "  INSTANCE_FAMILY=CPU_X64_S;",
+          "CREATE SERVICE api_svc",
+          "  IN COMPUTE POOL pool1",
+          "  FROM SPECIFICATION $$ ... $$;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are Hybrid Tables (Unistore) and how do they differ from standard Snowflake tables?",
+    "a": "Hybrid tables are a row-oriented table type optimized for low-latency, high-concurrency single-row reads and writes using primary-key indexes and row-level locking, in contrast to standard columnar micro-partition tables built for large analytical scans. They enforce unique, primary-key, and foreign-key constraints — which standard tables define but don't enforce — making them suitable for OLTP-style workloads. Unistore is the pattern of mixing hybrid and standard tables so transactional and analytical data live on one platform without a separate operational database and ETL bridge. Use hybrid tables for application state, workflow metadata, or low-latency serving of precomputed values; keep standard tables for big aggregations.",
+    "fj": "Hybrid tables are just regular tables with an index.",
+    "fs": "Hybrid tables are a row-store with enforced PK/FK constraints and row-level locking for OLTP-style point reads/writes — standard tables are columnar micro-partitions for big scans and don't enforce constraints.",
+    "level": "Sr",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Enforced constraints + index",
+        "lang": "sql",
+        "lines": [
+          "CREATE HYBRID TABLE sessions (",
+          "  id STRING PRIMARY KEY,",
+          "  user_id STRING NOT NULL,",
+          "  state STRING,",
+          "  INDEX idx_user (user_id)",
+          ");",
+          "-- PK/uniqueness actually enforced"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A query does a needle-in-a-haystack lookup on a huge table by ID. Would you cluster the table or enable Search Optimization Service?",
+    "a": "Use the Search Optimization Service (SOS), which builds and maintains a persistent search-access-path structure that makes highly selective point-lookup queries with equality predicates fast — returning a few rows from a massive table. Clustering is for range and inequality filters and only sorts data into one ordering, so it can't serve many different selective point lookups well, and for equality point lookups SOS is usually faster. Enable SOS per column with ON EQUALITY rather than the whole table to control cost, since it consumes serverless maintenance credits proportional to churn. Avoid stacking automatic clustering and SOS on a high-churn table, as combined maintenance can cost more than SOS alone.",
+    "fj": "I'd add a clustering key on the ID column.",
+    "fs": "Clustering helps range filters and only one sort order. For selective equality point lookups, Search Optimization Service is the right tool — I enable it ON EQUALITY for that column to bound cost.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "SOS on equality column",
+        "lang": "sql",
+        "lines": [
+          "ALTER TABLE events ADD",
+          "  SEARCH OPTIMIZATION",
+          "  ON EQUALITY(user_id);",
+          "-- great for: WHERE user_id = ?",
+          "-- (point lookup, few rows back)",
+          "-- serverless maintenance credits"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the Query Acceleration Service and which queries actually benefit from it?",
+    "a": "The Query Acceleration Service (QAS) offloads parts of an eligible query — large table scans with a selective filter or aggregation, or large INSERT/COPY operations — onto serverless compute beyond the warehouse's own nodes, so a few outlier scans don't force you to size up the whole warehouse. It helps unpredictable, scan-heavy workloads with occasional big queries, not many small uniform queries, since tiny scans don't have enough partitions to justify the resource-acquisition latency. Identify candidates with the QUERY_ACCELERATION_ELIGIBLE view or SYSTEM$ESTIMATE_QUERY_ACCELERATION, enable it on the warehouse, and cap it with a scale factor to bound cost. It's billed as serverless compute on top of warehouse credits.",
+    "fj": "QAS speeds up every query on the warehouse.",
+    "fs": "QAS offloads large selective scans/aggregations to serverless compute so I don't oversize for outliers. Small uniform queries don't benefit — I check QUERY_ACCELERATION_ELIGIBLE first and cap the scale factor.",
+    "level": "Sr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Enable with scale-factor cap",
+        "lang": "sql",
+        "lines": [
+          "ALTER WAREHOUSE etl_wh SET",
+          "  ENABLE_QUERY_ACCELERATION=TRUE",
+          "  QUERY_ACCELERATION_MAX_",
+          "    SCALE_FACTOR=8;",
+          "-- find candidates first:",
+          "-- account_usage.",
+          "--   query_acceleration_eligible"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does a Snowflake materialized view stay current, and what does it cost you?",
+    "a": "A background serverless service automatically maintains the MV as the base table changes — there is no manual refresh and no schedule. If some MV micro-partitions are out of date, Snowflake transparently skips them and reads the current values from the base table, so query results are always correct even when maintenance is behind; the BEHIND_BY metric shows the lag. Maintenance consumes serverless credits proportional to how much base-table data changes, including changes from reclustering, so MVs on high-churn tables get expensive. Track refreshes with MATERIALIZED_VIEW_REFRESH_HISTORY. The tradeoffs are the single-base-table and restricted-SQL limits plus ongoing maintenance cost.",
+    "fj": "An MV returns stale data until its next scheduled refresh.",
+    "fs": "MV results are always correct — if partitions are stale Snowflake reads those from the base table. There's no schedule; a serverless service maintains it, and the cost scales with base-table churn.",
+    "level": "Mid",
+    "asked": 10
+  },
+  {
+    "q": "Explain dynamic data masking with masking policies. How does a policy decide who sees the real value?",
+    "a": "A masking policy is a schema-level object attached to a column; at query time Snowflake rewrites the query so the policy's SQL expression replaces the column value everywhere it appears — projections, WHERE, JOIN, GROUP BY, and ORDER BY. The expression typically branches on CURRENT_ROLE or IS_ROLE_IN_SESSION to return the plaintext to privileged roles and a masked or partial value to everyone else, so the data is never physically altered — only the view at read time. One policy can be applied to many columns, and tag-based masking attaches a policy automatically to every column carrying a given tag, scaling governance across the account. It's column-level security enforced consistently regardless of how the column is queried.",
+    "fj": "Masking permanently overwrites the sensitive values in the table.",
+    "fs": "Masking is applied at query time by rewriting the query — the stored data is unchanged. The policy branches on the session role to return plaintext or a masked value, and it masks everywhere the column appears.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Role-conditional masking policy",
+        "lang": "sql",
+        "lines": [
+          "CREATE MASKING POLICY mask_email",
+          "  AS (v STRING) RETURNS STRING ->",
+          "  CASE WHEN CURRENT_ROLE()",
+          "    IN ('PII_READER') THEN v",
+          "  ELSE '***MASKED***' END;",
+          "ALTER TABLE u MODIFY COLUMN email",
+          "  SET MASKING POLICY mask_email;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A user should only see rows for their own region. How do row access policies enforce this, and how do they interact with masking?",
+    "a": "A row access policy is a schema object whose boolean expression decides, per row, whether the querying context can see it; you attach it to a table or view naming the columns it evaluates, and Snowflake injects the predicate into every query against that object. The expression typically maps CURRENT_ROLE or a mapping table to allowed region values, so users transparently see only their slice with no WHERE clause in their queries. When a table has both, Snowflake evaluates the row access policy first to filter rows, then applies masking policies to the surviving columns. A given column cannot appear in both a row access policy signature and a masking policy signature simultaneously.",
+    "fj": "I'd just give each team a filtered view per region.",
+    "fs": "A row access policy injects a per-row predicate into every query on the object, driven by the session role or a mapping table — no per-team views to maintain. Row policy runs before column masking.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "label": "Mapping-table row policy",
+        "lang": "sql",
+        "lines": [
+          "CREATE ROW ACCESS POLICY rap",
+          "  AS (region STRING) RETURNS BOOLEAN",
+          "  -> EXISTS (SELECT 1 FROM role_map m",
+          "       WHERE m.role=CURRENT_ROLE()",
+          "       AND m.region=region);",
+          "ALTER TABLE sales ADD ROW ACCESS",
+          "  POLICY rap ON (region);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do object tagging and sensitive data classification work together to govern PII at scale?",
+    "a": "Object tags are key-value labels you attach to objects and columns; tags inherit down the hierarchy and are queryable, so you can track ownership, cost center, or sensitivity centrally. Sensitive data classification scans columns and assigns system tags — SNOWFLAKE.CORE.SEMANTIC_CATEGORY for what the data is (NAME, EMAIL) and PRIVACY_CATEGORY for its sensitivity — either manually via SYSTEM$CLASSIFY or automatically through a classification profile on a database or schema. Tag mapping then auto-applies your own governance tag whenever a system category is detected, and tag-based masking attaches a masking policy to every column with that tag. This chains discovery to enforcement so new PII columns get protected without manual per-column work.",
+    "fj": "I manually add a masking policy to each PII column as I find them.",
+    "fs": "Classification auto-tags columns with a semantic/privacy category; tag mapping promotes that to my governance tag, and tag-based masking auto-attaches a policy. New PII gets protected without per-column manual work.",
+    "level": "Sr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Classify then tag-mask",
+        "lang": "sql",
+        "lines": [
+          "-- discover sensitive columns",
+          "SELECT SYSTEM$CLASSIFY(",
+          "  'prod.pub.users', {});",
+          "-- a masking policy attached to the",
+          "-- tag auto-applies to every column",
+          "-- the tag lands on"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you query ACCOUNT_USAGE vs INFORMATION_SCHEMA, and what's the trap that bites people?",
+    "a": "INFORMATION_SCHEMA is a per-database, real-time set of views and table functions with no latency but a short retention window — for example its QUERY_HISTORY table function only covers the last 7 days — so it's for current-state introspection and recent activity. ACCOUNT_USAGE in the shared SNOWFLAKE database gives account-wide history with up to 365 days retention but carries latency, commonly up to ~45 minutes for QUERY_HISTORY and around 2 hours for many views. The trap: people poll ACCOUNT_USAGE for a query they just ran and see nothing because of latency, or query INFORMATION_SCHEMA for last quarter's costs and get nothing because of the short window. Also, ACCOUNT_USAGE retains dropped objects with a DELETED timestamp, which INFORMATION_SCHEMA doesn't.",
+    "fj": "They're interchangeable, so I just pick whichever I remember.",
+    "fs": "INFORMATION_SCHEMA is real-time but short-retention (e.g. 7 days); ACCOUNT_USAGE is up to 365 days but lagged (~45 min to ~2 hrs). The trap is polling ACCOUNT_USAGE for a query I just ran and seeing nothing.",
+    "level": "Mid",
+    "asked": 11
+  },
+  {
+    "q": "What is a secure view in Snowflake and what do you give up by making a view secure?",
+    "a": "A secure view hides its definition from non-owners and, more importantly, disables the optimizer pushdowns that could leak underlying base-table data through side channels like user functions or error messages — so it's mandatory when sharing data or exposing a row/column-filtered subset across trust boundaries. The cost is performance: secure views forgo optimizations that need direct access to the base data, so they can be slower than equivalent standard views. Therefore use secure views where the view is a security boundary (data sharing, multi-tenant row filtering) and standard views for internal logic where speed matters and there's no untrusted consumer. Snowflake now also previews sharing non-secure views when you specifically need those optimizations.",
+    "fj": "I make every view secure to be safe.",
+    "fs": "Secure views disable optimizer pushdowns that could leak base data — but that costs performance. I use them only where the view is a security boundary (sharing, row filtering), and standard views for internal logic.",
+    "level": "Mid",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Secure view as boundary",
+        "lang": "sql",
+        "lines": [
+          "CREATE SECURE VIEW cust_safe AS",
+          "  SELECT id, region",
+          "  FROM customers",
+          "  WHERE tier = 'public';",
+          "-- safe to share; no pushdown leak",
+          "-- of hidden base-table columns"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you query JSON stored in a VARIANT column, and when do you need FLATTEN with LATERAL?",
+    "a": "VARIANT holds semi-structured data; you navigate objects with colon-and-dot path notation and cast leaf values with double-colon, like src:user.id::number. That works for scalar fields, but to turn an array into rows you need the FLATTEN table function, which produces a lateral view emitting one row per element. For nested arrays you chain FLATTEN calls, and LATERAL is required so each subsequent FLATTEN can reference the output of the previous one. Best practice is to extract and cast hot fields, or flatten into a relational table, rather than repeatedly parsing deep VARIANT paths at query time, which hurts pruning and performance.",
+    "fj": "I cast the whole VARIANT to a string and use LIKE on it.",
+    "fs": "I navigate with path notation (src:a.b::type) and use FLATTEN to expand arrays into rows — chaining FLATTEN over nested arrays needs LATERAL so each level sees the prior level's output.",
+    "level": "Jr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Path access + FLATTEN array",
+        "lang": "sql",
+        "lines": [
+          "SELECT",
+          "  src:user.id::number AS uid,",
+          "  f.value:sku::string AS sku",
+          "FROM orders,",
+          "LATERAL FLATTEN(",
+          "  input => src:items) f;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Loading a CSV with some dirty rows, you don't want one bad row to fail the whole batch. What COPY INTO options handle this?",
+    "a": "ON_ERROR controls per-load behavior: ABORT_STATEMENT (the default for bulk COPY) fails the whole statement on any error, CONTINUE loads the good rows and skips the bad ones, and SKIP_FILE_n or SKIP_FILE_n% skip an entire file once its error count or percentage crosses a threshold. To dry-run without loading, use VALIDATION_MODE (for example RETURN_ERRORS or RETURN_n_ROWS) so COPY tests the files and reports problems instead of inserting. After a load, the VALIDATE table function replays a past COPY and returns every error encountered, not just the first, which is how you triage rejected records. Choose the mode by whether partial loads are acceptable and how strict your data contract is.",
+    "fj": "If any row is malformed the whole COPY just fails and there's nothing I can do.",
+    "fs": "ON_ERROR=CONTINUE loads good rows and skips bad ones; SKIP_FILE_n% drops a file past a bad-row threshold. I dry-run with VALIDATION_MODE and use the VALIDATE function to list all rejected records.",
+    "level": "Jr",
+    "asked": 14,
+    "code": [
+      {
+        "label": "Tolerant load + validate",
+        "lang": "sql",
+        "lines": [
+          "COPY INTO t FROM @stg",
+          "  FILE_FORMAT=(TYPE=CSV)",
+          "  ON_ERROR='CONTINUE';",
+          "-- list every rejected row after:",
+          "SELECT * FROM TABLE(VALIDATE(",
+          "  t, JOB_ID => '_last'));"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your warehouse is at full concurrency and queries are piling up. Explain query queuing and the role of STATEMENT_QUEUED_TIMEOUT_IN_SECONDS.",
+    "a": "A warehouse cluster reserves compute per running query, and MAX_CONCURRENCY_LEVEL (default 8) caps how many run at once; when it's reached, additional statements queue until resources free up. Queuing shows as queue time in QUERY_HISTORY and load monitoring, and it signals throughput pressure rather than a slow individual query. STATEMENT_QUEUED_TIMEOUT_IN_SECONDS (default 0, meaning unlimited) bounds how long a statement waits in queue before Snowflake cancels it, so a backlog fails fast instead of stacking up. The real fix for sustained queuing is a multi-cluster warehouse to add throughput; the timeout is a guardrail, and lowering MAX_CONCURRENCY_LEVEL gives each heavy query more resources but reduces parallelism.",
+    "fj": "I'd just bump the warehouse to a bigger size to clear the queue.",
+    "fs": "Queuing is a throughput problem from MAX_CONCURRENCY_LEVEL, not query slowness — a bigger size won't fix it, a multi-cluster warehouse will. STATEMENT_QUEUED_TIMEOUT_IN_SECONDS just cancels statements that wait too long.",
+    "level": "Mid",
+    "asked": 10,
+    "code": [
+      {
+        "label": "Bound queue wait",
+        "lang": "sql",
+        "lines": [
+          "ALTER WAREHOUSE bi_wh SET",
+          "  STATEMENT_QUEUED_TIMEOUT_",
+          "    IN_SECONDS = 120,",
+          "  MAX_CONCURRENCY_LEVEL = 8;",
+          "-- sustained queue? add clusters:",
+          "-- MIN_CLUSTER_COUNT/MAX_CLUSTER_COUNT"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "On a multi-cluster warehouse, when would you pick the ECONOMY scaling policy over STANDARD?",
+    "a": "The scaling policy only applies in auto-scale mode, where MIN_CLUSTER_COUNT differs from MAX. STANDARD favors avoiding queuing: it starts an additional cluster as soon as a query would queue, prioritizing latency and concurrency. ECONOMY favors saving credits: it keeps running clusters fully loaded before starting a new one and is more conservative about spinning clusters up and quicker to shut them down, which can mean some queries queue. Choose STANDARD for interactive BI where users feel latency, and ECONOMY for batch or background workloads where a little queuing is fine and credit efficiency matters more. In maximized mode (MIN equals MAX) the policy is irrelevant because all clusters run.",
+    "fj": "ECONOMY is just the cheaper, strictly-better option.",
+    "fs": "ECONOMY conserves credits by keeping clusters full before adding one, so queries may queue — good for batch. STANDARD adds clusters fast to avoid queuing, which I want for interactive BI.",
+    "level": "Mid",
+    "asked": 8
+  },
+  {
+    "q": "What is Snowsight and what does it give an engineer beyond running SQL?",
+    "a": "Snowsight is Snowflake's web UI and the primary console for the platform: a SQL worksheet with autocomplete and result charts, plus the Query Profile for diagnosing performance operator-by-operator. Beyond ad-hoc SQL it surfaces dashboards, warehouse load and cost monitoring, the object and data-governance explorer with column-level data lineage, role and grant management, and notebooks and Workspaces for Python and Snowpark. It's also where you administer users, network policies, and the Trust Center. For an engineer the highest-value pieces are the Query Profile for tuning and the lineage and access views for governance, so you rarely need a third-party tool just to understand a workload.",
+    "fj": "Snowsight is only a fancier SQL editor.",
+    "fs": "Snowsight is the full console — Query Profile for tuning, cost/load monitoring, data lineage, governance, and notebooks. The Query Profile is where I diagnose a slow query operator by operator.",
+    "level": "Jr",
+    "asked": 9
+  },
+  {
+    "q": "Someone asks 'who has been reading our PII table and where did that column come from?' How does Access History answer both?",
+    "a": "The ACCOUNT_USAGE.ACCESS_HISTORY view records, per query, who accessed what: direct_objects_accessed and base_objects_accessed capture reads (including the underlying base tables behind a view), objects_modified captures writes, and policies_referenced shows which masking or row policies applied. For the read question you filter base_objects_accessed for the PII table and group by user_name. For provenance, the objects_modified column carries column-level write lineage — which source columns fed which target columns — so you can trace a field back through transformations, and Snowsight visualizes this as a lineage graph. It's an Enterprise-edition governance feature with the usual ACCOUNT_USAGE latency.",
+    "fj": "I'd grep the query logs in QUERY_HISTORY for the table name.",
+    "fs": "ACCESS_HISTORY links each query to base_objects_accessed (who read it, including via views) and objects_modified for column-level lineage — that's how I answer both 'who read PII' and 'where did this column come from'.",
+    "level": "Sr",
+    "asked": 10,
+    "code": [
+      {
+        "label": "Who read the PII table",
+        "lang": "sql",
+        "lines": [
+          "SELECT user_name, count(*)",
+          "FROM account_usage.access_history,",
+          "  LATERAL FLATTEN(",
+          "    base_objects_accessed) b",
+          "WHERE b.value:objectName::string",
+          "  = 'PROD.PUB.CUSTOMERS_PII'",
+          "GROUP BY 1 ORDER BY 2 DESC;"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you lock down account access with network policies, and how do SSO/SCIM change user management?",
+    "a": "A network policy defines allowed and blocked IP ranges and can be applied account-wide, per user, or per integration; the blocked list wins, and network policies are evaluated before authentication policies, so a blocked IP never even reaches login. Federated authentication (SAML SSO) hands authentication to an IdP like Okta or Entra ID so users sign in through corporate SSO instead of Snowflake-local passwords, centralizing MFA and offboarding. SCIM automates user and role provisioning and deprovisioning from the IdP, and you can apply a separate network policy to the SCIM integration so the provisioning service's IPs are allowed without widening access for normal users. Enabling SCIM does not by itself turn on SSO — you configure them separately.",
+    "fj": "Setting up SCIM automatically gives my users single sign-on too.",
+    "fs": "SCIM provisions/deprovisions users from the IdP; SSO (SAML) handles login — they're configured separately. Network policies are checked before auth, so a blocked IP never reaches the login step.",
+    "level": "Sr",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Restrict to corporate IPs",
+        "lang": "sql",
+        "lines": [
+          "CREATE NETWORK POLICY corp",
+          "  ALLOWED_IP_LIST=('203.0.113.0/24')",
+          "  BLOCKED_IP_LIST=('203.0.113.5');",
+          "ALTER ACCOUNT SET",
+          "  NETWORK_POLICY = corp;",
+          "-- separate policy on SCIM integ."
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your account has runaway serverless spend that resource monitors don't catch. How do Snowflake Budgets help, and how do they differ from resource monitors?",
+    "a": "A Budget sets a monthly compute spending limit on the whole account or a custom group of objects and sends a forecasted alert when time-series projection says you're on track to exceed it — by default when projected spend is more than 10% over the limit, configurable, delivered to email, a cloud queue, or a webhook like Slack or PagerDuty. Critically, a custom budget covers all compute for its objects including serverless features and background maintenance, which warehouse resource monitors don't track. The key difference: resource monitors can actively suspend warehouses at a credit threshold but only cover warehouse compute, while budgets are notify-only (no auto-suspend) but cover serverless and group spend by forecast. Use both — monitors to hard-stop warehouses, budgets to catch serverless drift early.",
+    "fj": "Resource monitors already cover all my spend, so I don't need budgets.",
+    "fs": "Resource monitors only track warehouse compute and can suspend; budgets are notify-only but cover serverless and background spend by forecast. I use monitors to hard-stop warehouses and budgets to catch serverless drift.",
+    "level": "Sr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Custom budget on objects",
+        "lang": "sql",
+        "lines": [
+          "CREATE BUDGET team_budget;",
+          "CALL team_budget!SET_SPENDING_LIMIT(",
+          "  1000);",
+          "CALL team_budget!ADD_RESOURCE(",
+          "  SYSTEM$REFERENCE('WAREHOUSE',",
+          "    'ETL_WH'));",
+          "-- forecast alert, covers serverless"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are object tags in Snowflake and how would you use them for cost allocation across teams?",
+    "a": "An object tag is a key-value label you define once and attach to objects like warehouses, databases, and even columns, and tags inherit down the hierarchy so a tag on a database applies to its schemas and tables. Because tags are queryable, they let you attribute usage without renaming or reorganizing objects — for example tag every warehouse with cost_center, then join credit consumption to the tag to bill each team. You set a tag with ALTER ... SET TAG and read assignments through the tag reference functions and ACCOUNT_USAGE tag views. Tags also underpin governance: tag-based masking attaches a policy to any column carrying a sensitivity tag. The discipline of tagging at creation is what makes later cost and governance reporting possible.",
+    "fj": "I'd rename every warehouse to start with the team name and parse that.",
+    "fs": "I attach a cost_center tag to each warehouse — tags are queryable and inherit, so I join credit usage to the tag to bill teams without renaming or reorganizing anything.",
+    "level": "Jr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Tag a warehouse for billing",
+        "lang": "sql",
+        "lines": [
+          "CREATE TAG cost_center;",
+          "ALTER WAREHOUSE etl_wh",
+          "  SET TAG cost_center = 'data_eng';",
+          "-- later: join metering to the tag",
+          "-- via account_usage tag views"
+        ]
+      }
+    ]
+  }
+]

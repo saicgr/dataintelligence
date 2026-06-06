@@ -1,0 +1,865 @@
+[
+  {
+    "q": "What is the difference between a transformation and an action in PySpark, and why does Spark use lazy evaluation?",
+    "a": "Transformations like filter, select, and join are lazy: they only add nodes to the DAG and read no data. Actions like collect, count, show, and write are eager and trigger the whole DAG to execute, which is the only point at which Spark actually reads and processes data. Lazy evaluation lets the Catalyst optimizer reorder and fuse stages, push predicates down to the scan, and prune unused columns before any I/O happens. Repeated actions replay the DAG from scratch unless you cache an intermediate DataFrame.",
+    "fs": "Lazy evaluation lets Catalyst push predicates down, prune columns, and fuse stages before any byte is read.",
+    "fj": "Forgetting that show() is an action, or thinking transformations execute immediately.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Lazy vs eager",
+        "lang": "pyspark",
+        "lines": [
+          "big = spark.read.parquet('events')",
+          "f = big.filter(col('amt') > 0)",
+          "# nothing read yet: just a DAG node",
+          "f.count()   # ACTION -> reads + runs",
+          "f.count()   # replays whole DAG again"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Classify filter, withColumn, union, groupBy().agg(), join, and sortBy as narrow or wide, and how do you avoid an unnecessary shuffle when joining a large table to a small lookup?",
+    "a": "filter, withColumn/map, and union are narrow: each input partition feeds at most one output partition with no network transfer. groupBy().agg(), join, and sortBy are wide because matching keys must co-locate, forcing a shuffle that writes to disk, sends over the network, and deserializes, often 10-100x slower than narrow ops. To join a large table to a small lookup, broadcast the small DataFrame so it is copied to every executor and the large table never moves. Spark auto-broadcasts when the small side is under spark.sql.autoBroadcastJoinThreshold, and explain() will show BroadcastHashJoin.",
+    "fs": "Use broadcast() on the small table to eliminate the shuffle of the large table entirely.",
+    "fj": "Letting Spark default to a sort-merge join that shuffles both tables instead of broadcasting the small side.",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Broadcast the small lookup",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql.functions \\",
+          "  import broadcast",
+          "big.join(broadcast(lookup), 'id')",
+          "# small side copied to every executor",
+          "# big table never shuffles",
+          "# explain -> BroadcastHashJoin"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between repartition(1) and coalesce(1) when writing a single Parquet file, and which would you choose?",
+    "a": "coalesce(n) is a narrow transformation that merges partitions locally with no shuffle, making it cheap for reducing partitions, though it can leave uneven partition sizes. repartition(n) is a wide transformation that does a full shuffle to produce evenly sized partitions, which is more expensive. To write a single file, prefer coalesce(1) since it avoids the unnecessary shuffle and the single-file write is the bottleneck anyway, but watch for OOM since one executor must hold the whole dataset. Increasing partitions with repartition is right before a heavy join on a skewed key or after reading a single flat file that yields too few partitions, targeting roughly 128-256 MB per partition.",
+    "fs": "Reducing partitions uses coalesce (no shuffle); rebalancing or increasing uses repartition (full shuffle, even sizes).",
+    "fj": "Using repartition(1) to write a single file, paying for a full shuffle when coalesce(1) suffices.",
+    "level": "Jr",
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "pyspark",
+        "lines": [
+          "# full shuffle of whole dataset",
+          "df.repartition(1) \\",
+          "  .write.parquet('out')"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "pyspark",
+        "lines": [
+          "# no shuffle, merges locally",
+          "df.coalesce(1) \\",
+          "  .write.parquet('out')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain the mechanical difference between a Broadcast Hash Join and a Sort-Merge Join, and how would you fix a slow 600 GB to 400 MB join?",
+    "a": "A Sort-Merge Join shuffles both sides by the join key, sorts each partition, then merges, which means two full shuffles and is expensive even at moderate scale. A Broadcast Hash Join collects the small table on the driver, broadcasts it to every executor as a local hash map, and lets large-table rows probe it locally with no shuffle of the big table, often 5-20x faster but risking OOM if the broadcast side exceeds executor memory. The safest fix is an explicit broadcast(products) hint, verified with explain(mode='formatted') showing BroadcastHashJoin. You can alternatively raise spark.sql.autoBroadcastJoinThreshold (default 10 MB) if executors have enough memory, or rely on AQE to auto-convert SMJ to BHJ at runtime.",
+    "fs": "An explicit broadcast() hint is the safest fix and needs no threshold change; verify with explain().",
+    "fj": "Raising autoBroadcastJoinThreshold without checking that executors have memory for the broadcast table, causing OOM.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Force BHJ + verify",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql.functions \\",
+          "  import broadcast",
+          "j = orders.join(broadcast(products),",
+          "                'product_id')",
+          "j.explain(mode='formatted')",
+          "# look for BroadcastHashJoin"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you use PySpark window functions to compute a per-user running total, rank by amount, and lag of the previous transaction, and do they shuffle?",
+    "a": "Define a WindowSpec with Window.partitionBy(\"user_id\") plus an orderBy, using one spec ordered by date and another ordered by amount descending. Running total is sum(\"amount\").over(w_date) with the default ROWS UNBOUNDED PRECEDING frame, rank is rank().over(w_amt), and the previous amount is lag(\"amount\", 1).over(w_date) which is null for the first row per user. partitionBy causes a shuffle because rows with the same user must co-locate, making it a wide transformation, but unlike groupBy().agg() it does not collapse rows. Use dense_rank for no gaps after ties or row_number for a unique sequence.",
+    "fs": "Window functions shuffle via partitionBy but produce one output row per input row rather than collapsing them.",
+    "fj": "Confusing rank, dense_rank, and row_number, or assuming windows reduce rows like a groupBy aggregation.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Per-user windows",
+        "lang": "pyspark",
+        "lines": [
+          "w = Window.partitionBy('user_id') \\",
+          "          .orderBy('date')",
+          "wa = w.orderBy(desc('amount'))",
+          "df.withColumn('rt', sum('amount').over(w))",
+          "  .withColumn('rk', rank().over(wa))",
+          "  .withColumn('prev',",
+          "       lag('amount',1).over(w))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How would you write a PySpark ETL job to deduplicate clickstream events on a natural key, fill NULL session_id, and number events within each session?",
+    "a": "Use dropDuplicates([\"user_id\", \"event_ts\", \"event_type\"]) on the natural key rather than distinct(), which compares all columns and keeps rows differing only in noise fields. Fill NULL session_id with when(col(\"session_id\").isNull(), concat(user_id, '_', date(event_ts))).otherwise(col(\"session_id\")). Then add row_number() over a window partitioned by session_id ordered by event_ts, a wide shuffle operation. On write, size partitions to roughly 128-256 MB and use partitionBy on a column like event_type so downstream jobs prune irrelevant files.",
+    "fs": "dropDuplicates on a subset key preserves legitimate differences in other columns, unlike distinct().",
+    "fj": "Using distinct() instead of dropDuplicates(subset), which fails to dedupe rows that differ only in session_id.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Dedupe on key, fill session",
+        "lang": "pyspark",
+        "lines": [
+          "key = ['user_id','event_ts','event_type']",
+          "d = df.dropDuplicates(key)",
+          "sid = concat('user_id', lit('_'),",
+          "             to_date('event_ts'))",
+          "d = d.withColumn('session_id', when(",
+          "  col('session_id').isNull(), sid)",
+          "  .otherwise(col('session_id')))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A join runs 6 hours with one task stuck while 199 finish in minutes; how do you diagnose and fix the data skew?",
+    "a": "One straggler task with massive shuffle read is the classic data-skew symptom: a single hot join key such as 'guest' or NULL dominates, so all its records land in one partition. Manual salting fixes this by appending a random bucket index 0..N to the skewed key in the large table and replicating each small-table row across all N buckets via explode, so the hot key splits across N partitions. Alternatively, enable AQE with spark.sql.adaptive.enabled and spark.sql.adaptive.skewJoin.enabled, which detects skewed partitions at runtime and splits them with zero code change on Spark 3.0+. AQE is the preferred first line of defense, while salting gives finer control, works on Spark 2.x, and avoids writing the skewed shuffle in the first place at the cost of N-times fan-out on the small table.",
+    "fs": "A single straggler task with outsized shuffle read means skew on one hot join-key value, fixable with salting or AQE skewJoin.",
+    "fj": "Blaming the cluster or general slowness instead of recognizing one hot key, and ignoring that salting multiplies the small table N times.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Salt large, fan out small",
+        "lang": "pyspark",
+        "lines": [
+          "N = 16",
+          "big = big.withColumn('s',",
+          "  (rand()*N).cast('int'))",
+          "small = small.withColumn('s',",
+          "  explode(array([lit(i) for i",
+          "                 in range(N)])))",
+          "big.join(small, ['key','s'])"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How would you use the Spark UI to diagnose a 3-hour job that should take 15 minutes, and fix the common root causes?",
+    "a": "Start at the Jobs tab sorted by duration, drill into the slow job's Stages tab sorted by duration, then open the worst stage's Summary Metrics to compare median versus max task duration. Max far exceeding median signals data skew; non-zero Shuffle Spill (Disk) signals executors out of memory; tiny per-task input sizes signal too many small partitions. Fix skew with AQE skewJoin or broadcast() of the small side, fix spill by raising spark.sql.shuffle.partitions or executor memory so partitions fit in memory, and fix small partitions with AQE coalescePartitions or a manual coalesce. The guiding target is 128-256 MB per partition, which AQE handles dynamically when adaptive execution is enabled.",
+    "fs": "Compare max versus median task duration in Summary Metrics to confirm skew, and check Shuffle Spill (Disk) for memory pressure.",
+    "fj": "Guessing at fixes without navigating Jobs to Stages to Summary Metrics, and ignoring the per-task input size that reveals small partitions.",
+    "level": "Sr"
+  },
+  {
+    "q": "How do you design an end-to-end partition strategy to bring an 800 GB daily PySpark pipeline from 90 minutes under a 20-minute SLA?",
+    "a": "Fix the shuffle first since it has the biggest impact: the default 200 shuffle partitions give 4 GB each at 800 GB and guarantee spill, so set spark.sql.shuffle.partitions to roughly 3200 to target about 256 MB per partition. Enable AQE with coalescePartitions and skewJoin to coalesce undersized partitions and handle residual skew automatically. Tune source reads via spark.sql.files.maxPartitionBytes around 128 MB and merge tiny files, and for output repartition by the write partition key before partitionBy(\"region\") so each region gets evenly sized roughly 256 MB files instead of many tiny ones. Apply changes in order, measuring stage durations in the Spark UI after each, and add repartition hints on join keys only if AQE does not auto-handle it.",
+    "fs": "Set shuffle.partitions to target ~256 MB per partition first since the default 200 causes spill at 800 GB scale.",
+    "fj": "Leaving spark.sql.shuffle.partitions at the default 200 and writing partitionBy(region) without repartitioning, producing spill and tiny files.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Target ~256MB partitions",
+        "lang": "pyspark",
+        "lines": [
+          "# 800GB / 256MB ~= 3200 partitions",
+          "c = spark.conf.set",
+          "c('spark.sql.shuffle.partitions','3200')",
+          "c('spark.sql.adaptive.enabled','true')",
+          "df.repartition('region').write \\",
+          "  .partitionBy('region').parquet(p)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Given orders(order_id, seller_id, amount), compute total revenue per seller ordered by revenue descending with ties by seller_id, assigned to result?",
+    "a": "Group orders by seller_id and aggregate F.sum(\"amount\") with a clean alias of total_revenue. Then order by F.desc(\"total_revenue\") followed by seller_id ascending so ties resolve deterministically. Assign the final DataFrame with columns seller_id and total_revenue to a variable named result, since the runner collects and diffs it. Deterministic ordering matters because the grader compares row order.",
+    "fs": "Order by desc revenue then seller_id ascending so ties are deterministic and the diff matches.",
+    "fj": "Omitting the seller_id tiebreaker, leaving non-deterministic ordering, or not assigning to a variable named result.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Deterministic ordering",
+        "lang": "pyspark",
+        "lines": [
+          "result = (orders",
+          "  .groupBy('seller_id')",
+          "  .agg(F.sum('amount')",
+          "        .alias('total_revenue'))",
+          "  .orderBy(F.desc('total_revenue'),",
+          "           'seller_id'))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why is a Python UDF slow, and how do a pandas (vectorized) UDF and a native Spark expression each fix it?",
+    "a": "A plain Python UDF runs row by row and forces Spark to serialize each row from the JVM to a Python worker and back, so Catalyst treats it as an opaque black box that blocks predicate pushdown and codegen. A pandas_udf is vectorized: Spark moves data in Apache Arrow columnar batches to the Python worker, the function operates on a whole pandas Series at once, and results return via Arrow, typically 3-100x faster. Best of all is staying in native Spark functions (when/otherwise, regexp_extract, etc.), which run entirely in the JVM with codegen and full optimizer support and never cross the Python boundary. Newer Spark also offers Arrow UDFs that skip the pandas conversion for another ~10% speedup and lower memory.",
+    "fs": "Prefer native Spark expressions; if you must go to Python, use a vectorized pandas_udf with Arrow batches, never a row-at-a-time UDF.",
+    "fj": "Reaching for a row-wise Python UDF for logic that a native when/otherwise or regexp expression could express in the JVM.",
+    "level": "Mid",
+    "code": [
+      {
+        "accent": "bug",
+        "label": "Row-wise Python UDF",
+        "lang": "pyspark",
+        "lines": [
+          "@udf('double')",
+          "def tax(x): return x * 1.07",
+          "df.withColumn('t', tax('amt'))"
+        ]
+      },
+      {
+        "accent": "fix",
+        "label": "Native expression",
+        "lang": "pyspark",
+        "lines": [
+          "df.withColumn('t', col('amt') * 1.07)",
+          "# stays in JVM, full codegen"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When is a pandas_udf the right tool over a native expression, and what gotchas come with grouped-map (applyInPandas)?",
+    "a": "Use a pandas_udf when the logic genuinely cannot be expressed in native Spark functions, for example calling a scikit-learn model, a scipy routine, or complex per-group pandas logic. A SERIES-to-SERIES pandas_udf vectorizes a scalar transform over Arrow batches; for whole-group logic use applyInPandas (grouped map), but it materializes each entire group as one pandas DataFrame in the worker, so a skewed group can OOM that executor. Control batch size with spark.sql.execution.arrow.maxRecordsPerBatch and ensure pyarrow is installed and spark.sql.execution.arrow.pyspark.enabled is true. Always declare an explicit return schema, because applyInPandas cannot infer it.",
+    "fs": "applyInPandas loads a whole group into one pandas DataFrame on the worker, so a hot group can OOM; cap batch size and watch skew.",
+    "fj": "Assuming pandas_udf is always faster, or using applyInPandas on skewed groups and blaming Spark when an executor OOMs.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Grouped map (per group)",
+        "lang": "pyspark",
+        "lines": [
+          "def fit(pdf):",
+          "  pdf['z'] = (pdf.v - pdf.v.mean())",
+          "  return pdf",
+          "df.groupBy('grp').applyInPandas(",
+          "  fit, schema='grp string, v double,",
+          "               z double')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does cache() actually do, how does it differ from persist(), and which storage level fits a large dataset reused many times?",
+    "a": "cache() is shorthand for persist(MEMORY_AND_DISK), the default DataFrame level: it keeps deserialized partitions in memory and spills evicted blocks to disk rather than recomputing. persist() lets you pick a StorageLevel: MEMORY_ONLY (fast but recomputes on eviction), MEMORY_AND_DISK_SER (serialized, smaller footprint, more CPU), or DISK_ONLY (smallest memory, slowest). Both are lazy, so nothing is cached until the next action materializes it, and you should unpersist() when done to free the blocks. For a large dataset reused many times that does not fit in RAM, MEMORY_AND_DISK_SER trades CPU for a smaller footprint and avoids recomputation; only cache when a DataFrame is reused, since a single-use DataFrame gains nothing.",
+    "fs": "cache() == persist(MEMORY_AND_DISK); it is lazy, only pays off on reuse, and you should unpersist() to release blocks.",
+    "fj": "Caching a DataFrame used once, or expecting cache() to take effect before the first action triggers it.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Pick a storage level",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark import StorageLevel",
+          "df = base.filter(...).persist(",
+          "  StorageLevel.MEMORY_AND_DISK)",
+          "df.count()   # materializes cache",
+          "df.join(...)  # reuses cached blocks",
+          "df.unpersist()"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does Adaptive Query Execution (AQE) do at runtime, and which three optimizations does it apply?",
+    "a": "AQE re-optimizes the physical plan using actual shuffle statistics gathered at each stage boundary, instead of relying only on stale compile-time estimates. Its three core features are: coalescing post-shuffle partitions so many tiny partitions merge into right-sized ones (controlled by advisoryPartitionSizeInBytes), converting a sort-merge join to a broadcast hash join when a side turns out smaller than the adaptive broadcast threshold, and skew-join handling that splits and replicates oversized partitions into even tasks. It is enabled by default since Spark 3.2 via spark.sql.adaptive.enabled, and you also keep spark.sql.adaptive.skewJoin.enabled on. AQE is why you can set a high static shuffle.partitions and let Spark coalesce down to the right number per stage.",
+    "fs": "AQE re-plans at shuffle boundaries: coalesce partitions, SMJ-to-broadcast, and skew-split, using real runtime stats.",
+    "fj": "Thinking AQE replaces tuning entirely, or not knowing it has been on by default since Spark 3.2.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Enable + tune AQE",
+        "lang": "pyspark",
+        "lines": [
+          "s = spark.conf.set",
+          "s('spark.sql.adaptive.enabled','true')",
+          "s('spark.sql.adaptive.skewJoin'",
+          "  '.enabled','true')",
+          "s('spark.sql.adaptive'",
+          "  '.advisoryPartitionSizeInBytes',",
+          "  '256m')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Walk through how you read explain(mode='formatted') output to decide whether a query plan is healthy.",
+    "a": "Read the physical plan bottom-up: scans at the bottom, then exchanges (shuffles), joins, and the final project at the top. Confirm the scan shows PushedFilters and a pruned column list, proving predicate and projection pushdown reached the source; if not, your filter is applied too late. Each Exchange node is a shuffle, so count them: an unexpected Exchange hashpartitioning before a join means a sort-merge join where you wanted a BroadcastExchange. Check the join operator type (BroadcastHashJoin vs SortMergeJoin) and, with AQE on, look for AdaptiveSparkPlan and the final stats; the formatted mode also prints per-node details so you can verify partition counts and filters.",
+    "fs": "Count Exchange nodes and confirm PushedFilters at the scan; an extra shuffle or SortMergeJoin where you expected a broadcast is the red flag.",
+    "fj": "Reading the plan top-down or just eyeballing it without checking PushedFilters, join type, and the number of Exchange nodes.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Inspect the plan",
+        "lang": "pyspark",
+        "lines": [
+          "df.explain(mode='formatted')",
+          "# scan: PushedFilters: [amt>0]",
+          "# Exchange hashpartitioning -> shuffle",
+          "# SortMergeJoin vs BroadcastHashJoin",
+          "# AdaptiveSparkPlan -> AQE active"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does partitioning differ from bucketing in Spark, and when does bucketing eliminate a shuffle that partitioning cannot?",
+    "a": "partitionBy writes a directory per value of a low-cardinality column (date, region) so reads can prune whole directories, but it does nothing to co-locate join keys and explodes into tiny files on high-cardinality columns. bucketBy(N, key) hash-distributes rows into a fixed N buckets within the table's files based on the join/aggregation key, recording that layout in the metastore. When two tables are bucketed on the same key with the same N, a join needs zero shuffle because matching keys already sit in the same bucket on both sides. The classic pattern is partitionBy(\"date\").bucketBy(64, \"user_id\"): prune by date, avoid shuffle on user_id; bucketing pays off only for repeated joins/aggs on a high-cardinality key and requires saveAsTable (metastore), not a plain path write.",
+    "fs": "Bucket on the high-cardinality join key with matching N on both tables to kill the join shuffle; partitionBy only enables directory pruning.",
+    "fj": "partitionBy on a high-cardinality column (creating millions of tiny dirs), or expecting bucketing to work without matching bucket counts.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Partition + bucket",
+        "lang": "pyspark",
+        "lines": [
+          "df.write \\",
+          "  .partitionBy('date') \\",
+          "  .bucketBy(64, 'user_id') \\",
+          "  .sortBy('user_id') \\",
+          "  .saveAsTable('events')",
+          "# same N both sides -> no shuffle"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What guarantees does a Structured Streaming checkpoint provide, and what breaks if you delete or relocate it?",
+    "a": "The checkpoint directory holds the offset log (what was read), the commit log (what was finished), and the state store snapshots; together with replayable sources and idempotent sinks this gives end-to-end exactly-once. On restart, Spark reads the last committed offsets and resumes from there, reprocessing any micro-batch that was in flight but not committed, so no data is lost or double-counted at the sink. Deleting the checkpoint forces the stream to start over from the source's earliest/latest offset and loses all aggregation state, causing duplicates or gaps. You also cannot freely change the query in ways that invalidate the stored state (e.g. altering aggregation keys), and each independent query needs its own checkpoint location.",
+    "fs": "The checkpoint's offset log + commit log + state store give exactly-once on restart; deleting it loses state and reprocesses from scratch.",
+    "fj": "Sharing one checkpoint across queries, or assuming you can delete/move it freely without losing state and exactly-once.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Checkpointed stream",
+        "lang": "pyspark",
+        "lines": [
+          "(df.writeStream",
+          "   .format('delta')",
+          "   .option('checkpointLocation',",
+          "           '/chk/orders')",
+          "   .outputMode('append')",
+          "   .start('/out/orders'))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "In Structured Streaming, what does a watermark do for a windowed aggregation, and what happens to data later than the watermark?",
+    "a": "A watermark with withWatermark(\"event_time\", \"10 minutes\") tells the engine the maximum lateness it will tolerate, computed as max-seen-event-time minus the threshold. It lets Spark finalize and emit a time window once the watermark passes the window end, and crucially lets it drop the window's state afterward so state does not grow unbounded. Events arriving with an event_time older than the current watermark are considered too late and are dropped from the aggregation, not added. Watermarks are required for append-mode windowed aggregations and for bounding state in stream-stream joins; pick the threshold from real observed lateness, since too tight drops valid data and too loose bloats state.",
+    "fs": "The watermark bounds state and emits/expires windows; events older than it are dropped, so tune the threshold to real lateness.",
+    "fj": "Omitting a watermark on a windowed agg (unbounded state growth) or assuming late data is silently still included.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Windowed agg + watermark",
+        "lang": "pyspark",
+        "lines": [
+          "(events",
+          "  .withWatermark('event_time',",
+          "                 '10 minutes')",
+          "  .groupBy(window('event_time',",
+          "                  '5 minutes'),",
+          "           'user_id')",
+          "  .count())"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Write a Delta Lake MERGE that upserts a CDC batch, and explain how to keep it from rewriting the whole table.",
+    "a": "MERGE matches the target to a source on a key, then runs WHEN MATCHED THEN UPDATE for changed rows and WHEN NOT MATCHED THEN INSERT for new ones, all atomically. The performance trap is that Delta must rewrite every data file that contains a matched row, so a key-only match condition can touch the entire table. Add a partition predicate to the ON clause (for example t.dt = s.dt) so Delta prunes to just the relevant partitions and rewrites far fewer files, and keep the source small enough to broadcast so dynamic file pruning kicks in. For deletes-in-CDC, add WHEN MATCHED AND s.op = 'D' THEN DELETE; periodically run OPTIMIZE since MERGE produces new small files.",
+    "fs": "Add a partition predicate to the MERGE ON clause so Delta prunes files; key-only matches can rewrite the whole table.",
+    "fj": "Writing MERGE on the key alone and wondering why it rewrites everything, or forgetting MERGE leaves small files needing OPTIMIZE.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Pruned upsert",
+        "lang": "sql",
+        "lines": [
+          "MERGE INTO tgt t",
+          "USING src s",
+          "  ON t.id = s.id",
+          " AND t.dt = s.dt   -- prune!",
+          "WHEN MATCHED AND s.op='D' THEN DELETE",
+          "WHEN MATCHED THEN UPDATE SET *",
+          "WHEN NOT MATCHED THEN INSERT *"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A new upstream field appears and your nightly write fails with a schema mismatch; how do you handle schema evolution safely in Delta?",
+    "a": "By default Delta rejects writes whose schema differs from the table to protect downstream consumers. To accept additive changes (new columns), use .option(\"mergeSchema\", \"true\") on that specific write so Delta adds the columns and backfills existing rows with null, or for a MERGE set spark.databricks.delta.schema.autoMerge.enabled=true. Prefer scoping mergeSchema to the write rather than the global autoMerge flag, because the global setting silently absorbs any stray column across all jobs and lets typos pollute the schema. mergeSchema handles adds and safe widening; it will not silently change a column's type incompatibly, and dropping or renaming requires an explicit ALTER with column mapping or an overwriteSchema.",
+    "fs": "Scope mergeSchema to the one write for additive evolution; the global autoMerge flag silently absorbs typos table-wide.",
+    "fj": "Turning on global autoMerge everywhere (so typos become columns), or expecting mergeSchema to handle incompatible type changes.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Additive evolution",
+        "lang": "pyspark",
+        "lines": [
+          "(df.write.format('delta')",
+          "   .mode('append')",
+          "   .option('mergeSchema', 'true')",
+          "   .save(path))",
+          "# new cols added; old rows -> null"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your streaming sink produces thousands of tiny files per hour, killing query performance; how do you compact them?",
+    "a": "Small files force the reader to open many file handles and list huge directories, so scans and the driver's planning both slow down. On Delta, run OPTIMIZE, which uses a bin-packing algorithm to rewrite many small files into right-sized ones (default target ~1 GB), and add ZORDER BY on common filter columns to co-locate related data for better data skipping. For continuous streaming you can enable auto-compaction (optimizeWrite / autoCompact) so Delta compacts after each commit instead of leaving the mess. On plain Parquet without Delta, the manual equivalent is reading the partition and rewriting with coalesce or repartition to fewer, larger files. After compaction, run VACUUM to remove the now-unreferenced small files past the retention window.",
+    "fs": "Run OPTIMIZE (bin-packing, ~1 GB targets) plus ZORDER, or enable auto-compaction; VACUUM clears the orphaned small files.",
+    "fj": "Ignoring the small-file problem until scans crawl, or running VACUUM with too-short retention and breaking time travel.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Compact + cluster",
+        "lang": "sql",
+        "lines": [
+          "OPTIMIZE events",
+          "  WHERE dt = '2026-06-01'",
+          "  ZORDER BY (user_id);",
+          "-- auto: delta.autoOptimize",
+          "--       .optimizeWrite = true"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "You re-run a daily job for one partition but it wipes the entire table; what is dynamic partition overwrite and how do you use it correctly?",
+    "a": "With the default mode='overwrite', Spark replaces the WHOLE table (or, for partitioned writes, may clear unrelated partitions), so a one-day rerun destroys history. Setting spark.sql.sources.partitionOverwriteMode=dynamic (or the writer option partitionOverwriteMode=dynamic) makes overwrite replace only the partitions actually present in the incoming DataFrame and leave all others untouched, which is exactly what an idempotent daily backfill needs. On Delta, the targeted alternative is replaceWhere with an explicit predicate, which atomically overwrites only rows matching the condition; note you cannot combine replaceWhere and partitionOverwriteMode in the same write, and replaceWhere takes precedence. Always confirm the partition column is in the DataFrame, or dynamic mode has nothing to scope to.",
+    "fs": "Set partitionOverwriteMode=dynamic (or use Delta replaceWhere) so an overwrite replaces only the incoming partitions, not the whole table.",
+    "fj": "Running mode('overwrite') on a partitioned table and nuking every other partition, not knowing dynamic mode or replaceWhere exists.",
+    "level": "Mid",
+    "code": [
+      {
+        "accent": "fix",
+        "label": "Dynamic overwrite",
+        "lang": "pyspark",
+        "lines": [
+          "(df.write.mode('overwrite')",
+          "   .option('partitionOverwriteMode',",
+          "           'dynamic')",
+          "   .partitionBy('dt')",
+          "   .save(path))",
+          "# only dt's in df are replaced"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "In a long iterative PySpark job the DAG keeps growing and recovery is slow; what does checkpoint() do that cache() does not?",
+    "a": "cache()/persist() keep the partitions but also keep the full lineage, so on executor loss Spark must recompute from the source, and in iterative algorithms the lineage chain grows until the planner itself becomes slow or stack-overflows. df.checkpoint() (after setting spark.sparkContext.setCheckpointDir) materializes the DataFrame to reliable storage like HDFS/S3 and TRUNCATES the lineage, so recovery reads the checkpoint instead of replaying hundreds of stages. It is an action (eager by default) and writes to durable storage, unlike the in-memory, lineage-preserving cache; there is also localCheckpoint() which is faster but not fault-tolerant. Use checkpoint to break lineage in deep iterative or recursive pipelines, and cache for plain reuse where lineage is short.",
+    "fs": "checkpoint() writes to reliable storage and truncates lineage; cache() keeps lineage and only recomputes, so deep iterative jobs need checkpoint.",
+    "fj": "Using cache() to fix a runaway lineage, not realizing only checkpoint() truncates it and requires a checkpoint dir.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Truncate lineage",
+        "lang": "pyspark",
+        "lines": [
+          "sc.setCheckpointDir('s3://bkt/chk')",
+          "for i in range(50):",
+          "  df = step(df)",
+          "  if i % 10 == 0:",
+          "    df = df.checkpoint()  # cut lineage"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between select, withColumn, and selectExpr, and why can chaining many withColumn calls hurt?",
+    "a": "select projects a chosen set of columns and is the natural way to add several derived columns in one pass. withColumn adds or replaces exactly one column and returns a new DataFrame, so chaining dozens of them builds a deeply nested projection that can blow up Catalyst analysis time and plan size. selectExpr lets you write SQL-style expression strings, handy for concise casts and CASE logic. For many derived columns, prefer a single select with a list of expressions (or withColumns in newer Spark) instead of a long withColumn chain, which keeps the logical plan flat and analysis fast.",
+    "fs": "Build many derived columns in one select (or withColumns), not a long withColumn chain that bloats the Catalyst plan.",
+    "fj": "Chaining 30 withColumn calls and hitting slow analysis, unaware that one select with a list is flatter and faster.",
+    "level": "Jr",
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "pyspark",
+        "lines": [
+          "df.withColumn('a', ...) \\",
+          "  .withColumn('b', ...) \\",
+          "  .withColumn('c', ...)  # deep plan"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "pyspark",
+        "lines": [
+          "df.select('*',",
+          "  expr('...').alias('a'),",
+          "  expr('...').alias('b'),",
+          "  expr('...').alias('c'))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do inner, left, and anti joins differ in PySpark, and which would you use to find records present in A but missing in B?",
+    "a": "An inner join keeps only rows whose key matches on both sides. A left (left_outer) join keeps every row from the left and fills right-side columns with null where there is no match. A left_anti join is the right tool to find rows in A with no match in B: it returns only the unmatched left rows and adds no columns from B, which is cleaner and cheaper than a left join followed by filtering where the right key is null. There is also left_semi, the mirror, which keeps left rows that DO have a match, again without importing B's columns.",
+    "fs": "Use left_anti to get rows in A missing from B in one step, instead of a left join plus an isNull filter.",
+    "fj": "Doing a left join then filtering right-key IS NULL, or confusing left_anti (no match) with left_semi (has match).",
+    "level": "Jr",
+    "code": [
+      {
+        "label": "Rows in A not in B",
+        "lang": "pyspark",
+        "lines": [
+          "a.join(b, 'id', 'left_anti')",
+          "# only A rows with no B match",
+          "# no columns from B added"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you express a multi-branch conditional column in PySpark, and why is when/otherwise better than a Python UDF?",
+    "a": "Use F.when(cond, val) chained with more .when() calls and a final .otherwise(default), which compiles to a native CASE WHEN that Catalyst can optimize and codegen entirely in the JVM. A Python UDF for the same logic runs row-by-row across the JVM-to-Python boundary with serialization overhead and blocks predicate pushdown. Without a trailing .otherwise(), unmatched rows return null, which is a common silent bug. Keep branch logic in when/otherwise, regexp, and arithmetic expressions so the whole thing stays a single optimized stage.",
+    "fs": "when/otherwise compiles to a native CASE WHEN with codegen; a UDF for the same branching is slower and opaque to Catalyst.",
+    "fj": "Reaching for a Python UDF to bucket values, or forgetting the .otherwise() so unmatched rows silently become null.",
+    "level": "Jr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Bucket with when/otherwise",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql import functions as F",
+          "df.withColumn('tier', F.when(",
+          "    F.col('amt') > 100, 'gold')",
+          "  .when(F.col('amt') > 10, 'silver')",
+          "  .otherwise('bronze'))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why does df['x'] == null never match rows in PySpark, and how do you correctly test for and fill nulls?",
+    "a": "Spark uses three-valued logic, so any comparison with null (including = null) returns null, not true, and a filter keeps only rows that evaluate to true. To test for null use col.isNull() / col.isNotNull(), not == None. To compare two columns treating null-equals-null as a match, use eqNullSafe (the <=> operator). To replace nulls, coalesce(col, default) returns the first non-null argument, and df.na.fill({...}) or fillna sets defaults per column. These keep null logic explicit instead of accidentally dropping rows.",
+    "fs": "Comparisons with null yield null under three-valued logic; use isNull/isNotNull, eqNullSafe, coalesce, and na.fill.",
+    "fj": "Writing col == None and getting zero rows, or assuming a filter keeps null rows.",
+    "level": "Jr",
+    "asked": 14,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "pyspark",
+        "lines": [
+          "df.filter(F.col('sid') == None)",
+          "# always empty: null isn't true"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "pyspark",
+        "lines": [
+          "df.filter(F.col('sid').isNull())",
+          "df.withColumn('sid',",
+          "  F.coalesce('sid', F.lit('NA')))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When should you pass an explicit schema to spark.read instead of letting Spark infer it, and how do you build one?",
+    "a": "Define a StructType of StructField(name, type, nullable) entries and pass it via .schema() for CSV/JSON reads. Inference triggers an extra pass over the data to sample types, which is slow on large inputs and non-deterministic when columns are sometimes empty, so an explicit schema is faster and prevents a column from being read as the wrong type (e.g. a zip code as a long that drops leading zeros). Parquet and ORC carry their schema in the footer, so inference there is cheap and explicit schemas matter mainly for evolution control. An explicit schema also lets you reject malformed rows predictably.",
+    "fs": "An explicit StructType skips the inference scan, fixes types deterministically, and avoids cost like reading zip codes as longs.",
+    "fj": "Relying on inferSchema on a huge CSV, paying an extra scan and risking wrong/unstable column types.",
+    "level": "Jr",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Explicit read schema",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql.types import *",
+          "s = StructType([",
+          "  StructField('id', LongType()),",
+          "  StructField('zip', StringType()),",
+          "  StructField('amt', DoubleType())])",
+          "spark.read.schema(s).csv(path)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you flatten a nested struct and explode an array column in PySpark, and what does explode do to row count?",
+    "a": "Access struct fields with dot notation or col('addr.city'), or call select('addr.*') to promote every nested field to a top-level column. For an array column, explode(col) emits one output row per element, multiplying row count by the array length and dropping rows whose array is empty or null. Use explode_outer when you must keep rows with null/empty arrays, and posexplode when you need the element index. For a map column, explode yields key and value columns. This is the standard pattern for flattening JSON-shaped data into a tabular form.",
+    "fs": "select('struct.*') flattens nested fields; explode emits a row per array element and drops empty/null arrays unless you use explode_outer.",
+    "fj": "Expecting explode to preserve rows with empty/null arrays, or not knowing explode_outer and posexplode exist.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "label": "Flatten + explode",
+        "lang": "pyspark",
+        "lines": [
+          "df.select('id', 'addr.*',",
+          "  F.explode('items').alias('item'))",
+          "# one row per item;",
+          "# empty/null items rows dropped",
+          "# use explode_outer to keep them"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Show several aggregations in one groupBy().agg() and explain why collect_list and countDistinct deserve caution.",
+    "a": "Pass multiple aggregate expressions to a single agg() call, each aliased, so the whole rollup runs in one shuffle: F.sum, F.avg, F.count, F.countDistinct, F.max all together. countDistinct is expensive because exact distinct counting needs a global shuffle; approx_count_distinct (HyperLogLog) is far cheaper when an estimate is acceptable. collect_list / collect_set gather all values per group into an array on one task, so a skewed hot key can OOM that executor. Always alias outputs since the default generated names like sum(amt) are awkward downstream.",
+    "fs": "Batch all aggregates in one agg() call; prefer approx_count_distinct over countDistinct, and watch collect_list OOM on skewed groups.",
+    "fj": "Calling agg multiple times (extra passes), or using collect_list on a hot key and OOMing one executor.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "label": "Multi-agg in one pass",
+        "lang": "pyspark",
+        "lines": [
+          "df.groupBy('region').agg(",
+          "  F.sum('amt').alias('total'),",
+          "  F.avg('amt').alias('avg'),",
+          "  F.approx_count_distinct('uid')",
+          "    .alias('users'))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between an Arrow-optimized Python UDF and a pandas_udf in modern Spark, and when do you pick each?",
+    "a": "A pandas_udf (since Spark 2.3) is vectorized: Spark ships Arrow batches to the worker and your function operates on a whole pandas Series at once, ideal when the logic is naturally vectorized or calls a pandas/numpy/sklearn routine. An Arrow-optimized Python UDF (Spark 3.5, enabled with useArrow=True or spark.sql.execution.pythonUDF.arrow.enabled) still runs row-by-row in Python but uses Arrow for serialization and consistent type coercion, roughly 1.6x faster than a pickled UDF without rewriting to pandas. Reach for pandas_udf when you can vectorize; use an Arrow UDF as a cheap drop-in speedup for existing per-row UDFs. Native Spark expressions still beat both when the logic can be expressed without Python.",
+    "fs": "pandas_udf vectorizes over a Series via Arrow; an Arrow-optimized UDF is still row-wise but ~1.6x faster than pickled via Arrow serialization.",
+    "fj": "Thinking useArrow makes a UDF vectorized (it doesn't — still row-by-row), or that pandas_udf and Arrow UDF are the same thing.",
+    "level": "Sr",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Arrow UDF vs pandas_udf",
+        "lang": "pyspark",
+        "lines": [
+          "g = F.udf(fn, 'double', useArrow=True)",
+          "# still row-wise, Arrow serde",
+          "@F.pandas_udf('double')",
+          "def vec(s: pd.Series)->pd.Series:",
+          "  return s * 1.07  # whole Series"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is pandas API on Spark (pyspark.pandas) and how does it differ from calling toPandas()?",
+    "a": "pyspark.pandas (import pyspark.pandas as ps) gives a pandas-like API whose operations compile to Spark jobs and run distributed across the cluster, so it scales past a single machine's RAM while keeping familiar pandas syntax. toPandas() instead collects the entire DataFrame to the driver as a real pandas object, bounded by driver memory and a common OOM source. Use pandas-on-Spark to port pandas code at scale or let analysts stay in pandas idioms; use toPandas() only on a small, already-reduced result. Note pandas-on-Spark has subtle differences (default index handling, ordering) and not every pandas method is supported.",
+    "fs": "pyspark.pandas runs pandas-style ops distributed as Spark jobs; toPandas() pulls everything to the driver and is RAM-bounded.",
+    "fj": "Using toPandas() on a big DataFrame to 'use pandas', OOMing the driver instead of pyspark.pandas which stays distributed.",
+    "level": "Mid",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Distributed pandas API",
+        "lang": "pyspark",
+        "lines": [
+          "import pyspark.pandas as ps",
+          "psdf = ps.read_parquet('events')",
+          "psdf.groupby('region')['amt'].sum()",
+          "# runs as Spark jobs, distributed",
+          "# vs df.toPandas() -> all to driver"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why is calling collect() (or toPandas()) on a large DataFrame dangerous, and what are the safer alternatives?",
+    "a": "collect() and toPandas() pull every partition back to the single driver JVM, whose memory is far smaller than the executors combined, so a large result triggers driver OOM and serialization overhead even when the cluster could handle the data fine. To preview, use df.show(n) or df.take(n), which fetch only a few rows. To inspect more without blowing memory, df.toLocalIterator() streams one partition at a time. If you genuinely need every row out, write to storage and read elsewhere instead of routing it through the driver. The rule is to reduce/aggregate first and only collect a small final result.",
+    "fs": "collect/toPandas funnel all data through the driver (OOM); use show/take to peek, toLocalIterator to stream, or write to storage.",
+    "fj": "Calling collect() to 'see the data' on a multi-GB DataFrame and crashing the driver, when show/take would do.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "pyspark",
+        "lines": [
+          "rows = big_df.collect()",
+          "# all partitions -> driver -> OOM"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "pyspark",
+        "lines": [
+          "big_df.show(20)",
+          "for r in big_df.toLocalIterator():",
+          "  handle(r)  # one partition at a time"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you unit test PySpark transformation code, and what makes a good test setup?",
+    "a": "Factor transformations into pure functions that take a DataFrame and return a DataFrame, so you can feed tiny in-memory inputs built with spark.createDataFrame and assert on the output. Share one local SparkSession across the test module via a session-scoped pytest fixture (master('local[1]')) because session startup is slow; tear it down with spark.stop(). Compare results with pyspark.testing.assertDataFrameEqual (built into Spark 3.5+) or chispa's assert_df_equality, which check schema and rows and print readable diffs. Keep fixtures small and deterministic, and assert on both schema and values so a silent type change is caught.",
+    "fs": "Test pure DataFrame-in/DataFrame-out functions on tiny inputs with a session-scoped local Spark fixture and assertDataFrameEqual.",
+    "fj": "Spinning up a new SparkSession per test (slow), or eyeballing show() output instead of asserting schema and rows.",
+    "level": "Mid",
+    "asked": 10,
+    "code": [
+      {
+        "label": "Local fixture + assert",
+        "lang": "python",
+        "lines": [
+          "@pytest.fixture(scope='session')",
+          "def spark():",
+          "  s = (SparkSession.builder",
+          "       .master('local[1]').getOrCreate())",
+          "  yield s; s.stop()",
+          "# assertDataFrameEqual(got, expected)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Give a complete window-function pattern for keeping only the latest record per key, and explain why it beats a self-join.",
+    "a": "Define Window.partitionBy(key).orderBy(desc(ts)), add row_number().over(w), then filter rn == 1 to keep the most recent row per key in a single pass. This is the canonical deduplication/SCD-latest pattern and is cleaner than a groupBy(key).agg(max(ts)) followed by a self-join back to the original, which shuffles twice and can re-duplicate on ties. row_number breaks ties deterministically (one row) where rank/dense_rank would keep all tied rows. The window still shuffles by key, but it is one shuffle and preserves all columns.",
+    "fs": "row_number over partitionBy(key).orderBy(desc(ts)) then filter rn==1 gets latest-per-key in one shuffle, no self-join.",
+    "fj": "Doing max(ts) then a self-join (double shuffle, tie duplicates), or using rank which keeps tied rows instead of one.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "label": "Latest row per key",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql.window import Window",
+          "w = Window.partitionBy('id') \\",
+          "  .orderBy(F.desc('ts'))",
+          "df.withColumn('rn',",
+          "    F.row_number().over(w)) \\",
+          "  .filter('rn = 1').drop('rn')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When is dropping from the DataFrame API down to the RDD API actually justified, and what do you lose?",
+    "a": "The DataFrame API runs through Catalyst and Tungsten with whole-stage codegen and off-heap memory, so it is typically 10-100x faster than equivalent Python RDD logic and should be the default. Drop to RDD only for genuinely record-level custom logic Catalyst cannot express, fine-grained control over partitioning via mapPartitions/partitioner, or interop with legacy RDD code. The cost is real: RDDs are opaque to the optimizer (no predicate pushdown, no codegen) and Python RDDs serialize every row to a Python worker. Often a pandas_udf, applyInPandas, or mapInPandas gives the custom-Python escape hatch while keeping the DataFrame plan, which is preferable to a raw RDD.",
+    "fs": "Stay on DataFrames for Catalyst/Tungsten; drop to RDD only for true record-level control, and prefer mapInPandas/applyInPandas first.",
+    "fj": "Using RDDs by default or for things expressible in SQL, losing all Catalyst optimization and paying Python serialization per row.",
+    "level": "Sr",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Partition-level escape hatch",
+        "lang": "pyspark",
+        "lines": [
+          "# prefer this over .rdd:",
+          "def f(itr):",
+          "  for pdf in itr:",
+          "    yield enrich(pdf)",
+          "df.mapInPandas(f, schema)",
+          "# keeps DataFrame plan, Arrow batches"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Compare Parquet, ORC, Avro, and CSV/JSON as PySpark storage formats, and why does columnar matter for analytics?",
+    "a": "Parquet and ORC are columnar: they store each column contiguously with per-column compression and footer statistics, so Spark reads only the columns a query projects (projection pushdown) and skips row groups via min/max stats (predicate pushdown), which is why they are the default for analytical workloads. Avro is row-oriented with a compact binary schema, better for write-heavy or full-row streaming/CDC payloads and schema evolution. CSV/JSON are human-readable but uncompressed, schema-less, and force full scans, so they are fine for ingestion but a poor query format. The practical default is Parquet (or Delta/Iceberg on top of it) and converting raw CSV/JSON to Parquet early in the pipeline.",
+    "fs": "Parquet/ORC are columnar, enabling column pruning and stats-based row-group skipping; Avro is row-wise for write-heavy, CSV/JSON force full scans.",
+    "fj": "Querying raw CSV/JSON repeatedly instead of converting to Parquet, losing column pruning and predicate pushdown.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "label": "Convert once, query fast",
+        "lang": "pyspark",
+        "lines": [
+          "raw = spark.read.json('s3://in/raw')",
+          "raw.write.parquet('s3://out/curated')",
+          "# later reads: column pruning +",
+          "# predicate pushdown via footer stats"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does a salted pre-aggregation look like for a heavily skewed groupBy, and why is it different from a salted join?",
+    "a": "For a skewed groupBy (one hot key dominates), append a random salt 0..N to the key, aggregate by (key, salt) in a first pass that spreads the hot key across N tasks, then strip the salt and re-aggregate by key in a cheap second pass. This works for distributive/algebraic aggregates like sum, count, and max where partial results recombine correctly, but not directly for holistic ones like exact median. It differs from a salted join, where you salt the large side and fan out the small side with explode so keys still match. AQE skewJoin handles skewed joins automatically, but skewed aggregations often still need this manual two-stage trick.",
+    "fs": "Two-stage salt: aggregate by (key,salt) then re-aggregate by key; valid for sum/count/max, not holistic aggregates like exact median.",
+    "fj": "Salting a groupBy but forgetting the second re-aggregation, or assuming it works for holistic aggregates like median.",
+    "level": "Sr",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Two-stage salted agg",
+        "lang": "pyspark",
+        "lines": [
+          "salt = (F.rand()*16).cast('int')",
+          "s = df.withColumn('slt', salt)",
+          "# pass 1: spread hot key",
+          "p = s.groupBy('key','slt') \\",
+          "  .agg(F.sum('v').alias('v'))",
+          "# pass 2: drop salt, re-aggregate",
+          "p.groupBy('key').agg(F.sum('v'))"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Beyond the API call, what actually controls whether a broadcast join happens, and how can a broadcast silently fail or hurt?",
+    "a": "Spark auto-broadcasts a side estimated below spark.sql.autoBroadcastJoinThreshold (default 10 MB), and an explicit broadcast() hint forces it regardless of the threshold. But the estimate is on the in-memory size, which can be much larger than the compressed file, and AQE can also demote a planned broadcast at runtime, so always verify with explain that you got BroadcastHashJoin. A broadcast that is too large drives driver-side collection and executor memory pressure or even OOM, and broadcasting both sides of an outer join is disallowed for certain join types. Setting the threshold to -1 disables auto-broadcast entirely, which is a useful diagnostic when a runaway broadcast is suspected.",
+    "fs": "Broadcast fires under autoBroadcastJoinThreshold or via a hint, but on the in-memory size; verify with explain and watch driver/executor OOM.",
+    "fj": "Assuming a small file always broadcasts, ignoring that the in-memory estimate or AQE can change the plan and cause OOM.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "Tune + verify broadcast",
+        "lang": "pyspark",
+        "lines": [
+          "spark.conf.set(",
+          "  'spark.sql.autoBroadcastJoinThreshold',",
+          "  str(50*1024*1024))",
+          "j = big.join(F.broadcast(small),'id')",
+          "j.explain()  # expect BroadcastHashJoin"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide partition count and layout end to end: input split size, shuffle partitions, and partitionBy on write?",
+    "a": "Three separate knobs control partitioning at different stages. Read parallelism is set by spark.sql.files.maxPartitionBytes (default 128 MB), which slices large files into input partitions; tiny files instead under-parallelize and need coalescing. Shuffle width is spark.sql.shuffle.partitions (default 200), which you raise so each post-shuffle partition lands near 128-256 MB, or let AQE coalesce dynamically. On write, partitionBy(col) creates a directory per value for read-time pruning, but on a high-cardinality column it explodes into tiny files, so repartition by that column first to get one sensibly sized file per partition value. Conflating these three is the usual cause of either too-few-partitions spill or too-many tiny files.",
+    "fs": "maxPartitionBytes sets read splits, shuffle.partitions sets shuffle width, partitionBy sets write layout; repartition by the write key to avoid tiny files.",
+    "fj": "Treating partitioning as one setting, e.g. raising shuffle.partitions to fix read parallelism, or partitionBy on a high-cardinality column.",
+    "level": "Sr",
+    "asked": 10,
+    "code": [
+      {
+        "label": "Three partition knobs",
+        "lang": "pyspark",
+        "lines": [
+          "c = spark.conf.set",
+          "c('spark.sql.files.maxPartitionBytes',",
+          "  '128m')      # read splits",
+          "c('spark.sql.shuffle.partitions','800')",
+          "df.repartition('dt').write \\",
+          "  .partitionBy('dt').parquet(path)"
+        ]
+      }
+    ]
+  }
+]

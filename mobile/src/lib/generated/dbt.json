@@ -1,0 +1,816 @@
+[
+  {
+    "q": "What is the difference between ref() and source() in dbt, and why does it matter?",
+    "a": "ref('model_name') references another dbt model and wires the DAG dependency, while resolving to the correct fully-qualified table name per environment (dev vs prod) so you never hardcode schemas. source('schema','table') references a raw external table loaded outside dbt, declared in a sources YAML block that enables freshness checks, docs, and testing of the raw layer. They serve different layers and bypassing either with a literal table name silently severs the lineage edge and breaks CI state selection. ref() builds are ordered automatically; source() is the entry point for dbt source freshness.",
+    "fj": "I just write the table name directly in my FROM clause.",
+    "fs": "I always use ref() for dbt models and source() for raw tables — hardcoding breaks the DAG, lineage docs, and CI state selection.",
+    "level": "Jr",
+    "asked": 31,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "stg model",
+        "lines": [
+          "-- raw table -> declared source",
+          "select * from",
+          "  {{ source('jaffle','orders') }}",
+          "-- mart refs the dbt model",
+          "select * from",
+          "  {{ ref('stg_orders') }}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Walk me through the four built-in dbt materializations — view, table, incremental, and ephemeral. When do you choose each?",
+    "a": "A view is a CREATE VIEW with zero storage that recomputes on every read — good for light transformations read infrequently. A table is dropped and rebuilt every run, costing storage but giving fast, predictable reads. Incremental builds the table once then only processes new or changed rows via is_incremental(), ideal for large fact tables where full rebuilds are too slow or costly. Ephemeral is never materialized but inlined as a CTE wherever it is ref'd, useful for shared sub-transformations. The decision rule: start with view, upgrade to table when reads suffer, upgrade to incremental when rebuilds get too expensive, and use ephemeral for shared CTE logic.",
+    "fj": "I use table for everything because it's faster.",
+    "fs": "I start with view, upgrade to table when read performance is a problem, and use incremental when full rebuilds become cost-prohibitive — ephemeral for shared CTE logic.",
+    "level": "Jr",
+    "asked": 27,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "config",
+        "lines": [
+          "{{ config(",
+          "  materialized='view'      -- light",
+          "  -- 'table'      rebuild+store",
+          "  -- 'incremental' new rows",
+          "  -- 'ephemeral'  inlined CTE",
+          ") }}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are dbt's built-in generic tests, and how do you add them to your models?",
+    "a": "dbt ships four generic tests: unique (distinct values, catches duplicate keys), not_null (no NULLs, catches missing required fields), accepted_values (values appear in a declared list, catches rogue enums), and relationships (every value exists in a referenced column, catches broken foreign keys). They are declared in YAML alongside the model under each column's tests block and run with dbt test or dbt build, which runs models and tests together. For custom business logic that doesn't fit the generic pattern, use singular tests — plain SQL files in tests/ that return failing rows. The unique plus not_null pair on every primary key should be the minimum bar.",
+    "fj": "I don't add tests — I validate data manually.",
+    "fs": "I add unique + not_null on every primary key, accepted_values on enum columns, and relationships for foreign keys. Tests run in CI on every PR.",
+    "level": "Jr",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "schema.yml",
+        "lines": [
+          "columns:",
+          "  - name: order_id",
+          "    tests: [unique, not_null]",
+          "  - name: status",
+          "    tests:",
+          "      - accepted_values:",
+          "          values: ['new','paid']"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a dbt seed, and when should you use one versus pulling data from a source?",
+    "a": "A seed is a CSV file in the seeds/ directory that dbt seed loads into the database as a table, giving you version-controlled, portable reference data without a loader. Use seeds for small, slowly-changing, code-owned lookups like country codes, currency mappings, or internal cost tables. Do not use them for large datasets, frequently-changing data, or anything sourced from an upstream system — that belongs in a source with a proper loader. Watch the type-inference gotcha: dbt may cast an ID column like 007 to integer and truncate leading zeros, so specify column_types for string IDs.",
+    "fj": "I'd use a seed for any static data.",
+    "fs": "Seeds are for small, code-owned reference tables. Anything large, frequently changing, or sourced from an upstream system belongs in a source with a proper loader.",
+    "level": "Jr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "id 007 -> 7",
+        "accent": "bug",
+        "lines": [
+          "# country_codes.csv has '007'",
+          "seeds:",
+          "  my_project:",
+          "    # dbt infers int -> drops 0s"
+        ]
+      },
+      {
+        "lang": "dbt",
+        "accent": "fix",
+        "lines": [
+          "seeds:",
+          "  my_project:",
+          "    +column_types:",
+          "      code: varchar(3)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you decide where to put logic in a dbt project — staging, intermediate, or marts?",
+    "a": "Staging models (stg_) are thin, one-per-source-table layers that rename, cast, and lightly filter, always materialized as views with no cross-source joins. Intermediate models (int_) join and apply business logic across staging models and are rarely exposed to BI, materialized as view or ephemeral. Marts (fct_, dim_) are the final business-facing models materialized as table or incremental, with fct_ for additive facts and dim_ for descriptive entities. The decision rule: raw source data goes to staging, cross-source joins and business rules go to intermediate, and BI-queried output goes to marts. Keeping staging thin means a source schema change only breaks the one stg_ model, not every downstream mart.",
+    "fj": "I put all the logic in the final model.",
+    "fs": "Staging isolates schema changes to one place; intermediates share business logic; marts are what BI tools query — each layer has a distinct contract.",
+    "level": "Mid",
+    "asked": 18
+  },
+  {
+    "q": "How do you choose between running dbt run and dbt build in CI?",
+    "a": "dbt run executes only the SQL models, leaving tests, snapshots, and seeds for separate commands, whereas dbt build runs models, tests, snapshots, and seeds in DAG order and stops a downstream model if an upstream test fails. In CI, prefer dbt build --select state:modified+ so only changed models and their downstream dependents are built and tested, failing fast before bad data cascades. In production, use dbt build for the full DAG or tag-based subsets. dbt run alone is fine for fast local iteration, but never ship a PR where CI only ran dbt run.",
+    "fj": "I run dbt run then dbt test separately in CI.",
+    "fs": "I use dbt build --select state:modified+ — it runs models and tests in DAG order so a failing test stops downstream builds, and only touches changed models and dependents.",
+    "level": "Mid",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "CI",
+        "lines": [
+          "# run only: skips tests",
+          "dbt run",
+          "# build: models+tests, DAG order",
+          "# fail-fast on changed + downstream",
+          "dbt build --select state:modified+"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why would you choose dbt over stored procedures for data transformations?",
+    "a": "dbt brings software-engineering discipline to transforms: models are .sql files in git with PRs, code review, and history, plus a first-class testing framework, automatic lineage and docs via ref() and source(), and environment isolation through targets. Stored procs rot inside the database with no tests, no audit trail, and manual per-environment schema management. dbt is also declarative — a SELECT defines what the data should look like, replacing procedural INSERT/UPDATE/MERGE boilerplate with materialization strategies. The trade-off is that dbt is transform-only ELT, so for a tiny team with a handful of transforms, stored procs can still be pragmatic.",
+    "fj": "dbt is just easier SQL writing.",
+    "fs": "dbt brings version control, testing, lineage, and environment isolation to transforms — the engineering-maturity advantages, not just syntax convenience.",
+    "level": "Mid",
+    "asked": 12
+  },
+  {
+    "q": "Walk me through how dbt incremental models work, including unique_key, is_incremental(), and what goes wrong without them.",
+    "a": "On the first run dbt issues a full CREATE TABLE AS SELECT; on later runs it wraps the SELECT in a MERGE, delete+insert, or insert depending on strategy, processing only rows that pass the is_incremental() filter. is_incremental() returns true only on incremental runs, letting you filter WHERE updated_at > MAX(updated_at) using {{ this }} to reference the table being built. unique_key tells dbt which columns to deduplicate on in the MERGE, giving upsert semantics. Without the is_incremental() filter you reprocess the entire source every run; without unique_key dbt appends every row and resent or corrected rows silently duplicate and compound.",
+    "fj": "I set materialized='incremental' and that makes it faster.",
+    "fs": "Incremental needs an is_incremental() filter to restrict input rows AND a unique_key for upsert semantics — without both, you're either reprocessing everything or silently accumulating duplicates.",
+    "level": "Mid",
+    "asked": 29,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "incremental",
+        "lines": [
+          "{{ config(",
+          "  materialized='incremental',",
+          "  unique_key='id') }}  -- upsert",
+          "select * from {{ ref('events') }}",
+          "{% if is_incremental() %}",
+          "where updated_at >",
+          "  (select max(updated_at) from {{ this }})"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain dbt snapshots and how they implement SCD Type 2. When would you use a snapshot vs a custom incremental model for history tracking?",
+    "a": "dbt snapshots implement SCD Type 2 by adding dbt_valid_from, dbt_valid_to, dbt_scd_id, and dbt_updated_at columns; on each run dbt compares source rows to the snapshot, inserting a new current record and closing the old one's dbt_valid_to. The timestamp strategy detects change via an updated_at column (fast but unreliable if the source doesn't update timestamps), while the check strategy compares enumerated columns (more thorough but must list columns). Snapshots are the right default since they need no custom SQL and are version-controlled. Reach for a custom incremental SCD2 model when you need complex multi-column change logic, non-standard retention windows, sub-run granularity, or when the table is too large for full snapshot comparison.",
+    "fj": "Snapshots keep a full history of all my tables automatically.",
+    "fs": "Snapshots capture changes on each run — not sub-run changes. The strategy choice (timestamp vs check) determines how reliably changes are detected, and deletions require explicit opt-in.",
+    "level": "Sr",
+    "asked": 23,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "snapshot",
+        "lines": [
+          "snapshots:",
+          "  - name: orders_snapshot",
+          "    config:",
+          "      unique_key: id",
+          "      strategy: timestamp",
+          "      updated_at: updated_at",
+          "  # check: check_cols [status,...]"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you use macros in dbt, and what is the difference between a macro and a dbt model? Give a real example of when a macro is the right choice.",
+    "a": "A macro is a Jinja function in macros/ that generates SQL expressions or statements at compile time, used for reusable logic, dynamic SQL, and operational tasks run via dbt run-operation. A model is a SELECT that produces a queryable relation. The rule: macros produce SQL text, models produce database objects. A good example is a dedup macro that generates a ROW_NUMBER CTE so you don't copy-paste it across ten staging models, or a post-hook macro that grants SELECT to a BI role. Avoid macros when logic is model-specific, when over-abstraction makes compiled SQL hard to debug, or when dbt-utils already provides it.",
+    "fj": "I put all reusable logic in macros.",
+    "fs": "Macros are for reusable SQL expressions and operational tasks. Over-abstracting makes compiled SQL hard to read and debug — I use macros when the same pattern appears in 3+ models.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "macros/dedup.sql",
+        "lines": [
+          "{% macro dedup(rel, key, ts) %}",
+          "qualify row_number() over (",
+          "  partition by {{ key }}",
+          "  order by {{ ts }} desc) = 1",
+          "{% endmacro %}",
+          "-- call: {{ dedup('o','id','ts') }}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A dbt model that was passing suddenly fails. Walk me through how you debug it.",
+    "a": "First check the dbt run output for the error and the compiled SQL path, then open the file in target/compiled/ and run that SQL directly in the warehouse console to separate dbt plumbing errors from actual SQL errors. If it's a SQL error, trace it upstream — a renamed column, a changed source schema, or a new value breaking accepted_values. If it's a dbt error, run dbt debug for connection or profile issues and dbt --debug run for the exact SQL sent. For test failures, use dbt test --store-failures to write the failing rows to a table and inspect them. The most common culprit is an upstream model or source schema change.",
+    "fj": "I'd re-run it and see if the error goes away.",
+    "fs": "I'd open target/compiled/ and run the compiled SQL manually in the warehouse to isolate whether it's a SQL error or a dbt error — then trace upstream.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "debug",
+        "lines": [
+          "# run compiled SQL in warehouse:",
+          "target/compiled/proj/models/x.sql",
+          "# write failing rows to a table:",
+          "dbt test --store-failures -s x",
+          "# exact SQL sent + conn check:",
+          "dbt --debug run -s x"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you choose between the dbt incremental strategies: merge, delete+insert, and insert_overwrite?",
+    "a": "merge upserts by comparing incoming rows to the target on unique_key — atomic and the best default under ~100M rows, but it scans the full target so it gets costly on byte-billed BigQuery. delete+insert deletes matching keys then inserts, avoiding the full MERGE scan and benchmarking faster on large Snowflake tables, at the cost of a brief non-atomic window. insert_overwrite atomically replaces whole partitions with no row comparison, dramatically cheaper for date-partitioned tables on BigQuery or Spark. Use append only for truly immutable event logs. Advanced tuning like incremental_predicates can limit the target scan to recent partitions for big cost reductions.",
+    "fj": "I always use merge — it handles duplicates.",
+    "fs": "Merge is the right default, but on BigQuery it scans the full target (byte billing) and on Snowflake it slows past 100M rows — I switch to insert_overwrite for partitioned BigQuery tables and delete+insert for large Snowflake tables.",
+    "level": "Mid",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "strategy",
+        "lines": [
+          "{{ config(",
+          "  materialized='incremental',",
+          "  unique_key='id',",
+          "  incremental_strategy='delete+insert',",
+          "  incremental_predicates=[",
+          "   \"DBT_INTERNAL_DEST.dt >= '2026-01-01'\"",
+          "  ]) }}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Snapshot vs incremental model — how do you decide which to use for slowly changing data?",
+    "a": "Use a snapshot when you need SCD Type 2 with minimal setup, the table is small-to-medium, your run cadence matches the change frequency, and the built-in validity columns meet downstream needs. Use a custom incremental model when retention policies require custom logic, the source has complex multi-column change detection, performance at scale matters (snapshots do a full-table comparison every run), or you need sub-hourly tracking. The core trade-off is that snapshots are simple and declarative while custom SCD2 is more flexible but requires you to write and maintain the change-detection SQL. Both still depend on a reliable change-detection signal, whether a trustworthy updated_at or enumerated columns.",
+    "fj": "Always use snapshots for any historical tracking.",
+    "fs": "Snapshots are the right default, but they do a full comparison on every run. For very large tables or custom retention policies, a custom incremental SCD2 is more controllable.",
+    "level": "Mid",
+    "asked": 13
+  },
+  {
+    "q": "Compare merge, delete+insert, and insert_overwrite as dbt incremental strategies — when does each win and why?",
+    "a": "merge is a single atomic MERGE that upserts by unique_key — the correct default, but it scans the full target table, which is expensive past 100M rows and on byte-billed BigQuery. delete+insert deletes matching keys then inserts, avoiding the full-target scan and running 3-4x faster on Snowflake at 500M+ rows, with a brief non-atomic window risk. insert_overwrite atomically replaces partitions and is dramatically cheaper on partitioned BigQuery tables, but on Snowflake it replaces the entire table — a data-loss footgun, so use delete+insert there instead. Roughly: BigQuery favors insert_overwrite for partitioned facts and merge for dimensions; Snowflake uses merge under 100M and delete+insert at scale.",
+    "fj": "I use insert_overwrite on Snowflake for partitioned tables.",
+    "fs": "insert_overwrite on Snowflake replaces the entire table — that's a data-loss footgun. I use delete+insert on Snowflake and reserve insert_overwrite for BigQuery and Databricks.",
+    "level": "Sr",
+    "asked": 16
+  },
+  {
+    "q": "How do you architect an incremental dbt model to be both correct with late-arriving data and cost-efficient at scale?",
+    "a": "The naive WHERE updated_at > MAX(updated_at) watermark silently skips late-arriving records, so add a lookback window like updated_at >= MAX(updated_at) - INTERVAL 'N', sizing N from the observed late-arrival p99 plus a safety margin rather than guessing. Pair it with unique_key and merge so re-processed rows update idempotently instead of duplicating, and use incremental_predicates to limit the target-table scan to the same window so MERGE doesn't scan the full table. Because incremental state drifts over months from schema changes or corrected data, schedule periodic full-refreshes and run a full-refresh-vs-incremental reconciliation test in CI comparing row counts and checksums.",
+    "fj": "I filter WHERE updated_at > MAX(updated_at) and it's always correct.",
+    "fs": "That misses late-arriving data. I use a lookback window sized to the observed late-arrival p99, paired with unique_key for idempotent re-processing and incremental_predicates to limit target scan cost.",
+    "level": "Sr",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "dbt",
+        "accent": "bug",
+        "lines": [
+          "-- skips late-arriving rows",
+          "where updated_at >",
+          "  (select max(updated_at)",
+          "     from {{ this }})"
+        ]
+      },
+      {
+        "lang": "dbt",
+        "accent": "fix",
+        "lines": [
+          "-- lookback covers late data",
+          "where updated_at >=",
+          "  (select max(updated_at)",
+          "     from {{ this }})",
+          "  - interval '3 days'"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you manage a large dbt DAG (500+ models) across multiple teams without it becoming a maintenance nightmare?",
+    "a": "Split the project into domain-owned sub-projects using dbt Mesh and cross-project refs, where upstream teams expose public models via enforced contracts and downstream teams consume them without touching internals. Use GitHub CODEOWNERS to require the owning team's review on changes to their directories, and mark cross-team interface models access: public with contracts so schema changes become versioned breaking changes instead of silent breakage. Tag models by domain and run frequency for operational selection, and monitor DAG health metrics like run times and test pass rates to catch regressions. Keep CI fast with dbt build --select state:modified+ so a single-file PR builds only a handful of models.",
+    "fj": "I'd just document which models not to change.",
+    "fs": "Documentation doesn't scale — I use CODEOWNERS for review gates, contracts for schema guarantees, and dbt Mesh for team ownership boundaries.",
+    "level": "Sr",
+    "asked": 18
+  },
+  {
+    "q": "What are dbt model contracts and exposures, and how do you use them together for enterprise data governance?",
+    "a": "Contracts are a YAML declaration that enforces column names and types at build time — with contract: enforced: true dbt runs a preflight check before issuing any DDL and fails the build if the SELECT returns the wrong schema, making the model an API with a stable interface; breaking changes require a model version bump. Exposures are YAML declarations of downstream consumers like dashboards, ML models, and reverse-ETL jobs that depend on your models, surfacing them in the lineage graph for impact analysis. Together, contracts guarantee the schema a dashboard depends on while exposures document which dashboard depends on it, so a proposed schema change shows exactly which stakeholders are affected and you can run dbt build --select +exposure:name to test the full upstream chain.",
+    "fj": "Contracts are like schema tests.",
+    "fs": "Contracts validate model structure at build time (preflight, before DDL is issued). Tests validate data content post-build. Contracts fail the build if the schema is wrong; tests fail if the data has quality issues — different layers of the same quality story.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "schema.yml",
+        "lines": [
+          "models:",
+          "  - name: fct_orders",
+          "    config:",
+          "      contract:",
+          "        enforced: true",
+          "    columns:",
+          "      - name: order_id"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you use advanced macros to build platform-level abstractions in dbt — and where does macro complexity become a liability?",
+    "a": "Platform macros worth building include a generate_schema_name override for environment-aware schema routing, a get_column_values macro for compile-time dynamic pivots, a safe_divide expression, and a project-standard dedup CTE. Dynamic SQL via run_query() can query information_schema at compile time to generate UNIONs or pivots, but it adds compile latency and makes the compiled SQL non-deterministic, so test carefully. Complexity becomes a liability when a macro exceeds ~50 lines of Jinja, nests other macros 3+ levels deep, or requires reading compiled SQL to understand — at that point the team debugs Jinja instead of SQL. The rule of thumb: if you can't explain what a macro generates in one sentence, prefer explicit SQL with some repetition.",
+    "fj": "I write macros for any repeated SQL pattern.",
+    "fs": "I use macros for patterns appearing in 5+ models that are stable. Below that threshold, the Jinja debugging overhead exceeds the DRY benefit.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "env-aware schema",
+        "lines": [
+          "{% macro generate_schema_name(",
+          "    custom, node) %}",
+          "{% if target.name == 'prod' %}",
+          "  {{ custom or target.schema }}",
+          "{% else %}{{ target.schema }}",
+          "{% endif %}{% endmacro %}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "A critical dbt fact table has drifted between its incremental and full-refresh versions. How do you diagnose, fix, and prevent it?",
+    "a": "Diagnose by materializing the model with --full-refresh into a parallel schema and comparing row counts, per-column NULL counts, and aggregate checksums against the incremental version via a reconciliation model joined on the primary key. Common root causes are schema changes applied with on_schema_change: append_new_columns leaving historical NULLs, upstream-corrected rows outside the lookback window, or a fixed is_incremental() filter bug leaving old-logic rows. Fix by running a full-refresh during low traffic using a CTAS-and-swap pattern to minimize downtime and coordinate with consumers. Prevent recurrence with a CI reconciliation gate (row-count delta and checksum match), a scheduled periodic full-refresh, and on_schema_change: fail so drift is loud rather than silent.",
+    "fj": "I'd just run --full-refresh.",
+    "fs": "I'd first diagnose the drift root cause (schema change, missing late data, filter bug), fix it, run full-refresh with a CTAS+swap pattern for minimal downtime, and add a CI reconciliation check to prevent recurrence.",
+    "level": "Sr",
+    "asked": 15
+  },
+  {
+    "q": "How do you evaluate whether to build a new dbt model or add logic to an existing one?",
+    "a": "Add to the existing model when the new logic serves the same grain, consumers, and refresh cadence, avoiding needless DAG complexity. Create a new model when the logic requires a different grain, has different consumers or SLAs, is complex enough to deserve independent testing, or would make the existing model unmaintainable — a SQL file over ~200 lines or with several CTEs doing fundamentally different things is a split signal. Weigh the cost: every model is another warehouse object, DAG node, and unit to test and monitor, so proliferation is its own burden at 500 models. And never violate the layering contract by putting mart-level business logic in staging or source-casting in a mart.",
+    "fj": "I always split models to keep them small.",
+    "fs": "Splitting has a cost — every model is a DAG node, a relation, and a CI build step. I split when the logic is independently testable, serves different consumers, or would make the parent model unmaintainable.",
+    "level": "Sr",
+    "asked": 12
+  },
+  {
+    "q": "dbt snapshots vs custom incremental SCD2 model — when does the complexity of a custom approach pay off?",
+    "a": "dbt snapshots give built-in SCD2 with minimal SQL, auto-managed validity columns, timestamp or check detection strategies, and hard-delete opt-in — right for tables under tens of millions of rows with daily-or-slower change and no custom retention needs. Custom incremental SCD2 means hand-written change detection and manual validity columns, but gives full control. Custom wins for regulatory retention requiring pruning, very large tables where snapshot's full-table comparison every run is too costly, non-standard SCD types, or sub-daily CDC tracking. The right path is to start with snapshots and migrate to custom only when you hit a concrete scale, retention, or semantics limitation.",
+    "fj": "I always use snapshots — they're built in so why write custom code?",
+    "fs": "Snapshots are right for most cases. I switch to custom SCD2 when the table is too large for full comparison, when retention policy requires pruning, or when the SCD type is non-standard.",
+    "level": "Sr",
+    "asked": 11
+  },
+  {
+    "q": "What is an exposure in dbt and what problem does it solve that tests and refs don't?",
+    "a": "An exposure is a YAML node declaring a downstream consumer of your models — a dashboard, ml model, application, notebook, or analysis — with its type, owner name and email, optional url, maturity (high/medium/low), and a depends_on list of the refs and sources it reads. It extends the lineage graph past the warehouse edge so dbt docs shows which BI tile or ML feature breaks if you change a model, and lets you run dbt build -s +exposure:weekly_report to build and test everything that dashboard depends on. ref() and tests stop at the warehouse boundary; exposures are how you answer 'what breaks downstream' before you ship a schema change.",
+    "fj": "An exposure is just documentation for a model.",
+    "fs": "Exposures extend lineage past the warehouse edge so I can run +exposure:name to test the full upstream chain a dashboard depends on, and do impact analysis before a schema change.",
+    "level": "Jr",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "exposures.yml",
+        "lines": [
+          "exposures:",
+          "  - name: weekly_report",
+          "    type: dashboard",
+          "    maturity: high",
+          "    url: https://bi/dash/12",
+          "    owner:",
+          "      name: Data Team",
+          "      email: data@co.com",
+          "    depends_on:",
+          "      - ref('fct_orders')"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Your incremental model added a new column upstream but it isn't appearing in the target table. What's happening and how do you control it?",
+    "a": "Incremental models default to on_schema_change: ignore, so a new column in your SELECT is silently dropped from the existing table and never appears; conversely removing a column makes the run fail. Set append_new_columns to add new columns (existing rows get NULL — it does not backfill), or sync_all_columns to add new columns, drop missing ones, and apply type changes. Use fail when silent drift would hurt more than a broken pipeline, so a schema mismatch stops the run loudly. None of these backfill historical rows, so a new column needs a one-time --full-refresh if you require values for old data.",
+    "fj": "New columns appear automatically when I add them to the SELECT.",
+    "fs": "Default is on_schema_change: ignore, which silently drops the new column. I set append_new_columns or sync_all_columns — and remember none of them backfill old rows, so a new column needs a --full-refresh for history.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "schema evolution",
+        "lines": [
+          "{{ config(",
+          "  materialized='incremental',",
+          "  unique_key='id',",
+          "  on_schema_change=",
+          "    'append_new_columns'",
+          "  -- 'sync_all_columns' | 'fail'",
+          "  -- default: 'ignore' (drops col)",
+          ") }}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do dbt model contract constraints actually behave across warehouses — is not_null or primary_key really enforced?",
+    "a": "Contracts always enforce column names and data types at build time via a preflight check before DDL, but constraint enforcement varies. not_null and check are platform-enforced only after the model is built (they fire on insert), so dbt classifies them as definable-but-not-part-of-the-contract preflight. primary_key, unique, and foreign_key are typically metadata-only: Snowflake records them but does not validate them unless you add rely for the optimizer, and Databricks primary_key requires Unity Catalog. So treat type contracts as a hard build-time guarantee, but back uniqueness and referential integrity with dbt tests (unique, relationships) rather than trusting warehouse constraints to reject bad rows.",
+    "fj": "If I declare primary_key in the contract, dbt rejects duplicate rows.",
+    "fs": "Contracts hard-enforce names and types at build time, but on Snowflake/BigQuery primary_key and unique are metadata-only — they don't reject duplicates. I still rely on dbt's unique and relationships tests for integrity.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "constraints",
+        "lines": [
+          "columns:",
+          "  - name: order_id",
+          "    data_type: int",
+          "    constraints:",
+          "      - type: not_null",
+          "      - type: primary_key",
+          "    # PK metadata-only on SF/BQ;",
+          "    # add a unique TEST too"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "In dbt, how do you handle hard deletes from a source in a snapshot, and what's the difference between the strategies?",
+    "a": "By default a snapshot only tracks inserts and updates, so a row deleted at the source keeps its last version open with dbt_valid_to = NULL forever — it looks permanently current, which is wrong. In dbt Core 1.9+ the hard_deletes config replaces the legacy invalidate_hard_deletes flag: hard_deletes: invalidate closes the deleted row by stamping dbt_valid_to with the run time, while hard_deletes: new_record inserts a fresh row flagged dbt_is_deleted = true so history stays gap-free and the deletion is an explicit event. Choose invalidate when you just need the record marked no-longer-current, and new_record when downstream auditing needs the deletion itself as a tracked state.",
+    "fj": "Snapshots automatically track deletes.",
+    "fs": "By default deletes leave the row open as if still current. I set hard_deletes: invalidate (closes dbt_valid_to) or new_record (adds a dbt_is_deleted row) — the 1.9+ replacement for invalidate_hard_deletes.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "dbt",
+        "label": "snapshot deletes",
+        "lines": [
+          "snapshots:",
+          "  - name: orders_snapshot",
+          "    config:",
+          "      strategy: timestamp",
+          "      unique_key: id",
+          "      updated_at: updated_at",
+          "      hard_deletes: new_record",
+          "      # or: invalidate"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What exactly does an ephemeral materialization do to the compiled SQL, and what are its limits?",
+    "a": "An ephemeral model is never built as a database object; instead dbt interpolates its SELECT as a common table expression into every downstream model that ref()s it. This keeps the warehouse free of clutter for thin, reusable transformations and avoids an extra read. But because there is no relation, you cannot select or query an ephemeral model directly, it produces no target object to inspect, and you cannot run tests against it standalone. Nesting many ephemeral models inflates the compiled SQL into a deep stack of CTEs that is hard to debug, so reserve ephemeral for light, shared logic and promote it to a view once you need to inspect or test it.",
+    "fj": "Ephemeral models are just a faster kind of table.",
+    "fs": "Ephemeral builds no object at all, it is inlined as a CTE into downstream models, so you cannot query or test it directly, and deep nesting makes the compiled SQL hard to debug.",
+    "level": "Jr",
+    "asked": 9,
+    "code": [
+      {
+        "label": "inlined as CTE",
+        "lang": "ts",
+        "lines": [
+          "{{ config(",
+          "  materialized='ephemeral') }}",
+          "select id, lower(email) as email",
+          "from {{ source('app','users') }}",
+          "-- downstream ref() pulls this in",
+          "-- as a CTE, no table created"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "dbt supports a materialized_view materialization on some adapters. How is it different from materialized='table' on a schedule?",
+    "a": "With materialized='materialized_view' dbt issues CREATE MATERIALIZED VIEW and on later runs applies configuration changes rather than rebuilding, delegating data refresh to the warehouse's own background maintenance instead of dbt run. A table on a schedule is fully recomputed each time dbt runs it, so freshness is bounded by your dbt cadence and you pay full recompute every run. The materialized view keeps itself current between dbt runs at the warehouse layer, which is cheaper for incremental upkeep but constrained by each adapter's MV limits, such as single-base-table or restricted SQL on some platforms. Use on_configuration_change to control whether dbt applies, skips, or fails on config drift.",
+    "fj": "A dbt materialized_view is the same as a table, dbt just rebuilds it each run.",
+    "fs": "materialized_view delegates refresh to the warehouse's background maintenance, so it stays current between dbt runs, unlike a table that I fully recompute every dbt run. It is bound by each adapter's MV restrictions.",
+    "level": "Mid",
+    "asked": 8,
+    "code": [
+      {
+        "label": "config",
+        "lang": "ts",
+        "lines": [
+          "{{ config(",
+          "  materialized='materialized_view',",
+          "  on_configuration_change='apply'",
+          "  -- 'continue' | 'fail'",
+          ") }}",
+          "-- warehouse maintains freshness,",
+          "-- not dbt run"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are dbt unit tests (1.8+) and how do they differ from data tests?",
+    "a": "Unit tests, GA in dbt 1.8, validate a model's transformation logic against small, static, hand-supplied inputs before any real data is materialized, so you assert that given these mock rows the SELECT produces these expected rows. Data tests (unique, not_null, singular SQL) instead run against already-built tables and check the quality of real data after the fact. You define unit tests in YAML with a given block of mock inputs per ref or source and an expect block of expected output, in dict, csv, or sql format, and run them with dbt test --select test_type:unit. They are ideal for pinning down tricky logic like a CASE expression, a regex, or date math, catching logic regressions in CI without warehouse data.",
+    "fj": "Unit tests are just the unique and not_null tests I put in YAML.",
+    "fs": "Those are data tests, they run on real built tables. Unit tests (1.8+) feed mock given rows into a model and assert the expected output, validating transformation logic before materializing anything.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "label": "unit test",
+        "lang": "ts",
+        "lines": [
+          "unit_tests:",
+          "  - name: test_is_adult",
+          "    model: dim_customers",
+          "    given:",
+          "      - input: ref('stg_cust')",
+          "        rows: [{age: 18},{age: 17}]",
+          "    expect:",
+          "      rows: [{adult: 1},{adult: 0}]"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does dbt source freshness work, and what do warn_after, error_after, and loaded_at_field do?",
+    "a": "A freshness block on a source declares how stale raw data may be before dbt complains. dbt source freshness queries the source table for the max value of loaded_at_field, compares it to now, and emits a warning past warn_after or a non-zero failure past error_after, each given as a count plus a period like hours or minutes. loaded_at_field is the timestamp column reflecting when a row landed; on warehouses that expose load metadata you can omit it and dbt uses warehouse metadata instead. Wire dbt source freshness into your scheduler so a stalled upstream loader is caught before you build models on stale data, rather than discovering it in a dashboard. If neither threshold is set, dbt skips freshness for that table.",
+    "fj": "Source freshness checks whether my dbt models ran recently.",
+    "fs": "It checks the raw source's loaded_at_field max against now, warning past warn_after and failing past error_after, so I catch a stalled upstream loader before building models on stale data.",
+    "level": "Mid",
+    "asked": 15,
+    "code": [
+      {
+        "label": "sources.yml",
+        "lang": "ts",
+        "lines": [
+          "sources:",
+          "  - name: app",
+          "    loaded_at_field: _loaded_at",
+          "    freshness:",
+          "      warn_after: {count: 12,",
+          "                   period: hour}",
+          "      error_after: {count: 24,",
+          "                    period: hour}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When do you write a singular test versus a custom generic test in dbt, and how do you tune severity?",
+    "a": "A singular test is a one-off .sql file in tests/ that returns failing rows for a single specific assertion, like a revenue reconciliation between two models, and is the fastest way to express bespoke logic that lives in exactly one place. A custom generic test is a parameterized test block (model and column arguments) stored in tests/generic/ that you then reuse by name across many models and columns in YAML, which is the right move once the same logic appears more than once. Both let you tune behavior with config: severity error or warn, plus error_if and warn_if thresholds like '>100' so a handful of stray rows only warns while a flood fails, and store_failures to persist failing rows for inspection.",
+    "fj": "I copy the same singular test SQL into a new file for every model that needs it.",
+    "fs": "Once an assertion repeats, I promote it to a custom generic test so I reference it by name across models, and I tune severity with error_if/warn_if thresholds instead of an all-or-nothing fail.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "label": "generic test",
+        "lang": "ts",
+        "lines": [
+          "{% test positive(model, column_name) %}",
+          "{{ config(severity='warn',",
+          "          error_if='>50') }}",
+          "select * from {{ model }}",
+          "where {{ column_name }} < 0",
+          "{% endtest %}",
+          "-- reuse: tests: [positive] in yml"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do dbt packages work, and how do you add one like dbt_utils?",
+    "a": "Packages let you import another dbt project's models, macros, and tests into yours. You declare them in packages.yml (or dependencies.yml) sourced from the dbt Hub by name and version, a git repo by url and revision, or a local path, then run dbt deps to install them under dbt_packages/, which is gitignored so you commit the lockfile not the source. dbt_utils is the canonical example, giving battle-tested macros like generate_surrogate_key, star, get_column_values, and union_relations plus generic tests, so you stop reinventing them. Always pin a version or revision rather than tracking a moving branch, so a package update never silently changes your compiled SQL, and re-run dbt deps after any change.",
+    "fj": "I copy useful macros from GitHub into my macros folder.",
+    "fs": "I add the package to packages.yml pinned to a version and run dbt deps, so it installs under dbt_packages and updates cleanly, rather than copy-pasting macros that then drift from upstream.",
+    "level": "Jr",
+    "asked": 14,
+    "code": [
+      {
+        "label": "packages.yml",
+        "lang": "ts",
+        "lines": [
+          "packages:",
+          "  - package: dbt-labs/dbt_utils",
+          "    version: 1.3.0",
+          "  - git: https://github.com/org/pkg.git",
+          "    revision: 0.4.1",
+          "# then: dbt deps"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do dbt model versions work, and how do ref() calls resolve to them?",
+    "a": "Model versions let one logical model expose several physical implementations so you can evolve a contracted interface without breaking consumers overnight. You declare versions in YAML (v1, v2, ...) with one marked latest_version; each version lives in a file named model_v1.sql, model_v2.sql by convention unless you override defined_in. An unpinned ref('my_model') resolves to latest_version, while ref('my_model', v=1) pins a specific version, so you ship v2 with a deprecation_date, let downstream teams migrate ref calls at their own pace, then retire v1. This is the controlled way to make a breaking schema change behind a contract, versus mutating a single model in place and breaking everyone at once.",
+    "fj": "To change a model's schema I just edit the model and tell people to update.",
+    "fs": "I add a new version (v2) alongside v1 with a deprecation_date, so unpinned ref() moves to latest while pinned ref(v=1) consumers migrate gradually, instead of breaking everyone in one shot.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "label": "versions",
+        "lang": "ts",
+        "lines": [
+          "models:",
+          "  - name: dim_customers",
+          "    latest_version: 2",
+          "    versions:",
+          "      - v: 1",
+          "        deprecation_date: 2026-09-01",
+          "      - v: 2  # dim_customers_v2.sql"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the dbt Semantic Layer with MetricFlow, and how do semantic models, measures, dimensions, and metrics fit together?",
+    "a": "The Semantic Layer lets you define metrics once as code so every BI tool, notebook, and app computes them identically, ending the spreadsheet-per-team drift. You write semantic models in YAML on top of dbt models, declaring entities (the join keys MetricFlow traverses), measures (aggregatable numeric columns like a sum of amount), and dimensions (the attributes you slice by, such as date or region). Metrics are then defined on top of measures (simple, ratio, cumulative, derived). MetricFlow compiles a query like revenue by region last quarter into SQL on the fly, picking the join path through entities, so analysts never hand-write the aggregation. The payoff is one governed definition of revenue rather than each dashboard rolling its own.",
+    "fj": "The semantic layer is just a folder of pre-aggregated summary tables.",
+    "fs": "It is metrics-as-code: semantic models declare entities, measures, and dimensions, and MetricFlow generates the SQL per query at runtime, so revenue is defined once and computed identically everywhere instead of per-dashboard.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "semantic model",
+        "lang": "ts",
+        "lines": [
+          "semantic_models:",
+          "  - name: orders",
+          "    entities: [{name: order_id,",
+          "                type: primary}]",
+          "    measures: [{name: revenue,",
+          "                agg: sum, expr: amount}]",
+          "    dimensions: [{name: ordered_at,",
+          "                  type: time}]"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "In dbt Mesh, what do the public, protected, and private access levels mean, and how do they govern cross-project ref?",
+    "a": "Access modifiers turn a model into a deliberate interface. private restricts a model to refs from within its own group, protected (the default) allows refs from anywhere in the same project or when installed as a package, and public marks a stable model as a cross-project interface other teams may consume. In dbt Mesh, a downstream project lists the upstream project in dependencies.yml and then uses a two-argument ref('upstream_project', 'model') to reach only the upstream's public models; attempting to ref a non-public model across projects errors. Pairing public with an enforced contract is what makes a cross-project edge safe, since the consuming team gets a guaranteed schema and the producing team can refactor internals freely.",
+    "fj": "Any model in another project can be ref'd as long as I import the project.",
+    "fs": "Only public models are reachable cross-project via a two-arg ref plus a dependencies.yml entry. private is group-only and protected is project/package-only, so access modifiers plus contracts define safe team boundaries.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "label": "access + xproj ref",
+        "lang": "ts",
+        "lines": [
+          "models:",
+          "  - name: fct_orders",
+          "    access: public  # cross-project",
+          "# downstream dependencies.yml:",
+          "#   projects: [{name: finance}]",
+          "# then in SQL:",
+          "#   {{ ref('finance','fct_orders') }}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain how dbt defer and state comparison combine to build Slim CI.",
+    "a": "Slim CI builds only what a PR changed instead of the whole DAG. dbt persists a manifest.json artifact from the last production run; --state points at it so state:modified+ selects models whose code differs from production plus everything downstream. --defer then tells dbt that any unselected upstream ref should resolve to the existing production relation rather than be rebuilt, so a single-file change builds that file alone against real prod parents. The result is dbt build --select state:modified+ --defer --state prod_artifacts, which keeps CI fast and cheap while still testing the changed models and their dependents. You can even point --state and --defer-state at different manifests if selection and resolution should use distinct baselines.",
+    "fj": "In CI I run dbt build with no selection so everything is tested fresh.",
+    "fs": "I run dbt build --select state:modified+ --defer --state prod_manifest, so only changed models and dependents build, and deferred upstream refs resolve to existing prod tables instead of rebuilding the whole DAG.",
+    "level": "Sr",
+    "asked": 19,
+    "code": [
+      {
+        "label": "slim CI",
+        "lang": "ts",
+        "lines": [
+          "dbt build \\",
+          "  --select state:modified+ \\",
+          "  --defer \\",
+          "  --state ./prod_artifacts",
+          "# changed+downstream only;",
+          "# upstream refs -> prod relations"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the append incremental strategy good for, and when does it silently corrupt data?",
+    "a": "append simply inserts the rows passing the is_incremental() filter with no key comparison, so it is the cheapest strategy and correct only for truly immutable, insert-only data such as an event or log stream where a given row is emitted exactly once. It corrupts data the moment a row can be re-sent, corrected, or reprocessed, because with no unique_key dedup every replay duplicates rows and aggregates silently double. It also has no defense against an overlapping watermark window: if your filter re-reads any already-loaded rows (for example a lookback), append will duplicate them where merge would have upserted. Use append only for append-only sources with exactly-once delivery; otherwise reach for merge or delete+insert.",
+    "fj": "append is fine, I just turn it on and it dedupes new rows for me.",
+    "fs": "append never dedupes, it has no key comparison. It is safe only for immutable exactly-once event streams. Any replay, correction, or overlapping watermark duplicates rows, so for mutable data I use merge.",
+    "level": "Mid",
+    "asked": 12,
+    "code": [
+      {
+        "label": "append risk",
+        "lang": "ts",
+        "lines": [
+          "{{ config(",
+          "  materialized='incremental',",
+          "  incremental_strategy='append') }}",
+          "-- no unique_key => replays",
+          "-- and lookbacks DUPLICATE rows;",
+          "-- only for exactly-once events"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do dbt groups and model ownership work, and why use them on a large project?",
+    "a": "A group is a named bundle of models under a single declared owner, defined once in YAML and then assigned to models via a group config. Groups are the unit that the private access level is scoped to, so a private model can only be ref'd by other models in the same group, letting a team hide internal building blocks while exposing a public interface. Each model belongs to at most one group and groups do not nest. On a large multi-team project, groups plus access modifiers encode ownership boundaries directly in the DAG: dbt docs shows who owns what, dbt can select by group for team-scoped runs, and an accidental cross-team ref into a private model fails at parse rather than leaking a dependency. They make the question who owns this model answerable from the project itself.",
+    "fj": "Ownership is just a comment or a row in our wiki.",
+    "fs": "I declare a group with an owner and tag models into it. Groups scope the private access level, so internal models stay team-only, ownership shows in docs, and I can select by group for team-scoped runs.",
+    "level": "Mid",
+    "asked": 9,
+    "code": [
+      {
+        "label": "group + owner",
+        "lang": "ts",
+        "lines": [
+          "groups:",
+          "  - name: finance",
+          "    owner: {name: Fin Team,",
+          "            email: fin@co.com}",
+          "models:",
+          "  - name: int_ledger",
+          "    config: {group: finance,",
+          "             access: private}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you make a dbt incremental model both idempotent and cheap to re-run on the same window?",
+    "a": "Idempotence means re-running the same window produces the same target, which requires a unique_key plus merge (or delete+insert) so reprocessed rows upsert in place instead of duplicating; without it a retry after a partial failure doubles rows. Cheapness on a wide target comes from incremental_predicates, which inject a filter on the destination side of the MERGE so the warehouse only scans and locks the recent partitions instead of the whole table, a large cost win on byte-billed or huge tables. Together they let you safely re-run a failed batch and bound its cost. For very large date-partitioned tables, insert_overwrite of just the affected partitions is the idempotent-and-cheap alternative, since rewriting a partition is naturally replay-safe.",
+    "fj": "If a run fails I just run it again, incremental handles it.",
+    "fs": "Only if it is idempotent: I need unique_key + merge so re-runs upsert instead of duplicate, and incremental_predicates to limit the target scan, or insert_overwrite to atomically replace just the affected partitions.",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "label": "idempotent + cheap",
+        "lang": "ts",
+        "lines": [
+          "{{ config(",
+          "  materialized='incremental',",
+          "  unique_key='id',",
+          "  incremental_strategy='merge',",
+          "  incremental_predicates=[",
+          "   \"DBT_INTERNAL_DEST.dt >= \"",
+          "   \"dateadd(day,-3,current_date)\"]) }}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does dbt build give you over running run, test, snapshot, and seed separately, and how does node ordering work?",
+    "a": "dbt build executes seeds, snapshots, models, and data tests as a single interleaved DAG run in topological order, rather than as four independent passes. The key behavior is per-node ordering: dbt runs a model, immediately runs its tests, and only proceeds to a downstream model if those tests pass, so a failing upstream test stops the bad data from propagating instead of building the whole graph and testing at the end. Separate dbt run then dbt test builds everything first, so downstream models are already materialized on bad data by the time tests fail. build also respects --select and state selection, so dbt build --select state:modified+ gives you a fail-fast, change-scoped CI run that run plus a later test pass cannot match.",
+    "fj": "dbt build is just a convenience alias for run plus test.",
+    "fs": "build interleaves seeds, snapshots, models, and tests in one DAG and runs each model's tests right after it, so a failing upstream test halts downstream builds. Separate run then test materializes everything on bad data first.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "label": "fail-fast order",
+        "lang": "ts",
+        "lines": [
+          "# build: model -> its tests ->",
+          "#   downstream only if tests pass",
+          "dbt build --select state:modified+",
+          "# vs run-all-then-test-all:",
+          "dbt run   # everything built first",
+          "dbt test  # fails AFTER bad data lands"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does Jinja templating drive a dbt model, and what is the difference between {{ }} and {% %}?",
+    "a": "Every .sql model is a Jinja template that dbt compiles to plain SQL before sending it to the warehouse, which is what makes ref(), source(), config(), and macros work. The {{ ... }} expression syntax evaluates and prints a value into the SQL, like {{ ref('orders') }} resolving to a table name, while {% ... %} statement syntax runs control flow such as if, for, and set without printing anything. So you loop with a {% for %} block but emit each column with {{ }} inside it, and gate code with {% if is_incremental() %}. You pass values in with var() and env_var(), and to see what actually ran you read target/compiled/, since the warehouse only ever sees the rendered SQL, never the Jinja.",
+    "fj": "dbt runs the Jinja and my SQL together at query time in the warehouse.",
+    "fs": "dbt compiles Jinja to plain SQL first; the warehouse only sees rendered SQL. {{ }} prints a value into the query, {% %} runs control flow like for/if without printing. I check target/compiled/ to see the result.",
+    "level": "Jr",
+    "asked": 12,
+    "code": [
+      {
+        "label": "for loop + if",
+        "lang": "ts",
+        "lines": [
+          "select",
+          "{% for c in ['paid','refunded'] %}",
+          "  sum(case when status='{{ c }}'",
+          "    then amt end) as {{ c }}_amt",
+          "  {%- if not loop.last %},{% endif %}",
+          "{% endfor %}",
+          "from {{ ref('orders') }}"
+        ]
+      }
+    ]
+  }
+]

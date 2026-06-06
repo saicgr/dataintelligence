@@ -1,0 +1,562 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
+
+import { track } from './analytics';
+import {
+  bankForTrack,
+  buildSessionDeck,
+  dailyPoolForRole,
+  deckCounts,
+  findCardById,
+  freshSessionCards,
+  lessonDeck,
+  roleDomain,
+  SessionCard,
+  trackBySlug,
+  weakSpotDeck,
+} from './content';
+import { basicsForRole } from './basics';
+import { buyProduct, type PurchaseResult, restoreAll } from './iap';
+import { BASE_PRODUCT_ID, PRO_PRODUCT_IDS, SUBSCRIPTION_IDS } from './products';
+import { setDailyReminder } from './reminders';
+import type { RoleKey } from './roles';
+import { CardState, Rating, schedule } from './srs';
+import {
+  DebriefInput,
+  insertDebrief,
+  listUserEntitlements,
+  pullFeedback,
+  pullProgress,
+  pushFeedback,
+  pushProgress,
+  pushStats,
+  writeEntitlement,
+} from './sync';
+
+export type Role = RoleKey;
+export type Mode = 'cram' | 'maintain';
+type SessionKind = 'daily' | 'track' | 'fresh' | 'weakspot' | 'lesson' | 'basics' | 'saved';
+
+/** Duolingo-style feedback events emitted by the store, consumed by the FeedbackBridge. */
+export type FeedbackKind = 'correct' | 'wrong' | 'complete' | 'streak' | 'levelUp';
+export interface FeedbackEvent {
+  kind: FeedbackKind;
+  at: number;
+}
+
+const DAY = 86_400_000;
+const dayKey = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+/** Free taste of the weekly "stay current" stream; the full stream is Pro (subscription). */
+const FREE_FRESH_PREVIEW = 3;
+
+/** SOLE writer of `owned`/`unlocked`. Never `set({ owned })` directly — route through here
+ *  so the derived `unlocked` gate (used in 11 places) can never go stale. */
+const withOwned = (owned: Record<string, boolean>) => ({
+  owned,
+  // Pro = any live entitlement: a Pro subscription OR the one-time lifetime unlock.
+  unlocked: PRO_PRODUCT_IDS.some((id) => !!owned[id]),
+});
+
+interface State {
+  // persisted
+  role: Role;
+  mode: Mode;
+  owned: Record<string, boolean>; // product id → owned
+  unlocked: boolean; // derived: owned[BASE_PRODUCT_ID]; never persisted
+  streak: number;
+  freezes: number;
+  xp: number;
+  lastActiveDay: string | null;
+  dailyGoal: number;
+  cardsToday: number; // = reviewedTodayIds.length (unique cards today)
+  reviewedTodayIds: string[];
+  goalDay: string | null;
+  playful: boolean;
+  onboarded: boolean; // first-run flow completed
+  reminders: boolean;
+  targetCompany: string;
+  interviewIn: number | null;
+  progress: Record<string, CardState>;
+  // Per-card reactions (persisted, local-first; synced to card_feedback when signed in).
+  // `feedback` and `savedIds` are independent — a card can be Saved AND Disliked at once.
+  feedback: Record<string, 'like' | 'dislike'>;
+  savedIds: string[];
+  // Duolingo feel — persisted toggles (default on, full energy)
+  sound: boolean;
+  haptics: boolean;
+  // Developer view: reveals all stages/questions unlocked. Only ever active when __DEV__
+  // (see `isDev`), so a production build can never expose it regardless of this flag.
+  devMode: boolean;
+
+  // auth (from Supabase session; not persisted here)
+  userId: string | null;
+
+  // transient feedback signal (NOT persisted) — consumed + cleared by the FeedbackBridge
+  lastEvent: FeedbackEvent | null;
+  levelUpTo: number | null;
+
+  // transient session
+  sessionKind: SessionKind;
+  trackSlug: string | null;
+  lessonIdx: number | null;
+  sessionDeck: SessionCard[];
+  sessionMeta: { due: number; fresh: number };
+  idx: number;
+  reveal: boolean;
+  lastChoice: number | null;
+  inSession: boolean; // playing a deck (vs browsing the Learn path)
+
+  // actions
+  setRole: (r: Role) => void;
+  setMode: (m: Mode) => void;
+  setInterview: (days: number | null, company?: string) => void;
+  setPlayful: (v: boolean) => void;
+  setSound: (v: boolean) => void;
+  setHaptics: (v: boolean) => void;
+  setDevMode: (v: boolean) => void;
+  emit: (kind: FeedbackKind) => void;
+  clearEvent: () => void;
+  clearLevelUp: () => void;
+  setReminders: (v: boolean) => void;
+  setDailyGoal: (n: number) => void;
+  applyHintCost: (n: number) => void;
+  startDaily: () => void;
+  startTrack: (slug: string) => void;
+  startFresh: () => void;
+  startSaved: () => void;
+  startWeakspot: () => void;
+  startBasics: () => void;
+  startLesson: (slug: string, lessonIdx: number) => void;
+  exitTrack: () => void;
+  endSession: () => void;
+  completeOnboarding: (role: Role, mode: Mode) => void;
+  restartOnboarding: () => void;
+  rebuildSession: () => void;
+  doReveal: () => void;
+  choose: (i: number) => void;
+  rate: (r: Rating) => void;
+  toggleSave: (id: string) => void;
+  setFeedback: (id: string, v: 'like' | 'dislike') => void;
+  replay: () => void;
+  // backend-wired
+  setUserId: (id: string | null) => void;
+  hydrateFromCloud: () => Promise<void>;
+  purchase: (productId?: string) => Promise<PurchaseResult>;
+  restore: () => Promise<boolean>;
+  submitDebrief: (d: DebriefInput) => Promise<void>;
+}
+
+type DeckInputs = Pick<
+  State,
+  'sessionKind' | 'trackSlug' | 'lessonIdx' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
+>;
+
+/** Ids the user disliked — buildSessionDeck pushes these to the back so they surface less (never hidden). */
+const dislikedSet = (feedback: Record<string, 'like' | 'dislike'>): Set<string> =>
+  new Set(Object.keys(feedback).filter((id) => feedback[id] === 'dislike'));
+
+function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; fresh: number } } {
+  const now = Date.now();
+  // Dev mode lifts the same gates Pro does (unlimited decks, smart scheduling), but only in dev builds.
+  const unlockAll = s.unlocked || (__DEV__ && s.devMode);
+  const adaptive = unlockAll; // Pro "smart scheduling": weakest-first + unlimited
+  const down = dislikedSet(s.feedback);
+  let deck: SessionCard[];
+  if (s.sessionKind === 'weakspot') {
+    deck = weakSpotDeck(dailyPoolForRole(s.role, now), s.progress, now, unlockAll ? 30 : 10);
+    // Brand-new user has no weak cards yet → don't show an empty session; fall back to a normal one.
+    if (deck.length === 0) {
+      deck = buildSessionDeck(dailyPoolForRole(s.role, now), s.progress, now, unlockAll ? 40 : 15, adaptive, down);
+    }
+  } else if (s.sessionKind === 'lesson' && s.trackSlug && s.lessonIdx != null) {
+    deck = lessonDeck(s.trackSlug, s.lessonIdx);
+  } else if (s.sessionKind === 'track' && s.trackSlug) {
+    deck = buildSessionDeck(bankForTrack(s.trackSlug), s.progress, now, unlockAll ? Infinity : 50, adaptive, down);
+  } else if (s.sessionKind === 'fresh') {
+    // Pillar 2 "stay current" — the weekly fresh stream is the subscription's headline value.
+    // Free users still taste it (the daily fresh trickle + a short preview here so the screen
+    // never dead-ends); Pro unlocks the full stream. The home pill routes locked users to the
+    // paywall, so this cap is mainly a safety net for deep links / dev.
+    deck = freshSessionCards(now, roleDomain(s.role), unlockAll ? Infinity : FREE_FRESH_PREVIEW);
+  } else if (s.sessionKind === 'saved') {
+    // Resolve saved ids to live cards, skipping any that expired / were removed by OTA.
+    deck = s.savedIds.map((id) => findCardById(id)).filter((cd): cd is SessionCard => !!cd);
+  } else if (s.sessionKind === 'basics') {
+    deck = buildSessionDeck(basicsForRole(s.role), s.progress, now, Infinity, false, down);
+  } else {
+    deck = buildSessionDeck(dailyPoolForRole(s.role, now), s.progress, now, unlockAll ? 40 : 15, adaptive, down);
+  }
+  return { deck, meta: deckCounts(deck, s.progress, now) };
+}
+
+const initial = buildDeck({
+  sessionKind: 'daily',
+  trackSlug: null,
+  lessonIdx: null,
+  role: 'de',
+  unlocked: false,
+  devMode: false,
+  progress: {},
+  feedback: {},
+  savedIds: [],
+});
+
+export const useStore = create<State>()(
+  persist(
+    (set, get) => ({
+      role: 'de',
+      mode: 'maintain',
+      owned: {},
+      unlocked: false,
+      streak: 0,
+      freezes: 0,
+      xp: 0,
+      lastActiveDay: null,
+      dailyGoal: 10,
+      cardsToday: 0,
+      reviewedTodayIds: [],
+      goalDay: null,
+      playful: true,
+      sound: true,
+      haptics: true,
+      devMode: false,
+      onboarded: false,
+      reminders: true,
+      targetCompany: '',
+      interviewIn: null,
+      progress: {},
+      feedback: {},
+      savedIds: [],
+      userId: null,
+      lastEvent: null,
+      levelUpTo: null,
+
+      sessionKind: 'daily',
+      trackSlug: null,
+      lessonIdx: null,
+      sessionDeck: initial.deck,
+      sessionMeta: initial.meta,
+      idx: 0,
+      reveal: false,
+      lastChoice: null,
+      inSession: false,
+
+      rebuildSession: () => {
+        const { deck, meta } = buildDeck(get());
+        set({ sessionDeck: deck, sessionMeta: meta });
+      },
+
+      setRole: (role) => {
+        set({ role, idx: 0, reveal: false, lastChoice: null });
+        get().rebuildSession();
+      },
+      setMode: (mode) => set({ mode }),
+      setInterview: (days, company) =>
+        set((s) => ({
+          interviewIn: days,
+          targetCompany: company ?? s.targetCompany,
+          mode: days != null && days <= 14 ? 'cram' : s.mode,
+        })),
+      setPlayful: (playful) => set({ playful }),
+      setSound: (sound) => set({ sound }),
+      setHaptics: (haptics) => set({ haptics }),
+      setDevMode: (devMode) => set({ devMode }),
+      emit: (kind) => set({ lastEvent: { kind, at: Date.now() } }),
+      clearEvent: () => set({ lastEvent: null }),
+      clearLevelUp: () => set({ levelUpTo: null }),
+      setReminders: (reminders) => {
+        set({ reminders });
+        void setDailyReminder(reminders);
+      },
+      setDailyGoal: (dailyGoal) => set({ dailyGoal }),
+      applyHintCost: (n) => set((s) => ({ xp: Math.max(0, s.xp - n) })),
+
+      startDaily: () => {
+        track('session_started', { kind: 'daily' });
+        set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startTrack: (slug) => {
+        track('session_started', { kind: 'track', track: slug });
+        set({ sessionKind: 'track', trackSlug: slug, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startFresh: () => {
+        track('session_started', { kind: 'fresh' });
+        set({ sessionKind: 'fresh', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startSaved: () => {
+        track('session_started', { kind: 'saved' });
+        set({ sessionKind: 'saved', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startWeakspot: () => {
+        track('session_started', { kind: 'weakspot' });
+        set({ sessionKind: 'weakspot', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startBasics: () => {
+        track('session_started', { kind: 'basics' });
+        set({ sessionKind: 'basics', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startLesson: (slug, lessonIdx) => {
+        track('session_started', { kind: 'lesson', track: slug, lesson: lessonIdx });
+        set({ sessionKind: 'lesson', trackSlug: slug, lessonIdx, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      exitTrack: () => {
+        set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null });
+        get().rebuildSession();
+      },
+      endSession: () => {
+        set({ inSession: false, sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null });
+        get().rebuildSession();
+      },
+      completeOnboarding: (role, mode) => {
+        track('onboarded', { role, mode });
+        set({ role, mode, onboarded: true, idx: 0, reveal: false, lastChoice: null });
+        get().rebuildSession();
+      },
+      // Dev affordance: re-show the first-run flow (the (tabs) layout redirects to /onboarding when false).
+      restartOnboarding: () => set({ onboarded: false }),
+
+      doReveal: () => set({ reveal: true }),
+      choose: (i) => set({ reveal: true, lastChoice: i }),
+
+      rate: (r) => {
+        const st = get();
+        const deck = st.sessionDeck;
+        const card = deck[st.idx];
+        const now = Date.now();
+        const today = dayKey(now);
+        const progress = { ...st.progress };
+        if (card) progress[card.id] = schedule(progress[card.id], r, now);
+        const nextIdx = st.idx + 1;
+        const xp = st.xp + (r === 'again' ? 5 : 10);
+
+        // daily goal = UNIQUE cards reviewed today (re-rating the same card doesn't double-count)
+        let reviewedTodayIds = st.goalDay === today ? st.reviewedTodayIds : [];
+        if (card && !reviewedTodayIds.includes(card.id)) reviewedTodayIds = [...reviewedTodayIds, card.id];
+        const cardsToday = reviewedTodayIds.length;
+        const goalDay = today;
+
+        // streak + freezes, settled once per completed-session-day
+        let streak = st.streak;
+        let freezes = st.freezes;
+        let lastActiveDay = st.lastActiveDay;
+        const done = nextIdx >= deck.length;
+        if (done && lastActiveDay !== today) {
+          if (lastActiveDay === dayKey(now - DAY)) {
+            streak += 1;
+          } else if (freezes > 0) {
+            freezes -= 1; // a freeze forgives the gap
+            streak += 1;
+          } else {
+            streak = 1;
+          }
+          lastActiveDay = today;
+          if (streak % 5 === 0) freezes = Math.min(2, freezes + 1); // earn a freeze every 5 days
+        }
+
+        set({
+          progress,
+          idx: nextIdx,
+          reveal: false,
+          lastChoice: null,
+          xp,
+          streak,
+          freezes,
+          lastActiveDay,
+          cardsToday,
+          reviewedTodayIds,
+          goalDay,
+          sessionMeta: deckCounts(deck, progress, now),
+        });
+
+        // Duolingo feedback events → FeedbackBridge plays sound/haptic + level-up overlay.
+        const streakBumped = done && streak > st.streak;
+        if (streakBumped) get().emit('streak');
+        else if (done) get().emit('complete');
+        if (level(xp) > level(st.xp)) {
+          set({ levelUpTo: level(xp) });
+          get().emit('levelUp');
+        }
+
+        if (st.userId) {
+          void pushProgress(st.userId, progress);
+          void pushStats(st.userId, streak, xp);
+        }
+        if (done) track('session_completed', { kind: st.sessionKind, count: deck.length });
+      },
+
+      toggleSave: (id) => {
+        const st = get();
+        const has = st.savedIds.includes(id);
+        const savedIds = has ? st.savedIds.filter((x) => x !== id) : [...st.savedIds, id];
+        set({ savedIds });
+        track('card_saved', { saved: !has });
+        if (st.userId) void pushFeedback(st.userId, id, !has, st.feedback[id] ?? null);
+      },
+      setFeedback: (id, v) => {
+        const st = get();
+        const feedback = { ...st.feedback };
+        if (feedback[id] === v) delete feedback[id]; // tapping the active reaction clears it
+        else feedback[id] = v;
+        set({ feedback });
+        track('card_feedback', { value: feedback[id] ?? 'clear' });
+        // Deprioritization takes effect on the NEXT session build — never reorder the deck mid-session
+        // (it would desync the current idx). SRS schedule is untouched here.
+        if (st.userId) void pushFeedback(st.userId, id, st.savedIds.includes(id), feedback[id] ?? null);
+      },
+
+      replay: () => {
+        set({ idx: 0, reveal: false, lastChoice: null });
+        get().rebuildSession();
+      },
+
+      setUserId: (userId) => set({ userId }),
+
+      hydrateFromCloud: async () => {
+        const uid = get().userId;
+        if (!uid) return;
+        const remote = await pullProgress(uid);
+        set((s) => ({ progress: { ...remote, ...s.progress } }));
+        // Reactions: remote as base, local wins on conflict (mirrors progress); savedIds is a union.
+        const remoteFb = await pullFeedback(uid);
+        set((s) => ({
+          feedback: { ...remoteFb.feedback, ...s.feedback },
+          savedIds: [...new Set([...remoteFb.savedIds, ...s.savedIds])],
+        }));
+        // merge server-side entitlements so a signed-in user keeps Pro/packs cross-device
+        // Only sync PERMANENT entitlements from the server (lifetime, packs). A subscription's
+        // status is the store's to decide — never resurrect a cancelled sub from a stale row.
+        const serverIds = (await listUserEntitlements(uid)).filter((id) => !SUBSCRIPTION_IDS.includes(id));
+        if (serverIds.length) {
+          const owned = { ...get().owned };
+          for (const id of serverIds) owned[id] = true;
+          set(withOwned(owned));
+        }
+        get().rebuildSession();
+      },
+
+      purchase: async (productId = BASE_PRODUCT_ID) => {
+        const r = await buyProduct(productId);
+        if (r.ok || r.mock) {
+          set(withOwned({ ...get().owned, [r.productId]: true }));
+          track('purchase', { mock: Boolean(r.mock), productId: r.productId, platform: r.platform });
+          get().rebuildSession();
+          const uid = get().userId;
+          if (uid && r.ok) await writeEntitlement(uid, r.productId, r.platform, r.receipt);
+        }
+        return r;
+      },
+
+      restore: async () => {
+        // Authoritative reconcile (the "Restore purchases" path). storeIds is live store truth:
+        // one-time purchases + ACTIVE subscriptions only (a lapsed sub won't appear).
+        const storeIds = await restoreAll();
+        const uid = get().userId;
+        const serverIds = uid ? await listUserEntitlements(uid) : [];
+        const subSet = new Set(SUBSCRIPTION_IDS);
+        const owned = { ...get().owned };
+        // Permanent entitlements (lifetime, packs) are additive from either source.
+        for (const id of [...storeIds, ...serverIds]) if (!subSet.has(id)) owned[id] = true;
+        // Subscriptions reflect LIVE store state only — revoke a lapsed sub even if a stale
+        // entitlements row still names it (the table never expires; the store is the truth).
+        for (const subId of SUBSCRIPTION_IDS) owned[subId] = storeIds.includes(subId);
+        set(withOwned(owned));
+        get().rebuildSession();
+        return PRO_PRODUCT_IDS.some((id) => owned[id]) || Object.values(owned).some(Boolean);
+      },
+
+      submitDebrief: async (d) => {
+        track('debrief_submitted', { topics: d.topics.length, outcome: d.outcome });
+        set({ targetCompany: d.company });
+        const uid = get().userId;
+        if (uid) await insertDebrief(uid, d);
+      },
+    }),
+    {
+      name: 'fieldnotes-v1',
+      version: 5,
+      storage: createJSONStorage(() => AsyncStorage),
+      partialize: (s) => ({
+        role: s.role,
+        mode: s.mode,
+        owned: s.owned,
+        streak: s.streak,
+        freezes: s.freezes,
+        xp: s.xp,
+        lastActiveDay: s.lastActiveDay,
+        dailyGoal: s.dailyGoal,
+        cardsToday: s.cardsToday,
+        reviewedTodayIds: s.reviewedTodayIds,
+        goalDay: s.goalDay,
+        playful: s.playful,
+        sound: s.sound,
+        haptics: s.haptics,
+        devMode: s.devMode,
+        onboarded: s.onboarded,
+        reminders: s.reminders,
+        targetCompany: s.targetCompany,
+        interviewIn: s.interviewIn,
+        progress: s.progress,
+        feedback: s.feedback,
+        savedIds: s.savedIds,
+      }),
+      // v1 stored a boolean `unlocked`; map it to owned[BASE] so Pro users aren't downgraded.
+      // v3 moved from the 3-value Role to the RoleKey catalog + added sound/haptics.
+      migrate: (persisted: unknown, from: number) => {
+        const p = (persisted ?? {}) as Record<string, unknown>;
+        if (from < 2) {
+          p.owned = p.unlocked ? { [BASE_PRODUCT_ID]: true } : {};
+          delete p.unlocked;
+          if (!Array.isArray(p.reviewedTodayIds)) p.reviewedTodayIds = [];
+        }
+        if (from < 3) {
+          const roleMap: Record<string, string> = { 'AI Engineer': 'ai', 'Data Engineer': 'de', Both: 'all' };
+          p.role = roleMap[p.role as string] ?? 'de';
+          if (typeof p.sound !== 'boolean') p.sound = true;
+          if (typeof p.haptics !== 'boolean') p.haptics = true;
+          if (typeof p.playful !== 'boolean') p.playful = true;
+        }
+        if (from < 4) {
+          // v4 added per-card reactions; init empty so existing users keep everything else.
+          if (typeof p.feedback !== 'object' || p.feedback === null) p.feedback = {};
+          if (!Array.isArray(p.savedIds)) p.savedIds = [];
+        }
+        if (from < 5) {
+          // v5 added the developer view toggle; default off.
+          if (typeof p.devMode !== 'boolean') p.devMode = false;
+        }
+        return p;
+      },
+      onRehydrateStorage: () => (state) => {
+        if (!state) return;
+        state.unlocked = !!state.owned?.[BASE_PRODUCT_ID];
+        state.rebuildSession();
+      },
+    }
+  )
+);
+
+/** The deck currently in play. */
+export function activeDeck(s: State): SessionCard[] {
+  return s.sessionDeck;
+}
+
+export function useActiveDeck(): SessionCard[] {
+  return useStore(activeDeck);
+}
+
+export const isPro = (s: State) => s.unlocked;
+/** Developer view is active only in dev builds — `__DEV__` guards it so production users never see it. */
+export const isDev = (s: State) => __DEV__ && s.devMode;
+export const ownsPack = (packId: string) => (s: State) => !!s.owned[packId];
+export const level = (xp: number) => Math.floor(xp / 1000) + 1;
+export const xpInLevel = (xp: number) => xp % 1000;
+export const trackName = (slug: string | null) => (slug ? trackBySlug(slug)?.name ?? slug : '');
