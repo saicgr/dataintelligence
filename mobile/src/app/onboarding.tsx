@@ -261,7 +261,7 @@ function Frustration({ c }: { c: C }) {
 
       {/* The freeze moment, visualized as a mock exchange */}
       <View style={{ gap: 9 }}>
-        <Bubble c={c} who="Interviewer" tint={c.navy} fg="#fff" text="“This join returns 2× the rows — why? And don't just say DISTINCT.”" align="left" />
+        <Bubble c={c} who="Interviewer" tint={c.navy} fg="#fff" text="“This join returns 2× the rows — what's going on?”" align="left" />
         <Bubble c={c} who="You" tint={c.card} fg={c.muted} text="“…uh… add DISTINCT?”  😬" align="right" border />
       </View>
 
