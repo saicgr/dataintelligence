@@ -7,7 +7,8 @@ import { Rating } from '../lib/srs';
 import { radius, useTheme } from '../lib/theme';
 import { CodeBlock } from './CodeBlock';
 import { MetricTable } from './MetricTable';
-import { Btn, Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { ResultFooter } from './ResultFooter';
 
 /**
  * `classify` — read an artifact (model output / prompt + context) and tap one label.
@@ -98,7 +99,7 @@ export function ClassifyView({ card }: { card: SessionCard }) {
             {cl.why}
           </T>
           <RedFlag fj={card.fj} fs={card.fs} />
-          <Btn label="Continue →" variant="green" style={{ marginTop: 13 }} onPress={() => rate(rating)} />
+          <ResultFooter ok={rating !== 'again'} continueLabel="Continue →" onContinue={() => rate(rating)} />
         </View>
       ) : null}
     </Card>

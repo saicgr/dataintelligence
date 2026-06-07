@@ -127,7 +127,7 @@ export function RoleSelect({ value, onChange }: { value: string; onChange: (key:
                       <T weight={on ? '800' : '700'} size={13.5}>
                         {r.name}
                         {r.tag ? (
-                          <T size={9} weight="900" color={c.accent}>
+                          <T size={9} weight="900" color={c.accentInk}>
                             {'  '}
                             {r.tag === 'rising' ? '↑ RISING' : 'NEW'}
                           </T>

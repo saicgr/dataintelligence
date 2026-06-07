@@ -115,7 +115,7 @@ export default function Paywall() {
 
       <View
         style={{ backgroundColor: scheme === 'dark' ? 'rgba(255,212,59,.08)' : '#fdf2dd', borderRadius: radius.md, padding: 9 }}>
-        <T weight="800" size={12} color={c.accent} style={{ textAlign: 'center' }}>{urgent}</T>
+        <T weight="800" size={12} color={c.warn} style={{ textAlign: 'center' }}>{urgent}</T>
       </View>
 
       {/* Plan picker */}
@@ -152,6 +152,13 @@ export default function Paywall() {
           router.back();
         }}
       />
+      <Row style={{ gap: 6, justifyContent: 'center', marginTop: 2 }}>
+        <T size={12}>🔓</T>
+        <T muted size={11.5} weight="700" style={{ textAlign: 'center', lineHeight: 16 }}>
+          No surprises — your exact renewal date shows before you&apos;re charged · cancel anytime ·
+          prefer no renewals? Lifetime is one-and-done.
+        </T>
+      </Row>
 
       <H2>Free vs Pro</H2>
       <View>
@@ -253,7 +260,7 @@ function PlanCard({
 
 function Cell({ v, pro }: { v: string; pro?: boolean }) {
   const { c } = useTheme();
-  const color = v === '✓' ? c.success : v === '—' ? c.muted : pro ? c.fg : c.accent;
+  const color = v === '✓' ? c.success : v === '—' ? c.muted : pro ? c.fg : c.accentInk;
   return (
     <T weight="800" size={12.5} color={color} style={{ width: 64, textAlign: 'center' }}>
       {v}

@@ -63,6 +63,10 @@ export default function RootLayout() {
           <Stack.Screen name="debrief" options={{ presentation: 'modal' }} />
           <Stack.Screen name="share" options={{ presentation: 'modal' }} />
           <Stack.Screen name="jd" options={{ presentation: 'modal' }} />
+          <Stack.Screen name="league" options={{ presentation: 'modal' }} />
+          <Stack.Screen name="mock" options={{ presentation: 'modal' }} />
+          <Stack.Screen name="checkpoint" options={{ presentation: 'modal' }} />
+          <Stack.Screen name="audio-session" />
         </Stack>
         <StatusBar style="auto" />
       </ThemeProvider>

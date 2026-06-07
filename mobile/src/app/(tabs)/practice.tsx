@@ -11,7 +11,7 @@ import { Card, H2, Row, Screen, T } from '../../ui/kit';
 
 export default function Practice() {
   const router = useRouter();
-  const { c, track } = useTheme();
+  const { c } = useTheme();
   const role = useStore((s) => s.role);
   const startTrack = useStore((s) => s.startTrack);
   const startWeakspot = useStore((s) => s.startWeakspot);
@@ -79,6 +79,28 @@ export default function Practice() {
           sub="A random topic from your prep — quick off-schedule reps"
           cta="Go ▶"
           onPress={surprise}
+        />
+      </CardEnter>
+
+      {/* Free, fully automated — no human. Timed, scored, no peeking. */}
+      <CardEnter delay={60}>
+        <Mode
+          icon="⏱️"
+          title="Mock interview"
+          sub="Timed rapid-fire round — scored, no peeking"
+          cta="Start ▶"
+          onPress={() => router.push('/mock' as Href)}
+        />
+      </CardEnter>
+
+      {/* Free, hands-free — answer out loud on a walk/commute. */}
+      <CardEnter delay={80}>
+        <Mode
+          icon="🎧"
+          title="Commute mode"
+          sub="Hands-free: questions read aloud, answer out loud"
+          cta="Listen ▶"
+          onPress={() => router.push('/audio-session' as Href)}
         />
       </CardEnter>
 

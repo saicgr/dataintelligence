@@ -21,7 +21,13 @@ import { buyProduct, type PurchaseResult, restoreAll } from './iap';
 import { BASE_PRODUCT_ID, PRO_PRODUCT_IDS, SUBSCRIPTION_IDS } from './products';
 import { setDailyReminder } from './reminders';
 import type { RoleKey } from './roles';
-import { CardState, Rating, schedule } from './srs';
+import { CardState, initCard, Rating, schedule } from './srs';
+import type { AccentKey } from './theme';
+import { upsertWeeklyXp, weekKey } from './leagues';
+import { questMetricForSession } from './quests';
+import { touchFriendActivity } from './friends';
+import { scheduleStreakReminder } from './notifications';
+import { syncWidget } from './widget';
 import {
   DebriefInput,
   insertDebrief,
@@ -47,6 +53,26 @@ export interface FeedbackEvent {
 
 const DAY = 86_400_000;
 const dayKey = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+/** Production formats (do, not just recognize) earn more XP — reward the harder work (plan #21). */
+const PRODUCTION_KINDS = new Set(['scenario', 'diag', 'querybuild', 'match', 'evidence', 'order', 'classify']);
+const xpFor = (kind: string | undefined, rating: Rating): number => {
+  const prod = kind ? PRODUCTION_KINDS.has(kind) : false;
+  if (rating === 'again') return prod ? 8 : 5;
+  return prod ? 20 : 10; // good / easy
+};
+
+/** True if every calendar day skipped between `lastDay` and `today` was a scheduled rest day. */
+function restDaysCover(lastDay: string, today: string, restDays: number[]): boolean {
+  if (!restDays.length) return false;
+  const start = Date.parse(lastDay + 'T00:00:00Z');
+  const end = Date.parse(today + 'T00:00:00Z');
+  if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return false;
+  for (let t = start + DAY; t < end; t += DAY) {
+    if (!restDays.includes(new Date(t).getUTCDay())) return false;
+  }
+  return true;
+}
 
 /** Free taste of the weekly "stay current" stream; the full stream is Pro (subscription). */
 const FREE_FRESH_PREVIEW = 3;
@@ -86,6 +112,22 @@ interface State {
   // Duolingo feel — persisted toggles (default on, full energy)
   sound: boolean;
   haptics: boolean;
+  // Accent theme (Pro + account gated for non-default swatches; see resolveAccent in theme.ts)
+  accentKey: AccentKey;
+  // Scheduled rest days (UTC weekday 0=Sun..6=Sat) — skipped rest days don't break the streak.
+  restDays: number[];
+  // Weekly league XP (resets each ISO week) — feeds the leaderboard.
+  weeklyXp: number;
+  weeklyXpWeek: string | null;
+  // Daily quests — per-day counters for diag/fresh/lesson completions (other quests derive from cardsToday).
+  questDay: string | null;
+  questProgress: Partial<Record<'diag' | 'fresh' | 'lesson', number>>;
+  // Interview-date mode: the actual calendar date (interviewIn is a derived day-count for legacy consumers).
+  interviewDate: string | null;
+  // Last mock-interview score (0..100).
+  lastMockScore: number | null;
+  // Passed chapter checkpoints, keyed `${slug}:${chapterIdx}` (plan #25).
+  checkpointsDone: string[];
   // Developer view: reveals all stages/questions unlocked. Only ever active when __DEV__
   // (see `isDev`), so a production build can never expose it regardless of this flag.
   devMode: boolean;
@@ -115,6 +157,12 @@ interface State {
   setPlayful: (v: boolean) => void;
   setSound: (v: boolean) => void;
   setHaptics: (v: boolean) => void;
+  setAccent: (k: AccentKey) => void;
+  setRestDays: (days: number[]) => void;
+  setInterviewDate: (iso: string | null) => void;
+  bumpQuest: (metric: 'diag' | 'fresh' | 'lesson', n?: number) => void;
+  recordMock: (score: number, missedIds: string[]) => void;
+  completeCheckpoint: (key: string) => void;
   setDevMode: (v: boolean) => void;
   emit: (kind: FeedbackKind) => void;
   clearEvent: () => void;
@@ -221,6 +269,15 @@ export const useStore = create<State>()(
       playful: true,
       sound: true,
       haptics: true,
+      accentKey: 'classic',
+      restDays: [],
+      weeklyXp: 0,
+      weeklyXpWeek: null,
+      questDay: null,
+      questProgress: {},
+      interviewDate: null,
+      lastMockScore: null,
+      checkpointsDone: [],
       devMode: false,
       onboarded: false,
       reminders: true,
@@ -262,6 +319,29 @@ export const useStore = create<State>()(
       setPlayful: (playful) => set({ playful }),
       setSound: (sound) => set({ sound }),
       setHaptics: (haptics) => set({ haptics }),
+      setAccent: (accentKey) => set({ accentKey }),
+      setRestDays: (restDays) => set({ restDays }),
+      setInterviewDate: (interviewDate) => set({ interviewDate }),
+      bumpQuest: (metric, n = 1) => {
+        const st = get();
+        const today = dayKey(Date.now());
+        const base = st.questDay === today ? st.questProgress : {};
+        set({ questDay: today, questProgress: { ...base, [metric]: (base[metric] ?? 0) + n } });
+      },
+      recordMock: (score, missedIds) => {
+        const st = get();
+        const now = Date.now();
+        const progress = { ...st.progress };
+        // Push missed cards toward weak-spot by registering a lapse + making them due now.
+        for (const id of missedIds) progress[id] = schedule(progress[id] ?? initCard(), 'again', now);
+        set({ lastMockScore: score, progress });
+        if (st.userId) void pushProgress(st.userId, progress);
+      },
+      completeCheckpoint: (key) => {
+        const st = get();
+        if (st.checkpointsDone.includes(key)) return;
+        set({ checkpointsDone: [...st.checkpointsDone, key], xp: st.xp + 50 });
+      },
       setDevMode: (devMode) => set({ devMode }),
       emit: (kind) => set({ lastEvent: { kind, at: Date.now() } }),
       clearEvent: () => set({ lastEvent: null }),
@@ -336,7 +416,11 @@ export const useStore = create<State>()(
         const progress = { ...st.progress };
         if (card) progress[card.id] = schedule(progress[card.id], r, now);
         const nextIdx = st.idx + 1;
-        const xp = st.xp + (r === 'again' ? 5 : 10);
+        const gain = xpFor(card?.kind, r);
+        const xp = st.xp + gain;
+        // Weekly league XP (resets each ISO week).
+        const wk = weekKey(now);
+        const weeklyXp = (st.weeklyXpWeek === wk ? st.weeklyXp : 0) + gain;
 
         // daily goal = UNIQUE cards reviewed today (re-rating the same card doesn't double-count)
         let reviewedTodayIds = st.goalDay === today ? st.reviewedTodayIds : [];
@@ -352,6 +436,8 @@ export const useStore = create<State>()(
         if (done && lastActiveDay !== today) {
           if (lastActiveDay === dayKey(now - DAY)) {
             streak += 1;
+          } else if (lastActiveDay && restDaysCover(lastActiveDay, today, st.restDays)) {
+            streak += 1; // only scheduled rest days were skipped — streak stays intact
           } else if (freezes > 0) {
             freezes -= 1; // a freeze forgives the gap
             streak += 1;
@@ -368,6 +454,8 @@ export const useStore = create<State>()(
           reveal: false,
           lastChoice: null,
           xp,
+          weeklyXp,
+          weeklyXpWeek: wk,
           streak,
           freezes,
           lastActiveDay,
@@ -386,11 +474,23 @@ export const useStore = create<State>()(
           get().emit('levelUp');
         }
 
+        if (done) {
+          // Daily quest credit for completing a diag/fresh/lesson session.
+          const metric = questMetricForSession(st.sessionKind, deck);
+          if (metric === 'diag' || metric === 'fresh' || metric === 'lesson') get().bumpQuest(metric);
+          // Re-engagement: reschedule the streak-at-risk nudge (no-op without notif permission).
+          void scheduleStreakReminder(streak, st.restDays);
+          if (st.userId) void touchFriendActivity(st.userId);
+          track('session_completed', { kind: st.sessionKind, count: deck.length });
+        }
+
         if (st.userId) {
           void pushProgress(st.userId, progress);
           void pushStats(st.userId, streak, xp);
+          void upsertWeeklyXp(st.userId, weeklyXp, 'You');
         }
-        if (done) track('session_completed', { kind: st.sessionKind, count: deck.length });
+        // Keep the home-screen widget fresh (no-op when no native widget present).
+        void syncWidget(get());
       },
 
       toggleSave: (id) => {
@@ -482,7 +582,7 @@ export const useStore = create<State>()(
     }),
     {
       name: 'fieldnotes-v1',
-      version: 5,
+      version: 8,
       storage: createJSONStorage(() => AsyncStorage),
       partialize: (s) => ({
         role: s.role,
@@ -499,6 +599,15 @@ export const useStore = create<State>()(
         playful: s.playful,
         sound: s.sound,
         haptics: s.haptics,
+        accentKey: s.accentKey,
+        restDays: s.restDays,
+        weeklyXp: s.weeklyXp,
+        weeklyXpWeek: s.weeklyXpWeek,
+        questDay: s.questDay,
+        questProgress: s.questProgress,
+        interviewDate: s.interviewDate,
+        lastMockScore: s.lastMockScore,
+        checkpointsDone: s.checkpointsDone,
         devMode: s.devMode,
         onboarded: s.onboarded,
         reminders: s.reminders,
@@ -532,6 +641,25 @@ export const useStore = create<State>()(
         if (from < 5) {
           // v5 added the developer view toggle; default off.
           if (typeof p.devMode !== 'boolean') p.devMode = false;
+        }
+        if (from < 6) {
+          // v6 added the Pro accent picker; default everyone to the free "Classic" accent.
+          if (typeof p.accentKey !== 'string') p.accentKey = 'classic';
+          // v6 also added scheduled rest days; default none.
+          if (!Array.isArray(p.restDays)) p.restDays = [];
+        }
+        if (from < 7) {
+          // v7 added weekly-league XP, daily quests, interview-date mode, and mock scores.
+          if (typeof p.weeklyXp !== 'number') p.weeklyXp = 0;
+          if (typeof p.weeklyXpWeek !== 'string') p.weeklyXpWeek = null;
+          if (typeof p.questDay !== 'string') p.questDay = null;
+          if (typeof p.questProgress !== 'object' || p.questProgress === null) p.questProgress = {};
+          if (typeof p.interviewDate !== 'string') p.interviewDate = null;
+          if (typeof p.lastMockScore !== 'number') p.lastMockScore = null;
+        }
+        if (from < 8) {
+          // v8 added chapter checkpoint tests.
+          if (!Array.isArray(p.checkpointsDone)) p.checkpointsDone = [];
         }
         return p;
       },

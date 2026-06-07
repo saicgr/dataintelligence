@@ -12,12 +12,28 @@ import { Card, Row, T } from './kit';
 const DAYS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
 
 export function StreakHero({ variant = 'hero' }: { variant?: 'hero' | 'compact' }) {
-  const { c } = useTheme();
+  const { c, scheme } = useTheme();
   const streak = useStore((s) => s.streak);
   const freezes = useStore((s) => s.freezes);
+  const lastActiveDay = useStore((s) => s.lastActiveDay);
+  const restDays = useStore((s) => s.restDays);
   const flame = '#f76707';
   const big = variant === 'hero';
   const litCount = Math.min(7, streak);
+
+  // Streak-loss urgency (plan #0.2) + rest-day awareness (plan #23).
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const doneToday = lastActiveDay === today;
+  const isRestToday = restDays.includes(now.getUTCDay());
+  const banner =
+    streak <= 0
+      ? null
+      : doneToday
+        ? { text: '✓ Streak safe — see you tomorrow', color: c.success }
+        : isRestToday
+          ? { text: '😌 Rest day — your streak is protected', color: c.success }
+          : { text: `⚠️ Study today to keep your ${streak}-day streak`, color: c.warn };
 
   return (
     <Card style={{ alignItems: 'center', paddingVertical: big ? 26 : 18, gap: 4 }}>
@@ -55,6 +71,19 @@ export function StreakHero({ variant = 'hero' }: { variant?: 'hero' | 'compact' 
           );
         })}
       </Row>
+
+      {banner ? (
+        <View
+          style={{
+            marginTop: 12,
+            backgroundColor: banner.color + (scheme === 'dark' ? '22' : '18'),
+            borderRadius: radius.md,
+            paddingVertical: 8,
+            paddingHorizontal: 14,
+          }}>
+          <T weight="800" size={12.5} color={banner.color}>{banner.text}</T>
+        </View>
+      ) : null}
 
       {streak > 0 && streak % 5 === 0 ? (
         <Pop trigger={streak} style={{ marginTop: 12 }}>

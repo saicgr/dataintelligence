@@ -1,5 +1,5 @@
 import { BlurView } from 'expo-blur';
-import { router } from 'expo-router';
+import { type Href, router } from 'expo-router';
 import { Fragment, useEffect, useRef, useState } from 'react';
 import { Modal, Pressable, ScrollView, TextInput, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
@@ -15,6 +15,9 @@ import Animated, {
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import {
+  CHAPTER_SIZE,
+  checkpointCount,
+  checkpointKey,
   freshSessionCards,
   lessonDeck,
   lessonCount,
@@ -32,6 +35,8 @@ import { radius, space, useTheme } from '../../lib/theme';
 import { haptic, sfx } from '../../lib/feedback';
 import { AnimatedProgressBar, CardEnter, CountUp, PressableScale, Shake } from '../../ui/anim';
 import { H2, Row, Segmented, T } from '../../ui/kit';
+import { InterviewPlanCard } from '../../ui/InterviewPlanCard';
+import { QuestStrip } from '../../ui/QuestStrip';
 import { RolePicker } from '../../ui/RolePicker';
 import { SessionView } from '../../ui/SessionView';
 
@@ -74,6 +79,8 @@ function LearnPath() {
   const progress = useStore((st) => st.progress);
   const role = useStore((st) => st.role);
   const due = useStore((st) => st.sessionMeta.due);
+  const interviewDate = useStore((st) => st.interviewDate);
+  const startDaily = useStore((st) => st.startDaily);
   const [showSettings, setShowSettings] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [q, setQ] = useState('');
@@ -158,11 +165,15 @@ function LearnPath() {
           }}>
           <View style={{ padding: space.md, gap: space.sm, paddingBottom: 130, paddingRight: 26 }}>
             <RoleHeader role={role} onPress={() => setShowSettings(true)} />
+            <InterviewPlanCard dateIso={interviewDate} onStart={startDaily} />
             <CardEnter>
               <ContinueHero action={action} />
             </CardEnter>
             <CardEnter delay={50}>
               <DailyStrip heroKind={action.kind} />
+            </CardEnter>
+            <CardEnter delay={75}>
+              <QuestStrip />
             </CardEnter>
             {grouped.map(({ g, tracks }, gi) => (
               <Fragment key={g}>
@@ -289,8 +300,12 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
   const xp = useStore((st) => st.xp);
   const streak = useStore((st) => st.streak);
   const freezes = useStore((st) => st.freezes);
+  const cardsToday = useStore((st) => st.cardsToday);
+  const dailyGoal = useStore((st) => st.dailyGoal);
   const devMode = useStore((st) => st.devMode);
   const setDevMode = useStore((st) => st.setDevMode);
+  const goalMet = cardsToday >= dailyGoal;
+  const goalPct = Math.max(0, Math.min(1, dailyGoal ? cardsToday / dailyGoal : 0));
   return (
     <View
       style={{
@@ -314,6 +329,12 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
             <CountUp to={streak} style={{ fontWeight: '800', fontSize: 14, color: '#f76707' }} />
           </Row>
         )}
+        <Row style={{ gap: 3 }}>
+          <T weight="800" size={13} color={goalMet ? c.success : c.muted}>🎯</T>
+          <T weight="800" size={13} color={goalMet ? c.success : c.muted}>
+            {goalMet ? 'Done' : `${cardsToday}/${dailyGoal}`}
+          </T>
+        </Row>
         <View style={{ backgroundColor: '#4263eb', borderRadius: 10, paddingHorizontal: 8, height: 26, justifyContent: 'center', flexDirection: 'row', alignItems: 'center' }}>
           <T color="#fff" weight="800" size={11.5}>Lv </T>
           <CountUp to={level(xp)} style={{ color: '#fff', fontWeight: '800', fontSize: 11.5 }} />
@@ -343,9 +364,11 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
           <T weight="900" size={18} color={c.muted}>⋯</T>
         </Pressable>
       </Row>
-      <View style={{ marginTop: 8 }}>
+      <Row style={{ marginTop: 8, gap: 8 }}>
         <AnimatedProgressBar value={xpInLevel(xp) / 1000} color="#f76707" track={c.border} height={8} />
-      </View>
+        {/* Daily-goal meter (plan #0.1): a visible second bar so the goal is never invisible. */}
+        <AnimatedProgressBar value={goalPct} color={goalMet ? c.success : c.accent} track={c.border} height={8} />
+      </Row>
     </View>
   );
 }
@@ -647,6 +670,7 @@ function Unit({
 }) {
   const { c, track } = useTheme();
   const startLesson = useStore((s) => s.startLesson);
+  const checkpointsDone = useStore((s) => s.checkpointsDone);
   const dev = useStore(isDev);
   const reduced = useReducedMotion();
   const [shake, setShake] = useState<{ i: number; n: number }>({ i: -1, n: 0 });
@@ -702,8 +726,16 @@ function Unit({
           const title = lessonTitle(t.slug, i);
           const titleOnRight = off < 0;
           const peekable = !locked; // unlocked stages can reveal their question list inline
+          // Chapter "boss" checkpoint after every CHAPTER_SIZE lessons (plan #25).
+          const chapterIdx = Math.floor(i / CHAPTER_SIZE);
+          const isChapterEnd = (i + 1) % CHAPTER_SIZE === 0 && chapterIdx < checkpointCount(t.slug);
+          const chapterStart = chapterIdx * CHAPTER_SIZE;
+          const chapterDone = statuses.slice(chapterStart, i + 1).every((s) => s.done);
+          const cpKey = checkpointKey(t.slug, chapterIdx);
+          const cpDone = checkpointsDone.includes(cpKey);
           return (
-            <View key={i} style={{ alignItems: 'center' }}>
+            <Fragment key={i}>
+            <View style={{ alignItems: 'center' }}>
               {i > 0 && (
                 <View
                   style={{
@@ -804,6 +836,42 @@ function Unit({
                 </CardEnter>
               )}
             </View>
+            {isChapterEnd && (
+              <View style={{ alignItems: 'center' }}>
+                <View style={{ width: 4, height: 16, borderRadius: 2, backgroundColor: cpDone ? col : c.border, opacity: cpDone ? 1 : 0.55 }} />
+                <Pressable
+                  onPress={() => {
+                    const available = chapterDone || dev;
+                    if (!available) { haptic.error(); return; }
+                    haptic.light();
+                    sfx.tap();
+                    router.push(`/checkpoint?slug=${t.slug}&chapter=${chapterIdx}` as Href);
+                  }}
+                  style={{ alignItems: 'center', paddingVertical: 6 }}>
+                  <View
+                    style={{
+                      width: 54,
+                      height: 54,
+                      borderRadius: 16,
+                      transform: [{ rotate: '45deg' }],
+                      backgroundColor: cpDone ? col : chapterDone || dev ? c.card : c.surface,
+                      borderWidth: 3,
+                      borderColor: chapterDone || dev ? col : c.border,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      opacity: chapterDone || dev ? 1 : 0.55,
+                    }}>
+                    <T size={20} style={{ transform: [{ rotate: '-45deg' }] }}>
+                      {cpDone ? '🏆' : chapterDone || dev ? '🏁' : '🔒'}
+                    </T>
+                  </View>
+                  <T weight="800" size={11} color={cpDone ? c.success : c.muted} style={{ marginTop: 8 }}>
+                    {cpDone ? `Chapter ${chapterIdx + 1} cleared` : `Checkpoint · Chapter ${chapterIdx + 1}`}
+                  </T>
+                </Pressable>
+              </View>
+            )}
+            </Fragment>
           );
         })}
         {/* User view hides the long tail — tease how much is ahead without revealing it. */}

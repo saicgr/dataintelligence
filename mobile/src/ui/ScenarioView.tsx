@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import { Pressable, TextInput, View } from 'react-native';
 
 import { SessionCard } from '../lib/content';
+import { type PeerAnswer, submitScenarioAnswer, topPeerAnswers, upvotePeerAnswer } from '../lib/peerAnswers';
 import { useStore } from '../lib/store';
 import { Rating } from '../lib/srs';
 import { radius, useTheme } from '../lib/theme';
-import { Btn, Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { Btn, Card, Chip, Row, T, TrackBadge } from './kit';
 import { RichAnswer } from './RichAnswer';
 
 const THINK_SECONDS = 90;
@@ -35,6 +36,8 @@ export function ScenarioView({ card }: { card: SessionCard }) {
   const arc = card.arc ?? [];
   const rubric = card.rubric ?? [];
 
+  const userId = useStore((s) => s.userId);
+  const [peers, setPeers] = useState<PeerAnswer[]>([]);
   const [phase, setPhase] = useState<'intro' | 'write' | 'revealed'>('intro');
   const [text, setText] = useState('');
   const [left, setLeft] = useState(THINK_SECONDS);
@@ -53,6 +56,13 @@ export function ScenarioView({ card }: { card: SessionCard }) {
   // when the answer is committed, auto-tick the key points the text covered
   useEffect(() => {
     if (phase === 'revealed') setChecked(coverage(text, rubric));
+  }, [phase]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // On reveal: contribute the (anonymized) answer + load how peers answered (no-op without Supabase).
+  useEffect(() => {
+    if (phase !== 'revealed') return;
+    if (text.trim().length > 20) void submitScenarioAnswer(card.id, text.trim(), userId);
+    topPeerAnswers(card.id).then(setPeers).catch(() => {});
   }, [phase]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // gentle countdown during the "write" phase; auto-reveals at 0
@@ -212,6 +222,20 @@ export function ScenarioView({ card }: { card: SessionCard }) {
               {rating === 'easy' ? 'nailed it' : rating === 'good' ? 'solid' : 'review again soon'}
             </T>
           </Row>
+
+          {peers.length > 0 && (
+            <View style={{ marginTop: 4, marginBottom: 12, gap: 7 }}>
+              <T muted weight="800" size={11} style={{ letterSpacing: 0.4 }}>HOW PEERS ANSWERED</T>
+              {peers.map((p) => (
+                <View key={p.id} style={{ borderWidth: 1, borderColor: c.border, borderRadius: radius.md, padding: 11 }}>
+                  <T size={12.5} style={{ lineHeight: 18 }}>{p.body}</T>
+                  <Pressable onPress={() => void upvotePeerAnswer(p.id)} hitSlop={6} style={{ marginTop: 6 }}>
+                    <T size={11.5} weight="800" color={c.accentInk}>▲ {p.votes} helpful</T>
+                  </Pressable>
+                </View>
+              ))}
+            </View>
+          )}
 
           <Btn label="Save & schedule" variant="green" onPress={() => rate(rating)} />
 

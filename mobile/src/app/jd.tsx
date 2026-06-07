@@ -2,9 +2,11 @@ import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Linking, Pressable, TextInput, View } from 'react-native';
 
+import { daysUntil } from '../lib/cramPlan';
 import { analyzeJd, JdResult } from '../lib/jd';
 import { useStore } from '../lib/store';
 import { radius, useTheme } from '../lib/theme';
+import { InterviewPlanCard } from '../ui/InterviewPlanCard';
 import { Btn, Card, H2, Row, Screen, T } from '../ui/kit';
 
 const WEB_URL = 'https://fieldnotes.dev/jd';
@@ -16,12 +18,23 @@ export default function JD() {
   const unlocked = useStore((s) => s.unlocked);
   const progress = useStore((s) => s.progress);
   const setRole = useStore((s) => s.setRole);
+  const interviewDate = useStore((s) => s.interviewDate);
+  const setInterviewDate = useStore((s) => s.setInterviewDate);
+  const startDaily = useStore((s) => s.startDaily);
   const [text, setText] = useState('');
   const [result, setResult] = useState<JdResult | null>(null);
+  const [dateText, setDateText] = useState(interviewDate ?? '');
 
   const analyze = () => {
     if (text.trim().length < 20) return;
     setResult(analyzeJd(text, progress));
+  };
+
+  const onDateChange = (v: string) => {
+    setDateText(v);
+    // Save only a valid, parseable future-ish date; clear when emptied.
+    if (v.trim() === '') setInterviewDate(null);
+    else if (/^\d{4}-\d{2}-\d{2}$/.test(v.trim()) && daysUntil(v.trim()) != null) setInterviewDate(v.trim());
   };
 
   return (
@@ -29,6 +42,31 @@ export default function JD() {
       <Pressable onPress={() => router.back()}>
         <T muted weight="700" size={13}>‹ Close</T>
       </Pressable>
+
+      <H2>When&apos;s your interview?</H2>
+      <Card style={{ gap: 10 }}>
+        <T muted size={12.5} style={{ lineHeight: 18 }}>
+          Add the date and we&apos;ll build a ramping cram plan + a morning-of warm-up.
+        </T>
+        <TextInput
+          value={dateText}
+          onChangeText={onDateChange}
+          placeholder="YYYY-MM-DD"
+          placeholderTextColor={c.muted}
+          autoCapitalize="none"
+          style={{
+            borderWidth: 1.5,
+            borderColor: c.border,
+            borderRadius: radius.md,
+            padding: 12,
+            color: c.fg,
+            backgroundColor: c.surface,
+            fontSize: 15,
+          }}
+        />
+      </Card>
+      <InterviewPlanCard dateIso={interviewDate} onStart={() => { startDaily(); router.replace('/'); }} />
+
       <H2>Paste a job description</H2>
       <T muted size={12.5} style={{ lineHeight: 18 }}>
         We&apos;ll match it to the tracks you should prep — and flag what you&apos;re missing.

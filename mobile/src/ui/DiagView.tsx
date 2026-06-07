@@ -7,7 +7,8 @@ import { Rating } from '../lib/srs';
 import { radius, useTheme } from '../lib/theme';
 import { CellState, MetricTable } from './MetricTable';
 import { CodeBlock, LineState } from './CodeBlock';
-import { Btn, Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { ResultFooter } from './ResultFooter';
 import { OptionList } from './Options';
 import { WebCrossSell } from './WebCrossSell';
 
@@ -100,7 +101,7 @@ export function DiagView({ card }: { card: SessionCard }) {
           </T>
           <RedFlag fj={card.fj} fs={card.fs} />
           {webx ? <WebCrossSell webx={webx} /> : null}
-          <Btn label="Save & schedule" variant="green" style={{ marginTop: 13 }} onPress={() => rate(rating)} />
+          <ResultFooter ok={rating !== 'again'} continueLabel="Save & schedule" onContinue={() => rate(rating)} />
         </View>
       ) : null}
     </Card>

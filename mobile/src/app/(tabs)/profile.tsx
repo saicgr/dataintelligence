@@ -4,9 +4,10 @@ import { Alert, Pressable, Switch, TextInput, View } from 'react-native';
 
 import { appleAvailable, signInWithApple, signInWithEmail, signInWithGoogle, signOut } from '../../lib/auth';
 import { hasSupabase } from '../../lib/env';
+import { haptic } from '../../lib/feedback';
 import { PACKS, SUB_YEARLY_PER_MONTH } from '../../lib/products';
 import { useStore } from '../../lib/store';
-import { radius, useTheme } from '../../lib/theme';
+import { ACCENTS, type AccentKey, radius, useTheme } from '../../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
 
 export default function Profile() {
@@ -23,6 +24,8 @@ export default function Profile() {
   const setHaptics = useStore((s) => s.setHaptics);
   const reminders = useStore((s) => s.reminders);
   const setReminders = useStore((s) => s.setReminders);
+  const restDays = useStore((s) => s.restDays);
+  const setRestDays = useStore((s) => s.setRestDays);
   const devMode = useStore((s) => s.devMode);
   const setDevMode = useStore((s) => s.setDevMode);
   const restartOnboarding = useStore((s) => s.restartOnboarding);
@@ -148,6 +151,9 @@ export default function Profile() {
         )}
       </Card>
 
+      <H2>Appearance</H2>
+      <AccentSection />
+
       <H2>Settings</H2>
       <Card style={{ gap: 0, padding: 0 }}>
         <ToggleRow
@@ -179,6 +185,7 @@ export default function Profile() {
           value={playful}
           onValueChange={setPlayful}
         />
+        <RestDaysRow value={restDays} onChange={setRestDays} />
         <NavRow icon="♻️" label="Restore purchase" onPress={() => void restore()} />
         <SettingRow icon="◐" label="Theme" right="System" />
         <SettingRow icon="ℹ️" label="About" right="v1.0" />
@@ -204,6 +211,124 @@ export default function Profile() {
       </Card>
       <T muted size={11} style={{ textAlign: 'center' }}>The web workbench (live coding + AI coach) is a separate plan.</T>
     </Screen>
+  );
+}
+
+/** Pro-gated accent picker. A non-default swatch requires a live Pro entitlement AND an account;
+ *  picking a locked one routes to the paywall instead of applying. The free "Classic" swatch is open. */
+function AccentSection() {
+  const { c, scheme } = useTheme();
+  const router = useRouter();
+  const accentKey = useStore((s) => s.accentKey);
+  const setAccent = useStore((s) => s.setAccent);
+  const unlocked = useStore((s) => s.unlocked);
+  const signedIn = Boolean(useStore((s) => s.userId));
+  const entitled = unlocked && signedIn;
+
+  const keys = Object.keys(ACCENTS) as AccentKey[];
+  // The accent actually in effect — falls back to Classic when a Pro swatch isn't entitled.
+  const activeKey: AccentKey = entitled ? accentKey : ACCENTS[accentKey]?.pro ? 'classic' : accentKey;
+
+  function pick(key: AccentKey) {
+    const opt = ACCENTS[key];
+    if (opt.pro && !entitled) {
+      Alert.alert(
+        'Pro accent themes',
+        signedIn
+          ? 'Unlock every accent color with FieldNotes Pro.'
+          : 'Accent themes need FieldNotes Pro and a signed-in account.',
+        [
+          { text: 'Not now', style: 'cancel' },
+          { text: 'See plans', onPress: () => router.push('/paywall') },
+        ]
+      );
+      return;
+    }
+    haptic.selection();
+    setAccent(key);
+  }
+
+  return (
+    <Card>
+      <Row style={{ flexWrap: 'wrap', gap: 14, justifyContent: 'center' }}>
+        {keys.map((key) => {
+          const opt = ACCENTS[key];
+          const sw = opt[scheme];
+          const selected = activeKey === key;
+          const locked = opt.pro && !entitled;
+          return (
+            <Pressable key={key} onPress={() => pick(key)} style={{ alignItems: 'center', width: 64 }}>
+              <View
+                style={{
+                  width: 48,
+                  height: 48,
+                  borderRadius: 24,
+                  backgroundColor: sw.accent,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  borderWidth: selected ? 3 : 1,
+                  borderColor: selected ? c.fg : c.border,
+                  opacity: locked ? 0.55 : 1,
+                }}>
+                {selected ? (
+                  <T size={20} weight="900" color={sw.onAccent}>✓</T>
+                ) : locked ? (
+                  <T size={16}>🔒</T>
+                ) : null}
+              </View>
+              <T size={11} weight="700" muted style={{ marginTop: 5 }}>{opt.name}</T>
+            </Pressable>
+          );
+        })}
+      </Row>
+      <T muted size={11.5} style={{ textAlign: 'center', marginTop: 12, lineHeight: 16 }}>
+        {entitled
+          ? 'Tap to change your accent color.'
+          : 'Classic is free. Other accents unlock with Pro + a signed-in account.'}
+      </T>
+    </Card>
+  );
+}
+
+/** Rest-day picker (plan #23): skipped rest days don't break the streak. Weekday index = UTC getUTCDay. */
+function RestDaysRow({ value, onChange }: { value: number[]; onChange: (d: number[]) => void }) {
+  const { c } = useTheme();
+  const labels = ['S', 'M', 'T', 'W', 'T', 'F', 'S']; // index 0=Sun .. 6=Sat
+  return (
+    <View style={{ paddingVertical: 11, paddingHorizontal: 15, borderTopWidth: 1, borderTopColor: c.border }}>
+      <Row>
+        <IconBox icon="🛌" />
+        <View style={{ flex: 1 }}>
+          <T size={13.5} weight="600">Rest days</T>
+          <T muted size={11} style={{ lineHeight: 15 }}>Skipped rest days won&apos;t break your streak.</T>
+        </View>
+      </Row>
+      <Row style={{ gap: 7, marginTop: 10, justifyContent: 'space-between' }}>
+        {labels.map((d, i) => {
+          const on = value.includes(i);
+          return (
+            <Pressable
+              key={i}
+              onPress={() => {
+                haptic.selection();
+                onChange(on ? value.filter((x) => x !== i) : [...value, i]);
+              }}
+              style={{
+                flex: 1,
+                height: 34,
+                borderRadius: 9,
+                alignItems: 'center',
+                justifyContent: 'center',
+                backgroundColor: on ? c.accent : 'transparent',
+                borderWidth: 1.5,
+                borderColor: on ? c.accent : c.border,
+              }}>
+              <T size={12} weight="800" color={on ? c.onAccent : c.muted}>{d}</T>
+            </Pressable>
+          );
+        })}
+      </Row>
+    </View>
   );
 }
 

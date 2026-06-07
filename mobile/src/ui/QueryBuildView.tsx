@@ -7,6 +7,7 @@ import { Rating, strength } from '../lib/srs';
 import { mono, radius, useTheme } from '../lib/theme';
 import { CodeBlock } from './CodeBlock';
 import { Btn, Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { ResultFooter } from './ResultFooter';
 import { OptionList } from './Options';
 import { WebCrossSell } from './WebCrossSell';
 
@@ -154,7 +155,7 @@ export function QueryBuildView({ card }: { card: SessionCard }) {
               paddingHorizontal: 12,
               opacity: hintsShown >= qb.hints.length ? 0.5 : 1,
             }}>
-            <T size={12} weight="800" color={c.accent}>
+            <T size={12} weight="800" color={c.accentInk}>
               💡 Gimme a Hint{hintsShown < qb.hints.length ? `  −${HINT_COST} XP` : ' (no more)'}
             </T>
           </Pressable>
@@ -252,7 +253,7 @@ export function QueryBuildView({ card }: { card: SessionCard }) {
       {tier === 'recall' ? (
         <View style={{ marginTop: 14 }}>
           <T weight="800" size={12} color={c.muted} style={{ letterSpacing: 0.4, marginBottom: 8 }}>
-            FREE RECALL — tick every clause you'd write
+            FREE RECALL — tick every clause you&apos;d write
           </T>
           {recallItems.map((it, i) => {
             const on = checked[i];
@@ -314,11 +315,10 @@ export function QueryBuildView({ card }: { card: SessionCard }) {
                 ) : null}
                 <RedFlag fj={card.fj} fs={card.fs} />
                 <WebCrossSell webx={qb.webx} />
-                <Btn
-                  label="Save & schedule"
-                  variant="green"
-                  style={{ marginTop: 13 }}
-                  onPress={() => rate(finalRating)}
+                <ResultFooter
+                  ok={ok}
+                  continueLabel="Save & schedule"
+                  onContinue={() => rate(finalRating)}
                 />
               </>
             );

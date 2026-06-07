@@ -173,6 +173,43 @@ export function CountUp({ to, style, duration = 850 }: { to: number; style?: Sty
   return <Text style={style}>{n}</Text>;
 }
 
+/** One-shot confetti burst for celebrations (session complete, goal hit). Reduce-motion → nothing. */
+export function Confetti({ count = 16 }: { count?: number }) {
+  const reduced = useReducedMotion();
+  if (reduced) return null;
+  const colors = ['#f76707', '#1a9e57', '#1c7ed6', '#e64980', '#ccff00', '#7048e8'];
+  return (
+    <View pointerEvents="none" style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 0, zIndex: 10 }}>
+      {Array.from({ length: count }).map((_, i) => (
+        <ConfettiPiece key={i} i={i} color={colors[i % colors.length]} />
+      ))}
+    </View>
+  );
+}
+function ConfettiPiece({ i, color }: { i: number; color: string }) {
+  const y = useSharedValue(0);
+  const o = useSharedValue(0);
+  const rot = useSharedValue(0);
+  useEffect(() => {
+    const delay = (i % 6) * 45;
+    o.value = withSequence(withTiming(1, { duration: 90 }), withDelay(550, withTiming(0, { duration: 520 })));
+    y.value = withDelay(delay, withTiming(240 + (i % 5) * 28, { duration: 1150, easing: Easing.in(Easing.quad) }));
+    rot.value = withTiming(360 * (i % 2 ? 1 : -1), { duration: 1150 });
+  }, [i, o, y, rot]);
+  const st = useAnimatedStyle(() => ({
+    opacity: o.value,
+    transform: [{ translateY: y.value }, { rotate: `${rot.value}deg` }],
+  }));
+  return (
+    <Animated.View
+      style={[
+        { position: 'absolute', left: `${(i * 17) % 100}%`, width: 8, height: 12, borderRadius: 2, backgroundColor: color },
+        st,
+      ]}
+    />
+  );
+}
+
 /** Spring-animated progress fill — drop-in for a static progress bar. */
 export function AnimatedProgressBar({
   value,

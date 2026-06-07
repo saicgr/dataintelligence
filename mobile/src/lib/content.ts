@@ -822,6 +822,9 @@ export function dailyPoolForRole(roleKey: string, now: number): SessionCard[] {
  * `adaptive` (Pro "smart scheduling") orders due cards WEAKEST-first (Birdbrain-style)
  * instead of oldest-due-first, so the session sits at the edge of your ability.
  */
+/** Production ("do") formats — biased forward in a session so it's not mostly flip/MCQ recognition. */
+const PRODUCTION_KINDS = new Set<string>(['scenario', 'diag', 'querybuild', 'match', 'evidence', 'order', 'classify']);
+
 export function buildSessionDeck(
   pool: SessionCard[],
   progress: Record<string, CardState>,
@@ -852,7 +855,16 @@ export function buildSessionDeck(
     const st = progress[c.id];
     return !st || st.reps === 0;
   });
-  let ordered = [...due, ...newCards];
+  // Pedagogy (plan #9): bias sessions toward "do" formats — interleave production cards (scenario,
+  // diag, build, evidence, order, match, classify) with recognition (flip/MCQ) so they aren't buried.
+  const prodNew = newCards.filter((c) => PRODUCTION_KINDS.has(c.kind));
+  const recNew = newCards.filter((c) => !PRODUCTION_KINDS.has(c.kind));
+  const mixedNew: SessionCard[] = [];
+  for (let i = 0, j = 0; i < prodNew.length || j < recNew.length; ) {
+    if (i < prodNew.length) mixedNew.push(prodNew[i++]);
+    if (j < recNew.length) mixedNew.push(recNew[j++]);
+  }
+  let ordered = [...due, ...mixedNew];
   // Disliked cards sink to the back (stable) so they fall off the end when the deck is capped — surfaced
   // less without being hidden, and SRS schedule is untouched.
   if (deprioritize && deprioritize.size) {
@@ -886,6 +898,24 @@ export function lessonDeck(slug: string, lessonIdx: number, size = LESSON_SIZE):
 export function lessonCount(slug: string, size = LESSON_SIZE): number {
   return Math.ceil(bankForTrack(slug).length / size);
 }
+
+/** Lessons per chapter — a "boss" checkpoint test caps each chapter (plan #25). */
+export const CHAPTER_SIZE = 3;
+
+/** How many checkpoint "boss" nodes a track has (one per completed chapter boundary). */
+export function checkpointCount(slug: string): number {
+  return Math.floor(lessonCount(slug) / CHAPTER_SIZE);
+}
+
+/** Cumulative no-peek review deck for chapter `chapterIdx` — all cards from that chapter's lessons. */
+export function checkpointDeck(slug: string, chapterIdx: number, size = LESSON_SIZE): SessionCard[] {
+  const start = chapterIdx * CHAPTER_SIZE * size;
+  const end = start + CHAPTER_SIZE * size;
+  return bankForTrack(slug).slice(start, end);
+}
+
+/** Stable key for a chapter checkpoint (used in the persisted `checkpointsDone` set). */
+export const checkpointKey = (slug: string, chapterIdx: number): string => `${slug}:${chapterIdx}`;
 
 // Lesson titles live in ./lesson-titles.json so the dump script (scripts/dump-content.mjs) reads the
 // SAME source the app does — authored per-track titles + the positional fallback progression.

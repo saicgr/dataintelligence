@@ -8,8 +8,10 @@ import { answerFeedback, haptic, sfx } from '../lib/feedback';
 import { dueLabel } from '../lib/srs';
 import { useActiveDeck, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
-import { AnimatedProgressBar, CardEnter, Pop, Shake } from './anim';
+import { AnimatedProgressBar, CardEnter, Confetti } from './anim';
 import { Btn, Card, Chip, Row, T, TrackBadge } from './kit';
+import { Mascot } from './Mascot';
+import { ResultFooter } from './ResultFooter';
 import { StreakHero } from './StreakHero';
 import { ClassifyView } from './ClassifyView';
 import { CodeBlock } from './CodeBlock';
@@ -387,18 +389,14 @@ function ChoiceBlock({
 
       {reveal && (
         <View style={{ marginTop: 4 }}>
-          {gotIt ? (
-            <Pop trigger={reveal} style={{ alignSelf: 'flex-start', marginBottom: 8 }}>
-              <T weight="800" size={15} color={c.success}>🎉 Nailed it</T>
-            </Pop>
-          ) : (
-            <Shake trigger={reveal} style={{ alignSelf: 'flex-start', marginBottom: 8 }}>
-              <T weight="800" size={15} color={c.danger}>✗ Common trap</T>
-            </Shake>
-          )}
           <RichAnswer text={card.why ?? ''} size={13} />
           <RedFlag fj={card.fj} fs={card.fs} />
-          <Btn label="Continue →" variant="green" onPress={onContinue} style={{ marginTop: 13 }} />
+          <ResultFooter
+            ok={gotIt}
+            message={gotIt ? undefined : 'A common trap — review the explanation above.'}
+            continueLabel="Continue →"
+            onContinue={onContinue}
+          />
         </View>
       )}
     </View>
@@ -464,7 +462,7 @@ function Followups({ items }: { items: { q: string; a: string }[] }) {
               backgroundColor: isOpen ? c.surface : 'transparent',
             }}>
             <Row style={{ alignItems: 'flex-start', gap: 8 }}>
-              <T size={12.5} weight="800" color={c.accent}>
+              <T size={12.5} weight="800" color={c.accentInk}>
                 {isOpen ? '▾' : '▸'}
               </T>
               <T size={13} weight="700" style={{ flex: 1, lineHeight: 19 }}>
@@ -620,9 +618,10 @@ function Done() {
   const goalMet = cardsToday >= dailyGoal;
   return (
     <View style={{ gap: space.md }}>
+      {playful ? <Confetti /> : null}
       <StreakHero variant="compact" />
       <Card style={{ alignItems: 'center', padding: 24 }}>
-      <T size={playful ? 52 : 38}>{playful ? '🎉🎉🎉' : '✓'}</T>
+      {playful ? <Mascot mood="celebrate" size={96} /> : <T size={38}>✓</T>}
       <T size={22} weight="900" style={{ marginTop: 6 }}>
         {goalMet ? 'Daily goal complete' : 'All caught up for today'}
       </T>

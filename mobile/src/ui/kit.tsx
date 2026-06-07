@@ -3,15 +3,25 @@ import {
   Pressable,
   ScrollView,
   StyleProp,
+  StyleSheet,
   Text,
   TextStyle,
   View,
   ViewStyle,
 } from 'react-native';
+import Animated, {
+  Easing,
+  useAnimatedStyle,
+  useReducedMotion,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { radius, space, useTheme } from '../lib/theme';
-import { PressableScale } from './anim';
+import { haptic } from '../lib/feedback';
+import { radius, shade, space, useTheme } from '../lib/theme';
+
+const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
 export function Screen({ children, scroll = true }: { children: ReactNode; scroll?: boolean }) {
   const { c } = useTheme();
@@ -114,7 +124,7 @@ export function Chip({ label, kind = 'ghost' }: { label: string; kind?: 'ghost' 
   const map = {
     ghost: { bg: 'transparent', fg: c.muted, bd: c.border },
     green: { bg: scheme === 'dark' ? 'rgba(63,185,80,.14)' : '#e3f7ec', fg: c.success, bd: 'transparent' },
-    amber: { bg: scheme === 'dark' ? 'rgba(255,212,59,.12)' : '#fdf2dd', fg: c.accent, bd: 'transparent' },
+    amber: { bg: scheme === 'dark' ? 'rgba(255,212,59,.12)' : '#fdf2dd', fg: c.warn, bd: 'transparent' },
   }[kind];
   return (
     <View
@@ -131,48 +141,92 @@ export function Chip({ label, kind = 'ghost' }: { label: string; kind?: 'ghost' 
   );
 }
 
-type BtnVariant = 'primary' | 'navy' | 'ghost' | 'green';
+type BtnVariant = 'primary' | 'navy' | 'ghost' | 'green' | 'danger' | 'neutral';
+/**
+ * Chunky 3D pill (Duolingo feel): a solid darker bottom "edge" that the face presses
+ * down onto when tapped. The de-facto button across the app. `primary` is keylime with
+ * ink text (never white — keylime fails contrast under white). Honors reduce-motion.
+ */
 export function Btn({
   label,
   onPress,
   variant = 'primary',
   style,
+  disabled = false,
 }: {
   label: string;
   onPress?: () => void;
   variant?: BtnVariant;
   style?: StyleProp<ViewStyle>;
+  disabled?: boolean;
 }) {
   const { c } = useTheme();
-  const styles: Record<BtnVariant, { bg: string; fg: string; bd?: string }> = {
-    primary: { bg: '#f76707', fg: '#fff' },
-    navy: { bg: c.navy, fg: '#fff' },
-    green: { bg: c.success, fg: '#fff' },
-    ghost: { bg: c.card, fg: c.fg, bd: c.border },
+  const reduced = useReducedMotion();
+  const v: Record<BtnVariant, { bg: string; fg: string; edge: string; bd?: string }> = {
+    primary: { bg: c.accent, fg: c.onAccent, edge: shade(c.accent, 0.74) },
+    navy: { bg: c.navy, fg: '#fff', edge: shade(c.navy, 0.62) },
+    green: { bg: c.success, fg: '#fff', edge: shade(c.success, 0.72) },
+    danger: { bg: c.danger, fg: '#fff', edge: shade(c.danger, 0.72) },
+    neutral: { bg: c.card, fg: c.fg, edge: c.border, bd: c.border },
+    ghost: { bg: 'transparent', fg: c.fg, edge: 'transparent', bd: c.border },
   };
-  const s = styles[variant];
-  // Subtle press-scale (timing, no spring overshoot) so every button has a quiet, alive press.
+  const s = v[variant];
+  const flat = variant === 'ghost'; // ghost reads as a flat secondary action
+  const DEPTH = flat ? 0 : 4;
+
+  // Layout props stay on the 3D wrapper; everything else (padding/sizing overrides) reaches the face,
+  // preserving the old `style` override semantics for compact buttons.
+  const f = (StyleSheet.flatten(style) ?? {}) as Record<string, unknown>;
+  const outer: Record<string, unknown> = {};
+  const faceOverride: Record<string, unknown> = {};
+  for (const k of Object.keys(f)) {
+    (OUTER_STYLE_KEYS.has(k) ? outer : faceOverride)[k] = f[k];
+  }
+
+  const ty = useSharedValue(0);
+  const faceStyle = useAnimatedStyle(() => ({ transform: [{ translateY: ty.value }] }));
+
   return (
-    <PressableScale
-      onPress={onPress}
-      scaleTo={0.97}
-      hapticStyle="none"
-      style={[
-        {
-          backgroundColor: s.bg,
-          borderColor: s.bd ?? 'transparent',
-          borderWidth: s.bd ? 1.5 : 0,
-          borderRadius: radius.md,
-          paddingVertical: 14,
-          paddingHorizontal: 16,
-          alignItems: 'center',
-        },
-        style,
-      ]}>
-      <Text style={{ color: s.fg, fontWeight: '800', fontSize: 14.5 }}>{label}</Text>
-    </PressableScale>
+    <AnimatedPressable
+      disabled={disabled}
+      onPressIn={() => {
+        if (!reduced && !flat) ty.value = withTiming(DEPTH, { duration: 55, easing: Easing.out(Easing.quad) });
+      }}
+      onPressOut={() => {
+        if (!reduced && !flat) ty.value = withTiming(0, { duration: 90, easing: Easing.out(Easing.quad) });
+      }}
+      onPress={() => {
+        if (disabled) return;
+        haptic.light();
+        onPress?.();
+      }}
+      style={[{ borderRadius: radius.md, backgroundColor: s.edge, paddingBottom: DEPTH, opacity: disabled ? 0.5 : 1 }, outer]}>
+      <Animated.View
+        style={[
+          {
+            backgroundColor: s.bg,
+            borderColor: s.bd ?? 'transparent',
+            borderWidth: s.bd ? 1.5 : 0,
+            borderRadius: radius.md,
+            paddingVertical: 14,
+            paddingHorizontal: 16,
+            alignItems: 'center',
+          },
+          faceOverride,
+          faceStyle,
+        ]}>
+        <Text style={{ color: s.fg, fontWeight: '800', fontSize: 14.5 }}>{label}</Text>
+      </Animated.View>
+    </AnimatedPressable>
   );
 }
+
+/** `style` keys that affect outer layout (kept on the 3D wrapper, not the pressable face). */
+const OUTER_STYLE_KEYS = new Set([
+  'margin', 'marginTop', 'marginBottom', 'marginLeft', 'marginRight', 'marginHorizontal', 'marginVertical',
+  'alignSelf', 'flex', 'flexGrow', 'flexShrink', 'flexBasis', 'width', 'minWidth', 'maxWidth',
+  'position', 'top', 'left', 'right', 'bottom', 'zIndex',
+]);
 
 /** Segmented control (role + mode toggles). */
 export function Segmented({

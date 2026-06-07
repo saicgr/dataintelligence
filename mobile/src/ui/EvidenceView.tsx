@@ -7,7 +7,8 @@ import { Rating } from '../lib/srs';
 import { radius, useTheme } from '../lib/theme';
 import { CellState, MetricTable } from './MetricTable';
 import { CodeBlock, LineState } from './CodeBlock';
-import { Btn, Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { ResultFooter } from './ResultFooter';
 import { OptionList } from './Options';
 
 type Tapped = { r: number; col: number } | number | null;
@@ -131,7 +132,7 @@ export function EvidenceView({ card }: { card: SessionCard }) {
             {ev.why}
           </T>
           <RedFlag fj={card.fj} fs={card.fs} />
-          <Btn label="Continue →" variant="green" style={{ marginTop: 13 }} onPress={() => rate(rating)} />
+          <ResultFooter ok={rating !== 'again'} continueLabel="Continue →" onContinue={() => rate(rating)} />
         </View>
       ) : null}
     </Card>

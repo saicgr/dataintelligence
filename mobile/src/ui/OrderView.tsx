@@ -6,6 +6,7 @@ import { useStore } from '../lib/store';
 import { Rating } from '../lib/srs';
 import { mono, radius, useTheme } from '../lib/theme';
 import { Btn, Card, Chip, RedFlag, Row, T, TrackBadge } from './kit';
+import { ResultFooter } from './ResultFooter';
 
 const arrEq = (a: number[], b: number[]) => a.length === b.length && a.every((v, i) => v === b[i]);
 
@@ -120,7 +121,7 @@ export function OrderView({ card }: { card: SessionCard }) {
             </T>
           ) : null}
           <RedFlag fj={card.fj} fs={card.fs} />
-          <Btn label="Continue →" variant="green" style={{ marginTop: 13 }} onPress={() => rate(rating)} />
+          <ResultFooter ok={rating !== 'again'} continueLabel="Continue →" onContinue={() => rate(rating)} />
         </View>
       )}
     </Card>
