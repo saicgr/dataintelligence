@@ -236,6 +236,7 @@ const RAW_TRACKS: Track[] = [
   { slug: 'rag', name: 'RAG', color: 'rag', icon: '🔍', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'llms', name: 'LLMs', color: 'rag', icon: '🧠', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'agents', name: 'AI Agents', color: 'rag', icon: '🤖', q: 0, domain: 'ai', group: 'concept' },
+  { slug: 'agentic-ai', name: 'Agentic AI', color: 'rag', icon: '🕹️', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'vectordb', name: 'Vector DB', color: 'sql', icon: '🧮', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'prompt', name: 'Prompt Eng', color: 'eval', icon: '💬', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'evals', name: 'LLM Evals', color: 'eval', icon: '🧪', q: 0, domain: 'ai', group: 'concept' },
@@ -285,6 +286,7 @@ const RAW_TRACKS: Track[] = [
   { slug: 'spark-oncall', name: 'Spark On-Call', color: 'spark', icon: '🔥', q: 0, domain: 'de', group: 'oncall' },
   { slug: 'cr-sql', name: 'SQL Bug Hunt', color: 'sql', icon: '🔎', q: 0, domain: 'de', group: 'oncall' },
   { slug: 'airflow-oncall', name: 'Airflow On-Call', color: 'sysd', icon: '🐞', q: 0, domain: 'de', group: 'oncall' },
+  { slug: 'data-reliability', name: 'Data Reliability', color: 'eval', icon: '🛡️', q: 0, domain: 'de', group: 'oncall' },
   // ── Interview craft lesson units ──
   { slug: 'interview-craft', name: 'Interview Craft', color: 'eval', icon: '🎯', q: 0, domain: 'de', group: 'craft' },
   { slug: 'prompt-lab', name: 'Prompt Lab', color: 'eval', icon: '🧪', q: 0, domain: 'ai', group: 'craft' },
@@ -367,6 +369,48 @@ export function bankForRole(roleKey: string): SessionCard[] {
 /** Question list (title + level) for the Library track view — from the real bank. */
 export function questionsFor(slug: string): QRow[] {
   return (GENERATED[slug] ?? []).map((c) => [c.q, c.level] as QRow);
+}
+
+export interface CardHit {
+  card: SessionCard;
+  track: Track;
+  idxInTrack: number; // position in its track bank — used for the free/Pro gate
+}
+
+/**
+ * Full-text search across every question in the role's tracks (not just track names).
+ * Matches the question, its answer/why/framing, follow-up drill-downs, and the track name, so a
+ * user can type a phrase they remember (e.g. "daily report") and jump straight to that card.
+ */
+export function searchCards(query: string, roleKey: string, limit = 16): CardHit[] {
+  const ql = query.trim().toLowerCase();
+  if (ql.length < 2) return [];
+  const out: CardHit[] = [];
+  const seen = new Set<string>();
+  for (const t of tracksForRole(roleKey)) {
+    const bank = bankForTrack(t.slug);
+    for (let i = 0; i < bank.length; i++) {
+      const card = bank[i];
+      if (seen.has(card.id)) continue;
+      const hay = [
+        card.q,
+        card.a,
+        card.why,
+        card.framing,
+        t.name,
+        ...(card.followups?.flatMap((f) => [f.q, f.a]) ?? []),
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+      if (hay.includes(ql)) {
+        seen.add(card.id);
+        out.push({ card, track: t, idxInTrack: i });
+        if (out.length >= limit) return out;
+      }
+    }
+  }
+  return out;
 }
 
 const levelTag = levelLabel;

@@ -1695,5 +1695,159 @@
         "a": "Tag-based masking: attach a masking policy to a sensitivity tag, and every column carrying that tag is automatically masked. So tags do double duty — cost_center for chargeback and a sensitivity tag for auto-applied protection. The same tag infrastructure that allocates spend also drives policy enforcement at scale."
       }
     ]
+  },
+  {
+    "q": "After a paused pipeline resumes, the backlog floods your next Task run and your single-cluster warehouse can't keep up — queries queue and the run drags. How do you absorb the spike and bound the work on Snowflake?",
+    "a": "Give the warehouse elasticity for the spike, and bound the work each run takes. Make it a multi-cluster warehouse so concurrent load spins up additional clusters automatically and queries stop queuing, then scales back down when the surge clears; the STANDARD scaling policy spins clusters up eagerly to minimize queuing, ECONOMY favors fully loading fewer clusters to save credits. Don't make one task swallow two days at once — drain the Stream in bounded chunks (process a slice, let the task reschedule) so the catch-up is many small refreshes, not one monster. And right-size, don't just upsize: a bigger single warehouse speeds one query but doesn't fix concurrency; more clusters fix concurrency.",
+    "fj": "Bump the warehouse to X-Large until it catches up.",
+    "fs": "Multi-cluster (not just bigger) for the concurrency spike, plus draining the Stream in bounded chunks so no single run swallows the whole backlog; sizing is not concurrency.",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Multi-cluster vs a bigger single warehouse — what's the difference?",
+        "a": "A larger size (S to L to XL) gives one query more compute — it speeds up a single heavy statement. Multi-cluster adds MORE warehouses of the same size to run more queries CONCURRENTLY — it fixes queuing. A backlog spike is a concurrency problem, so add clusters; scale size for individual slow queries."
+      },
+      {
+        "q": "When would you pick ECONOMY over STANDARD scaling?",
+        "a": "ECONOMY favors fully loading existing clusters before starting new ones, trading some queuing latency for fewer credits. Use it for backlog draining and backfills where latency doesn't matter; use STANDARD for user-facing concurrency where you want queuing minimized immediately."
+      },
+      {
+        "q": "How do you keep the catch-up from blowing the credit budget?",
+        "a": "Cap the multi-cluster MAX_CLUSTER_COUNT, set AUTO_SUSPEND tight so clusters stop when idle, and attach a resource monitor to suspend the warehouse at a credit threshold. Elastic for the spike, but bounded."
+      }
+    ]
+  },
+  {
+    "q": "A reporting table must stay within one hour of fresh, and you'd rather declare that target than hand-roll a scheduler with retries and dependency wiring. How do you do that on Snowflake?",
+    "a": "Make it a Dynamic Table with TARGET_LAG = '1 hour'. You write the query that defines the table; Snowflake manages the refreshes (incrementally where it can) to keep the table within the declared lag, and it handles the DAG of dependent Dynamic Tables for you — no manual Streams+Tasks plumbing. For intermediate tables in a chain, TARGET_LAG = DOWNSTREAM lets them refresh only when a downstream consumer needs data, avoiding wasted compute. Monitor the actual lag and refresh outcomes via DYNAMIC_TABLE_REFRESH_HISTORY and alert when it slips, so the SLA is observed, not assumed. The win is declarative freshness: you state the target, not the schedule.",
+    "fj": "Create a task that runs every 30 minutes and hope it keeps up.",
+    "fs": "A Dynamic Table with TARGET_LAG declares the freshness target and lets Snowflake manage incremental refresh and the dependency DAG; DOWNSTREAM avoids refreshing intermediates nobody is consuming, and refresh history makes the SLA observable.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Declarative freshness target",
+        "lang": "sql",
+        "lines": [
+          "CREATE OR REPLACE DYNAMIC TABLE exec_kpis",
+          "  TARGET_LAG = '1 hour'",
+          "  WAREHOUSE = reporting_wh",
+          "AS",
+          "SELECT day, region, SUM(amount) AS revenue",
+          "FROM sales GROUP BY day, region;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does TARGET_LAG = DOWNSTREAM do?",
+        "a": "The table drops its own schedule and refreshes only when a downstream Dynamic Table that depends on it refreshes, using the shortest target lag among its consumers. It saves compute on intermediate tables — but if it has NO downstream consumer it never refreshes, and Snowflake won't warn you."
+      },
+      {
+        "q": "When is a Dynamic Table the WRONG choice vs Streams + Tasks?",
+        "a": "When you need imperative control — calling stored procedures, multi-statement side effects, external calls, or branching logic per run. Dynamic Tables are declarative query state; Streams+Tasks give you arbitrary procedural steps. Reach for tasks when the work isn't 'keep this query's result fresh.'"
+      },
+      {
+        "q": "How do you know it's actually meeting the lag?",
+        "a": "Query DYNAMIC_TABLE_REFRESH_HISTORY and the table's lag metrics to see refresh times, whether refreshes were incremental or full, and the actual lag achieved; alert when actual lag exceeds the target so a slipping SLA pages instead of going unnoticed."
+      }
+    ]
+  },
+  {
+    "q": "A Task drives a MERGE that keeps failing on a bad batch, and because it's the root of a task graph, the whole downstream chain silently stops running. How do you make the chain resilient and observable?",
+    "a": "Stop the failure from silently wedging the graph and make it loud. Set SUSPEND_TASK_AFTER_NUM_FAILURES so a chronically failing task auto-suspends after N consecutive failures (Snowflake's default is 10) instead of retrying forever or blocking unnoticed, and wire an error-notification integration so failures page. Gate the task with WHEN SYSTEM$STREAM_HAS_DATA('stream') so it runs only when there's actually work, avoiding empty churn. Bound runaway statements with USER_TASK_TIMEOUT_MS (default 60 min) so a hung MERGE fails fast rather than holding the slot. And handle the bad batch itself — quarantine the offending rows so one poison record doesn't fail the whole MERGE. Observability comes from TASK_HISTORY: alert on failures, don't discover them via a stale downstream table.",
+    "fj": "Add more retries to the task so it eventually gets through.",
+    "fs": "Auto-suspend on repeated failure + error notifications + a timeout + a STREAM_HAS_DATA gate, and quarantine the poison batch — so the chain fails loud and bounded instead of silently wedging.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Resilient task config",
+        "lang": "sql",
+        "lines": [
+          "CREATE OR REPLACE TASK load_orders",
+          "  WAREHOUSE = etl_wh",
+          "  SCHEDULE = '30 MINUTE'",
+          "  SUSPEND_TASK_AFTER_NUM_FAILURES = 3",
+          "  USER_TASK_TIMEOUT_MS = 1800000",
+          "  ERROR_INTEGRATION = etl_alerts",
+          "WHEN SYSTEM$STREAM_HAS_DATA('orders_stream')",
+          "AS",
+          "  MERGE INTO orders t USING orders_stream s ON t.id = s.id ...;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does SUSPEND_TASK_AFTER_NUM_FAILURES actually protect against?",
+        "a": "A task that fails or times out every run forever — burning credits and masking a real problem. After N consecutive failures it suspends the task (the root of a graph), forcing a human to look. The Snowflake default is 10; set it lower for critical chains so you find out sooner."
+      },
+      {
+        "q": "Why gate on SYSTEM$STREAM_HAS_DATA?",
+        "a": "It returns true only when the Stream has unconsumed changes, so the task body runs only when there's work — no empty refreshes, no wasted warehouse spin-ups, and the schedule can be aggressive without churning credits on no-op runs."
+      },
+      {
+        "q": "How do you keep one bad row from failing the whole MERGE?",
+        "a": "Validate and clean in the staging step and route rejects to a quarantine table (or load upstream with ON_ERROR = CONTINUE) so the MERGE only sees clean rows. The poison record becomes a queryable reject you can fix and replay, not an exception that aborts the batch."
+      }
+    ]
+  },
+  {
+    "q": "A 90-day backfill is running on the same warehouse your production dashboards use, and now those dashboards are queuing and timing out. How do you isolate it on Snowflake and keep its cost bounded?",
+    "a": "Separate the workloads onto separate warehouses — that's the whole point of Snowflake's compute/storage split. Run the backfill on its own dedicated warehouse so production has its own compute that the backfill physically can't contend for. Put that backfill warehouse on the ECONOMY scaling policy (latency doesn't matter for a backfill) and attach a resource monitor that suspends it at a credit threshold so it can't run away. Set a tight AUTO_SUSPEND so it stops when idle, and chunk the backfill so it yields. Production keeps its own warehouse, its own scaling, and its own cost line.",
+    "fj": "Resize the shared warehouse bigger so there's room for both.",
+    "fs": "Put the backfill on its own warehouse (ECONOMY policy + resource monitor + tight auto-suspend), not the prod one — isolate by warehouse so the backfill can't contend with or out-spend production.",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Why does a separate warehouse fully isolate them?",
+        "a": "In Snowflake, warehouses are independent compute clusters over shared storage. Two warehouses don't share CPU or memory, so a heavy backfill on warehouse A cannot slow queries on warehouse B — unlike resizing one shared warehouse, which just raises a ceiling both still compete under."
+      },
+      {
+        "q": "How do you cap the backfill's spend?",
+        "a": "Attach a RESOURCE MONITOR to the backfill warehouse with a credit quota and a SUSPEND (or SUSPEND_IMMEDIATE) action at, say, 90-100%, plus a tight AUTO_SUSPEND so idle clusters stop. The backfill gets elasticity but can't blow the budget."
+      },
+      {
+        "q": "Does isolating cost more than one shared warehouse?",
+        "a": "Not necessarily — you pay per-second per active warehouse, so a separate backfill warehouse that auto-suspends costs only while it runs. You avoid the hidden cost of prod timeouts and of oversizing the shared warehouse just to absorb contention."
+      }
+    ]
+  },
+  {
+    "q": "Snowpipe auto-ingest is loading your event files, but you've found duplicate rows downstream. Why does this happen and how do you get exactly-once on Snowflake?",
+    "a": "Snowpipe guarantees at-least-once, not exactly-once: a file can occasionally be processed more than once (retries, re-notifications, or a manual reload of an already-loaded file), so a raw append accumulates duplicates. Get exactly-once at the table by making the load idempotent — land raw into a staging table, then MERGE into the target on a stable business/event key so a re-seen record updates rather than inserts. Where there's no natural key, dedup using file-and-row identity (METADATA$FILENAME + METADATA$FILE_ROW_NUMBER) or a content hash. Snowpipe's load history dedupes identical file loads for a window, but don't rely on it as your correctness boundary — the idempotent MERGE is the guarantee.",
+    "fj": "Snowpipe handles exactly-once, so the duplicates must be a source bug.",
+    "fs": "Snowpipe is at-least-once; make the TABLE exactly-once with an idempotent MERGE on a business key (or METADATA$FILENAME + row number / hash) — don't treat load history as the correctness guarantee.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Dedup on ingest with file metadata",
+        "lang": "sql",
+        "lines": [
+          "MERGE INTO events t",
+          "USING (",
+          "  SELECT *, METADATA$FILENAME AS _f, METADATA$FILE_ROW_NUMBER AS _r",
+          "  FROM @stage (FILE_FORMAT => ev_fmt)",
+          ") s",
+          "ON t.event_id = s.event_id            -- business key",
+          "WHEN NOT MATCHED THEN INSERT ...;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why isn't Snowpipe's load-history dedup enough on its own?",
+        "a": "It prevents reloading the SAME file for a limited retention window (about 14 days), but it won't dedup the same logical event arriving in DIFFERENT files, and it lapses after the window. It reduces duplicates; it doesn't make the table idempotent. The MERGE does."
+      },
+      {
+        "q": "What if there's no natural business key?",
+        "a": "Synthesize a stable identity: METADATA$FILENAME + METADATA$FILE_ROW_NUMBER pins a row to its source position, or hash the row's content. MERGE or dedup on that so the same physical record can't be inserted twice even if its file is reprocessed."
+      },
+      {
+        "q": "Streams vs MERGE for the dedup step?",
+        "a": "A Stream tracks new rows in the staging table so your MERGE only processes the delta (efficient), but the Stream doesn't dedup — the MERGE key does. Use the Stream to bound the work, the keyed MERGE to guarantee exactly-once."
+      }
+    ]
   }
 ]

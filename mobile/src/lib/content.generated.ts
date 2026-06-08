@@ -57,6 +57,11 @@ import vertexAi from './generated/vertex-ai.json';
 import azureAi from './generated/azure-ai.json';
 import cortex from './generated/cortex.json';
 import mosaic from './generated/mosaic.json';
+// Cross-vendor production track: shared failure scenarios (SLA, catch-up, late data) diagnosed
+// platform-neutrally; drill-downs fork into Databricks vs Snowflake native fixes.
+import dataReliability from './generated/data-reliability.json';
+// Agentic AI: MCP, multi-agent orchestration, LangGraph/AutoGen/CrewAI, memory, guardrails, eval.
+import agenticAi from './generated/agentic-ai.json';
 
 export interface GeneratedCard {
   q: string;
@@ -130,4 +135,6 @@ export const GENERATED: Record<string, GeneratedCard[]> = {
   snaplogic: snaplogic as unknown as GeneratedCard[],
   aem: aem as unknown as GeneratedCard[],
   workfront: workfront as unknown as GeneratedCard[],
+  'data-reliability': dataReliability as unknown as GeneratedCard[],
+  'agentic-ai': agenticAi as unknown as GeneratedCard[],
 };

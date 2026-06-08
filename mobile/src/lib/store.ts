@@ -46,7 +46,7 @@ import {
 
 export type Role = RoleKey;
 export type Mode = 'cram' | 'maintain';
-type SessionKind = 'daily' | 'track' | 'fresh' | 'weakspot' | 'lesson' | 'basics' | 'saved' | 'company' | 'incident' | 'diagnostic';
+type SessionKind = 'daily' | 'track' | 'fresh' | 'weakspot' | 'lesson' | 'basics' | 'saved' | 'company' | 'incident' | 'diagnostic' | 'single';
 
 /** Duolingo-style feedback events emitted by the store, consumed by the FeedbackBridge. */
 export type FeedbackKind = 'correct' | 'wrong' | 'complete' | 'streak' | 'levelUp';
@@ -155,6 +155,7 @@ interface State {
   trackSlug: string | null;
   companyKey: string | null;
   incidentId: string | null;
+  singleId: string | null; // a single card opened directly from search
   lessonIdx: number | null;
   sessionLevel: Level | null; // optional difficulty filter for a track session (track screen selector)
   userLevel: Level | null; // PERSISTED default level (Junior/Senior/Pro) chosen at onboarding → filters daily/role sessions
@@ -197,6 +198,7 @@ interface State {
   startCompany: (key: string) => void;
   startIncident: (id: string) => void;
   startDiagnostic: () => void;
+  startSingle: (cardId: string) => void;
   startLesson: (slug: string, lessonIdx: number) => void;
   exitTrack: () => void;
   endSession: () => void;
@@ -220,7 +222,7 @@ interface State {
 
 type DeckInputs = Pick<
   State,
-  'sessionKind' | 'trackSlug' | 'companyKey' | 'incidentId' | 'lessonIdx' | 'sessionLevel' | 'userLevel' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
+  'sessionKind' | 'trackSlug' | 'companyKey' | 'incidentId' | 'singleId' | 'lessonIdx' | 'sessionLevel' | 'userLevel' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
 >;
 
 /** Ids the user disliked — buildSessionDeck pushes these to the back so they surface less (never hidden). */
@@ -262,6 +264,10 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
     // never dead-ends); Pro unlocks the full stream. The home pill routes locked users to the
     // paywall, so this cap is mainly a safety net for deep links / dev.
     deck = freshSessionCards(now, roleDomain(s.role), unlockAll ? Infinity : FREE_FRESH_PREVIEW);
+  } else if (s.sessionKind === 'single' && s.singleId) {
+    // One card opened directly from search — just that card (free/Pro gating is enforced at tap time).
+    const card = findCardById(s.singleId);
+    deck = card ? [card] : [];
   } else if (s.sessionKind === 'saved') {
     // Resolve saved ids to live cards, skipping any that expired / were removed by OTA.
     deck = s.savedIds.map((id) => findCardById(id)).filter((cd): cd is SessionCard => !!cd);
@@ -282,6 +288,7 @@ const initial = buildDeck({
   trackSlug: null,
   companyKey: null,
   incidentId: null,
+  singleId: null,
   lessonIdx: null,
   sessionLevel: null,
   userLevel: null,
@@ -339,6 +346,7 @@ export const useStore = create<State>()(
       trackSlug: null,
       companyKey: null,
       incidentId: null,
+      singleId: null,
       lessonIdx: null,
       sessionLevel: null,
       userLevel: null,
@@ -461,6 +469,11 @@ export const useStore = create<State>()(
       startLesson: (slug, lessonIdx) => {
         track('session_started', { kind: 'lesson', track: slug, lesson: lessonIdx });
         set({ sessionKind: 'lesson', trackSlug: slug, lessonIdx, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startSingle: (cardId) => {
+        track('session_started', { kind: 'single', card: cardId });
+        set({ sessionKind: 'single', singleId: cardId, idx: 0, reveal: false, lastChoice: null, inSession: true });
         get().rebuildSession();
       },
       exitTrack: () => {

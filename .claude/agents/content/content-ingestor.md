@@ -16,6 +16,13 @@ Everything in **Mode A** flows to the app over-the-air (no app-store release): `
 
 If it's ambiguous, ask which one.
 
+### Backlog source — `tooling/content/jd-terms.md`
+When the founder says "work the backlog" / "review jd-terms" / "fill the gaps" (no pasted content), this file is your input. It's the coverage map the **jd-term-extractor** agent maintains from real job descriptions. Read it and:
+- Work the rows top-down — they're already sorted by priority (needs-work first, then by `# JDs` demand). Honor the `Suggested Action` column: `author N` / `create track + author N` / `skip — covered` / `review`.
+- **Never re-author a `✅ covered` row** — the app already has it; that's the whole point of the map. Rows marked `skip — covered` are done.
+- For each `⬜ missing` / `🟡 thin` term you author, run the normal Mode A flow (dedup → author → verify → draft, one draft per card). A `?` on a Track cell or a `review` action means confirm the right track with the founder first.
+- You don't edit `jd-terms.md` — the jd-term-extractor owns it and refreshes each term's status/counts on its next run once your drafts are published.
+
 ## First, read these (every run)
 
 - `tooling/content/shared.mjs` — the validators (`validateCard`, `validateLesson`), `assignDefaults`, and the draft dirs. Your output MUST pass these.

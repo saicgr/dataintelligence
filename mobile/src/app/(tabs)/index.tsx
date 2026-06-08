@@ -16,6 +16,7 @@ import Animated, {
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import {
+  type CardHit,
   CHAPTER_SIZE,
   checkpointCount,
   checkpointKey,
@@ -26,6 +27,7 @@ import {
   LEVEL_OPTIONS,
   levelLabel,
   roleDomain,
+  searchCards,
   Track,
   trackCardCount,
   tracksForRole,
@@ -84,17 +86,21 @@ function Player() {
 
 /* ── Learn path (browse) ───────────────────────────────────────────────────── */
 function LearnPath() {
-  const { c } = useTheme();
+  const { c, track: trackColor } = useTheme();
   const progress = useStore((st) => st.progress);
   const role = useStore((st) => st.role);
   const userLevel = useStore((st) => st.userLevel);
+  const unlocked = useStore((st) => st.unlocked);
+  const devMode = useStore((st) => st.devMode);
+  const startSingle = useStore((st) => st.startSingle);
   const due = useStore((st) => st.sessionMeta.due);
   const interviewDate = useStore((st) => st.interviewDate);
   const startDaily = useStore((st) => st.startDaily);
   const startFresh = useStore((st) => st.startFresh);
   const startDiagnostic = useStore((st) => st.startDiagnostic);
   const [showSettings, setShowSettings] = useState(false);
-  const [searchOpen, setSearchOpen] = useState(false);
+  // Search is visible by default (not hidden behind the header glass); the icon just toggles it off.
+  const [searchOpen, setSearchOpen] = useState(true);
   const [q, setQ] = useState('');
   const [manual, setManual] = useState<Record<string, boolean>>({});
   const action = nextAction(role, progress, due);
@@ -112,6 +118,12 @@ function LearnPath() {
     (x) => x.tracks.length > 0
   );
   const shown = grouped.flatMap((x) => x.tracks);
+  // Question-level search: typing a phrase also surfaces matching cards across the role's tracks,
+  // so you can jump straight into a remembered question instead of hunting through tracks.
+  const cardHits = query.length >= 2 ? searchCards(query, role) : [];
+  // Free users taste the first 2 cards of any track (matches the track screen); the rest are Pro.
+  const canOpen = (h: CardHit) => unlocked || (__DEV__ && devMode) || h.idxInTrack < 2;
+  const openHit = (h: CardHit) => (canOpen(h) ? startSingle(h.card.id) : router.push('/paywall'));
 
   // Collapsed by default — the Continue hero already surfaces the current lesson, so the
   // sections start tidy and expansion is user-driven (keeps the screen calm).
@@ -153,11 +165,10 @@ function LearnPath() {
           <TextInput
             value={q}
             onChangeText={setQ}
-            placeholder="Search tracks…"
+            placeholder="Search tracks & questions…"
             placeholderTextColor={c.muted}
             autoCapitalize="none"
             autoCorrect={false}
-            autoFocus
             clearButtonMode="while-editing"
             style={{ flex: 1, paddingVertical: 9, color: c.fg, fontSize: 13.5 }}
           />
@@ -205,6 +216,62 @@ function LearnPath() {
               </Fragment>
             ))}
             {shown.length === 0 && query.length > 0 && <T muted size={13}>No tracks match “{q}”.</T>}
+            {query.length >= 2 && (
+              <View style={{ gap: 8 }}>
+                <H2 style={{ marginTop: 6 }}>Questions</H2>
+                {cardHits.length === 0 ? (
+                  <T muted size={13}>No questions match “{q}”.</T>
+                ) : (
+                  cardHits.map((h) => {
+                    const open = canOpen(h);
+                    const col = trackColor(h.track.color);
+                    return (
+                      <Pressable
+                        key={h.card.id}
+                        accessibilityRole="button"
+                        accessibilityLabel={open ? `Open question: ${h.card.q}` : `Pro question: ${h.card.q}`}
+                        onPress={() => openHit(h)}
+                        style={{
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          gap: 10,
+                          padding: 12,
+                          backgroundColor: c.card,
+                          borderColor: c.border,
+                          borderWidth: 1,
+                          borderRadius: radius.md,
+                        }}>
+                        <View
+                          style={{
+                            width: 28,
+                            height: 28,
+                            borderRadius: 8,
+                            backgroundColor: col + '29',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}>
+                          <T size={14}>{h.track.icon}</T>
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <T size={13} weight="600" style={{ lineHeight: 17 }} numberOfLines={2}>
+                            {h.card.q}
+                          </T>
+                          <T muted size={11} weight="700" style={{ marginTop: 2 }}>
+                            {h.track.name}
+                            {h.card.level ? ` · ${h.card.level}` : ''}
+                          </T>
+                        </View>
+                        {open ? (
+                          <T muted weight="800">›</T>
+                        ) : (
+                          <T weight="800" size={10} color={trackColor('rag')}>Pro</T>
+                        )}
+                      </Pressable>
+                    );
+                  })
+                )}
+              </View>
+            )}
             {shown.length === 0 && query.length === 0 && userLevel && (
               <View style={{ gap: 6, paddingVertical: 8 }}>
                 <T weight="800" size={14}>No {levelLabel(userLevel)} topics for this role yet.</T>

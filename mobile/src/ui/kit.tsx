@@ -78,6 +78,7 @@ export function T({
   size = 14,
   color,
   style,
+  numberOfLines,
 }: {
   children: ReactNode;
   muted?: boolean;
@@ -85,10 +86,13 @@ export function T({
   size?: number;
   color?: string;
   style?: StyleProp<TextStyle>;
+  numberOfLines?: number;
 }) {
   const { c } = useTheme();
   return (
-    <Text style={[{ color: color ?? (muted ? c.muted : c.fg), fontWeight: weight, fontSize: size }, style]}>
+    <Text
+      numberOfLines={numberOfLines}
+      style={[{ color: color ?? (muted ? c.muted : c.fg), fontWeight: weight, fontSize: size }, style]}>
       {children}
     </Text>
   );

@@ -1526,5 +1526,175 @@
         "a": "Not always — for pure, ultra-low-latency BI with very high concurrency on small data, a dedicated warehouse can still edge it on raw query latency. The lakehouse wins when you also need ML, streaming, large-scale or open-format data and want to avoid copies and split governance. The trade is breadth and one governed copy versus a narrowly-tuned BI engine."
       }
     ]
+  },
+  {
+    "q": "A 4-hour Auto Loader stream into a bronze Delta table failed overnight, so the next run finds ~8 hours of backlogged files in the source bucket, tries to ingest them in one micro-batch, and the executors OOM. How do you recover safely and stop this from recurring?",
+    "a": "The OOM is unbounded micro-batch size, not a too-small cluster. Bound each batch with `cloudFiles.maxFilesPerTrigger` (hard limit; default 1000) and/or `cloudFiles.maxBytesPerTrigger` (soft limit) so a backlog drains over many rate-limited batches instead of one giant one. For a scheduled catch-up job use `Trigger.AvailableNow`, which discovers files asynchronously and still honors those rate limits, processing the whole backlog across multiple micro-batches then stopping. Because Auto Loader tracks processed files in its checkpoint (RocksDB), the recovery run only picks up the new 8 hours and never reprocesses, so a simple job retry is safe. Add a task retry policy with backoff so a transient failure self-heals before paging anyone.",
+    "fj": "Bump the cluster to a bigger instance type so it fits all the files in memory.",
+    "fs": "Treats it as a backpressure problem: caps batch size with maxFilesPerTrigger/maxBytesPerTrigger and lets AvailableNow drain the backlog incrementally, leaning on the checkpoint for exactly-once recovery rather than scaling hardware.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Bounded catch-up ingest",
+        "lang": "python",
+        "lines": [
+          "(spark.readStream.format(\"cloudFiles\")",
+          "   .option(\"cloudFiles.format\", \"json\")",
+          "   .option(\"cloudFiles.maxFilesPerTrigger\", 1000)   # hard cap per batch",
+          "   .option(\"cloudFiles.maxBytesPerTrigger\", \"2g\")     # soft cap per batch",
+          "   .option(\"cloudFiles.schemaLocation\", schema_path)",
+          "   .load(src)",
+          " .writeStream",
+          "   .option(\"checkpointLocation\", ckpt)   # RocksDB: won't reprocess files",
+          "   .trigger(availableNow=True)            # drain backlog over many batches, then stop",
+          "   .toTable(\"bronze.events\"))"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why prefer Trigger.AvailableNow over a plain batch read of the directory?",
+        "a": "AvailableNow runs as a streaming query, so it reuses the Auto Loader checkpoint to skip already-processed files and respects maxFilesPerTrigger/maxBytesPerTrigger to chunk the backlog. A plain batch read would re-list and re-ingest everything and has no rate limiting, reproducing the OOM."
+      },
+      {
+        "q": "maxBytesPerTrigger is set but a single batch still exceeded it. Bug?",
+        "a": "No. maxBytesPerTrigger is a soft limit. Auto Loader adds files until it crosses one of the limits, so the last file can push the batch over the byte target. maxFilesPerTrigger is the hard limit; use it when you need a firm per-batch ceiling."
+      },
+      {
+        "q": "After several days the catch-up job slows down on listing. What's the lever?",
+        "a": "Switch from directory-listing to file-notification mode (cloudFiles.useNotifications / managed file events) so discovery is event-driven instead of re-listing a huge prefix, and set cloudFiles.maxFileAge to expire old entries from the checkpoint state."
+      }
+    ]
+  },
+  {
+    "q": "A gold aggregate table powers an exec dashboard and the contract is: never more than 1 hour stale, and on-call must be paged when it falls behind. Today nobody finds out until a stakeholder complains. How do you enforce and monitor this on Databricks?",
+    "a": "Split it into scheduling, SLA detection, and data-quality detection. Schedule the producing Lakeflow Job at a cadence comfortably under 1 hour and set per-task metric thresholds: a Run duration warning so a slow/stuck run fires an event before it blows the SLA, plus on-failure notifications routed to PagerDuty/Slack. For the stay-fresh guarantee, enable Lakehouse Monitoring on the gold table, which tracks freshness and completeness against historical patterns and alerts on anomalies, and set a Databricks SQL alert on `MAX(updated_at)` so staleness is detected from the data itself, not just job status. If the table is produced by a Lakeflow Declarative Pipeline, add expectations to quarantine or fail bad rows so freshness never comes at the cost of correctness.",
+    "fj": "Add a cron job and eyeball the dashboard each morning.",
+    "fs": "Separates 'job ran' from 'data is fresh': pairs Lakeflow duration-warning thresholds and failure alerts with Lakehouse Monitoring freshness metrics and a data-driven SQL alert on the latest timestamp, so a silently-late table still pages.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Data-driven freshness alert (Databricks SQL)",
+        "lang": "sql",
+        "lines": [
+          "-- Alert fires when the gold table is more than 60 min stale",
+          "SELECT",
+          "  timestampdiff(MINUTE, MAX(updated_at), now()) AS staleness_min",
+          "FROM gold.exec_kpis",
+          "-- DBSQL Alert: trigger when staleness_min > 60, notify on-call"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why isn't a job-success notification enough for a freshness SLA?",
+        "a": "A job can succeed while emitting stale or empty data (upstream late, partial source, no new rows). Job status proves the run finished, not that the table advanced. A freshness check on MAX(updated_at) plus Lakehouse Monitoring catches the silent-staleness case job alerts miss."
+      },
+      {
+        "q": "What does the Lakeflow Run-duration warning threshold actually do?",
+        "a": "You set an expected completion time per task; if a run exceeds it, Databricks emits an event you can wire to a notification. It catches a long-running or stuck run early, before it breaches the downstream SLA, rather than only alerting after the job ultimately fails or times out."
+      },
+      {
+        "q": "How would Declarative Pipeline expectations fit here?",
+        "a": "Expectations are declarative data-quality constraints (expect_or_drop / expect_or_fail). They keep bad rows out of gold so meeting the freshness clock never ships corrupt numbers, and the pipeline event log exposes the drop/fail metrics you can also alert on."
+      }
+    ]
+  },
+  {
+    "q": "A 90-day backfill is running on the same shared all-purpose cluster the analytics and hourly production jobs use. The backfill pins every core, production jobs queue behind it, and SLAs slip. How do you isolate it?",
+    "a": "Stop running batch backfills on shared all-purpose compute. Run the backfill on its own dedicated job cluster (or serverless jobs compute) so it gets a separate, auto-terminating resource pool that can't starve interactive or production work. Back the job clusters with an instance pool to cut startup latency without sharing live capacity, and cap the backfill's blast radius with the pool's max capacity and the job's concurrency limits. Schedule it off-peak and chunk it (e.g., per-day partitions with maxFilesPerTrigger-style bounding) so it yields between slices. Production stays on its own job clusters, giving you true compute isolation plus independent autoscaling and cost attribution instead of one contended cluster.",
+    "fj": "Tell people to run the backfill at night and hope it finishes before the morning load.",
+    "fs": "Reaches for compute isolation (dedicated job/serverless clusters, instance pool with capped max capacity, off-peak chunked scheduling) so the backfill and production autoscale and bill independently and can't contend for the same cores.",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Job cluster vs instance pool vs serverless for the backfill?",
+        "a": "A job cluster is dedicated to one run and auto-terminates, giving isolation. An instance pool keeps warm instances to cut the minutes-long startup of repeated job clusters but shares a capped capacity you must size. Serverless jobs compute removes pool/capacity management entirely and scales per job. For an isolated backfill, dedicated job clusters or serverless are cleanest."
+      },
+      {
+        "q": "How do you keep the backfill itself from over-scaling and eating the cloud account?",
+        "a": "Cap autoscaling max workers on the job cluster, or set the instance pool's max capacity (requests beyond it fail with INSTANCE_POOL_MAX_CAPACITY_FAILURE rather than ballooning), and set the job's max_concurrent_runs so overlapping triggers don't multiply the footprint."
+      }
+    ]
+  },
+  {
+    "q": "Two runs of the same Workflow overlapped last night (a slow run hadn't finished when the schedule fired the next one) and both wrote the same gold Delta table, producing duplicate rows. How do you prevent the overlap AND make the write safe even if it ever overlaps again?",
+    "a": "Set the Workflow's `max_concurrent_runs = 1` (already the default for new jobs) so a queued trigger waits instead of running a second copy in parallel. But concurrency control is a guard, not the fix; a manual re-run, a retry, or a partial failure can still re-execute a slice. The real fix is making the write idempotent: replace a blind append with a Delta `MERGE` keyed on the business key so re-processing the same data updates rather than duplicates. For streaming foreachBatch writes, use the `txnAppId`/`txnVersion` DataFrameWriter options so Delta detects and ignores duplicate batch writes. Idempotency means correctness no longer depends on perfect scheduling.",
+    "fj": "Just turn off the schedule overlap so two runs never start at once.",
+    "fs": "Treats max_concurrent_runs=1 as a guard and a keyed idempotent MERGE (or txnAppId/txnVersion) as the actual correctness fix, since retries and manual re-runs can re-execute regardless of concurrency.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Idempotent upsert on the business key",
+        "lang": "sql",
+        "lines": [
+          "MERGE INTO gold.orders AS t",
+          "USING staged_orders AS s",
+          "ON t.order_id = s.order_id        -- business key, not row identity",
+          "WHEN MATCHED THEN UPDATE SET *",
+          "WHEN NOT MATCHED THEN INSERT *"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "max_concurrent_runs is already 1 -- why did the runs still overlap in some setups?",
+        "a": "Overlap usually comes from a path that bypasses the limit: a continuous/streaming trigger, separate manual run-now invocations, or a different job pointing at the same table. The setting caps concurrent runs of that one job; it doesn't coordinate other writers, which is exactly why the write itself must be idempotent."
+      },
+      {
+        "q": "When would you reach for txnAppId/txnVersion instead of a MERGE?",
+        "a": "In foreachBatch streaming sinks where you write the micro-batch DataFrame directly. Tagging each write with a stable txnAppId and monotonic txnVersion lets Delta recognize a replayed batch after a restart and skip it, giving idempotent appends without restructuring the write as a keyed merge."
+      },
+      {
+        "q": "Two concurrent writers now hit ConcurrentAppendException. Why, and the fix?",
+        "a": "Delta's optimistic concurrency detects conflicting commits to the same files. Narrow each writer to disjoint data (partition predicates so they touch different files), or serialize them; raising isolation to Serializable prevents reordering but doesn't make genuinely conflicting writes coexist. The durable answer is still one writer per partition plus idempotent merges."
+      }
+    ]
+  },
+  {
+    "q": "Your hourly Structured Streaming aggregate counts events per hour, but mobile clients buffer offline and events can arrive up to 2 hours after their event-time. The current job buckets by processing-time-ish logic and the hourly counts come out low. Fix it on Databricks.",
+    "a": "Aggregate by event-time windows and set a watermark to the real lateness bound: `groupBy(window(eventTime, '1 hour'))` with `withWatermark('eventTime', '2 hours')`. The watermark trails the max event-time by 2 hours, so events inside that bound update their correct hour bucket; events later than the watermark are dropped, and state for closed windows is evicted so the job doesn't grow unbounded. Note the output-mode tradeoff: append mode only emits a window's final result after the watermark passes, so each hour is delayed ~2 hours but never restated; update mode emits running counts immediately and revises them as late data lands. Pick update (or foreachBatch with an idempotent MERGE into the gold table) when downstream needs early-but-correctable numbers. Don't shrink the watermark to chase latency or you'll silently drop the late events causing the undercount.",
+    "fj": "Switch from processing-time to event-time windows and call it done.",
+    "fs": "Tunes the watermark to the actual 2-hour lateness, names the append-delay vs update-restatement output-mode tradeoff, and lands restated counts idempotently rather than just dropping late data to keep latency low.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Event-time windowed count with watermark",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql.functions import window, col",
+          "",
+          "agg = (events",
+          "  .withWatermark(\"event_time\", \"2 hours\")        # allowed lateness == real bound",
+          "  .groupBy(window(col(\"event_time\"), \"1 hour\"))",
+          "  .count())",
+          "",
+          "# update mode: early counts, revised as late data lands",
+          "(agg.writeStream",
+          "    .outputMode(\"update\")",
+          "    .option(\"checkpointLocation\", ckpt)",
+          "    .foreachBatch(merge_into_gold)   # idempotent MERGE on window key",
+          "    .start())"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does append output mode delay every hour by ~2 hours here?",
+        "a": "In append mode a windowed aggregate's row is only final once no more late data can change it, which is when the watermark passes the window's end. With a 2-hour watermark, the 1pm bucket isn't emitted until ~3pm. It's never restated, but it's late, which is the cost of the no-restatement guarantee."
+      },
+      {
+        "q": "What's the risk of setting the watermark to 30 minutes to cut latency?",
+        "a": "Events arriving 31 minutes to 2 hours late fall outside the threshold and get dropped from the aggregate, recreating the exact undercount you're fixing. The watermark must cover the real lateness; you trade latency for completeness, not the other way around."
+      },
+      {
+        "q": "Update mode emits the same window multiple times. How do you avoid duplicates downstream?",
+        "a": "Sink via foreachBatch and MERGE on the window key (and any group keys) so each emission upserts that window's latest count instead of appending. That makes the restating output idempotent, so re-emissions and stream restarts converge to one correct row per window."
+      }
+    ]
   }
 ]

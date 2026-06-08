@@ -1,0 +1,159 @@
+[
+  {
+    "q": "A batch job runs every 4 hours, loading whichever files landed since the last run. One night a run failed, but the pipeline only alerts on success, so nobody noticed. The next run then picked up ~8 hours of files at once; the oversized batch ran 3x longer, spilled, and the 6am daily report missed its SLA. What went wrong, and how do you fix it?",
+    "a": "Three compounding failures, and none of them is 'the cluster is too small.' First, the job alerts on success instead of failure, so a missed run is invisible — flip that so a failed or skipped run pages immediately. Second, each run's workload is unbounded: it processes 'everything since last success,' so one miss doubles the next batch. Cap each run's input (files or bytes) so a backlog drains over several rate-limited runs instead of one giant one. Third, make the load idempotent — upsert on a business key, deterministic partitions — so simply re-running the failed window is safe and can't double-count. And decouple the report's freshness SLA from 'a job succeeded': alert on data age, not run status.",
+    "fj": "Give the job a bigger cluster so it can chew through 8 hours of data.",
+    "fs": "It's a backpressure and alerting problem, not a sizing one: alert on failure, cap per-run input so a backlog drains incrementally, and make the load idempotent so re-running the missed window is safe.",
+    "level": "Mid",
+    "followups": [
+      { "q": "How would you bound the catch-up run on Databricks?", "a": "Auto Loader with cloudFiles.maxFilesPerTrigger (hard cap, default 1000) and/or cloudFiles.maxBytesPerTrigger (soft cap), run as a scheduled job with Trigger.AvailableNow so the backlog drains across many rate-limited micro-batches and then stops. The checkpoint ensures the recovery run only ingests genuinely new files." },
+      { "q": "And on Snowflake?", "a": "Prefer event-driven Snowpipe so there is no fixed window to miss, or a Task gated by WHEN SYSTEM$STREAM_HAS_DATA('stream') so it runs only when there is work — on a multi-cluster warehouse so a one-off surge spins up extra clusters to absorb it instead of queuing." },
+      { "q": "Why is 'alert on success' such a common trap?", "a": "A success ping confirms the happy path but is silent exactly when you need it: a job that never started, crashed before reporting, or was skipped emits nothing. You want a freshness/heartbeat check that fires on the ABSENCE of an on-time successful run, plus explicit on-failure alerts." }
+    ]
+  },
+  {
+    "q": "Your ingestion pipeline was paused for two days during a platform migration. When you turn it back on, the first run faces a two-day backlog that threatens to overwhelm the warehouse and blow every downstream SLA at once. How do you bring it back safely?",
+    "a": "Don't let the live path swallow the backlog in one shot. Drain it as a separate, rate-limited backfill on its own compute so production queries aren't starved, and bound each chunk (cap files/bytes, or go partition-by-partition). Prioritize the most recent partitions first if downstream cares about 'now' more than the gap, then fill history behind it. Keep the load idempotent so chunked reprocessing can't duplicate, and watermark progress so a failure resumes mid-drain instead of restarting. Cut back to the normal cadence only once the lag is inside SLA.",
+    "fj": "Just turn it back on — it'll catch up on its own eventually.",
+    "fs": "Isolate and rate-limit the drain: separate compute, bounded chunks, recent-first, idempotent and watermarked, so the backlog can't contend with the live path or duplicate.",
+    "level": "Mid",
+    "followups": [
+      { "q": "How do you isolate the drain on Databricks?", "a": "Run the backfill on a dedicated job cluster (or serverless jobs compute), separate from the all-purpose cluster serving interactive/production work, with maxFilesPerTrigger to rate-limit and Trigger.AvailableNow to chunk. Cap the cluster's max workers so the drain can't over-scale and eat the account." },
+      { "q": "And on Snowflake?", "a": "Drain the Stream in bounded chunks from a separate warehouse so prod keeps its own compute, and put that warehouse on the ECONOMY scaling policy to favor cost over latency for a non-urgent backfill. A resource monitor caps its credits." },
+      { "q": "Recent-first or oldest-first — how do you choose?", "a": "If the value is current freshness (a live dashboard), process newest partitions first so the SLA recovers fast, then backfill history behind it. If downstream needs contiguous history before it can compute (a windowed metric), oldest-first in order is safer. State the trade-off explicitly rather than defaulting." }
+    ]
+  },
+  {
+    "q": "The 6am executive report has been late three mornings in a row, but every job in the pipeline reports SUCCESS and no alert has fired. How do you make this visible and stop it recurring?",
+    "a": "The gap is that you're monitoring job status, not data freshness. A job can succeed while producing stale or empty output — late upstream, partial source, zero new rows — so add a freshness SLA on the OUTPUT: alert when MAX(updated_at) on the report table is older than the SLA, independent of run status. Then map the critical path: the report is late because of the longest dependency chain, so instrument per-stage timing to find which step is drifting and whether it's contention, data growth, or a slow upstream. Add a run-duration warning that fires BEFORE the SLA is breached, and give the critical pipeline priority compute so it isn't queued behind ad-hoc work. Lateness should page on its own — not wait for a stakeholder to notice.",
+    "fj": "All the jobs are green, so the pipeline is fine — probably a one-off.",
+    "fs": "Monitor data freshness and the critical path, not job status: alert on output age, warn on run duration before the breach, and find the longest dependency that's drifting.",
+    "level": "Sr",
+    "followups": [
+      { "q": "How would you enforce this on Databricks?", "a": "Schedule the producer as a Lakeflow Job under the SLA cadence, set a per-task run-duration warning so a slow run alerts early, enable Lakehouse Monitoring freshness on the output table, and add a Databricks SQL alert on timestampdiff(MINUTE, MAX(updated_at), now()) > SLA." },
+      { "q": "And on Snowflake?", "a": "Make the output a Dynamic Table with TARGET_LAG = '1 hour' (the SLA) — Snowflake then manages refresh to keep it within that lag declaratively — and alert off DYNAMIC_TABLE_REFRESH_HISTORY when actual lag slips. For task-driven pipelines, alert on the latest-load timestamp." },
+      { "q": "What is the 'critical path' and why does it matter here?", "a": "It's the longest chain of dependent steps that determines the earliest the report can finish. Speeding up a step NOT on the critical path does nothing for the SLA. You find it from per-stage timings, then optimize or parallelize that specific bottleneck step." }
+    ]
+  },
+  {
+    "q": "Your hourly aggregate of mobile events undercounts: clients buffer events offline and they can arrive up to two hours after the event actually happened. How do you get correct hourly numbers?",
+    "a": "Aggregate by EVENT time, not arrival/processing time, and set a watermark to the real lateness bound (~2 hours) so events inside that window land in their correct hour while state for closed windows is evicted. Decide the output contract: emit each hour only once it's final (delayed by the watermark, never restated), or emit running counts early and restate as late data arrives. If you restate, write idempotently (upsert keyed on the window) so re-emissions converge instead of duplicating. Don't shrink the watermark to chase latency — anything later than the bound is silently dropped, which recreates the undercount you're fixing.",
+    "fj": "Switch to event-time windows and it's fixed.",
+    "fs": "Event-time windows PLUS a watermark sized to the real lateness, an explicit final-vs-restate output choice, and idempotent restatement — not just swapping the time column.",
+    "level": "Sr",
+    "followups": [
+      { "q": "How does this look on Databricks Structured Streaming?", "a": "groupBy(window(eventTime,'1 hour')) with withWatermark('eventTime','2 hours'). Append mode emits a window only after the watermark passes it (late but never restated); update mode emits early and revises. With update mode, sink via foreachBatch + MERGE on the window key so restatements are idempotent." },
+      { "q": "And on Snowflake?", "a": "Snowflake has no streaming watermark; you model lateness with a reprocessing window — re-aggregate the last N hours on each run (a Stream + MERGE, or a Dynamic Table whose query covers the late window) so late arrivals restate their hour idempotently. You trade some recompute for correctness." },
+      { "q": "What's the cost of a 2-hour watermark in append mode?", "a": "Every window is delayed ~2 hours before it's emitted, because the engine must wait until no more late data can change it. You get no-restatement correctness at the price of latency — that's the fundamental trade-off." }
+    ]
+  },
+  {
+    "q": "A task failed halfway through writing, the orchestrator retried it, and now the target table has duplicate rows for that window. What's the root cause and how do you prevent it?",
+    "a": "The write isn't idempotent: a blind append means a retry re-inserts rows that partially landed the first time. The fix is to make re-running a window converge to the same result — replace append with an upsert/MERGE keyed on a business key (not row identity) so a re-run updates instead of duplicating, and make partition writes deterministic so you can overwrite a whole partition. Assume at-least-once everywhere: any step can run twice, so design it to be harmless. Dedup keys, committing the output and the watermark in one transaction, and idempotent upserts are the tools.",
+    "fj": "Add a SELECT DISTINCT at the end to strip the duplicates.",
+    "fs": "Make the write idempotent — MERGE/upsert on a business key, or deterministic partition overwrite — so retries and re-runs converge; dedup-after-the-fact is a band-aid that hides the bug.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Idempotent upsert on a business key",
+        "lang": "sql",
+        "lines": [
+          "MERGE INTO gold.orders t",
+          "USING staged s",
+          "  ON t.order_id = s.order_id   -- business key, not a surrogate",
+          "WHEN MATCHED THEN UPDATE SET *",
+          "WHEN NOT MATCHED THEN INSERT *;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      { "q": "On Databricks, what if it's a streaming foreachBatch sink?", "a": "Tag each write with the DataFrameWriter txnAppId + txnVersion options. Delta recognizes a replayed micro-batch after a restart and skips it, giving idempotent appends without rewriting the logic as a keyed MERGE." },
+      { "q": "On Snowflake, how do you dedup at load time?", "a": "MERGE on the business key, or dedup staged rows using METADATA$FILENAME + METADATA$FILE_ROW_NUMBER (or a row hash) so a file reloaded by at-least-once Snowpipe doesn't create duplicates. Load history helps but isn't a correctness guarantee." },
+      { "q": "Why key the MERGE on a business key, not a surrogate id?", "a": "A surrogate is generated per insert, so the same logical record gets a new id on a re-run and the MERGE sees it as 'not matched' and duplicates. The natural/business key is stable across runs, which is what makes the upsert idempotent." }
+    ]
+  },
+  {
+    "q": "Upstream added a new column and renamed another in the JSON they land for you. Your loader kept succeeding, but a downstream metric has been silently wrong for a week because the field never made it in. How do you prevent this class of bug?",
+    "a": "Decide explicitly between schema enforcement and schema evolution — silent acceptance is the worst of both. For controlled inputs, enforce a contract: reject or alert on an unexpected schema instead of dropping fields, so a producer change fails loudly. Where evolution is wanted, use it deliberately and capture anything unmodeled (a rescue/variant column) plus an alert when it's non-empty, so new fields are visible rather than lost. Back it with a data contract between producer and consumer so renames/additions are a coordinated, reviewed change — not a surprise. The principle: an unexpected schema change should fail closed or alert, never pass silently.",
+    "fj": "Turn on auto schema-merge so the loader always adapts.",
+    "fs": "Make unexpected schema changes fail closed or alert — enforce a contract, and where you do evolve, rescue unmodeled fields and alert on them rather than dropping silently.",
+    "level": "Mid",
+    "followups": [
+      { "q": "How does Auto Loader handle this on Databricks?", "a": "cloudFiles.schemaEvolutionMode controls behavior (addNewColumns to evolve, rescue, or failOnNewColumns). The _rescued_data column captures fields that don't match the schema so nothing is silently lost — alert when it's populated. By default a new column can fail the stream so you actually notice." },
+      { "q": "And on Snowflake?", "a": "Load into a VARIANT and project columns explicitly so new keys stay visible and queryable, or use INFER_SCHEMA + MATCH_BY_COLUMN_NAME for structured loads. Add a check that alerts when unexpected keys appear rather than ignoring them." },
+      { "q": "What does a 'data contract' actually buy you?", "a": "It makes the schema a versioned, agreed interface: the producer can't add/rename/drop a field without a reviewed change, and CI can validate incoming data against the contract and reject violations — turning a silent week-long bug into a caught, pre-merge failure." }
+    ]
+  },
+  {
+    "q": "An analyst kicked off a 90-day reprocess on the shared cluster/warehouse the production pipelines use. Now production dashboards are timing out. How do you stop backfills from taking down production?",
+    "a": "Backfills and production must not share the same finite compute. Give the backfill its own isolated, auto-terminating compute so it physically can't starve the live path, rate-limit it into bounded chunks, and schedule it off-peak. Cap its blast radius — max workers / warehouse size / a spend cap — so it can't over-scale and eat the account either. Production keeps its own dedicated compute with independent autoscaling and cost attribution. The rule is isolate by workload, not by politeness: 'please run it at night' is not an architecture.",
+    "fj": "Ask the analyst to run it overnight so it doesn't clash with the dashboards.",
+    "fs": "Isolate the backfill onto its own capped, auto-terminating compute, rate-limited and off-peak, so production autoscales and bills independently and can't be starved.",
+    "level": "Mid",
+    "followups": [
+      { "q": "On Databricks?", "a": "Run the backfill on a dedicated job cluster or serverless jobs compute (not the shared all-purpose cluster), optionally backed by an instance pool to cut startup, with autoscale max-workers capped so it can't balloon. Production runs on its own job clusters — true compute isolation plus separate cost attribution." },
+      { "q": "On Snowflake?", "a": "Spin the backfill on a separate virtual warehouse so it has its own compute, attach a resource monitor that suspends it at a credit threshold, and use the ECONOMY scaling policy since latency doesn't matter for a backfill. Prod queries keep their own warehouse." },
+      { "q": "Why isn't 'just make the shared cluster bigger' the answer?", "a": "It raises cost for everyone and still lets a runaway backfill consume the headroom and contend with prod. Isolation bounds the blast radius; sizing just moves the ceiling. You want the backfill unable to touch production capacity at all." }
+    ]
+  },
+  {
+    "q": "One malformed file in a nightly batch throws an exception that aborts the entire 2-hour job. It's failed three nights running because the same bad file keeps reappearing. How do you make the pipeline resilient to bad records?",
+    "a": "A single poison record shouldn't be able to fail a whole batch. Route bad rows/files to a dead-letter / quarantine location and keep processing the good ones, then alert on the quarantine volume so failures are visible and triaged — not silently swallowed. Make the bad-record handling explicit (skip-and-capture, with the reason) so you can replay after a fix. The principle is graceful degradation with observability: isolate the failure, keep the SLA, and turn the rejects into a queryable artifact rather than a stack trace.",
+    "fj": "Wrap the whole job in a try/except so it stops crashing.",
+    "fs": "Quarantine bad records to a dead-letter path and keep processing the good ones, with an alert on reject volume — isolate the failure instead of failing the batch or silently swallowing it.",
+    "level": "Mid",
+    "followups": [
+      { "q": "On Databricks?", "a": "Use badRecordsPath (or Auto Loader's rescued-data column) so malformed records are written aside and the job continues, then monitor that path. You keep the good data flowing and retain the rejects for replay." },
+      { "q": "On Snowflake?", "a": "COPY INTO with ON_ERROR = CONTINUE (or SKIP_FILE) loads the clean rows and skips the bad ones; VALIDATION_MODE and the load history surface what was rejected so you can fix and reload. Alert when the rejected count is non-trivial." },
+      { "q": "What's the danger of just skipping bad records silently?", "a": "Silent skips become silent data loss — your counts are quietly low and nobody knows. Quarantine-and-alert keeps the batch healthy WHILE making the dropped volume visible and replayable, which is the difference between resilience and a hidden bug." }
+    ]
+  },
+  {
+    "q": "A pipeline scheduled every 30 minutes occasionally takes 40. On those nights a second run starts while the first is still going, both write the same table, and you get duplicates and lock contention. How do you fix it?",
+    "a": "Two problems: prevent the overlap, and survive it if it happens anyway. Enforce single-flight — at most one active run of this job — so a late run delays the next trigger instead of running concurrently. But concurrency control is a guard, not a correctness guarantee (a manual re-run or a retry can still double-execute), so ALSO make the write idempotent (MERGE on a business key) so two executions converge. Separately, treat the 40-minute run as a capacity signal: if runs routinely overrun the interval, the schedule is too tight or the step needs optimization or more compute.",
+    "fj": "Change the schedule to every 45 minutes so the runs don't overlap.",
+    "fs": "Single-flight (max one active run) as a guard PLUS an idempotent keyed write as the real fix — and treat chronic overrun as a sign the interval or the step itself needs attention.",
+    "level": "Sr",
+    "followups": [
+      { "q": "On Airflow?", "a": "Set max_active_runs=1 on the DAG (and catchup=False so a paused gap doesn't fire a storm of backfilled runs). depends_on_past or a pool can further serialize. That prevents overlap; the write still needs to be idempotent for retries." },
+      { "q": "On Databricks Workflows?", "a": "max_concurrent_runs = 1 (the default for new jobs) queues a trigger instead of running a second copy in parallel, and an idempotent MERGE makes the write safe regardless. Watch for ConcurrentAppendException if two writers ever do touch the same files." },
+      { "q": "Do Snowflake tasks overlap?", "a": "No — a standalone scheduled task does NOT start a new run while the previous run of that task is still executing; Snowflake skips the scheduled run. So overlap there usually means a SEPARATE writer (a manual job, another task) hit the same table — which is again why the write must be idempotent." }
+    ]
+  },
+  {
+    "q": "Someone cleared the checkpoint/state directory to 'fix' a stuck streaming job. Now it either wants to reprocess the entire history or it skipped a chunk and left a gap. How do you reason about this and prevent it?",
+    "a": "The cursor / high-water-mark IS the pipeline's memory of what it has consumed; destroying it means the job no longer knows where it was. Recovery hinges on idempotency: if the write is idempotent, a full reprocess is merely expensive, not corrupting — you can replay safely. If it isn't, a reset duplicates and a partial reset leaves a gap. So (1) treat the checkpoint/offset store as durable, protected state, not a scratch dir to delete; (2) commit progress transactionally WITH the output so they can't diverge; and (3) keep writes idempotent so a forced replay is always safe. Prevent the human cause too: document that clearing state is a data-loss operation.",
+    "fj": "Just delete the checkpoint and let it start fresh — it'll sort itself out.",
+    "fs": "The checkpoint is durable consumed-state: protect it, commit it transactionally with the output, and keep writes idempotent so a forced replay is safe rather than duplicating or gapping.",
+    "level": "Sr",
+    "followups": [
+      { "q": "On Databricks?", "a": "The Structured Streaming checkpoint (offsets + commit log, in RocksDB) is what guarantees exactly-once; deleting it forces a full reprocess and, with a non-idempotent sink, duplicates. Never colocate it with deletable scratch, and rely on an idempotent MERGE so a rebuild is safe." },
+      { "q": "On Snowflake?", "a": "A Stream's offset advances only when its rows are consumed in a DML transaction, so consuming and writing in one transaction keeps them in lockstep — a failure rolls both back and you re-read the same rows. Don't recreate the stream to 'reset' it; that loses the offset and the change interval." },
+      { "q": "Why does idempotency make checkpoint loss survivable?", "a": "If re-applying the same data converges to the same result, then 'reprocess from the beginning' costs compute but can't corrupt — the worst case is a slow, safe replay. Idempotency turns a catastrophic state-loss into a mere performance problem." }
+    ]
+  },
+  {
+    "q": "An upstream filter change cut your daily row count roughly in half, but the job still 'succeeded' and the dashboard just quietly shows lower numbers. Nobody noticed for days. How do you catch this class of problem?",
+    "a": "Success means 'ran without error,' not 'the data is right.' Add data-quality gates on volume and freshness: assert row counts (and key distributions) against expected ranges or historical baselines, and fail or circuit-break when they deviate beyond a threshold — a 50% drop should halt promotion and page, not publish. Reconcile against the source where feasible (counts / control totals). Treat these assertions as part of the pipeline, not an afterthought, so a regression is caught at the boundary before it reaches the dashboard. Anomaly detection on the metric series catches the subtler drifts a hard threshold misses.",
+    "fj": "The job is green, so the data must be fine.",
+    "fs": "Gate on data quality, not just job status: assert volume/distribution against a baseline and circuit-break on anomalies before publishing, plus reconcile against source totals.",
+    "level": "Sr",
+    "followups": [
+      { "q": "On Databricks?", "a": "Lakeflow Declarative Pipeline expectations (expect_or_drop / expect_or_fail) enforce row-level and aggregate constraints and expose drop/fail metrics in the event log; Lakehouse Monitoring tracks volume/quality drift over time and alerts on anomalies." },
+      { "q": "On Snowflake?", "a": "Add a validation step — a scheduled Task (or a check on the Dynamic Table) that compares today's count to a rolling baseline and notifies/raises on a large deviation, gating downstream. ACCOUNT_USAGE and metric tables give you the history to baseline against." },
+      { "q": "Hard threshold or anomaly detection — when each?", "a": "Hard thresholds (count within +/-20% of the 7-day median) are simple and catch big breaks like a halving. Anomaly/seasonality-aware detection catches gradual drift and weekly patterns a static band would false-alarm on. Start with thresholds, add anomaly detection for the subtle cases." }
+    ]
+  },
+  {
+    "q": "Your daily partition job double-counted one day and missed another around the spring/fall clock change. What happened, and how do you make date-partitioned pipelines robust to DST?",
+    "a": "Mixing local time and DST into partitioning logic creates 23- and 25-hour 'days' and ambiguous repeated timestamps, so a naive 'midnight-to-midnight local' window can overlap or gap at the change. Standardize on UTC for storage and partition boundaries, convert to local only at presentation, and make the partition write idempotent (overwrite the whole partition) so a re-run can't double-count. Be explicit about the timezone everywhere — never rely on the cluster/session default — and test the DST days specifically. The principle: compute in UTC, render in local, overwrite partitions idempotently.",
+    "fj": "It's a rare edge case — just rerun the two affected days by hand.",
+    "fs": "Partition and compute in UTC (render local only at the edge) and overwrite partitions idempotently, with the timezone explicit everywhere — don't let DST create 23/25-hour days in your logic.",
+    "level": "Mid",
+    "followups": [
+      { "q": "Why UTC specifically, not a fixed offset?", "a": "A fixed offset (e.g. -05:00) is wrong half the year when DST shifts; UTC has no DST and no offset changes, so boundaries are unambiguous and stable. You apply the local-with-DST conversion once, at display time, where ambiguity is acceptable." },
+      { "q": "How does idempotent partition overwrite help here?", "a": "If each daily run fully replaces its target partition (INSERT OVERWRITE / MERGE on the partition), then re-running a mis-bounded day corrects it instead of appending more rows — so even if a boundary bug slips through, the fix is a safe re-run, not a manual dedup." }
+    ]
+  }
+]
