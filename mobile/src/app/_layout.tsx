@@ -1,7 +1,7 @@
 import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
-import { useColorScheme } from 'react-native';
+import { Platform, useColorScheme, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { identify, initAnalytics, track } from '../lib/analytics';
@@ -49,27 +49,54 @@ function useBootstrap() {
   }, [setUserId, hydrate]);
 }
 
+// On web this is a phone app rendered through react-native-web, so clamp it to a
+// centered phone-width column over a dark backdrop — otherwise it stretches edge-to-edge
+// and reads like a website. Native (iOS/Android) is unaffected.
+const isWeb = Platform.OS === 'web';
+
 export default function RootLayout() {
   const scheme = useColorScheme();
   useBootstrap();
   return (
-    <GestureHandlerRootView style={{ flex: 1 }}>
-      <ThemeProvider value={scheme === 'dark' ? DarkTheme : DefaultTheme}>
-        <Stack screenOptions={{ headerShown: false }}>
-          <Stack.Screen name="(tabs)" />
-          <Stack.Screen name="onboarding" />
-          <Stack.Screen name="track/[slug]" />
-          <Stack.Screen name="paywall" options={{ presentation: 'modal' }} />
-          <Stack.Screen name="debrief" options={{ presentation: 'modal' }} />
-          <Stack.Screen name="share" options={{ presentation: 'modal' }} />
-          <Stack.Screen name="jd" options={{ presentation: 'modal' }} />
-          <Stack.Screen name="league" options={{ presentation: 'modal' }} />
-          <Stack.Screen name="mock" options={{ presentation: 'modal' }} />
-          <Stack.Screen name="checkpoint" options={{ presentation: 'modal' }} />
-          <Stack.Screen name="audio-session" />
-        </Stack>
-        <StatusBar style="auto" />
-      </ThemeProvider>
+    <GestureHandlerRootView style={[{ flex: 1 }, isWeb && { backgroundColor: '#0b0f15', alignItems: 'center' }]}>
+      <View
+        style={
+          isWeb
+            ? {
+                flex: 1,
+                width: '100%',
+                maxWidth: 440,
+                alignSelf: 'center',
+                overflow: 'hidden',
+                shadowColor: '#000',
+                shadowOpacity: 0.45,
+                shadowRadius: 40,
+                shadowOffset: { width: 0, height: 0 },
+              }
+            : { flex: 1 }
+        }>
+        <ThemeProvider value={scheme === 'dark' ? DarkTheme : DefaultTheme}>
+          <Stack screenOptions={{ headerShown: false }}>
+            <Stack.Screen name="(tabs)" />
+            <Stack.Screen name="onboarding" />
+            <Stack.Screen name="track/[slug]" />
+            <Stack.Screen name="paywall" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="debrief" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="share" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="jd" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="league" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="friends" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="certificate" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="contest" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="code" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="mock" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="checkpoint" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="audio-session" />
+            <Stack.Screen name="incidents" />
+          </Stack>
+          <StatusBar style="auto" />
+        </ThemeProvider>
+      </View>
     </GestureHandlerRootView>
   );
 }

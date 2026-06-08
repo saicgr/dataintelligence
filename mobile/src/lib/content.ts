@@ -19,7 +19,19 @@ export { freshCount, freshForTrack, freshPackCards, freshPackCount, freshSession
  * Everything is offline-first; fresh content is version-checked on launch.
  */
 
-export type Level = 'Jr' | 'Mid' | 'Sr';
+export type Level = 'Jr' | 'Mid' | 'Sr' | 'Staff' | 'Principal';
+/** The full seniority ladder, junior→principal, in display order. */
+export const LEVELS: Level[] = ['Jr', 'Mid', 'Sr', 'Staff', 'Principal'];
+/** Canonical seniority label for a level — the single source of truth used everywhere (home header,
+ * onboarding + settings selectors, track breakdown). Jr→Junior, Mid→Mid, Sr→Senior, Staff→Staff, Principal→Principal. */
+export const levelLabel = (l: Level): string =>
+  l === 'Sr' ? 'Senior' : l === 'Mid' ? 'Mid' : l === 'Staff' ? 'Staff' : l === 'Principal' ? 'Principal' : 'Junior';
+/** Options for the level selector controls (onboarding + settings + track screen). Labels match `levelLabel`.
+ * `null` value = "All levels" (no filter). */
+export const LEVEL_OPTIONS: { label: string; value: Level | null }[] = [
+  { label: 'All levels', value: null },
+  ...LEVELS.map((value) => ({ label: levelLabel(value), value })),
+];
 export type Domain = 'de' | 'ai';
 export type DomainFilter = Domain | 'all';
 
@@ -164,6 +176,7 @@ export interface SessionCard {
   tk: TrackColorKey;
   tool: string;
   tag: string;
+  level?: Level; // difficulty tier (Jr/Mid/Sr) for level-filtered track sessions
   q: string;
   // MCQ
   opts?: ChoiceOption[];
@@ -240,6 +253,9 @@ const RAW_TRACKS: Track[] = [
   // ── Concept tracks: Vendor / integration ──
   { slug: 'palantir', name: 'Palantir Foundry', color: 'sysd', icon: '🛰️', q: 0, domain: 'de', group: 'concept' },
   { slug: 'data-integration', name: 'Data Integration', color: 'kafka', icon: '🔌', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'snaplogic', name: 'SnapLogic', color: 'dbt', icon: '🔗', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'aem', name: 'Adobe Experience Manager', color: 'rag', icon: '🅰️', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'workfront', name: 'Workfront Fusion', color: 'kafka', icon: '⚙️', q: 0, domain: 'de', group: 'concept' },
   // ── Concept tracks: Architecture / security ──
   { slug: 'architecture', name: 'Architecture', color: 'sysd', icon: '🏛️', q: 0, domain: 'de', group: 'concept' },
   { slug: 'security', name: 'Security', color: 'eval', icon: '🔐', q: 0, domain: 'de', group: 'concept' },
@@ -302,6 +318,29 @@ export function tracksForRole(roleKey: string): Track[] {
   return slugs.map((s) => trackBySlug(s)).filter((t): t is Track => !!t);
 }
 
+// Per-track level counts derived from the (static-per-session) card bank — cached so the home path
+// can curate by level on every render without rebuilding each bank repeatedly. (A reload re-inits the
+// module, picking up fresh card levels after a re-tag.)
+const _levelCountCache = new Map<string, Record<Level, number>>();
+/** Per-level card counts for a track (drives level-aware curation + the track-screen breakdown). */
+export function levelCountsForTrack(slug: string): Record<Level, number> {
+  const cached = _levelCountCache.get(slug);
+  if (cached) return cached;
+  const counts: Record<Level, number> = { Jr: 0, Mid: 0, Sr: 0, Staff: 0, Principal: 0 };
+  for (const c of bankForTrack(slug)) if (c.level) counts[c.level] += 1;
+  _levelCountCache.set(slug, counts);
+  return counts;
+}
+
+/** The tracks a role studies at a given level — every TOPIC spans tiers, so a track shows at any
+ *  level where it has ≥1 card. `null` = "All levels" → every track. May be empty (the home path
+ *  shows a hint when a role has no cards at the chosen level — e.g. Principal). */
+export function tracksForRoleAtLevel(roleKey: string, level: Level | null): Track[] {
+  const all = tracksForRole(roleKey);
+  if (!level) return all;
+  return all.filter((t) => levelCountsForTrack(t.slug)[level] > 0);
+}
+
 /** Domain filter for fresh/scenario content: a role's domain if homogeneous, else 'all'. */
 export function roleDomain(roleKey: string): DomainFilter {
   const doms = new Set(tracksForRole(roleKey).map((t) => t.domain));
@@ -330,7 +369,7 @@ export function questionsFor(slug: string): QRow[] {
   return (GENERATED[slug] ?? []).map((c) => [c.q, c.level] as QRow);
 }
 
-const levelTag = (l: Level) => (l === 'Sr' ? 'Senior' : l === 'Mid' ? 'Mid' : 'Junior');
+const levelTag = levelLabel;
 
 function cardFromGenerated(t: Track, c: GeneratedCard, i: number): SessionCard {
   return {
@@ -339,6 +378,7 @@ function cardFromGenerated(t: Track, c: GeneratedCard, i: number): SessionCard {
     tk: t.color,
     tool: t.name,
     tag: levelTag(c.level),
+    level: c.level,
     q: c.q,
     a: c.a,
     fj: c.fj,
@@ -358,7 +398,7 @@ export function bankForTrack(slug: string): SessionCard[] {
   // Path's sequential-unlock + SRS progress (keyed on that id scheme) work unchanged. Fresh cards are
   // appended after and intentionally skip the re-id.
   const lessons = lessonsForTrack(slug, now);
-  if (lessons.length) return [...lessons.map((c, i) => ({ ...c, id: `${slug}-${i}` })), ...fresh];
+  if (lessons.length) return [...lessons.map((c, i) => ({ ...c, id: `${slug}-${i}`, level: c.level ?? ('Mid' as Level) })), ...fresh];
   const t = trackBySlug(slug);
   if (!t) return fresh;
   return [...(GENERATED[slug] ?? []).map((c, i) => cardFromGenerated(t, c, i)), ...fresh];

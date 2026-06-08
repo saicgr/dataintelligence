@@ -189,6 +189,9 @@ export function Btn({
   return (
     <AnimatedPressable
       disabled={disabled}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{ disabled }}
       onPressIn={() => {
         if (!reduced && !flat) ty.value = withTiming(DEPTH, { duration: 55, easing: Easing.out(Easing.quad) });
       }}
@@ -255,6 +258,44 @@ export function Segmented({
               alignItems: 'center',
             }}>
             <Text style={{ color: on ? c.fg : c.muted, fontWeight: '800', fontSize: 12.5 }}>{o.label}</Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+/** Wrapping chip selector — used for the level ladder (All + Junior…Principal), where 6 options
+ *  don't fit a Segmented on a phone, so they wrap. Generic over the value (string or null). */
+export function LevelPicker<T extends string | null>({
+  options,
+  value,
+  onChange,
+}: {
+  options: { label: string; value: T }[];
+  value: T;
+  onChange: (v: T) => void;
+}) {
+  const { c } = useTheme();
+  return (
+    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
+      {options.map((o) => {
+        const on = o.value === value;
+        return (
+          <Pressable
+            key={String(o.value)}
+            accessibilityRole="button"
+            accessibilityState={{ selected: on }}
+            onPress={() => onChange(o.value)}
+            style={{
+              borderWidth: 1.5,
+              borderColor: on ? c.fg : c.border,
+              backgroundColor: on ? c.fg : c.card,
+              borderRadius: 999,
+              paddingVertical: 8,
+              paddingHorizontal: 13,
+            }}>
+            <Text style={{ color: on ? c.card : c.muted, fontWeight: '800', fontSize: 12.5 }}>{o.label}</Text>
           </Pressable>
         );
       })}

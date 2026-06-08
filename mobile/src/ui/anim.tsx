@@ -11,6 +11,7 @@ import Animated, {
   useReducedMotion,
   useSharedValue,
   withDelay,
+  withRepeat,
   withSequence,
   withSpring,
   withTiming,
@@ -19,6 +20,73 @@ import Animated, {
 import { haptic, sfx } from '../lib/feedback';
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
+
+/**
+ * "↓ follow-up below" cue — signals there's more content to scroll to after an answer.
+ * The arrow bounces gently on a loop; honors reduce-motion (static). Pass `color` (e.g. c.accentInk).
+ */
+export function FollowUpCue({
+  label = 'follow-up below',
+  color = '#6b7790',
+  style,
+  compact = false,
+  bg,
+}: {
+  label?: string;
+  color?: string;
+  style?: StyleProp<ViewStyle>;
+  /** Icon-only floating chevron dot (no label) — a subtle "scroll for more" hint. */
+  compact?: boolean;
+  /** Circle fill for compact mode (e.g. c.accent). */
+  bg?: string;
+}) {
+  const reduced = useReducedMotion();
+  const y = useSharedValue(0);
+  useEffect(() => {
+    if (reduced) return;
+    y.value = withRepeat(
+      withSequence(
+        withTiming(4, { duration: 600, easing: Easing.inOut(Easing.quad) }),
+        withTiming(0, { duration: 600, easing: Easing.inOut(Easing.quad) })
+      ),
+      -1,
+      false
+    );
+  }, [reduced, y]);
+  const st = useAnimatedStyle(() => ({ transform: [{ translateY: y.value }] }));
+  if (compact) {
+    return (
+      <Animated.View
+        accessibilityRole="image"
+        accessibilityLabel={label}
+        style={[
+          {
+            alignSelf: 'center',
+            width: 26,
+            height: 26,
+            borderRadius: 13,
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: bg ?? color,
+            shadowColor: '#000',
+            shadowOpacity: 0.12,
+            shadowRadius: 4,
+            shadowOffset: { width: 0, height: 2 },
+          },
+          st,
+          style,
+        ]}>
+        <Text style={{ color, fontWeight: '900', fontSize: 14, lineHeight: 16 }}>↓</Text>
+      </Animated.View>
+    );
+  }
+  return (
+    <View style={[{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 }, style]}>
+      <Text style={{ color, fontWeight: '800', fontSize: 11.5, letterSpacing: 0.3 }}>{label}</Text>
+      <Animated.Text style={[{ color, fontWeight: '900', fontSize: 14 }, st]}>↓</Animated.Text>
+    </View>
+  );
+}
 
 /**
  * A Pressable whose content springs down on press and fires gated haptic/sfx feedback.

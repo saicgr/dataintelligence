@@ -97,6 +97,8 @@ export const ROLES: RoleDef[] = [
   { key: 'snowflake-ai', name: 'Snowflake AI / Cortex', emoji: '❄️', family: 'Vendor', blurb: 'Cortex, ML, GenAI on Snowflake', tag: 'rising' },
   { key: 'palantir-fde', name: 'Palantir Foundry Engineer', emoji: '🛰️', family: 'Vendor', blurb: 'Ontology, pipelines, AIP', tag: 'new' },
   { key: 'integration-dev', name: 'Integration Developer', emoji: '🔌', family: 'Vendor', blurb: 'SnapLogic / Informatica / Fivetran' },
+  { key: 'aem-dev', name: 'Adobe AEM Developer', emoji: '🅰️', family: 'Vendor', blurb: 'Sling, JCR, Dispatcher, AEMaaCS', tag: 'new' },
+  { key: 'workfront-dev', name: 'Workfront Fusion Developer', emoji: '⚙️', family: 'Vendor', blurb: 'Scenarios, modules, integrations', tag: 'new' },
   // Everything
   { key: 'all', name: 'Explore all tracks', emoji: '🌐', family: 'All', blurb: 'Every track, unfiltered' },
 ];
@@ -134,7 +136,9 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   'snowflake-admin': ['snowflake', 'security', 'sql', 'observability', 'git', 'terraform', ...CRAFT],
   'snowflake-ai': ['snowflake', 'cortex', 'llms', 'rag', 'evals', 'python', 'sql', 'git', ...CRAFT],
   'palantir-fde': ['python-drills', 'sql-coding', 'palantir', 'python', 'typescript', 'sql', 'modeling', 'data-integration', ...SHIP, ...CRAFT],
-  'integration-dev': ['data-integration', 'sql-coding', 'sql', 'python', 'kafka', 'airflow', 'git', 'cicd', ...CRAFT],
+  'integration-dev': ['data-integration', 'snaplogic', 'sql-coding', 'sql', 'python', 'kafka', 'airflow', 'git', 'cicd', ...CRAFT],
+  'aem-dev': ['aem', 'typescript', 'apis', 'architecture', 'databases', 'sql', ...SHIP, ...CRAFT],
+  'workfront-dev': ['workfront', 'apis', 'data-integration', 'snaplogic', 'sql', 'python', ...SHIP, ...CRAFT],
   all: [], // resolved dynamically to every track in content.ts
 };
 

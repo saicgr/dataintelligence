@@ -37,6 +37,10 @@ export default function Progress() {
   }));
   const badges = computeBadges({ streak, xp, progress, lastMockScore, trackCoverage });
 
+  // Certificate eligibility: a fully-covered track, else interview-ready role readiness.
+  const mastered = trackCoverage.find((t) => t.pct >= 100);
+  const ready = readinessForRole(role, progress, Date.now()) >= 0.8;
+
   return (
     <Screen>
       <H2>Your progress</H2>
@@ -48,6 +52,15 @@ export default function Progress() {
           Level {level(xp)} · {xpInLevel(xp)}/1000 XP to Level {level(xp) + 1}
         </T>
         <Btn label="🏆 Weekly league" variant="navy" onPress={() => router.push('/league' as Href)} />
+        {mastered ? (
+          <Btn
+            label={`🏅 Claim ${mastered.name} certificate`}
+            variant="green"
+            onPress={() => router.push(`/certificate?kind=track&track=${mastered.slug}` as Href)}
+          />
+        ) : ready ? (
+          <Btn label="🏅 Claim readiness certificate" variant="green" onPress={() => router.push('/certificate' as Href)} />
+        ) : null}
         <Btn label="📣 Share my streak card" variant="ghost" onPress={() => router.push('/share')} />
       </Card>
 

@@ -5,10 +5,11 @@ import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 
 import { answerFeedback, haptic, sfx } from '../lib/feedback';
+import { requestPermission } from '../lib/notifications';
 import { dueLabel } from '../lib/srs';
 import { useActiveDeck, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
-import { AnimatedProgressBar, CardEnter, Confetti } from './anim';
+import { AnimatedProgressBar, CardEnter, Confetti, FollowUpCue } from './anim';
 import { Btn, Card, Chip, Row, T, TrackBadge } from './kit';
 import { Mascot } from './Mascot';
 import { ResultFooter } from './ResultFooter';
@@ -310,7 +311,14 @@ function ChoiceBlock({
   onChoose,
   onContinue,
 }: {
-  card: { opts?: { t: string; ok: boolean; why?: string }[]; why?: string; fj: string; fs: string; lines?: string[] };
+  card: {
+    opts?: { t: string; ok: boolean; why?: string }[];
+    why?: string;
+    fj: string;
+    fs: string;
+    lines?: string[];
+    followups?: { q: string; a: string }[];
+  };
   reveal: boolean;
   lastChoice: number | null;
   onChoose: (i: number) => void;
@@ -391,6 +399,7 @@ function ChoiceBlock({
         <View style={{ marginTop: 4 }}>
           <RichAnswer text={card.why ?? ''} size={13} />
           <RedFlag fj={card.fj} fs={card.fs} />
+          <StuckHelp followups={card.followups} />
           <ResultFooter
             ok={gotIt}
             message={gotIt ? undefined : 'A common trap — review the explanation above.'}
@@ -424,12 +433,18 @@ function Reveal({
   publishedAt?: string;
   children?: React.ReactNode;
 }) {
+  const { c } = useTheme();
   return (
     <View style={{ marginTop: 14 }}>
       <RichAnswer text={answer} size={13} />
       {code?.length ? <CodePanels panels={code} /> : null}
       <RedFlag fj={fj} fs={fs} />
-      {followups?.length ? <Followups items={followups} /> : null}
+      {followups?.length ? (
+        <>
+          <FollowUpCue color={c.accentInk} label="drill deeper" style={{ marginTop: 12 }} />
+          <Followups items={followups} />
+        </>
+      ) : null}
       {sourceUrl ? <SourceRow url={sourceUrl} label={sourceLabel} publishedAt={publishedAt} /> : null}
       {children}
     </View>
@@ -437,14 +452,16 @@ function Reveal({
 }
 
 /** Drill-down: tappable follow-up questions that expand to reveal their answer. */
-function Followups({ items }: { items: { q: string; a: string }[] }) {
+function Followups({ items, hideHeader }: { items: { q: string; a: string }[]; hideHeader?: boolean }) {
   const { c } = useTheme();
   const [open, setOpen] = useState<number | null>(null);
   return (
-    <View style={{ marginTop: 13, gap: 7 }}>
-      <T muted weight="800" size={11} style={{ letterSpacing: 0.4 }}>
-        DRILL DEEPER
-      </T>
+    <View style={{ marginTop: hideHeader ? 7 : 13, gap: 7 }}>
+      {hideHeader ? null : (
+        <T muted weight="800" size={11} style={{ letterSpacing: 0.4 }}>
+          DRILL DEEPER
+        </T>
+      )}
       {items.map((f, i) => {
         const isOpen = open === i;
         return (
@@ -477,6 +494,46 @@ function Followups({ items }: { items: { q: string; a: string }[] }) {
           </Pressable>
         );
       })}
+    </View>
+  );
+}
+
+/**
+ * Tutor-feel expander (no runtime AI): a "still stuck?" affordance that progressively reveals the
+ * pre-authored follow-up drill-downs — a different angle on the same idea. Flip cards already show
+ * follow-ups inline; this brings the same help to choice/MCQ reveals where they were hidden.
+ */
+function StuckHelp({ followups }: { followups?: { q: string; a: string }[] }) {
+  const { c } = useTheme();
+  const [open, setOpen] = useState(false);
+  if (!followups?.length) return null;
+  return (
+    <View style={{ marginTop: 12 }}>
+      <Pressable
+        onPress={() => {
+          haptic.selection();
+          setOpen((o) => !o);
+        }}
+        style={{
+          flexDirection: 'row',
+          alignItems: 'center',
+          gap: 8,
+          borderWidth: 1,
+          borderColor: c.border,
+          borderRadius: radius.md,
+          paddingVertical: 11,
+          paddingHorizontal: 12,
+          backgroundColor: open ? c.surface : 'transparent',
+        }}>
+        <T size={14}>🤔</T>
+        <T size={13} weight="800" style={{ flex: 1 }}>
+          Still stuck? Explain it another way
+        </T>
+        <T size={12.5} weight="800" color={c.accentInk}>
+          {open ? '▾' : '▸'}
+        </T>
+      </Pressable>
+      {open ? <Followups items={followups} hideHeader /> : null}
     </View>
   );
 }
@@ -608,6 +665,34 @@ function FeedbackRow({
   );
 }
 
+/** Push-permission priming (plan #4): asked AFTER a completed session, not during onboarding. */
+function NotifPrime() {
+  const notifAsked = useStore((s) => s.notifAsked);
+  const setNotifAsked = useStore((s) => s.setNotifAsked);
+  if (notifAsked) return null;
+  return (
+    <Card style={{ gap: 10 }}>
+      <Row style={{ gap: 10, alignItems: 'flex-start' }}>
+        <T size={20}>🔔</T>
+        <View style={{ flex: 1 }}>
+          <T weight="800" size={14}>Keep your streak alive?</T>
+          <T muted size={12} style={{ lineHeight: 17, marginTop: 2 }}>
+            One gentle daily nudge — no spam. Change it anytime in Profile.
+          </T>
+        </View>
+      </Row>
+      <Row style={{ gap: 10 }}>
+        <View style={{ flex: 1 }}>
+          <Btn label="Not now" variant="ghost" onPress={() => setNotifAsked(true)} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Btn label="Enable" variant="primary" onPress={() => { void requestPermission(); setNotifAsked(true); }} />
+        </View>
+      </Row>
+    </Card>
+  );
+}
+
 function Done() {
   const router = useRouter();
   const replay = useStore((s) => s.replay);
@@ -620,6 +705,7 @@ function Done() {
     <View style={{ gap: space.md }}>
       {playful ? <Confetti /> : null}
       <StreakHero variant="compact" />
+      <NotifPrime />
       <Card style={{ alignItems: 'center', padding: 24 }}>
       {playful ? <Mascot mood="celebrate" size={96} /> : <T size={38}>✓</T>}
       <T size={22} weight="900" style={{ marginTop: 6 }}>

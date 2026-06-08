@@ -42,6 +42,7 @@ const DUE_HOUR = 10; // 10am — daytime "due for review"
 const ID_STREAK = 'fieldnotes-streak';
 const ID_DUE = 'fieldnotes-due';
 const ID_FRESH = 'fieldnotes-fresh';
+const ID_CONTEST = 'fieldnotes-contest';
 
 // Expo Go strips push APIs and merely importing expo-notifications runs an auto-registration
 // side-effect that red-boxes there. Skip the import entirely in Expo Go (matches reminders.native.ts).
@@ -280,6 +281,37 @@ function nextInWindow(now: Date): Date {
   return d;
 }
 
+// ---- Weekly contest "closes soon" nudge -------------------------------------
+
+/**
+ * One-shot reminder that the weekly contest closes soon. Schedules a DATE notification on the
+ * morning of the LAST day of the current ISO week (when `daysLeft` whole days remain). Cancels its
+ * own id first; daysLeft <= 0 just cancels. Quiet-hours respected via QUIET_START.
+ */
+export async function scheduleContestReminder(daysLeft: number): Promise<void> {
+  const N = await ready();
+  if (!N) return;
+  try {
+    await N.cancelScheduledNotificationAsync?.(ID_CONTEST);
+    if (!daysLeft || daysLeft < 1) return;
+
+    await ensureChannel(N);
+    // Fire on the morning of the final day (daysLeft-1 days out), inside quiet hours.
+    const d = new Date();
+    d.setDate(d.getDate() + Math.max(0, daysLeft - 1));
+    d.setHours(QUIET_START_HOUR + 1, 0, 0, 0);
+    if (d.getTime() <= Date.now() + 60_000) return; // too soon / already passed → skip
+
+    await N.scheduleNotificationAsync({
+      identifier: ID_CONTEST,
+      content: { title: 'Weekly contest closes today', body: 'One ranked timed round before the board locks — go beat your score.' },
+      trigger: { type: N.SchedulableTriggerInputTypes?.DATE ?? 'date', date: d },
+    });
+  } catch {
+    /* swallow */
+  }
+}
+
 // ---- Bulk cancel (optional convenience) -------------------------------------
 
 /** Cancel every re-engagement notification this module owns. No-ops when unavailable. */
@@ -291,6 +323,7 @@ export async function cancelAllReengagement(): Promise<void> {
       N.cancelScheduledNotificationAsync(ID_STREAK),
       N.cancelScheduledNotificationAsync(ID_DUE),
       N.cancelScheduledNotificationAsync(ID_FRESH),
+      N.cancelScheduledNotificationAsync(ID_CONTEST),
     ]);
   } catch {
     /* swallow */

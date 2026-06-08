@@ -2,10 +2,11 @@ import { type Href, useRouter } from 'expo-router';
 import { useState } from 'react';
 import { View } from 'react-native';
 
+import { COMPANY_SETS, COMPANY_KEYS } from '../../lib/companySets';
 import { tracksForRole } from '../../lib/content';
 import { haptic, sfx } from '../../lib/feedback';
-import { useStore } from '../../lib/store';
-import { useTheme } from '../../lib/theme';
+import { FREE_CODE_RUNS, useStore } from '../../lib/store';
+import { radius, useTheme } from '../../lib/theme';
 import { CardEnter, PressableScale, Shake } from '../../ui/anim';
 import { Card, H2, Row, Screen, T } from '../../ui/kit';
 
@@ -14,7 +15,10 @@ export default function Practice() {
   const { c } = useTheme();
   const role = useStore((s) => s.role);
   const startTrack = useStore((s) => s.startTrack);
+  const startCompany = useStore((s) => s.startCompany);
   const startWeakspot = useStore((s) => s.startWeakspot);
+  const startSaved = useStore((s) => s.startSaved);
+  const savedCount = useStore((s) => s.savedIds.length);
   const unlocked = useStore((s) => s.unlocked);
   const tracks = tracksForRole(role);
 
@@ -28,6 +32,12 @@ export default function Practice() {
   const surprise = () => {
     if (tracks.length === 0) return;
     drill(tracks[Math.floor(Math.random() * tracks.length)].slug);
+  };
+  const drillCompany = (key: string) => {
+    haptic.light();
+    sfx.tap();
+    startCompany(key);
+    router.push('/');
   };
 
   return (
@@ -71,6 +81,79 @@ export default function Practice() {
         </Card>
       </CardEnter>
 
+      {/* Curated company bundles — fixes the cold-start of crowdsourced most-asked lists. */}
+      <CardEnter delay={30}>
+        <Card style={{ padding: 14, gap: 11 }}>
+          <Row style={{ gap: 9 }}>
+            <T size={22}>🏢</T>
+            <View style={{ flex: 1 }}>
+              <T weight="800" size={15}>By company</T>
+              <T muted size={12}>Drill the topics a company leans on — tap one</T>
+            </View>
+          </Row>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
+            {COMPANY_KEYS.map((key) => (
+              <PressableScale key={key} onPress={() => drillCompany(key)} hapticStyle="selection" scaleTo={0.93}>
+                <Row
+                  style={{
+                    gap: 5,
+                    borderWidth: 1.5,
+                    borderColor: c.border,
+                    backgroundColor: c.card,
+                    borderRadius: 999,
+                    paddingVertical: 7,
+                    paddingHorizontal: 13,
+                  }}>
+                  <T weight="700" size={12}>{COMPANY_SETS[key].label}</T>
+                </Row>
+              </PressableScale>
+            ))}
+          </View>
+        </Card>
+      </CardEnter>
+
+      {/* Interactive code judge — write & run real SQL/Python/PySpark, graded by output. */}
+      <CardEnter delay={35}>
+        <Card style={{ padding: 14, gap: 11 }}>
+          <Row style={{ gap: 9 }}>
+            <T size={22}>💻</T>
+            <View style={{ flex: 1 }}>
+              <T weight="800" size={15}>Code drills</T>
+              <T muted size={12}>Write &amp; run real code — graded by output, not multiple choice</T>
+              <T size={11} weight="700" color={c.accentInk} style={{ marginTop: 2 }}>
+                {unlocked ? 'Pro · unlimited runs' : `${FREE_CODE_RUNS} free runs/day · Pro = unlimited`}
+              </T>
+            </View>
+          </Row>
+          <Row style={{ gap: 7 }}>
+            {(['sql', 'python', 'pyspark'] as const).map((lang) => (
+              <PressableScale
+                key={lang}
+                onPress={() => {
+                  haptic.light();
+                  sfx.tap();
+                  router.push(`/code?lang=${lang}` as Href);
+                }}
+                hapticStyle="selection"
+                scaleTo={0.93}
+                style={{ flex: 1 }}>
+                <View
+                  style={{
+                    alignItems: 'center',
+                    borderWidth: 1.5,
+                    borderColor: c.border,
+                    backgroundColor: c.card,
+                    borderRadius: radius.md,
+                    paddingVertical: 11,
+                  }}>
+                  <T weight="800" size={12.5}>{lang === 'sql' ? 'SQL' : lang === 'python' ? 'Python' : 'PySpark'}</T>
+                </View>
+              </PressableScale>
+            ))}
+          </Row>
+        </Card>
+      </CardEnter>
+
       {/* Free quick mix — genuinely different from Home's scheduled review. */}
       <CardEnter delay={40}>
         <Mode
@@ -79,17 +162,6 @@ export default function Practice() {
           sub="A random topic from your prep — quick off-schedule reps"
           cta="Go ▶"
           onPress={surprise}
-        />
-      </CardEnter>
-
-      {/* Free, fully automated — no human. Timed, scored, no peeking. */}
-      <CardEnter delay={60}>
-        <Mode
-          icon="⏱️"
-          title="Mock interview"
-          sub="Timed rapid-fire round — scored, no peeking"
-          cta="Start ▶"
-          onPress={() => router.push('/mock' as Href)}
         />
       </CardEnter>
 
@@ -104,6 +176,24 @@ export default function Practice() {
         />
       </CardEnter>
 
+      {/* Free — review the cards you bookmarked (also surfaced in Library). Hidden until you save one. */}
+      {savedCount > 0 && (
+        <CardEnter delay={110}>
+          <Mode
+            icon="🔖"
+            title="Saved cards"
+            sub={`${savedCount} card${savedCount === 1 ? '' : 's'} you bookmarked — review them`}
+            cta="Review ▶"
+            onPress={() => {
+              haptic.light();
+              sfx.tap();
+              startSaved();
+              router.push('/');
+            }}
+          />
+        </CardEnter>
+      )}
+
       {/* Pro tier, clearly fenced below the free value. */}
       <Row style={{ gap: 10, marginTop: 6, marginBottom: 2 }}>
         <View style={{ flex: 1, height: 1, backgroundColor: c.border }} />
@@ -111,7 +201,29 @@ export default function Practice() {
         <View style={{ flex: 1, height: 1, backgroundColor: c.border }} />
       </Row>
 
+      <CardEnter delay={70}>
+        <LockedMode
+          icon="🚨"
+          title="Production incidents"
+          sub="Pick a real on-call scenario — inspect → fix → verify"
+          unlocked={unlocked}
+          unlockedCta="Browse ▶"
+          onUnlocked={() => router.push('/incidents' as Href)}
+          onLocked={() => router.push('/paywall')}
+        />
+      </CardEnter>
       <CardEnter delay={80}>
+        <LockedMode
+          icon="⏱️"
+          title="Mock interview"
+          sub="Timed rapid-fire round — scored, no peeking"
+          unlocked={unlocked}
+          unlockedCta="Start ▶"
+          onUnlocked={() => router.push('/mock' as Href)}
+          onLocked={() => router.push('/paywall')}
+        />
+      </CardEnter>
+      <CardEnter delay={90}>
         <LockedMode
           icon="📝"
           title="Paste a job description"

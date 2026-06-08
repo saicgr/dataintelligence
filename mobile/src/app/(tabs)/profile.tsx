@@ -151,6 +151,9 @@ export default function Profile() {
         )}
       </Card>
 
+      <H2>Social</H2>
+      <Btn label="👥  Friends &amp; shared streaks" variant="neutral" onPress={() => router.push('/friends')} />
+
       <H2>Appearance</H2>
       <AccentSection />
 

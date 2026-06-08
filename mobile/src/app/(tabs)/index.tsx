@@ -1,7 +1,7 @@
 import { BlurView } from 'expo-blur';
 import { type Href, router } from 'expo-router';
 import { Fragment, useEffect, useRef, useState } from 'react';
-import { Modal, Pressable, ScrollView, TextInput, View } from 'react-native';
+import { Modal, Platform, Pressable, ScrollView, TextInput, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
   runOnJS,
@@ -10,6 +10,7 @@ import Animated, {
   useReducedMotion,
   useSharedValue,
   withRepeat,
+  withSpring,
   withTiming,
 } from 'react-native-reanimated';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -22,23 +23,31 @@ import {
   lessonDeck,
   lessonCount,
   lessonTitle,
+  LEVEL_OPTIONS,
+  levelLabel,
   roleDomain,
   Track,
   trackCardCount,
   tracksForRole,
+  tracksForRoleAtLevel,
 } from '../../lib/content';
 import { basicsForRole } from '../../lib/basics';
+import { daysLeftInWeek } from '../../lib/leagues';
 import { GROUP_LABEL, GROUP_ORDER, roleByKey } from '../../lib/roles';
 import { CardState } from '../../lib/srs';
 import { isDev, level, useStore, xpInLevel } from '../../lib/store';
 import { radius, space, useTheme } from '../../lib/theme';
 import { haptic, sfx } from '../../lib/feedback';
 import { AnimatedProgressBar, CardEnter, CountUp, PressableScale, Shake } from '../../ui/anim';
-import { H2, Row, Segmented, T } from '../../ui/kit';
+import { H2, LevelPicker, Row, Segmented, T } from '../../ui/kit';
 import { InterviewPlanCard } from '../../ui/InterviewPlanCard';
 import { QuestStrip } from '../../ui/QuestStrip';
 import { RolePicker } from '../../ui/RolePicker';
 import { SessionView } from '../../ui/SessionView';
+
+// On web the app is clamped to a centered phone column (see _layout); RN <Modal> escapes that,
+// so web-only styles below re-center sheet content to the same width.
+const isWeb = Platform.OS === 'web';
 
 /**
  * The Duolingo-style "Learn" home: a winding Path of bite-size lesson units, with a
@@ -78,9 +87,12 @@ function LearnPath() {
   const { c } = useTheme();
   const progress = useStore((st) => st.progress);
   const role = useStore((st) => st.role);
+  const userLevel = useStore((st) => st.userLevel);
   const due = useStore((st) => st.sessionMeta.due);
   const interviewDate = useStore((st) => st.interviewDate);
   const startDaily = useStore((st) => st.startDaily);
+  const startFresh = useStore((st) => st.startFresh);
+  const startDiagnostic = useStore((st) => st.startDiagnostic);
   const [showSettings, setShowSettings] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [q, setQ] = useState('');
@@ -94,8 +106,8 @@ function LearnPath() {
 
   const query = q.trim().toLowerCase();
   const match = (t: Track) => !query || t.name.toLowerCase().includes(query) || t.slug.toLowerCase().includes(query);
-  // Role-filtered: only the selected role's tracks, grouped into Learn-path sections.
-  const roleTracks = tracksForRole(role).filter(match);
+  // Role + level filtered: a track shows only if it has cards at the chosen level ("All levels" = all).
+  const roleTracks = tracksForRoleAtLevel(role, userLevel).filter(match);
   const grouped = GROUP_ORDER.map((g) => ({ g, tracks: roleTracks.filter((t) => t.group === g) })).filter(
     (x) => x.tracks.length > 0
   );
@@ -173,7 +185,18 @@ function LearnPath() {
               <DailyStrip heroKind={action.kind} />
             </CardEnter>
             <CardEnter delay={75}>
-              <QuestStrip />
+              {/* Each quest opens the session that actually advances it: fresh stream for "review a
+                  fresh card", a diagnostic deck for "finish a diagnostic", else the daily review queue. */}
+              <QuestStrip
+                onPressQuest={(qq) => {
+                  if (qq.id === 'review-fresh') startFresh();
+                  else if (qq.id === 'finish-diagnostic') startDiagnostic();
+                  else startDaily();
+                }}
+              />
+            </CardEnter>
+            <CardEnter delay={90}>
+              <ContestBanner />
             </CardEnter>
             {grouped.map(({ g, tracks }, gi) => (
               <Fragment key={g}>
@@ -181,7 +204,15 @@ function LearnPath() {
                 {tracks.map(renderUnit)}
               </Fragment>
             ))}
-            {shown.length === 0 && <T muted size={13}>No tracks match “{q}”.</T>}
+            {shown.length === 0 && query.length > 0 && <T muted size={13}>No tracks match “{q}”.</T>}
+            {shown.length === 0 && query.length === 0 && userLevel && (
+              <View style={{ gap: 6, paddingVertical: 8 }}>
+                <T weight="800" size={14}>No {levelLabel(userLevel)} topics for this role yet.</T>
+                <T muted size={12.5} style={{ lineHeight: 18 }}>
+                  Pick another level — or “All levels” — from your prep (tap “{role ? 'change ›' : 'Pick a role'}” above).
+                </T>
+              </View>
+            )}
           </View>
         </ScrollView>
         <Scrollbar
@@ -305,7 +336,7 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
   const devMode = useStore((st) => st.devMode);
   const setDevMode = useStore((st) => st.setDevMode);
   const goalMet = cardsToday >= dailyGoal;
-  const goalPct = Math.max(0, Math.min(1, dailyGoal ? cardsToday / dailyGoal : 0));
+  const xpPct = Math.max(0, Math.min(1, xpInLevel(xp) / 1000));
   return (
     <View
       style={{
@@ -335,9 +366,25 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
             {goalMet ? 'Done' : `${cardsToday}/${dailyGoal}`}
           </T>
         </Row>
-        <View style={{ backgroundColor: '#4263eb', borderRadius: 10, paddingHorizontal: 8, height: 26, justifyContent: 'center', flexDirection: 'row', alignItems: 'center' }}>
-          <T color="#fff" weight="800" size={11.5}>Lv </T>
-          <CountUp to={level(xp)} style={{ color: '#fff', fontWeight: '800', fontSize: 11.5 }} />
+        {/* Level as a circular coin with a ring — reads as a "level badge", not a mystery bar.
+            A thin fill at the base shows XP progress toward the next level. */}
+        <View
+          style={{
+            width: 32,
+            height: 32,
+            borderRadius: 16,
+            backgroundColor: '#4263eb',
+            borderWidth: 2,
+            borderColor: '#91a7ff',
+            alignItems: 'center',
+            justifyContent: 'center',
+            overflow: 'hidden',
+          }}>
+          <T color="rgba(255,255,255,0.85)" weight="900" style={{ fontSize: 6.5, letterSpacing: 0.5, lineHeight: 8 }}>LV</T>
+          <CountUp to={level(xp)} style={{ color: '#fff', fontWeight: '900', fontSize: 12.5, lineHeight: 14 }} />
+          <View style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 3, backgroundColor: 'rgba(255,255,255,0.25)' }}>
+            <View style={{ height: 3, width: `${xpPct * 100}%`, backgroundColor: '#fff' }} />
+          </View>
         </View>
         {/* Dev-only: flip the whole Learn path between the curated User view and the full Dev view.
             `__DEV__`-gated so it never renders (and can never engage) in a production build. */}
@@ -364,11 +411,6 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
           <T weight="900" size={18} color={c.muted}>⋯</T>
         </Pressable>
       </Row>
-      <Row style={{ marginTop: 8, gap: 8 }}>
-        <AnimatedProgressBar value={xpInLevel(xp) / 1000} color="#f76707" track={c.border} height={8} />
-        {/* Daily-goal meter (plan #0.1): a visible second bar so the goal is never invisible. */}
-        <AnimatedProgressBar value={goalPct} color={goalMet ? c.success : c.accent} track={c.border} height={8} />
-      </Row>
     </View>
   );
 }
@@ -376,13 +418,18 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
 /** A tappable "studying as <role>" line above the path; opens the role/settings panel. */
 function RoleHeader({ role, onPress }: { role: string; onPress: () => void }) {
   const { c } = useTheme();
+  const userLevel = useStore((s) => s.userLevel);
   const def = roleByKey(role);
+  // Prefix the chosen seniority (Junior/Mid/Senior) to the role — e.g. "Junior Data Engineer".
+  // Skip it for the catch-all "all" role ("Senior Explore all tracks" makes no sense) and when no level is set.
+  const name = def?.name ?? 'Pick a role';
+  const titled = def && role !== 'all' && userLevel ? `${levelLabel(userLevel)} ${name}` : name;
   return (
     <PressableScale onPress={onPress} hapticStyle="selection" scaleTo={0.99}>
       <Row style={{ justifyContent: 'space-between', paddingVertical: 2 }}>
         <Row style={{ gap: 6, flex: 1 }}>
           <T size={15}>{def?.emoji ?? '🎯'}</T>
-          <T weight="800" size={13}>Preparing as {def?.name ?? 'Pick a role'}</T>
+          <T weight="800" size={13}>Preparing as {titled}</T>
         </Row>
         <T weight="800" size={12} color={c.muted}>change ›</T>
       </Row>
@@ -484,6 +531,24 @@ function ContinueHero({ action: a }: { action: NextAction }) {
   );
 }
 
+/** Weekly contest entry — a ranked, timed round; the countdown is days left this week. */
+function ContestBanner() {
+  const { c, track } = useTheme();
+  const days = daysLeftInWeek();
+  return (
+    <PressableScale onPress={() => router.push('/contest')} sound>
+      <Row style={{ gap: 10, borderRadius: radius.md, paddingVertical: 12, paddingHorizontal: 13, backgroundColor: c.card, borderWidth: 1, borderColor: c.border }}>
+        <T size={20}>⚡</T>
+        <View style={{ flex: 1 }}>
+          <T weight="800" size={13.5}>Weekly contest</T>
+          <T muted size={11.5}>Ranked timed round · closes in {days}d</T>
+        </View>
+        <T weight="900" size={12.5} color={track('rag')}>Enter ▶</T>
+      </Row>
+    </PressableScale>
+  );
+}
+
 /** Quiet secondary shelf: small Review / Stay-current pills (the hero's action is omitted). */
 function DailyStrip({ heroKind }: { heroKind: NextAction['kind'] }) {
   const { c, track } = useTheme();
@@ -537,15 +602,32 @@ function DailyStrip({ heroKind }: { heroKind: NextAction['kind'] }) {
 function SettingsSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { c, scheme } = useTheme();
   const insets = useSafeAreaInsets();
+  const { height: winH } = useWindowDimensions();
   const s = useStore();
   const dark = scheme === 'dark';
   const [roleQ, setRoleQ] = useState('');
+  // Swipe-down-to-dismiss: the pan is bound to the grabber (handle + header) only, so it never
+  // fights the inner ScrollView. Drag past ~110px → close; otherwise spring back.
+  const ty = useSharedValue(0);
+  const grab = Gesture.Pan()
+    .onUpdate((e) => {
+      ty.value = Math.max(0, e.translationY);
+    })
+    .onEnd((e) => {
+      if (e.translationY > 110) runOnJS(onClose)();
+      ty.value = withSpring(0, { damping: 18, stiffness: 160 });
+    });
+  const sheetStyle = useAnimatedStyle(() => ({ transform: [{ translateY: ty.value }] }));
   return (
     <Modal visible={open} transparent animationType="slide" onRequestClose={onClose} statusBarTranslucent>
-      {/* Light scrim so the frosted glass reads as glass; tap-outside dismisses. */}
-      <Pressable style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.22)', justifyContent: 'flex-end' }} onPress={onClose}>
+      {/* Light scrim so the frosted glass reads as glass; tap-outside dismisses.
+          On web, RN Modal fills the whole window, so center the sheet to the phone-frame width. */}
+      <Pressable
+        style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.22)', justifyContent: 'flex-end', ...(isWeb && { alignItems: 'center' }) }}
+        onPress={onClose}>
         {/* Inner Pressable swallows taps so tapping the sheet itself doesn't dismiss. */}
-        <Pressable onPress={() => {}} style={{ maxHeight: '85%' }}>
+        <Pressable onPress={() => {}} style={{ maxHeight: '85%', ...(isWeb && { width: '100%', maxWidth: 440 }) }}>
+          <Animated.View style={sheetStyle}>
           <BlurView
             intensity={dark ? 55 : 75}
             tint={dark ? 'systemThickMaterialDark' : 'systemThickMaterialLight'}
@@ -560,27 +642,35 @@ function SettingsSheet({ open, onClose }: { open: boolean; onClose: () => void }
               paddingTop: 10,
               paddingBottom: insets.bottom + 16,
             }}>
-            <View
-              style={{
-                alignSelf: 'center',
-                width: 38,
-                height: 5,
-                borderRadius: 999,
-                backgroundColor: dark ? 'rgba(255,255,255,0.3)' : 'rgba(0,0,0,0.22)',
-                marginBottom: 12,
-              }}
-            />
-            <Row style={{ justifyContent: 'space-between', marginBottom: 10 }}>
-              <T weight="800" size={17}>Your prep</T>
-              <Pressable onPress={onClose} hitSlop={10}>
-                <T weight="800" size={14} color="#4263eb">Done</T>
-              </Pressable>
-            </Row>
+            {/* Grabber zone — the handle + title row; dragging here dismisses the sheet. */}
+            <GestureDetector gesture={grab}>
+              <View>
+                <View
+                  style={{
+                    alignSelf: 'center',
+                    width: 38,
+                    height: 5,
+                    borderRadius: 999,
+                    backgroundColor: dark ? 'rgba(255,255,255,0.3)' : 'rgba(0,0,0,0.22)',
+                    marginBottom: 12,
+                  }}
+                />
+                <Row style={{ justifyContent: 'space-between', marginBottom: 10 }}>
+                  <T weight="800" size={17}>Your prep</T>
+                  <Pressable onPress={onClose} hitSlop={10}>
+                    <T weight="800" size={14} color="#4263eb">Done</T>
+                  </Pressable>
+                </Row>
+              </View>
+            </GestureDetector>
             <ScrollView
               showsVerticalScrollIndicator
               indicatorStyle={dark ? 'white' : 'black'}
               keyboardShouldPersistTaps="handled"
-              style={{ flexShrink: 1 }}
+              nestedScrollEnabled
+              // A definite numeric height makes the inner list actually scroll (a %/flex height
+              // inside a Modal doesn't establish a scroll viewport on web — the list was getting clipped).
+              style={{ maxHeight: winH * 0.66 }}
               contentContainerStyle={{ gap: 12, paddingBottom: 8 }}>
               {/* Goal first — a quick toggle, no scrolling past 40 roles to reach it. */}
               <T weight="800" size={12.5}>Goal</T>
@@ -592,6 +682,10 @@ function SettingsSheet({ open, onClose }: { open: boolean; onClose: () => void }
                 value={s.mode}
                 onChange={(v) => s.setMode(v as never)}
               />
+              {/* Difficulty level — scopes BOTH which tracks show on Home and which questions appear in sessions. */}
+              <T weight="800" size={12.5} style={{ marginTop: 4 }}>Level</T>
+              <LevelPicker options={LEVEL_OPTIONS} value={s.userLevel} onChange={(v) => s.setUserLevel(v)} />
+              <T muted size={11}>Filters your tracks and questions to that seniority. “All levels” shows everything.</T>
               <T weight="800" size={12.5} style={{ marginTop: 4 }}>I&apos;m preparing as</T>
               <View
                 style={{
@@ -619,6 +713,7 @@ function SettingsSheet({ open, onClose }: { open: boolean; onClose: () => void }
               <RolePicker value={s.role} onChange={(v) => s.setRole(v)} query={roleQ} />
             </ScrollView>
           </BlurView>
+          </Animated.View>
         </Pressable>
       </Pressable>
     </Modal>

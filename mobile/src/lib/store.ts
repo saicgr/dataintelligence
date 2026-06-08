@@ -10,6 +10,7 @@ import {
   deckCounts,
   findCardById,
   freshSessionCards,
+  type Level,
   lessonDeck,
   roleDomain,
   SessionCard,
@@ -17,6 +18,9 @@ import {
   weakSpotDeck,
 } from './content';
 import { basicsForRole } from './basics';
+import { companyBank } from './companySets';
+import { incidentDeck } from './incidents';
+import { maybeRequestReview } from './review';
 import { buyProduct, type PurchaseResult, restoreAll } from './iap';
 import { BASE_PRODUCT_ID, PRO_PRODUCT_IDS, SUBSCRIPTION_IDS } from './products';
 import { setDailyReminder } from './reminders';
@@ -42,7 +46,7 @@ import {
 
 export type Role = RoleKey;
 export type Mode = 'cram' | 'maintain';
-type SessionKind = 'daily' | 'track' | 'fresh' | 'weakspot' | 'lesson' | 'basics' | 'saved';
+type SessionKind = 'daily' | 'track' | 'fresh' | 'weakspot' | 'lesson' | 'basics' | 'saved' | 'company' | 'incident' | 'diagnostic';
 
 /** Duolingo-style feedback events emitted by the store, consumed by the FeedbackBridge. */
 export type FeedbackKind = 'correct' | 'wrong' | 'complete' | 'streak' | 'levelUp';
@@ -56,6 +60,8 @@ const dayKey = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
 /** Production formats (do, not just recognize) earn more XP — reward the harder work (plan #21). */
 const PRODUCTION_KINDS = new Set(['scenario', 'diag', 'querybuild', 'match', 'evidence', 'order', 'classify']);
+/** Free code-drill runs per day. Pro removes the cap. Runs are 100% on-device (no server cost) — this is purely an upgrade hook. */
+export const FREE_CODE_RUNS = 3;
 const xpFor = (kind: string | undefined, rating: Rating): number => {
   const prod = kind ? PRODUCTION_KINDS.has(kind) : false;
   if (rating === 'again') return prod ? 8 : 5;
@@ -128,6 +134,11 @@ interface State {
   lastMockScore: number | null;
   // Passed chapter checkpoints, keyed `${slug}:${chapterIdx}` (plan #25).
   checkpointsDone: string[];
+  // Whether we've shown the notification-permission priming row (after first session, not onboarding).
+  notifAsked: boolean;
+  // Code-drill run quota: free users get FREE_CODE_RUNS/day (Pro = unlimited). Resets on a new day.
+  codeRunDay: string | null;
+  codeRunsToday: number;
   // Developer view: reveals all stages/questions unlocked. Only ever active when __DEV__
   // (see `isDev`), so a production build can never expose it regardless of this flag.
   devMode: boolean;
@@ -142,7 +153,11 @@ interface State {
   // transient session
   sessionKind: SessionKind;
   trackSlug: string | null;
+  companyKey: string | null;
+  incidentId: string | null;
   lessonIdx: number | null;
+  sessionLevel: Level | null; // optional difficulty filter for a track session (track screen selector)
+  userLevel: Level | null; // PERSISTED default level (Junior/Senior/Pro) chosen at onboarding → filters daily/role sessions
   sessionDeck: SessionCard[];
   sessionMeta: { due: number; fresh: number };
   idx: number;
@@ -161,8 +176,11 @@ interface State {
   setRestDays: (days: number[]) => void;
   setInterviewDate: (iso: string | null) => void;
   bumpQuest: (metric: 'diag' | 'fresh' | 'lesson', n?: number) => void;
+  /** Record one code-drill run (resets the counter on a new day). Returns false if the free quota is spent. */
+  bumpCodeRun: () => boolean;
   recordMock: (score: number, missedIds: string[]) => void;
   completeCheckpoint: (key: string) => void;
+  setNotifAsked: (v: boolean) => void;
   setDevMode: (v: boolean) => void;
   emit: (kind: FeedbackKind) => void;
   clearEvent: () => void;
@@ -171,15 +189,19 @@ interface State {
   setDailyGoal: (n: number) => void;
   applyHintCost: (n: number) => void;
   startDaily: () => void;
-  startTrack: (slug: string) => void;
+  startTrack: (slug: string, level?: Level) => void;
   startFresh: () => void;
   startSaved: () => void;
   startWeakspot: () => void;
   startBasics: () => void;
+  startCompany: (key: string) => void;
+  startIncident: (id: string) => void;
+  startDiagnostic: () => void;
   startLesson: (slug: string, lessonIdx: number) => void;
   exitTrack: () => void;
   endSession: () => void;
-  completeOnboarding: (role: Role, mode: Mode) => void;
+  completeOnboarding: (role: Role, mode: Mode, level?: Level | null) => void;
+  setUserLevel: (l: Level | null) => void;
   restartOnboarding: () => void;
   rebuildSession: () => void;
   doReveal: () => void;
@@ -198,7 +220,7 @@ interface State {
 
 type DeckInputs = Pick<
   State,
-  'sessionKind' | 'trackSlug' | 'lessonIdx' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
+  'sessionKind' | 'trackSlug' | 'companyKey' | 'incidentId' | 'lessonIdx' | 'sessionLevel' | 'userLevel' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
 >;
 
 /** Ids the user disliked — buildSessionDeck pushes these to the back so they surface less (never hidden). */
@@ -221,7 +243,19 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
   } else if (s.sessionKind === 'lesson' && s.trackSlug && s.lessonIdx != null) {
     deck = lessonDeck(s.trackSlug, s.lessonIdx);
   } else if (s.sessionKind === 'track' && s.trackSlug) {
-    deck = buildSessionDeck(bankForTrack(s.trackSlug), s.progress, now, unlockAll ? Infinity : 50, adaptive, down);
+    const pool = bankForTrack(s.trackSlug);
+    const scoped = s.sessionLevel ? pool.filter((cd) => cd.level === s.sessionLevel) : pool;
+    deck = buildSessionDeck(scoped.length ? scoped : pool, s.progress, now, unlockAll ? Infinity : 50, adaptive, down);
+  } else if (s.sessionKind === 'company' && s.companyKey) {
+    deck = buildSessionDeck(companyBank(s.companyKey), s.progress, now, unlockAll ? Infinity : 50, adaptive, down);
+  } else if (s.sessionKind === 'incident' && s.incidentId) {
+    // Production incidents are free + short — run the whole on-call deck, weakest-first when adaptive.
+    deck = buildSessionDeck(incidentDeck(s.incidentId), s.progress, now, Infinity, adaptive, down);
+  } else if (s.sessionKind === 'diagnostic') {
+    // "Finish a diagnostic" quest — diag-format cards from the role pool (so completing it credits
+    // the diag quest). Falls back to the full daily pool if the role has no diag cards.
+    const pool = dailyPoolForRole(s.role, now).filter((cd) => cd.kind === 'diag');
+    deck = buildSessionDeck(pool.length ? pool : dailyPoolForRole(s.role, now), s.progress, now, unlockAll ? 30 : 12, adaptive, down);
   } else if (s.sessionKind === 'fresh') {
     // Pillar 2 "stay current" — the weekly fresh stream is the subscription's headline value.
     // Free users still taste it (the daily fresh trickle + a short preview here so the screen
@@ -234,7 +268,11 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
   } else if (s.sessionKind === 'basics') {
     deck = buildSessionDeck(basicsForRole(s.role), s.progress, now, Infinity, false, down);
   } else {
-    deck = buildSessionDeck(dailyPoolForRole(s.role, now), s.progress, now, unlockAll ? 40 : 15, adaptive, down);
+    // Daily: respect the user's chosen level (Junior/Senior/Pro → Jr/Mid/Sr). Fall back to the
+    // full pool if filtering leaves too little (never starve the daily queue).
+    const pool = dailyPoolForRole(s.role, now);
+    const scoped = s.userLevel ? pool.filter((cd) => cd.level === s.userLevel) : pool;
+    deck = buildSessionDeck(scoped.length >= 5 ? scoped : pool, s.progress, now, unlockAll ? 40 : 15, adaptive, down);
   }
   return { deck, meta: deckCounts(deck, s.progress, now) };
 }
@@ -242,7 +280,11 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
 const initial = buildDeck({
   sessionKind: 'daily',
   trackSlug: null,
+  companyKey: null,
+  incidentId: null,
   lessonIdx: null,
+  sessionLevel: null,
+  userLevel: null,
   role: 'de',
   unlocked: false,
   devMode: false,
@@ -275,9 +317,12 @@ export const useStore = create<State>()(
       weeklyXpWeek: null,
       questDay: null,
       questProgress: {},
+      codeRunDay: null,
+      codeRunsToday: 0,
       interviewDate: null,
       lastMockScore: null,
       checkpointsDone: [],
+      notifAsked: false,
       devMode: false,
       onboarded: false,
       reminders: true,
@@ -292,7 +337,11 @@ export const useStore = create<State>()(
 
       sessionKind: 'daily',
       trackSlug: null,
+      companyKey: null,
+      incidentId: null,
       lessonIdx: null,
+      sessionLevel: null,
+      userLevel: null,
       sessionDeck: initial.deck,
       sessionMeta: initial.meta,
       idx: 0,
@@ -328,6 +377,14 @@ export const useStore = create<State>()(
         const base = st.questDay === today ? st.questProgress : {};
         set({ questDay: today, questProgress: { ...base, [metric]: (base[metric] ?? 0) + n } });
       },
+      bumpCodeRun: () => {
+        const st = get();
+        const today = dayKey(Date.now());
+        const used = st.codeRunDay === today ? st.codeRunsToday : 0; // reset on a new day
+        if (!st.unlocked && used >= FREE_CODE_RUNS) return false; // free quota spent
+        set({ codeRunDay: today, codeRunsToday: used + 1 });
+        return true;
+      },
       recordMock: (score, missedIds) => {
         const st = get();
         const now = Date.now();
@@ -336,12 +393,15 @@ export const useStore = create<State>()(
         for (const id of missedIds) progress[id] = schedule(progress[id] ?? initCard(), 'again', now);
         set({ lastMockScore: score, progress });
         if (st.userId) void pushProgress(st.userId, progress);
+        // High moment → maybe ask for a store review (throttled + capped internally).
+        if (score >= 80) void maybeRequestReview();
       },
       completeCheckpoint: (key) => {
         const st = get();
         if (st.checkpointsDone.includes(key)) return;
         set({ checkpointsDone: [...st.checkpointsDone, key], xp: st.xp + 50 });
       },
+      setNotifAsked: (notifAsked) => set({ notifAsked }),
       setDevMode: (devMode) => set({ devMode }),
       emit: (kind) => set({ lastEvent: { kind, at: Date.now() } }),
       clearEvent: () => set({ lastEvent: null }),
@@ -358,9 +418,9 @@ export const useStore = create<State>()(
         set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
         get().rebuildSession();
       },
-      startTrack: (slug) => {
-        track('session_started', { kind: 'track', track: slug });
-        set({ sessionKind: 'track', trackSlug: slug, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+      startTrack: (slug, level) => {
+        track('session_started', { kind: 'track', track: slug, level: level ?? 'all' });
+        set({ sessionKind: 'track', trackSlug: slug, sessionLevel: level ?? null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
         get().rebuildSession();
       },
       startFresh: () => {
@@ -383,6 +443,21 @@ export const useStore = create<State>()(
         set({ sessionKind: 'basics', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
         get().rebuildSession();
       },
+      startCompany: (key) => {
+        track('session_started', { kind: 'company', company: key });
+        set({ sessionKind: 'company', companyKey: key, trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startIncident: (id) => {
+        track('session_started', { kind: 'incident', incident: id });
+        set({ sessionKind: 'incident', incidentId: id, trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
+      startDiagnostic: () => {
+        track('session_started', { kind: 'diagnostic' });
+        set({ sessionKind: 'diagnostic', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        get().rebuildSession();
+      },
       startLesson: (slug, lessonIdx) => {
         track('session_started', { kind: 'lesson', track: slug, lesson: lessonIdx });
         set({ sessionKind: 'lesson', trackSlug: slug, lessonIdx, idx: 0, reveal: false, lastChoice: null, inSession: true });
@@ -396,9 +471,13 @@ export const useStore = create<State>()(
         set({ inSession: false, sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null });
         get().rebuildSession();
       },
-      completeOnboarding: (role, mode) => {
-        track('onboarded', { role, mode });
-        set({ role, mode, onboarded: true, idx: 0, reveal: false, lastChoice: null });
+      completeOnboarding: (role, mode, level) => {
+        track('onboarded', { role, mode, level: level ?? 'all' });
+        set({ role, mode, userLevel: level ?? null, onboarded: true, idx: 0, reveal: false, lastChoice: null });
+        get().rebuildSession();
+      },
+      setUserLevel: (userLevel) => {
+        set({ userLevel });
         get().rebuildSession();
       },
       // Dev affordance: re-show the first-run flow (the (tabs) layout redirects to /onboarding when false).
@@ -467,6 +546,8 @@ export const useStore = create<State>()(
 
         // Duolingo feedback events → FeedbackBridge plays sound/haptic + level-up overlay.
         const streakBumped = done && streak > st.streak;
+        // Milestone streaks are a high moment → maybe ask for a store review (throttled internally).
+        if (streakBumped && (streak === 7 || streak === 30 || streak === 100)) void maybeRequestReview();
         if (streakBumped) get().emit('streak');
         else if (done) get().emit('complete');
         if (level(xp) > level(st.xp)) {
@@ -582,7 +663,7 @@ export const useStore = create<State>()(
     }),
     {
       name: 'fieldnotes-v1',
-      version: 8,
+      version: 11,
       storage: createJSONStorage(() => AsyncStorage),
       partialize: (s) => ({
         role: s.role,
@@ -601,13 +682,17 @@ export const useStore = create<State>()(
         haptics: s.haptics,
         accentKey: s.accentKey,
         restDays: s.restDays,
+        userLevel: s.userLevel,
         weeklyXp: s.weeklyXp,
         weeklyXpWeek: s.weeklyXpWeek,
         questDay: s.questDay,
         questProgress: s.questProgress,
+        codeRunDay: s.codeRunDay,
+        codeRunsToday: s.codeRunsToday,
         interviewDate: s.interviewDate,
         lastMockScore: s.lastMockScore,
         checkpointsDone: s.checkpointsDone,
+        notifAsked: s.notifAsked,
         devMode: s.devMode,
         onboarded: s.onboarded,
         reminders: s.reminders,
@@ -660,6 +745,20 @@ export const useStore = create<State>()(
         if (from < 8) {
           // v8 added chapter checkpoint tests.
           if (!Array.isArray(p.checkpointsDone)) p.checkpointsDone = [];
+        }
+        if (from < 9) {
+          // v9 moved the notification-permission ask out of onboarding to a post-first-session prime.
+          if (typeof p.notifAsked !== 'boolean') p.notifAsked = false;
+        }
+        if (from < 10) {
+          // v10 added a default difficulty level chosen at onboarding.
+          const valid = ['Jr', 'Mid', 'Sr', 'Staff', 'Principal'];
+          if (!valid.includes(p.userLevel as string)) p.userLevel = null;
+        }
+        if (from < 11) {
+          // v11 added the code-drill daily run quota.
+          if (typeof p.codeRunDay !== 'string') p.codeRunDay = null;
+          if (typeof p.codeRunsToday !== 'number') p.codeRunsToday = 0;
         }
         return p;
       },

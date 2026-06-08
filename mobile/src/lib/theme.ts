@@ -34,9 +34,9 @@ export const palette: Record<'light' | 'dark', Palette> = {
     muted: '#6b7790',
     // Defaults mirror ACCENTS[DEFAULT_ACCENT] — the free "Classic" accent. useTheme() overrides
     // these per the user's picked accent (Pro + account gated; see resolveAccent below).
-    accent: '#f76707',
+    accent: '#cf4602',
     onAccent: '#ffffff',
-    accentInk: '#d9480f',
+    accentInk: '#c2410c',
     success: '#1a9e57',
     danger: '#e8453c',
     warn: '#c9922a',
@@ -48,7 +48,7 @@ export const palette: Record<'light' | 'dark', Palette> = {
     border: '#262e3a',
     fg: '#e9eef5',
     muted: '#8a97ac',
-    accent: '#ff922b',
+    accent: '#cf4602',
     onAccent: '#ffffff',
     accentInk: '#ff922b',
     success: '#3fb950',
@@ -74,8 +74,9 @@ export type AccentKey = 'classic' | 'keylime' | 'violet' | 'sky' | 'rose' | 'tea
 export const ACCENTS: Record<AccentKey, { name: string; pro: boolean; light: AccentSwatch; dark: AccentSwatch }> = {
   classic: {
     name: 'Classic', pro: false,
-    light: { accent: '#f76707', onAccent: '#ffffff', accentInk: '#d9480f' },
-    dark: { accent: '#ff922b', onAccent: '#ffffff', accentInk: '#ff922b' },
+    // White text on a slightly-deepened orange → 4.64:1 (WCAG AA); accentInk handles orange TEXT on light.
+    light: { accent: '#cf4602', onAccent: '#ffffff', accentInk: '#c2410c' },
+    dark: { accent: '#cf4602', onAccent: '#ffffff', accentInk: '#ff922b' },
   },
   keylime: {
     name: 'Keylime', pro: true,

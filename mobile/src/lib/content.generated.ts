@@ -38,6 +38,10 @@ import palantir from './generated/palantir.json';
 import security from './generated/security.json';
 import terraform from './generated/terraform.json';
 import typescript from './generated/typescript.json';
+// Integration / Adobe MarTech tracks (authored by the content-gen swarm).
+import snaplogic from './generated/snaplogic.json';
+import aem from './generated/aem.json';
+import workfront from './generated/workfront.json';
 // Roles increment: stats / BI / databases / APIs / deep-learning + BI tools
 import apis from './generated/apis.json';
 import bi from './generated/bi.json';
@@ -123,4 +127,7 @@ export const GENERATED: Record<string, GeneratedCard[]> = {
   'azure-ai': azureAi as unknown as GeneratedCard[],
   cortex: cortex as unknown as GeneratedCard[],
   mosaic: mosaic as unknown as GeneratedCard[],
+  snaplogic: snaplogic as unknown as GeneratedCard[],
+  aem: aem as unknown as GeneratedCard[],
+  workfront: workfront as unknown as GeneratedCard[],
 };

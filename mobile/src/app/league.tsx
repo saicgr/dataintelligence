@@ -155,6 +155,7 @@ export default function League() {
         </T>
       )}
 
+      <Btn label="⚡ Enter the weekly contest" variant="navy" onPress={() => router.push('/contest')} />
       <Btn label="Keep studying →" variant="primary" onPress={() => router.back()} />
     </Screen>
   );

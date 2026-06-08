@@ -1,6 +1,8 @@
+import { type Href, useRouter } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
+import { CODE_PROBLEMS } from '../lib/codeProblems';
 import { SessionCard } from '../lib/content';
 import { useStore } from '../lib/store';
 import { Rating, strength } from '../lib/srs';
@@ -27,12 +29,15 @@ type Tier = 'full' | 'assemble' | 'recall';
  */
 export function QueryBuildView({ card }: { card: SessionCard }) {
   const { c, track } = useTheme();
+  const router = useRouter();
   const rate = useStore((s) => s.rate);
   const applyHintCost = useStore((s) => s.applyHintCost);
   const st = useStore((s) => s.progress[card.id]);
   const col = track(card.tk);
   const qb = card.querybuild!;
   const bank = qb.assemble.bank ?? [];
+  // If this card maps to a real executable problem, offer the on-device "Solve & run" handoff.
+  const runnable = CODE_PROBLEMS.find((p) => p.id === qb.webx?.problemId);
 
   const tier: Tier = (st?.reps ?? 0) === 0 ? 'full' : strength(st) < 0.6 ? 'assemble' : 'recall';
   const showBeats = tier === 'full';
@@ -314,6 +319,14 @@ export function QueryBuildView({ card }: { card: SessionCard }) {
                   </View>
                 ) : null}
                 <RedFlag fj={card.fj} fs={card.fs} />
+                {runnable ? (
+                  <Btn
+                    label="▶ Solve & run it for real"
+                    variant="navy"
+                    style={{ marginTop: 10 }}
+                    onPress={() => router.push(`/code?lang=${runnable.lang}&problem=${runnable.id}` as Href)}
+                  />
+                ) : null}
                 <WebCrossSell webx={qb.webx} />
                 <ResultFooter
                   ok={ok}

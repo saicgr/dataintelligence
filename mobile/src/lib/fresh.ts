@@ -306,6 +306,7 @@ function toCard(c: FreshCard, now: number): SessionCard {
     tk: c.tk,
     tool: c.tool,
     tag: freshTag(c.publishedAt, now),
+    level: 'Sr', // fresh "stay-current" cards are advanced by nature
     q: c.q,
     a: c.a,
     fj: c.fj,

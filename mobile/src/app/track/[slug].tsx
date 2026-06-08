@@ -2,12 +2,10 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Pressable, View } from 'react-native';
 
-import { QRow, questionsFor, trackBySlug } from '../../lib/content';
+import { LEVELS, type Level, levelLabel, QRow, questionsFor, trackBySlug } from '../../lib/content';
 import { useStore } from '../../lib/store';
 import { radius, useTheme } from '../../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
-
-const LEVELS = ['All', 'Jr', 'Mid', 'Sr'] as const;
 
 export default function TrackDetail() {
   const { slug } = useLocalSearchParams<{ slug: string }>();
@@ -15,7 +13,7 @@ export default function TrackDetail() {
   const { c, track } = useTheme();
   const startTrack = useStore((s) => s.startTrack);
   const unlocked = useStore((s) => s.unlocked);
-  const [lvl, setLvl] = useState<(typeof LEVELS)[number]>('All');
+  const [lvl, setLvl] = useState<Level | 'All'>('All');
 
   const t = trackBySlug(slug ?? '');
   if (!t) return null;
@@ -47,26 +45,30 @@ export default function TrackDetail() {
         </View>
       </Row>
 
-      <H2>Levels</H2>
-      <Row style={{ gap: 9 }}>
-        {(['Jr', 'Mid', 'Sr'] as const).map((lv) => (
-          <View
-            key={lv}
-            style={{
-              flex: 1,
-              backgroundColor: c.card,
-              borderColor: c.border,
-              borderWidth: 1,
-              borderRadius: radius.md,
-              paddingVertical: 12,
-              alignItems: 'center',
-            }}>
-            <T weight="900" size={19} color={col}>{rows.filter((r) => r[1] === lv).length}</T>
-            <T weight="700" size={11.5} color={c.muted} style={{ marginTop: 3 }}>
-              {lv === 'Jr' ? 'Junior' : lv === 'Mid' ? 'Mid' : 'Senior'}
-            </T>
-          </View>
-        ))}
+      <H2>Levels · tap to drill that level</H2>
+      <Row style={{ gap: 9, flexWrap: 'wrap' }}>
+        {LEVELS.map((lv) => ({ lv, count: rows.filter((r) => r[1] === lv).length }))
+          .filter((x) => x.count > 0)
+          .map(({ lv, count }) => (
+            <Pressable
+              key={lv}
+              accessibilityRole="button"
+              accessibilityLabel={`Start a ${levelLabel(lv)} session, ${count} cards`}
+              onPress={() => { startTrack(t.slug, lv); router.push('/'); }}
+              style={{
+                minWidth: 88,
+                flexGrow: 1,
+                backgroundColor: c.card,
+                borderColor: c.border,
+                borderWidth: 1,
+                borderRadius: radius.md,
+                paddingVertical: 12,
+                alignItems: 'center',
+              }}>
+              <T weight="900" size={19} color={col}>{count}</T>
+              <T weight="700" size={11.5} color={c.muted} style={{ marginTop: 3 }}>{levelLabel(lv)}</T>
+            </Pressable>
+          ))}
       </Row>
       <Pressable onPress={() => router.push('/track/behavioral')}>
         <Row
@@ -84,16 +86,16 @@ export default function TrackDetail() {
       </Pressable>
 
       <Btn
-        label="▶ Start a session for this track"
+        label={lvl === 'All' ? '▶ Start a session (all levels)' : `▶ Start a ${levelLabel(lvl)} session`}
         onPress={() => {
-          startTrack(t.slug);
+          startTrack(t.slug, lvl === 'All' ? undefined : lvl);
           router.push('/');
         }}
       />
 
       <H2>Questions</H2>
-      <Row>
-        {LEVELS.map((l) => (
+      <Row style={{ flexWrap: 'wrap' }}>
+        {(['All', ...LEVELS.filter((lv) => rows.some((r) => r[1] === lv))] as const).map((l) => (
           <Pressable
             key={l}
             onPress={() => setLvl(l)}
@@ -106,7 +108,7 @@ export default function TrackDetail() {
               paddingHorizontal: 12,
             }}>
             <T weight="700" size={12} color={lvl === l ? c.card : c.muted}>
-              {l === 'All' ? 'All levels' : l}
+              {l === 'All' ? 'All levels' : levelLabel(l)}
             </T>
           </Pressable>
         ))}
