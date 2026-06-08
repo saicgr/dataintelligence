@@ -58,7 +58,19 @@ export interface ArcStep {
 }
 
 /** Languages a code panel can be tagged with (display only — no execution). */
-export type Lang = 'sql' | 'python' | 'pyspark' | 'airflow' | 'dbt' | 'ts';
+export type Lang =
+  | 'sql'
+  | 'python'
+  | 'pyspark'
+  | 'airflow'
+  | 'dbt'
+  | 'ts'
+  | 'js'
+  | 'go'
+  | 'rust'
+  | 'scala'
+  | 'cpp'
+  | 'dart';
 
 /**
  * A labelled, read-only code example attached to a flip card's answer.
@@ -232,6 +244,12 @@ const RAW_TRACKS: Track[] = [
   { slug: 'python', name: 'Python', color: 'kafka', icon: '🐍', q: 0, domain: 'de', group: 'concept' },
   { slug: 'sysd', name: 'System Design', color: 'sysd', icon: '📐', q: 0, domain: 'de', group: 'concept' },
   { slug: 'typescript', name: 'TypeScript', color: 'sql', icon: '🟦', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'nodejs', name: 'Node.js', color: 'kafka', icon: '🟢', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'go', name: 'Go', color: 'kafka', icon: '🐹', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'rust', name: 'Rust', color: 'dbt', icon: '🦀', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'cpp', name: 'C++', color: 'sysd', icon: '🧮', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'scala', name: 'Scala', color: 'spark', icon: '🔺', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'flutter', name: 'Flutter', color: 'sql', icon: '🦋', q: 0, domain: 'de', group: 'concept' },
   // ── Concept tracks: AI Engineering ──
   { slug: 'rag', name: 'RAG', color: 'rag', icon: '🔍', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'llms', name: 'LLMs', color: 'rag', icon: '🧠', q: 0, domain: 'ai', group: 'concept' },

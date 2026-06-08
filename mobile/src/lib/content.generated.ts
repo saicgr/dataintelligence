@@ -62,6 +62,13 @@ import mosaic from './generated/mosaic.json';
 import dataReliability from './generated/data-reliability.json';
 // Agentic AI: MCP, multi-agent orchestration, LangGraph/AutoGen/CrewAI, memory, guardrails, eval.
 import agenticAi from './generated/agentic-ai.json';
+// Programming-language coding tracks (Q&A + code panels), authored by the content swarm.
+import nodejs from './generated/nodejs.json';
+import go from './generated/go.json';
+import rust from './generated/rust.json';
+import cpp from './generated/cpp.json';
+import scala from './generated/scala.json';
+import flutter from './generated/flutter.json';
 
 export interface GeneratedCard {
   q: string;
@@ -73,7 +80,7 @@ export interface GeneratedCard {
   /** Optional real code examples shown under the answer (bug/fix or single snippet). */
   code?: {
     label?: string;
-    lang?: 'sql' | 'python' | 'pyspark' | 'airflow' | 'dbt' | 'ts';
+    lang?: 'sql' | 'python' | 'pyspark' | 'airflow' | 'dbt' | 'ts' | 'js' | 'go' | 'rust' | 'scala' | 'cpp' | 'dart';
     lines: string[];
     accent?: 'bug' | 'fix';
   }[];
@@ -137,4 +144,11 @@ export const GENERATED: Record<string, GeneratedCard[]> = {
   workfront: workfront as unknown as GeneratedCard[],
   'data-reliability': dataReliability as unknown as GeneratedCard[],
   'agentic-ai': agenticAi as unknown as GeneratedCard[],
+  // Programming-language coding tracks
+  nodejs: nodejs as unknown as GeneratedCard[],
+  go: go as unknown as GeneratedCard[],
+  rust: rust as unknown as GeneratedCard[],
+  cpp: cpp as unknown as GeneratedCard[],
+  scala: scala as unknown as GeneratedCard[],
+  flutter: flutter as unknown as GeneratedCard[],
 };

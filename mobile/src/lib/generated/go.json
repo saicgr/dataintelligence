@@ -1,0 +1,1267 @@
+[
+  {
+    "q": "What is a goroutine, and how does it differ from an OS thread?",
+    "a": "A goroutine is a function executing concurrently with other goroutines in the same address space, managed by the Go runtime rather than the OS. Unlike OS threads which start with 1\u20138 MB stacks, goroutines start with a few kilobytes and grow their stack on demand. The Go scheduler multiplexes many goroutines onto a smaller pool of OS threads (M:N scheduling), so creating thousands of goroutines is cheap while spawning that many OS threads would exhaust memory.",
+    "fj": "A goroutine is basically a thread, just lighter.",
+    "fs": "The key difference I call out is stack management: goroutines start at ~2 KB with a growable segmented or copied stack, so you can have hundreds of thousands without the per-thread MB cost \u2014 the runtime scheduler handles all the context switching in user space.",
+    "level": "Jr",
+    "asked": 32,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Spawning goroutines",
+        "lines": [
+          "func worker(id int) {",
+          "    fmt.Printf(\"worker %d\\n\", id)",
+          "}",
+          "",
+          "for i := 0; i < 1000; i++ {",
+          "    go worker(i) // cheap",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does GOMAXPROCS control?",
+        "a": "`GOMAXPROCS` sets the number of OS threads (Ps in the GMP model) that can execute user-level Go code simultaneously. It defaults to the number of logical CPU cores. Increasing it beyond the core count gives no throughput benefit for CPU-bound work; decreasing it to 1 effectively serialises execution and can mask races."
+      },
+      {
+        "q": "What happens to a goroutine when it makes a blocking syscall?",
+        "a": "The runtime detaches the P (processor) from the blocked M (OS thread) and hands that P to another M so other goroutines keep running. When the syscall completes, the original M tries to re-acquire a P; if none is free it parks the goroutine on the global run queue and the M goes to sleep."
+      }
+    ]
+  },
+  {
+    "q": "Explain the Go GMP scheduler model \u2014 what are G, M, and P?",
+    "a": "G is a goroutine (the unit of work), M is an OS thread (the actual kernel-level thread that runs code), and P is a logical processor that holds a local run queue and execution context. Each M must hold a P to run Go code; GOMAXPROCS controls how many Ps exist. The scheduler uses work-stealing: when a P's local queue is empty it steals half the tasks from another P's queue or pulls from the global run queue.",
+    "fj": "Go runs goroutines directly on CPU cores.",
+    "fs": "I think about P as a 'token' \u2014 an M can only execute Go code while holding a P, and the number of Ps is GOMAXPROCS. That's why a blocking syscall detaches the P so it can be grabbed by another M.",
+    "level": "Mid",
+    "asked": 24,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Runtime introspection",
+        "lines": [
+          "import \"runtime\"",
+          "",
+          "// default = num CPU cores",
+          "p := runtime.GOMAXPROCS(0)",
+          "g := runtime.NumGoroutine()",
+          "fmt.Printf(\"%d Ps, %d Gs\\n\", p, g)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is cooperative vs. asynchronous preemption in Go?",
+        "a": "Before Go 1.14 the scheduler relied on cooperative preemption at function call sites \u2014 a tight loop with no calls could hog an M forever. Go 1.14 added asynchronous preemption via OS signals: after roughly 10 ms the runtime sends SIGURG to the thread, interrupting it at a safe point so other goroutines get scheduled."
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between a buffered and an unbuffered channel?",
+    "a": "An unbuffered channel (`make(chan T)`) synchronises sender and receiver \u2014 the send blocks until a receiver is ready and vice versa. A buffered channel (`make(chan T, n)`) allows up to n values to be in flight; a send only blocks when the buffer is full and a receive only blocks when the buffer is empty. Unbuffered channels are used for rendezvous-style synchronisation; buffered channels decouple producer and consumer speeds and are often used as semaphores by sending tokens to bound concurrency.",
+    "fj": "Buffered channels are just faster because they don't block.",
+    "fs": "Buffered channels don't remove blocking \u2014 they delay it. The first send never blocks but the (n+1)th send blocks until a receiver drains the buffer. I use `make(chan struct{}, n)` as a counting semaphore to cap concurrent workers at n.",
+    "level": "Jr",
+    "asked": 30,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Semaphore via buffered chan",
+        "lines": [
+          "sem := make(chan struct{}, 5)",
+          "for _, url := range urls {",
+          "    sem <- struct{}{} // acquire",
+          "    go func(u string) {",
+          "        defer func() { <-sem }()",
+          "        fetch(u)",
+          "    }(url)",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens when you receive from a nil channel?",
+        "a": "Receiving from a nil channel blocks forever. This is sometimes used intentionally in a `select` to disable a case at runtime \u2014 if you set a channel variable to `nil` inside a `select` case, that case is no longer selectable until the variable is assigned again."
+      }
+    ]
+  },
+  {
+    "q": "What happens when you close a channel, and what are the rules around closing?",
+    "a": "Closing a channel signals to receivers that no more values will be sent. A receive on a closed channel returns immediately with the zero value and a `false` ok flag. Sending to a closed channel panics at runtime. Only the sender should close a channel (never the receiver), and you should close it only once \u2014 closing a closed channel also panics. The close happens-before a receive of the zero value per the Go memory model.",
+    "fj": "You close it when you're done so the receiver knows to stop.",
+    "fs": "The invariant I enforce is: only the single writer or a designated coordinator closes; if multiple goroutines produce, I use a `sync.WaitGroup` plus a separate closer goroutine to avoid a double-close panic.",
+    "level": "Mid",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Safe drain with range",
+        "lines": [
+          "ch := make(chan int, 10)",
+          "",
+          "go func() {",
+          "    for i := 0; i < 5; i++ {",
+          "        ch <- i",
+          "    }",
+          "    close(ch) // sender closes",
+          "}()",
+          "",
+          "for v := range ch { // exits on close",
+          "    fmt.Println(v)",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you safely close a channel when multiple goroutines produce?",
+        "a": "Use a `sync.WaitGroup` to track all producers. A single coordinator goroutine calls `wg.Wait()` then `close(ch)`. Alternatively, use a `sync.Once` so the first caller to close wins and subsequent calls become no-ops without a panic."
+      }
+    ]
+  },
+  {
+    "q": "Explain channel direction types in Go function signatures.",
+    "a": "Go lets you annotate a channel parameter with its direction: `chan<- T` is send-only and `<-chan T` is receive-only. These are compile-time enforcements \u2014 passing a bidirectional channel to a function expecting `chan<- T` is fine (narrowing conversion), but you cannot convert a directional channel back to bidirectional. Using directional types in APIs makes ownership and data-flow explicit: the function signature documents who produces and who consumes.",
+    "fj": "I just pass the plain channel and the code makes the direction clear.",
+    "fs": "I declare `chan<-` and `<-chan` in every public function signature \u2014 it's machine-checked documentation that prevents accidental receives in a producer or accidental sends in a consumer at compile time.",
+    "level": "Jr",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Directional channels",
+        "lines": [
+          "func produce(out chan<- int) {",
+          "    out <- 42",
+          "    close(out)",
+          "}",
+          "",
+          "func consume(in <-chan int) {",
+          "    for v := range in {",
+          "        fmt.Println(v)",
+          "    }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does `select` work in Go, and what does a `default` case do?",
+    "a": "`select` blocks until one of its channel operations can proceed, then executes that case. If multiple cases are ready simultaneously, Go picks one at random \u2014 this prevents starvation but means you cannot assume ordering. Adding a `default` case makes the `select` non-blocking: if no channel operation is immediately ready, `default` executes instead of blocking. `select {}` (empty select) blocks the goroutine forever and is a common way to park the `main` goroutine while background goroutines run.",
+    "fj": "select just picks the first channel that has data.",
+    "fs": "I highlight the random selection behaviour \u2014 multiple ready cases means unpredictable ordering, so any logic that depends on priority ordering needs an explicit outer loop or priority channel design, not just ordering the cases.",
+    "level": "Mid",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Non-blocking send with default",
+        "lines": [
+          "func trySend(ch chan<- int, v int) bool {",
+          "    select {",
+          "    case ch <- v:",
+          "        return true",
+          "    default:",
+          "        return false // none ready",
+          "    }",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you implement a timeout on an operation using select?",
+        "a": "Use `time.After` or a `time.NewTimer` in a `select` case: `case <-time.After(2*time.Second): return errors.New(\"timeout\")`. For production code, prefer `time.NewTimer` so you can stop it and avoid a small goroutine leak from the undrained `time.After` timer channel."
+      }
+    ]
+  },
+  {
+    "q": "How do you use `context.Context` for cancellation and timeouts?",
+    "a": "`context.WithCancel` returns a context and a `cancel` function; calling `cancel()` broadcasts cancellation to all goroutines holding that context or derived contexts. `context.WithTimeout` and `context.WithDeadline` also cancel automatically when the deadline passes. Goroutines should select on `ctx.Done()` in their loop and return when they receive a signal. The first argument to every function in a call chain that performs I/O or long work should accept `context.Context` \u2014 this is the canonical Go convention for propagating deadlines.",
+    "fj": "I pass context to HTTP requests so they get cancelled when the parent dies.",
+    "fs": "I always `defer cancel()` immediately after `WithTimeout` \u2014 even when the operation finishes before the timeout \u2014 to release the timer resource and avoid a timer goroutine leak.",
+    "level": "Mid",
+    "asked": 26,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Context timeout pattern",
+        "lines": [
+          "ctx, cancel := context.WithTimeout(",
+          "    context.Background(),",
+          "    5*time.Second,",
+          ")",
+          "defer cancel() // always call",
+          "",
+          "if err := doWork(ctx); err != nil {",
+          "    // err may be context.DeadlineExceeded",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What values should you store in a context, and what shouldn't go in?",
+        "a": "Context values are for request-scoped data that crosses API boundaries: trace IDs, auth tokens, deadline, cancellation. Don't store business logic parameters there \u2014 use explicit function arguments instead. The `context.Value` key should be an unexported type to avoid collisions between packages."
+      },
+      {
+        "q": "How does ctx.Err() differ from <-ctx.Done()?",
+        "a": "`ctx.Done()` is a channel that closes when the context is cancelled or times out \u2014 you select on it. `ctx.Err()` returns the reason as an error (`context.Canceled` or `context.DeadlineExceeded`) after `Done()` is closed, or `nil` if the context is still live. Use `Err()` when you want to log or return the cancellation reason."
+      }
+    ]
+  },
+  {
+    "q": "How does `sync.Mutex` differ from `sync.RWMutex`, and when do you choose each?",
+    "a": "`sync.Mutex` provides exclusive access \u2014 only one goroutine can hold the lock at a time for either reading or writing. `sync.RWMutex` distinguishes reads from writes: multiple goroutines may hold the read lock simultaneously (`RLock`/`RUnlock`), but a write lock (`Lock`/`Unlock`) is exclusive and blocks all readers. Choose `RWMutex` when reads are far more frequent than writes (e.g., a configuration cache); use a plain `Mutex` when writes and reads are balanced because `RWMutex` has higher overhead per operation.",
+    "fj": "RWMutex is just a faster Mutex.",
+    "fs": "RWMutex only wins when the read-to-write ratio is high \u2014 I've benchmarked caches where RWMutex is 3\u20135x faster at read-heavy load, but at even 50/50 access it loses to a plain Mutex due to writer starvation prevention overhead.",
+    "level": "Mid",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Read-heavy cache",
+        "lines": [
+          "type Cache struct {",
+          "    mu   sync.RWMutex",
+          "    data map[string]string",
+          "}",
+          "",
+          "func (c *Cache) Get(k string) string {",
+          "    c.mu.RLock()",
+          "    defer c.mu.RUnlock()",
+          "    return c.data[k]",
+          "}",
+          "",
+          "func (c *Cache) Set(k, v string) {",
+          "    c.mu.Lock()",
+          "    defer c.mu.Unlock()",
+          "    c.data[k] = v",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "When would you use `sync.WaitGroup`, and what is the most common mistake?",
+    "a": "`sync.WaitGroup` lets the main goroutine wait for a collection of goroutines to finish. Call `wg.Add(n)` before launching the goroutines (not inside them), call `wg.Done()` \u2014 ideally via `defer` \u2014 inside each goroutine, and `wg.Wait()` to block until all finish. The most common mistake is calling `wg.Add` inside the goroutine itself: if the goroutine doesn't start before `wg.Wait()` is called the counter is still zero and `Wait` returns early.",
+    "fj": "I call Add and Done inside the goroutine to keep it self-contained.",
+    "fs": "Add must be called before go \u2014 if you call it inside the goroutine, the scheduler might not start it before Wait sees a zero count and returns. I always add a comment next to Add to prevent the regression.",
+    "level": "Mid",
+    "asked": 22,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Race: Add inside goroutine",
+        "lines": [
+          "var wg sync.WaitGroup",
+          "for _, u := range urls {",
+          "    go func(u string) {",
+          "        wg.Add(1) // too late!",
+          "        defer wg.Done()",
+          "        fetch(u)",
+          "    }(u)",
+          "}",
+          "wg.Wait() // may return early"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Add before go",
+        "lines": [
+          "var wg sync.WaitGroup",
+          "for _, u := range urls {",
+          "    wg.Add(1) // before launch",
+          "    go func(u string) {",
+          "        defer wg.Done()",
+          "        fetch(u)",
+          "    }(u)",
+          "}",
+          "wg.Wait()"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What does `sync.Once` guarantee, and what is its typical use case?",
+    "a": "`sync.Once` ensures a function is executed exactly once regardless of how many goroutines call `once.Do(f)` concurrently. All callers block until the first invocation of `f` returns \u2014 including concurrent calls that arrive while `f` is running. Per the Go memory model, the completion of `f` is synchronized before any `Do` returns. It is ideal for lazy singleton initialization: database connections, parsed config, HTTP clients \u2014 objects that are expensive to create and safe to share once created.",
+    "fj": "I just use a package-level variable and initialise it in init.",
+    "fs": "Once is better than init for objects that shouldn't be created in tests or might fail \u2014 init always runs. Once defers construction until first use and the Do completion happens-before any reader sees the result, so no additional mutex is needed.",
+    "level": "Mid",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Lazy singleton",
+        "lines": [
+          "var (",
+          "    once sync.Once",
+          "    db   *sql.DB",
+          ")",
+          "",
+          "func DB() *sql.DB {",
+          "    once.Do(func() {",
+          "        db, _ = sql.Open(\"postgres\", dsn)",
+          "    })",
+          "    return db",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you detect data races in Go, and what is the underlying guarantee the race detector provides?",
+    "a": "Run tests or binaries with the `-race` flag: `go test -race ./...` or `go run -race main.go`. The race detector instruments every memory access at compile time using ThreadSanitizer and reports concurrent unsynchronised reads and writes at runtime with a full goroutine stack trace. It has ~5\u201310x CPU overhead and ~5\u201310x memory overhead so it is not used in production, but should be run in CI. It does not prove the absence of races \u2014 only races that actually execute during the instrumented run are caught.",
+    "fj": "I just look for places where multiple goroutines touch the same variable.",
+    "fs": "Code review can't catch all races \u2014 the race detector is the tool I always enable in CI. I also describe what it can't catch: if the racy path is never executed during the test run it remains silent.",
+    "level": "Jr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "go",
+        "label": "CI race check",
+        "lines": [
+          "// go.yml",
+          "- run: go test -race ./..."
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When would you use sync/atomic instead of a mutex?",
+        "a": "`sync/atomic` operations are appropriate for a single integer or pointer that needs safe concurrent update without the overhead of a mutex \u2014 counters, flags, stats. They guarantee sequentially consistent ordering but cannot protect multi-field invariants: if you need to update two related fields atomically, use a mutex or copy-on-write struct."
+      }
+    ]
+  },
+  {
+    "q": "Explain Go's memory model and the happens-before relationship.",
+    "a": "The Go memory model defines when a write to a variable is guaranteed visible to a read in another goroutine. A write W is visible to a read R only if W happens-before R and no other write interferes. Synchronisation operations establish happens-before edges: an unbuffered channel send happens-before the corresponding receive completes; a mutex Unlock happens-before a subsequent Lock; goroutine creation happens-before the goroutine starts; `once.Do` completion happens-before any `Do` returns. Without these edges, the compiler and CPU may reorder memory accesses, so reads may see stale values.",
+    "fj": "Go takes care of memory visibility automatically in goroutines.",
+    "fs": "The rule I internalise: if two goroutines share a variable without any synchronisation primitive between them, the compiler is legally allowed to cache the value in a register and the reader may never see the write. That's not a bug in the hardware \u2014 it's allowed by the memory model.",
+    "level": "Sr",
+    "asked": 18,
+    "followups": [
+      {
+        "q": "How does the buffered channel rule differ from the unbuffered channel rule in the memory model?",
+        "a": "For an unbuffered channel, the send is synchronized before the receive completes (the receiver sees the send). For a buffered channel with capacity C, the kth receive is synchronized before the completion of the (k+C)th send \u2014 meaning the buffer itself can absorb C sends before a synchronisation edge exists. This is why you can use a buffered channel of capacity C as a counting semaphore."
+      }
+    ]
+  },
+  {
+    "q": "What is the `error` interface, and how does idiomatic Go error handling differ from exceptions?",
+    "a": "The `error` interface has a single method `Error() string`. Functions signal failure by returning an `error` as the last return value; callers check and handle it immediately. This is explicit rather than implicit: errors are values that flow through the normal return path rather than unwinding the stack via exceptions. The advantage is that every error-handling site is visible in the code and callers decide how to handle or propagate errors, but the cost is verbosity and the risk of silently ignoring errors by assigning to `_`.",
+    "fj": "I check if err != nil after each call and return it up the stack.",
+    "fs": "The key word is 'values' \u2014 errors are data, not control flow. That lets you wrap, transform, and inspect them with the full power of the type system, which exceptions discourage.",
+    "level": "Jr",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Idiomatic pattern",
+        "lines": [
+          "func readConfig(p string) (",
+          "    Config, error) {",
+          "    data, err := os.ReadFile(path)",
+          "    if err != nil {",
+          "        return Config{}, fmt.Errorf(",
+          "            \"readConfig %s: %w\", p, err,",
+          "        )",
+          "    }",
+          "    return parse(data)",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain `fmt.Errorf` with `%w`, and how `errors.Is` and `errors.As` unwrap error chains.",
+    "a": "`fmt.Errorf(\"context: %w\", err)` wraps `err`, adding context while preserving the original error in the chain. `errors.Is(err, target)` walks the chain calling `Unwrap` at each step and reports true if any node equals `target` \u2014 this replaces direct `==` comparison, which fails for wrapped errors. `errors.As(err, &target)` similarly walks the chain but assigns the first error that can be assigned to `target`'s type, enabling extraction of typed error fields. Both respect custom `Is`/`As`/`Unwrap` methods.",
+    "fj": "I compare errors with == or check the error string.",
+    "fs": "Comparing with == breaks the moment the error is wrapped even once \u2014 errors.Is handles the whole chain. I always use errors.Is for sentinel checks and errors.As when I need the typed fields like a *net.OpError's Addr.",
+    "level": "Mid",
+    "asked": 24,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Breaks with wrapping",
+        "lines": [
+          "err := fmt.Errorf(\"open: %w\",",
+          "    os.ErrNotExist)",
+          "if err == os.ErrNotExist { // false!",
+          "    handle()",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Unwrap-aware check",
+        "lines": [
+          "err := fmt.Errorf(\"open: %w\",",
+          "    os.ErrNotExist)",
+          "if errors.Is(err, os.ErrNotExist) {",
+          "    handle()",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When would you define a sentinel error vs. a custom error type?",
+        "a": "Use a sentinel (`var ErrNotFound = errors.New(\"not found\")`) when callers only need to match the identity \u2014 is this the not-found case? Use a custom type when callers need structured data from the error, like the offending key, HTTP status code, or retry-after duration. With a custom type you implement `Error() string` and callers use `errors.As` to extract the fields."
+      }
+    ]
+  },
+  {
+    "q": "How are interfaces satisfied in Go \u2014 what is implicit satisfaction, and why does it matter?",
+    "a": "In Go, a type satisfies an interface automatically if it implements all the interface's methods \u2014 there is no `implements` keyword. This is structural typing (duck typing at the type level). It means types defined in third-party packages or the standard library can satisfy your interfaces without modification, enabling you to wrap, mock, or replace dependencies by just defining an interface that matches the methods you use. The `io.Reader` and `io.Writer` interfaces are the canonical example: any type with the right signature works.",
+    "fj": "You just define the interface and Go figures out if the type matches.",
+    "fs": "Implicit satisfaction lets me write interfaces in the consumer, not the producer. I declare the narrowest interface I need locally \u2014 often just one or two methods \u2014 so the dependency is on behavior not on a concrete package, making the code trivially testable.",
+    "level": "Jr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Consumer-side interface",
+        "lines": [
+          "// Defined in your package:",
+          "type Storer interface {",
+          "    Save(ctx context.Context,",
+          "        key string, val []byte) error",
+          "}",
+          "",
+          "// *redis.Client satisfies it",
+          "// without touching the redis pkg."
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain the nil interface gotcha \u2014 when is `err != nil` true even though you returned a nil pointer?",
+    "a": "An interface value has two internal fields: a type pointer and a data pointer. An interface is `nil` only when both are nil. If you return a typed nil \u2014 e.g., `var p *MyError = nil; return p` where the return type is `error` \u2014 the interface stores a non-nil type (`*MyError`) with a nil data pointer. Comparing it to `nil` returns `false`, causing bugs like \"error is not nil but there is no error\". The fix is to return `nil` directly, not a typed nil variable.",
+    "fj": "I always check err != nil \u2014 if the pointer is nil the error is nil.",
+    "fs": "This is the most surprising Go gotcha: the interface wrapper is not nil. I explicitly prohibit patterns like `return (*MyError)(nil)` in code review. The rule is: if a function returns `error`, its return statement must say `return nil` not `return someTypedNilVar`.",
+    "level": "Sr",
+    "asked": 22,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Typed nil != nil",
+        "lines": [
+          "func check() error {",
+          "    var p *MyError // typed nil",
+          "    if badInput {",
+          "        p = &MyError{msg: \"bad\"}",
+          "    }",
+          "    return p // interface wraps type!",
+          "}",
+          "// check() != nil even when p == nil"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Return nil directly",
+        "lines": [
+          "func check() error {",
+          "    if badInput {",
+          "        return &MyError{msg: \"bad\"}",
+          "    }",
+          "    return nil // untyped nil interface",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does a type assertion work, and what is a type switch?",
+    "a": "A type assertion `x.(T)` extracts the concrete value of type `T` from interface `x` and panics if the concrete type is not `T`. The two-value form `v, ok := x.(T)` is safe: `ok` is false and `v` is the zero value of `T` if the assertion fails. A type switch `switch v := x.(type)` is a multi-branch version that matches the concrete type in each case and binds `v` to the concrete type in that branch, enabling clean dispatch over heterogeneous collections without reflection.",
+    "fj": "I cast the interface to the concrete type with x.(T).",
+    "fs": "Always use the two-value form unless a panic on mismatch is genuinely the right behavior. In production code a type assertion panic is almost always a bug \u2014 the type switch or ok-form should be used so you can handle unknown types gracefully.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Type switch dispatch",
+        "lines": [
+          "func describe(i interface{}) string {",
+          "    switch v := i.(type) {",
+          "    case int:",
+          "        return fmt.Sprintf(\"int: %d\", v)",
+          "    case string:",
+          "        return fmt.Sprintf(\"str: %s\", v)",
+          "    case error:",
+          "        return \"err: \" + v.Error()",
+          "    default:",
+          "        return \"unknown\"",
+          "    }",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain the internal structure of a Go slice and the append shared-backing-array bug.",
+    "a": "A slice is a three-field struct: a pointer to an underlying array, a length, and a capacity. Two slices can share the same backing array \u2014 a subslice `s[2:5]` shares memory with `s`. When you `append` to such a subslice and there is remaining capacity, the append writes into the shared array and mutations are visible through the original slice. When capacity is exceeded, `append` allocates a new array and the two slices diverge. This surprising aliasing is a frequent source of subtle bugs.",
+    "fj": "append always creates a new slice so you don't have to worry about sharing.",
+    "fs": "append only reallocates when cap is exceeded. Within existing capacity, append writes to the shared backing array \u2014 I always use a full slice expression `s[lo:hi:hi]` to set the capacity equal to length when passing subslices to functions that will append, so they can't clobber the original.",
+    "level": "Sr",
+    "asked": 20,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Append clobbers original",
+        "lines": [
+          "orig := []int{1, 2, 3, 4, 5}",
+          "sub := orig[0:2] // shares array, cap=5",
+          "sub = append(sub, 99)",
+          "// orig[2] is now 99, not 3!"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Cap = len to isolate",
+        "lines": [
+          "orig := []int{1, 2, 3, 4, 5}",
+          "// full slice expr: [lo:hi:max]",
+          "sub := orig[0:2:2] // cap=2, forces alloc",
+          "sub = append(sub, 99)",
+          "// orig unchanged"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does Go 1.18+ change the append growth factor?",
+        "a": "Prior to Go 1.18, append roughly doubled capacity below 1024 and grew by 25% above. Go 1.18 changed to a smoother formula: growth starts near 2x for small slices and transitions smoothly to ~1.25x for large ones, avoiding the sharp cliff at exactly 1024. The exact factor is `newcap = oldcap + (oldcap + 3*threshold) / 4` where threshold is 256."
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between `copy` and an append slice-to-slice? When must you use `copy`?",
+    "a": "`copy(dst, src)` copies min(len(dst), len(src)) elements and never allocates. An append like `dst = append(dst, src...)` also works but allocates if `cap(dst) < len(dst)+len(src)`. You must use `copy` when you want to break the backing-array link and create an independent slice from the original data, or when you are writing into a pre-allocated buffer for performance. `copy` is also the only safe way to shift elements within a single slice.",
+    "fj": "I use append(nil, src...) to copy a slice.",
+    "fs": "append(nil, src...) works but allocates a new backing array on each call. In hot paths where I pre-allocate, I use make+copy so I control exactly one allocation. I also use copy when I need to snapshot a slice from a larger array to prevent the GC from retaining the whole backing array.",
+    "level": "Mid",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Snapshot to free large array",
+        "lines": [
+          "// large keeps entire backing array alive",
+          "large := loadHugeData() // 1 GB array",
+          "small := large[0:5]    // still holds ref",
+          "",
+          "// snapshot to release large:",
+          "snap := make([]byte, 5)",
+          "copy(snap, large[0:5])",
+          "large = nil // now GC can collect"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are the concurrency safety rules for Go maps, and what are your options for safe concurrent access?",
+    "a": "Go maps are not safe for concurrent read/write. A concurrent write with any other operation (read or write) causes a runtime panic with `fatal error: concurrent map read and map write`. Read-only concurrent access is safe. The options are: (1) protect with `sync.Mutex` or `sync.RWMutex` wrapping the map; (2) use `sync.Map`, which is optimised for high-read / low-write workloads and store/load of disjoint keys, but trades type safety for concurrency; (3) shard the map across multiple mutex-protected maps to reduce lock contention.",
+    "fj": "I use sync.Map for any concurrent map access.",
+    "fs": "sync.Map is not a drop-in replacement \u2014 it uses interface{} so you lose type safety and it's slower than a mutex-guarded typed map for write-heavy or small maps. I benchmark both and only use sync.Map when the access pattern is truly disjoint or heavily read-skewed.",
+    "level": "Mid",
+    "asked": 18,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Concurrent map write panic",
+        "lines": [
+          "m := map[string]int{}",
+          "go func() { m[\"a\"] = 1 }()",
+          "go func() { m[\"b\"] = 2 }()",
+          "// fatal: concurrent map writes"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Mutex-protected map",
+        "lines": [
+          "var mu sync.Mutex",
+          "m := map[string]int{}",
+          "go func() {",
+          "    mu.Lock(); m[\"a\"] = 1; mu.Unlock()",
+          "}()",
+          "go func() {",
+          "    mu.Lock(); m[\"b\"] = 2; mu.Unlock()",
+          "}()"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Show the nil map write panic and how to avoid it.",
+    "a": "A nil map (`var m map[string]int`) can be read safely \u2014 it returns the zero value for any key \u2014 but any write panics at runtime: `panic: assignment to entry in nil map`. The fix is always initialise maps with `make(map[K]V)` or a map literal. In struct constructors, initialise all map fields in the constructor to prevent callers from hitting the nil-write panic.",
+    "fj": "I check if the map is nil before writing to it.",
+    "fs": "I enforce that every exported struct with map fields has a constructor that calls make \u2014 defensive nil checks at every call site are a maintenance trap. The struct owns the invariant that its maps are always non-nil.",
+    "level": "Jr",
+    "asked": 14,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "nil map write",
+        "lines": [
+          "var m map[string]int",
+          "m[\"key\"] = 1",
+          "// panic: assignment to entry",
+          "//        in nil map"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Always initialise",
+        "lines": [
+          "m := make(map[string]int)",
+          "m[\"key\"] = 1 // safe"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the map comma-ok idiom, and why is it essential for distinguishing missing keys from zero values?",
+    "a": "Indexing a map with a key that doesn't exist returns the zero value of the value type \u2014 `0` for int, `\"\"` for string, `nil` for pointers. This makes it impossible to distinguish a missing key from a key explicitly set to the zero value using a single-value index. The comma-ok idiom `v, ok := m[key]` returns a boolean `ok` that is true only when the key exists. It is essential whenever zero is a meaningful value: scores, flags, counters \u2014 any domain where 0 has semantics different from 'absent'.",
+    "fj": "I check if the value is zero to see if the key exists.",
+    "fs": "The zero-vs-absent ambiguity is a real bug waiting to happen in analytics code where 0 means 'no events today', not 'user not in map'. Comma-ok is non-negotiable whenever zero has domain meaning.",
+    "level": "Jr",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Comma-ok pattern",
+        "lines": [
+          "scores := map[string]int{\"alice\": 0}",
+          "",
+          "// Wrong: can't tell missing vs zero",
+          "v := scores[\"bob\"] // returns 0",
+          "",
+          "// Right:",
+          "v, ok := scores[\"bob\"]",
+          "if !ok {",
+          "    fmt.Println(\"bob not in map\")",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain defer: when are arguments evaluated, what is the execution order, and how does defer interact with named return values?",
+    "a": "Deferred function arguments are evaluated at the `defer` statement, not when the deferred function executes. Deferred calls execute in LIFO order after the surrounding function returns. Named return values can be read and modified by a deferred function after the `return` statement sets them \u2014 the `return` sets the named variable, then defers run and may change it, then the function actually returns. This enables patterns like wrapping errors in a single deferred function at the top of a method.",
+    "fj": "Defer just runs cleanup code at the end of the function.",
+    "fs": "The argument evaluation timing is the gotcha: `defer fmt.Println(i)` captures i's current value immediately. And named returns give defers write access after return \u2014 which I use for a single-point error annotation: `defer func() { if err != nil { err = fmt.Errorf(\"myFunc: %w\", err) } }()`.",
+    "level": "Mid",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Named return + defer",
+        "lines": [
+          "func readFile(path string) (err error) {",
+          "    f, err := os.Open(path)",
+          "    if err != nil { return }",
+          "    defer func() {",
+          "        if cerr := f.Close(); cerr != nil",
+          "            && err == nil {",
+          "            err = cerr // wraps close err",
+          "        }",
+          "    }()",
+          "    return decode(f)",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the defer-in-a-loop gotcha?",
+        "a": "Defer is function-scoped, not block-scoped. Deferring inside a loop (e.g., closing a file in each iteration) accumulates all defers until the function returns, potentially exhausting file descriptors. The fix is to extract the loop body into a helper function so each call has its own defer scope, or to call `Close()` explicitly without defer."
+      }
+    ]
+  },
+  {
+    "q": "Show the defer-in-a-loop file descriptor leak and the correct fix.",
+    "a": "When you defer `f.Close()` inside a loop, all the deferred closes pile up in a LIFO stack and only execute when the enclosing function returns, not at the end of each iteration. In a loop over thousands of paths this exhausts the process's file descriptor limit. The clean fix is to move the open/process/close into a helper function that is called per iteration, so each invocation gets its own defer scope.",
+    "fj": "I defer Close at the top of the loop to be safe.",
+    "fs": "defer is function-scoped \u2014 I never defer inside a loop unless the loop is the entire function body. The named-function refactor is the canonical solution and it also makes the code easier to test.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "FD leak: defer in loop",
+        "lines": [
+          "func processAll(paths []string) error {",
+          "    for _, p := range paths {",
+          "        f, err := os.Open(p)",
+          "        if err != nil { return err }",
+          "        defer f.Close() // piles up!",
+          "        process(f)",
+          "    }",
+          "    return nil",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Helper function per file",
+        "lines": [
+          "func processOne(p string) error {",
+          "    f, err := os.Open(p)",
+          "    if err != nil { return err }",
+          "    defer f.Close() // scoped here",
+          "    return process(f)",
+          "}",
+          "",
+          "func processAll(paths []string) error {",
+          "    for _, p := range paths {",
+          "        if err := processOne(p);",
+          "            err != nil { return err }",
+          "    }",
+          "    return nil",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does `panic` and `recover` work, and when is it appropriate to use them?",
+    "a": "`panic` stops the normal execution flow of a function: deferred functions in the panicking goroutine still run, then panic unwinds up the call stack until it reaches a `recover` in a deferred function or the program crashes. `recover` only works inside a deferred function; outside of one it always returns `nil`. Use panic/recover for truly unrecoverable programmer errors (index out of bounds, nil pointer in logic) or to convert panics at library boundaries into errors so callers see a normal error return. HTTP handlers and RPC servers typically catch panics at the transport layer to avoid crashing the whole server.",
+    "fj": "I use panic for any unrecoverable error to crash early.",
+    "fs": "The design principle I follow is from the Go standard library itself: panic internally within a package for invariant violations, recover at the package boundary and convert to error so callers never see a panic. Letting panics escape package boundaries is bad library design.",
+    "level": "Mid",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Recover at boundary",
+        "lines": [
+          "func safeRun(f func()) (err error) {",
+          "    defer func() {",
+          "        if r := recover(); r != nil {",
+          "            err = fmt.Errorf(",
+          "                \"panic: %v\", r,",
+          "            )",
+          "        }",
+          "    }()",
+          "    f()",
+          "    return nil",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain struct embedding and method promotion \u2014 what methods does the embedding type expose?",
+    "a": "Embedding a type `T` inside a struct promotes all of `T`'s exported (and unexported, within the same package) methods to the outer struct. A struct embedding `T` by value promotes all methods of `T` with value receivers and all methods of `*T` with pointer receivers are promoted to the pointer type of the outer struct only. A struct embedding `*T` promotes both value and pointer receiver methods to both value and pointer forms of the outer struct. Embedding is composition, not inheritance \u2014 there is no overriding, but you can shadow a promoted method by defining a method with the same name on the outer struct.",
+    "fj": "Embedding is like inheritance \u2014 the outer struct inherits all methods.",
+    "fs": "It's composition, not inheritance, and the method set rules matter for interface satisfaction: if you embed T by value, the outer struct value doesn't satisfy interfaces requiring T's pointer receiver methods \u2014 only a pointer to the outer struct does. That asymmetry bites people.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Embedding + promotion",
+        "lines": [
+          "type Logger struct{}",
+          "func (l *Logger) Log(s string) {",
+          "    fmt.Println(s)",
+          "}",
+          "",
+          "type Server struct {",
+          "    *Logger // embeds pointer",
+          "}",
+          "",
+          "// s := &Server{&Logger{}}",
+          "// s.Log(\"ok\") // promoted"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When embedding a value type vs. a pointer type, what is the difference in nil safety?",
+        "a": "Embedding `*T` means the outer struct can be created with the embedded pointer nil, and calling any promoted method on it will panic with a nil pointer dereference. Embedding `T` (value) guarantees the embedded field is always initialised to its zero value, which is often safer but prevents sharing the same instance across multiple embedding structs."
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between a pointer receiver and a value receiver, and how does it affect the method set?",
+    "a": "A value receiver method (`func (t T) M()`) is callable on both values and pointers of type T. A pointer receiver method (`func (t *T) M()`) is only in the method set of `*T` \u2014 not in the method set of `T`. This matters for interface satisfaction: if an interface requires a pointer receiver method, only a `*T` satisfies it, not a bare `T`. In practice: use pointer receivers when the method needs to mutate the receiver or when the struct is large; use value receivers for immutable read-only logic on small structs.",
+    "fj": "I use pointer receivers when I need to modify the struct.",
+    "fs": "The method set asymmetry is the one that surprises people at interface assignment: assigning a T value to an interface requiring *T methods is a compile error. I always use pointer receivers consistently on a type to avoid confusion \u2014 mixing causes subtly different method sets depending on whether you have a pointer or value.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Value doesn't satisfy interface",
+        "lines": [
+          "type Stringer interface {",
+          "    String() string",
+          "}",
+          "type T struct{ Name string }",
+          "func (t *T) String() string {",
+          "    return t.Name",
+          "}",
+          "var _ Stringer = T{}",
+          "// compile error: T does not",
+          "// implement Stringer"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Use pointer",
+        "lines": [
+          "var _ Stringer = &T{}",
+          "// *T has String() in its method set"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain Go generics (1.18+): type parameters, constraints, and what `comparable` and `any` mean.",
+    "a": "Generics let you write functions and types parameterised over a type argument: `func Map[T, U any](s []T, f func(T) U) []U`. Constraints are interfaces that restrict valid type arguments: `any` allows any type, `comparable` restricts to types that support `==` and `!=` (required for map keys). You can define constraints as interfaces with union elements: `type Number interface { ~int | ~float64 }` uses a tilde to include all types whose underlying type is int or float64. Generics eliminate repetitive code without reflection, preserving type safety.",
+    "fj": "Generics let you write functions that work on any type like interface{}.",
+    "fs": "The constraint system is the key insight \u2014 a tilde-union constraint like `~int | ~int64` means your generic function works on any named type built on those underlying types (like `type UserID int`), not just the exact primitive, which is much more useful in domain-driven code.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Generic Map function",
+        "lines": [
+          "func Map[T, U any](",
+          "    s []T, f func(T) U,",
+          ") []U {",
+          "    out := make([]U, len(s))",
+          "    for i, v := range s {",
+          "        out[i] = f(v)",
+          "    }",
+          "    return out",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What limitations do generics have as of Go 1.21?",
+        "a": "You cannot use a parameterised type or function as a type argument directly (no higher-kinded types). Methods on generic types cannot introduce new type parameters \u2014 only the type itself can. Type inference does not work in all cases, sometimes requiring explicit type arguments. And parametric polymorphism is monomorphised at compile time (or via a dictionary, depending on the case), which can increase binary size."
+      }
+    ]
+  },
+  {
+    "q": "How does escape analysis work in Go, and what commands let you inspect it?",
+    "a": "Escape analysis is performed by the compiler at build time to decide whether a variable can live on the goroutine's stack or must be heap-allocated. A value 'escapes' to the heap when: it is returned by pointer, stored in an interface, captured by a closure that outlives the function, or passed to a function whose arguments escape. Stack allocation is essentially free (just a pointer bump); heap allocation requires GC tracking. Run `go build -gcflags='-m'` to see escape decisions; `-m=2` gives more detail.",
+    "fj": "Go automatically manages memory so I don't think about stack vs. heap.",
+    "fs": "Escape analysis directly affects GC pressure. In hot paths I use -gcflags='-m' to confirm structs stay on the stack. Common surprises: assigning to an interface escapes the underlying value, and closures that capture loop variables escape to the heap.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Inspect escape decisions",
+        "lines": [
+          "// Run:",
+          "// go build -gcflags='-m' ./...",
+          "",
+          "func noEscape() int {",
+          "    x := 42 // stays on stack",
+          "    return x",
+          "}",
+          "",
+          "func escapes() *int {",
+          "    x := 42 // heap: returned ptr",
+          "    return &x",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does assigning a value to an interface cause it to escape to the heap?",
+        "a": "An interface stores a pointer to the value's data. If the interface outlives the function (e.g., it's returned or stored in a long-lived struct), the compiler must guarantee the pointee outlives the stack frame, so it allocates the value on the heap. This is a common hidden allocation when storing small structs or ints in `interface{}` \u2014 use type-safe generics or pre-allocated concrete types in hot paths."
+      }
+    ]
+  },
+  {
+    "q": "Describe the classic goroutine leak pattern and the standard fix.",
+    "a": "A goroutine leak occurs when a goroutine is blocked on a channel receive or send with no one to unblock it, or when it loops waiting on work that never arrives. Common causes: starting a goroutine that reads from a channel nobody ever writes to or closes; blocking on a response channel when the sender exits early; long-running goroutines with no cancellation check. The standard fix is to pass a `context.Context` and select on `ctx.Done()` alongside the blocking operation \u2014 when the context is cancelled, the goroutine can exit cleanly.",
+    "fj": "Goroutine leaks happen when you forget to call Done on a WaitGroup.",
+    "fs": "I detect leaks with goleak in tests and the runtime.NumGoroutine metric in production. The root cause is almost always a goroutine blocked on an unbounded channel with no context \u2014 so my rule is: every goroutine that blocks on a channel must also select on ctx.Done().",
+    "level": "Sr",
+    "asked": 22,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Goroutine leak",
+        "lines": [
+          "func startWorker(ch <-chan Job) {",
+          "    go func() {",
+          "        for j := range ch { // blocks",
+          "            process(j) // forever if",
+          "        }   // ch never closed",
+          "    }()",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Context-aware worker",
+        "lines": [
+          "func startWorker(",
+          "    ctx context.Context,",
+          "    ch <-chan Job,",
+          ") {",
+          "    go func() {",
+          "        for {",
+          "            select {",
+          "            case <-ctx.Done(): return",
+          "            case j, ok := <-ch:",
+          "                if !ok { return }",
+          "                process(j)",
+          "            }",
+          "        }",
+          "    }()",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Show the loop-variable capture goroutine bug and how Go 1.22 changed the semantics.",
+    "a": "Before Go 1.22, a `for` loop declared a single variable reused each iteration; goroutines or closures capturing it by reference all saw the final value. In Go 1.22+ (when `go.mod` declares `go 1.22`), each iteration gets its own variable, so the bug no longer exists. For older modules the canonical fix is `v := v` inside the loop body to shadow the variable with a per-iteration copy. The Go blog post calls this a decade-old trap that caused a real production incident at Let's Encrypt.",
+    "fj": "I pass the loop variable to the goroutine as an argument to avoid the issue.",
+    "fs": "Passing as an argument is also correct and remains the most explicit fix even in 1.22+ codebases for clarity. I always add a comment calling out the capture when I see goroutines inside loops, because the 1.22 fix only applies if go.mod says 1.22 \u2014 mixed module environments still have the old behavior.",
+    "level": "Sr",
+    "asked": 26,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Pre-1.22: all print last value",
+        "lines": [
+          "for _, v := range []string{",
+          "    \"a\", \"b\", \"c\",",
+          "} {",
+          "    go func() {",
+          "        fmt.Println(v) // captures &v",
+          "    }()",
+          "}",
+          "// likely prints: c c c"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Fix: shadow or pass arg",
+        "lines": [
+          "for _, v := range []string{",
+          "    \"a\", \"b\", \"c\",",
+          "} {",
+          "    v := v // per-iteration copy",
+          "    go func() {",
+          "        fmt.Println(v) // own v",
+          "    }()",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What happens when you send on a closed channel?",
+    "a": "Sending on a closed channel panics at runtime: `panic: send on closed channel`. This is unconditional \u2014 there is no safe 'try-send' on a closed channel. The typical cause is a producer goroutine that outlives the consumer which closes the channel as a done signal. The fix is to invert the ownership: only the producer (or a coordinator) should close, never the consumer; or use a context cancellation to tell producers to stop without closing the channel.",
+    "fj": "I check if the channel is closed before sending.",
+    "fs": "There is no 'is-channel-closed' check \u2014 any such pattern has a TOCTOU race. The design fix is ownership: whoever creates and writes to the channel is the one who closes it. If multiple senders, use a WaitGroup-plus-closer pattern so exactly one close happens after all senders finish.",
+    "level": "Mid",
+    "asked": 20,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Send after consumer closes",
+        "lines": [
+          "ch := make(chan int)",
+          "go func() {",
+          "    <-ch",
+          "    close(ch) // consumer closes!",
+          "}()",
+          "ch <- 1 // ok",
+          "ch <- 2 // panic: send on closed"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Producer closes with once",
+        "lines": [
+          "ch := make(chan int)",
+          "var once sync.Once",
+          "closeOnce := func() {",
+          "    once.Do(func() { close(ch) })",
+          "}",
+          "// producer(s) call closeOnce()",
+          "// consumer ranges over ch safely"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a worker pool in Go?",
+    "a": "A worker pool creates a fixed number of goroutines that each pull work from a shared channel. You send jobs on a `jobs` channel, launch N workers that range over it, and use a `sync.WaitGroup` to know when all workers finish. Close the `jobs` channel after enqueueing all work so workers exit their range loops. The pool bounds concurrency to N regardless of the total number of jobs, preventing resource exhaustion.",
+    "fj": "I spawn a goroutine for every job and use a WaitGroup to wait.",
+    "fs": "Unbounded goroutines-per-job is the anti-pattern \u2014 it saturates the machine under bursty load. The fixed-worker pool is the right model: N workers, one jobs channel, close-on-done. I tune N based on CPU count for CPU-bound work or queue depth and I/O latency for I/O-bound work.",
+    "level": "Sr",
+    "asked": 24,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Fixed worker pool",
+        "lines": [
+          "const N = 5",
+          "jobs := make(chan Job, 100)",
+          "var wg sync.WaitGroup",
+          "",
+          "for i := 0; i < N; i++ {",
+          "    wg.Add(1)",
+          "    go func() {",
+          "        defer wg.Done()",
+          "        for j := range jobs {",
+          "            process(j)",
+          "        }",
+          "    }()",
+          "}",
+          "",
+          "for _, j := range allJobs {",
+          "    jobs <- j",
+          "}",
+          "close(jobs)",
+          "wg.Wait()"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you collect results from a worker pool without races?",
+        "a": "Add a `results` channel of the same or larger capacity. Each worker sends its result on the channel after processing. A separate collector goroutine (or the main goroutine) ranges over the results channel and gathers them. Close the results channel after wg.Wait() returns to signal the collector to stop. Alternatively use a slice protected by a mutex if the results channel approach feels heavyweight."
+      }
+    ]
+  },
+  {
+    "q": "Describe the fan-out / fan-in pattern and implement a simple merge function.",
+    "a": "Fan-out distributes work from one channel to multiple goroutines each reading from the same channel (or multiple derived channels). Fan-in merges results from multiple channels into a single output channel. A `merge` function spawns one goroutine per input channel that drains it to the output; a `sync.WaitGroup` is used to close the output channel once all input channels are exhausted. This pattern is the basis for concurrent pipelines.",
+    "fj": "I just use a single channel and let goroutines compete for work.",
+    "fs": "The canonical merge keeps the pipeline composable \u2014 each stage emits a channel, so you can chain stages without coupling them. The wg-inside-merge pattern lets the merge function own the close of the output, so callers just range over the returned channel.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Fan-in merge",
+        "lines": [
+          "func merge(cs ...<-chan int) <-chan int {",
+          "    out := make(chan int)",
+          "    var wg sync.WaitGroup",
+          "    wg.Add(len(cs))",
+          "    for _, c := range cs {",
+          "        c := c",
+          "        go func() {",
+          "            defer wg.Done()",
+          "            for v := range c {",
+          "                out <- v",
+          "            }",
+          "        }()",
+          "    }",
+          "    go func() {",
+          "        wg.Wait()",
+          "        close(out)",
+          "    }()",
+          "    return out",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a deadlock in Go, how does the runtime detect it, and what are the common causes?",
+    "a": "A deadlock occurs when every goroutine is blocked waiting for a resource held by another goroutine, creating a cycle with no exit. Go's runtime detects when all goroutines are asleep and no external event (I/O, timer) can wake any of them, and terminates the program with `all goroutines are asleep - deadlock!`. Common causes: an unbuffered channel send with no receiver; two goroutines each waiting for the other to send; a goroutine waiting on itself; or acquiring locks in inconsistent order.",
+    "fj": "Deadlocks happen when two goroutines both need the same mutex.",
+    "fs": "Mutex ordering is one cause, but channel deadlocks are just as common and harder to spot. I track them with `go tool trace` or by adding context timeouts everywhere \u2014 if ctx.Done() fires instead of the expected work channel, I know something is blocked. Consistent lock ordering is the structural prevention for mutex deadlocks.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Channel deadlock",
+        "lines": [
+          "ch := make(chan int)",
+          "ch <- 1 // blocks: no receiver",
+          "// all goroutines are asleep - deadlock!"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Receiver before sender",
+        "lines": [
+          "ch := make(chan int, 1) // buffered",
+          "ch <- 1                // doesn't block",
+          "v := <-ch",
+          "fmt.Println(v)"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does Go's garbage collector work at a high level, and what are the main GC knobs available to you?",
+    "a": "Go uses a concurrent, tri-colour mark-sweep garbage collector that runs mostly concurrently with the application. The write barrier keeps the GC consistent while mutation happens. The main knob is `GOGC`: it sets the target heap growth percentage between collections (default 100, meaning 'collect when heap doubles'). Setting `GOGC=off` disables GC; lower values cause more frequent collections and lower peak heap; higher values reduce CPU cost at the expense of peak memory. Go 1.19 added `GOMEMLIMIT` which sets a soft total memory limit, capping heap growth independently of GOGC.",
+    "fj": "Go's GC is automatic \u2014 I don't tune it.",
+    "fs": "For latency-sensitive services I lower GOGC to 50\u201370% to reduce heap growth and shorten mark pause. For throughput-oriented batch jobs I raise it to 200\u2013400 to amortise GC cost. GOMEMLIMIT is the new first-line knob in containerised environments \u2014 setting it just below the container memory limit prevents OOM kills by triggering GC before the OS kills the process.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Tuning via runtime",
+        "lines": [
+          "import \"runtime/debug\"",
+          "",
+          "// Cut heap growth target in half",
+          "debug.SetGCPercent(50)",
+          "",
+          "// Soft memory limit (Go 1.19+)",
+          "debug.SetMemoryLimit(",
+          "    450 * 1024 * 1024, // 450 MiB",
+          ")"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does GOGC=off do and when might you use it?",
+        "a": "GOGC=off disables garbage collection entirely. The heap grows unboundedly until the process exits. It is appropriate for short-lived CLI tools or batch jobs where the total memory footprint is bounded and predictable \u2014 skipping GC eliminates all GC pauses and CPU cost, sometimes giving 2\u20135x throughput gains for short-lived computation."
+      }
+    ]
+  },
+  {
+    "q": "Walk through a complete example: how do you write a Go function that is safe under the race detector and correct per the Go memory model?",
+    "a": "Every shared mutable state must have exactly one synchronisation edge on every access path. For a counter incremented by many goroutines, either use `sync/atomic` (`atomic.AddInt64`) or a `sync.Mutex` guard. For communication between goroutines, use a channel \u2014 the send/receive pair provides the happens-before edge. Annotating with `-race` at test time catches any remaining unguarded accesses. The memory model says: without synchronisation, reordering is legal; with it, both the compiler and CPU are constrained to respect the ordering.",
+    "fj": "I make my code safe by not using global variables.",
+    "fs": "I think in happens-before edges: for every shared variable, I trace every write W and every read R and ask 'is there a happens-before path from W to R?' If there is none \u2014 not a channel, not an unlock-then-lock, not an atomic \u2014 the code has undefined behaviour under the memory model, regardless of how it behaves on my machine.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Atomic counter (safe)",
+        "lines": [
+          "var count int64",
+          "",
+          "func inc() {",
+          "    atomic.AddInt64(&count, 1)",
+          "}",
+          "",
+          "func get() int64 {",
+          "    return atomic.LoadInt64(&count)",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the `any` type in Go, and what are the performance pitfalls of using it heavily?",
+    "a": "`any` is an alias for `interface{}` introduced in Go 1.18. Using `any` boxes concrete values into interface structs that hold a type pointer and a data pointer. For small values (int, bool, small structs) the boxing copies the value to the heap to produce the data pointer, incurring an allocation. Heavy use of `any` in hot paths increases GC pressure. Solutions include type-safe generics (avoid boxing entirely), `sync.Pool` for reusing interface values, or avoiding `any` in performance-critical types.",
+    "fj": "any is just a convenient way to accept any type.",
+    "fs": "The hidden cost is the boxing allocation. A function accepting `any` and storing an int in it allocates 8 bytes on the heap per call. In a tight loop handling millions of events this generates significant GC work. I use generics or concrete types in hot paths and reserve `any` for configuration/plugin APIs where the allocation cost is amortised.",
+    "level": "Mid",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Generic vs any: no boxing",
+        "lines": [
+          "// any: boxes int to heap per call",
+          "func PrintAny(v any) {",
+          "    fmt.Println(v)",
+          "}",
+          "",
+          "// Generic: no boxing for int",
+          "func Print[T any](v T) {",
+          "    fmt.Println(v)",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you iterate over a map in Go, and why is the iteration order non-deterministic?",
+    "a": "You iterate a map with a `for k, v := range m` loop. Go deliberately randomises the starting bucket each iteration (introduced in Go 1.3) to prevent programs from depending on any particular order, which would be fragile since the internal hash map may rehash. This means you cannot depend on map iteration order \u2014 code that worked coincidentally in one Go version might break in another. If you need sorted output, collect keys into a slice, sort it, then index the map.",
+    "fj": "Maps in Go are iterated in insertion order, mostly.",
+    "fs": "The randomisation is intentional and documented \u2014 I always sort keys explicitly when order matters, in tests especially, so CI doesn't fail intermittently due to map ordering.",
+    "level": "Jr",
+    "asked": 12,
+    "code": [
+      {
+        "lang": "go",
+        "label": "Sorted map iteration",
+        "lines": [
+          "m := map[string]int{",
+          "    \"b\": 2, \"a\": 1, \"c\": 3,",
+          "}",
+          "keys := make([]string, 0, len(m))",
+          "for k := range m {",
+          "    keys = append(keys, k)",
+          "}",
+          "sort.Strings(keys)",
+          "for _, k := range keys {",
+          "    fmt.Println(k, m[k])",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the empty struct `struct{}` used for in Go, and why is it preferred over `bool` for set membership and signal channels?",
+    "a": "`struct{}` is a zero-size type: it occupies no memory at runtime. A `map[string]struct{}` is the idiomatic set \u2014 values cost nothing. A `chan struct{}` is the idiomatic signal channel \u2014 sending and receiving require no payload allocation. Using `bool` works but wastes one byte per map entry and one byte per channel message, which matters at scale. The Go runtime also special-cases zero-size values so their address may be a shared global, making `struct{}` allocations truly free.",
+    "fj": "I use map[string]bool for sets because it's clearer.",
+    "fs": "struct{} is idiomatic Go \u2014 any experienced reviewer will flag map[string]bool as a set and suggest struct{}. Beyond clarity, at a million-entry set the difference is 1 MB vs. 0 MB for the value side.",
+    "level": "Jr",
+    "code": [
+      {
+        "lang": "go",
+        "label": "Set and signal channel",
+        "lines": [
+          "// Set",
+          "seen := make(map[string]struct{})",
+          "seen[\"x\"] = struct{}{}",
+          "_, ok := seen[\"x\"]",
+          "",
+          "// Done signal",
+          "done := make(chan struct{})",
+          "go func() {",
+          "    doWork()",
+          "    close(done)",
+          "}()",
+          "<-done // wait for signal"
+        ]
+      }
+    ]
+  }
+]

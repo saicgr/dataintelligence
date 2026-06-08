@@ -1,0 +1,1163 @@
+[
+  {
+    "q": "What is RAII and why is it the central idiom of modern C++?",
+    "a": "RAII (Resource Acquisition Is Initialization) ties a resource's lifetime to a C++ object's lifetime: you acquire the resource in the constructor and release it in the destructor. Because destructors run deterministically when an object goes out of scope — including on exception paths — RAII eliminates entire classes of resource leaks without explicit cleanup code. Every standard RAII wrapper (`unique_ptr`, `lock_guard`, `fstream`) exploits this guarantee. The key insight is that C++ guarantees destructor calls on stack-unwinding, making RAII far more reliable than try/finally patterns.",
+    "fj": "RAII just means using smart pointers instead of raw `new`.",
+    "fs": "RAII uses the scope lifetime as a free cleanup guarantee — the destructor fires on both normal exit and stack unwinding, so I never write cleanup code in two places.",
+    "level": "Jr",
+    "asked": 32,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "leak: manual cleanup skipped on throw",
+        "lines": [
+          "void bad() {",
+          "  FILE* f = fopen(\"x\", \"r\");",
+          "  process(f); // throws",
+          "  fclose(f);  // never reached",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "RAII: destructor closes always",
+        "lines": [
+          "void good() {",
+          "  std::ifstream f(\"x\");",
+          "  process(f); // throws OK",
+          "} // ~ifstream() closes file"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Does RAII work inside `std::vector`?",
+        "a": "Yes. When a `vector` is destroyed or an element is erased, the element destructors fire in order, releasing any RAII-managed resources inside them. This composes — a `vector<unique_ptr<T>>` safely owns heap objects."
+      },
+      {
+        "q": "How does stack unwinding interact with RAII?",
+        "a": "When an exception propagates, the runtime destroys all objects whose constructors have completed in the scope being unwound, calling their destructors. This is what makes RAII leak-safe under exceptions — no `finally` block needed."
+      }
+    ]
+  },
+  {
+    "q": "What does `std::unique_ptr` express, and when would you use it over a raw pointer?",
+    "a": "`std::unique_ptr<T>` expresses sole ownership: exactly one `unique_ptr` owns the object and the object is destroyed when that pointer is destroyed or reset. It is move-only (no copy), so ownership transfers are explicit. Use it instead of raw `new` whenever a heap object has a clear single owner — the compiler enforces the ownership model at zero runtime cost over a raw pointer. Use `std::make_unique` (C++14) rather than `new` to avoid resource leaks when argument evaluation order is unspecified.",
+    "fj": "`unique_ptr` is just a fancy pointer wrapper — it only matters if you forget to call `delete`.",
+    "fs": "I default to `unique_ptr` for every single-owner heap object; the move-only semantics make ownership transfer visible at the call site and the cost is literally zero.",
+    "level": "Jr",
+    "asked": 28,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "double-free risk with raw new",
+        "lines": [
+          "Widget* w = new Widget();",
+          "use(w);",
+          "delete w; // easy to double-free",
+          "delete w; // UB"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "unique_ptr: automatic, single delete",
+        "lines": [
+          "auto w = std::make_unique<Widget>();",
+          "use(*w);",
+          "// deleted when w goes out of scope"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you transfer ownership out of a function with `unique_ptr`?",
+        "a": "Return the `unique_ptr` by value. NRVO or move elision typically applies, and even without elision the compiler will move, not copy. The caller receives sole ownership."
+      },
+      {
+        "q": "What happens if you pass a `unique_ptr` to a function by value?",
+        "a": "The caller must `std::move` it into the parameter, transferring ownership. After the call the caller's `unique_ptr` is null and the function (or its callee) owns the resource."
+      }
+    ]
+  },
+  {
+    "q": "Explain `std::shared_ptr` — what is the control block and what does it cost?",
+    "a": "`std::shared_ptr<T>` implements shared ownership via a reference-counted control block allocated alongside (or separate from) the managed object. The control block stores a strong-reference count, a weak-reference count, and the deleter. Every copy of a `shared_ptr` atomically increments the strong count; every destruction atomically decrements it. When the strong count hits zero the managed object is destroyed. The cost is: one extra heap allocation for the control block (avoided by `make_shared`), atomic increment/decrement on every copy (cache-line thrashing under contention), and two pointer-worth of storage per `shared_ptr` instance.",
+    "fj": "`shared_ptr` is basically a safe version of a raw pointer — just use it everywhere.",
+    "fs": "I treat `shared_ptr` as a last resort for genuinely shared lifetimes; its atomic ref-count costs are real and I profile before sprinkling it through hot paths.",
+    "level": "Mid",
+    "asked": 25,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "make_shared: one allocation",
+        "lines": [
+          "// Two allocations: obj + control block",
+          "auto p = std::shared_ptr<Widget>(",
+          "    new Widget());",
+          "",
+          "// One allocation: obj+control together",
+          "auto p = std::make_shared<Widget>();"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is a `weak_ptr` and why do you need it?",
+        "a": "`weak_ptr` holds a non-owning reference to a `shared_ptr`-managed object. It does not increment the strong count, so it does not keep the object alive. You call `lock()` to get a temporary `shared_ptr`; if the object is already gone, `lock()` returns null. The primary use is breaking reference cycles and observer patterns where you want to observe without owning."
+      }
+    ]
+  },
+  {
+    "q": "How does a `shared_ptr` cycle cause a memory leak, and how do you fix it?",
+    "a": "When two objects each hold `shared_ptr`s to the other, their strong reference counts never reach zero even after all external references are dropped, so neither destructor fires and the memory leaks. The fix is to replace one direction of the cycle with a `weak_ptr`: the 'back-edge' owner holds a `weak_ptr`, which does not keep the referent alive, breaking the cycle. This pattern appears in parent–child tree nodes, Observer/Subject pairs, and graph edges.",
+    "fj": "I'd just delete them both manually when I'm done.",
+    "fs": "Whenever I see a bidirectional ownership relationship I immediately make one side a `weak_ptr`; ownership must be a DAG, not a cycle.",
+    "level": "Mid",
+    "asked": 22,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "cycle: both strong → never freed",
+        "lines": [
+          "struct A { std::shared_ptr<B> b; };",
+          "struct B { std::shared_ptr<A> a; };",
+          "auto a = std::make_shared<A>();",
+          "auto b = std::make_shared<B>();",
+          "a->b = b; b->a = a;",
+          "// a, b go out of scope → LEAK"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "weak_ptr breaks the cycle",
+        "lines": [
+          "struct B { std::weak_ptr<A> a; };",
+          "// Now B does not keep A alive",
+          "// a's strong count → 0 → freed"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Can you detect `shared_ptr` cycles at compile time?",
+        "a": "No. The compiler sees valid `shared_ptr` copies. Cycle detection requires runtime tooling (Valgrind, AddressSanitizer leak checks, or custom ref-count auditing). The design cure is enforcing that ownership graphs are DAGs."
+      }
+    ]
+  },
+  {
+    "q": "What are rvalue references and move semantics? Why were they introduced in C++11?",
+    "a": "An rvalue reference (`T&&`) binds to temporaries and expiring values, enabling the compiler and programmer to identify resources that can be 'stolen' rather than copied. Before C++11, returning a `std::vector` from a function forced a deep copy of all elements; with move semantics the vector's internal buffer pointer is transferred in O(1). A move constructor takes an rvalue reference, pilfers the source's resources, and leaves the source in a valid but unspecified state (usually null/empty). `std::move` is just a cast to an rvalue reference — it does not move anything itself.",
+    "fj": "`std::move` actually moves the data.",
+    "fs": "`std::move` is a cast — it tells the compiler 'treat this as expendable'; the actual resource transfer happens in the move constructor or assignment operator that's chosen by overload resolution.",
+    "level": "Mid",
+    "asked": 30,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "move vs copy",
+        "lines": [
+          "std::vector<int> src(1'000'000);",
+          "",
+          "// copy: O(n) — allocates new buffer",
+          "auto a = src;",
+          "",
+          "// move: O(1) — pointer swap",
+          "auto b = std::move(src);",
+          "// src is now empty"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the 'moved-from' state?",
+        "a": "After a move, the source is in a 'valid but unspecified' state: you can safely reassign or destroy it, but you must not read from it unless you first reinitialize it. For `vector` this is typically the empty state; for `unique_ptr` it is null."
+      },
+      {
+        "q": "When does the compiler automatically generate a move constructor?",
+        "a": "The compiler generates a move constructor if the class declares no user-defined destructor, copy constructor, or copy assignment operator. Adding any of those suppresses auto-generation, which is part of why the Rule of Five matters."
+      }
+    ]
+  },
+  {
+    "q": "What are the Rule of Zero, Three, and Five?",
+    "a": "The Rule of Zero says: if your class manages no resources directly, declare none of the five special members and let the compiler generate correct ones from members' own special members. The Rule of Three (pre-C++11) says: if you need a custom destructor, copy constructor, or copy assignment, you almost certainly need all three. The Rule of Five (C++11) extends this: also define move constructor and move assignment so the class gets the performance benefits of move semantics. Failing to follow these rules leads to double frees, use-after-move bugs, and missed move optimizations.",
+    "fj": "I just write a destructor and let the compiler handle the rest.",
+    "fs": "I aim for Rule of Zero by using RAII members (`unique_ptr`, `vector`) so the compiler-generated specials are correct; I only write all five when I'm managing a raw resource directly.",
+    "level": "Mid",
+    "asked": 26,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "Rule of Three violated — double free",
+        "lines": [
+          "struct Buf {",
+          "  int* data;",
+          "  Buf() { data = new int[10]; }",
+          "  ~Buf() { delete[] data; }",
+          "  // no copy ctor/assign!",
+          "};",
+          "Buf a; Buf b = a;",
+          "// ~Buf x2 → double-free UB"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "Rule of Zero: let unique_ptr manage",
+        "lines": [
+          "struct Buf {",
+          "  std::unique_ptr<int[]> data;",
+          "  Buf() : data(new int[10]) {}",
+          "  // compiler gives correct 5 specials",
+          "};"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why should move constructors be marked `noexcept`?",
+        "a": "Containers like `std::vector` use move during reallocation only if the move constructor is `noexcept`. If it might throw, the container falls back to copying to preserve the strong exception guarantee. Marking moves `noexcept` is critical for performance."
+      }
+    ]
+  },
+  {
+    "q": "What is `std::forward` and perfect forwarding?",
+    "a": "Perfect forwarding allows a template function to pass its arguments to another function preserving the original value category (lvalue stays lvalue, rvalue stays rvalue). Without it, a named parameter is always an lvalue inside the function body even if the caller passed an rvalue, so the move opportunity is lost. The pattern uses a forwarding reference (`T&&` in a template context, not a plain rvalue ref) and `std::forward<T>(arg)` to conditionally cast to an rvalue when `T` was deduced as non-reference. `std::forward` is used in factory functions, `emplace`, and generic wrappers.",
+    "fj": "`std::forward` is the same as `std::move` but for templates.",
+    "fs": "`std::forward<T>` is a conditional cast: it casts to `T&&` only when `T` was deduced as a non-reference (i.e., the caller passed an rvalue); it's a no-op for lvalues, preserving the value category through the wrapper.",
+    "level": "Sr",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "perfect forwarding factory",
+        "lines": [
+          "template<typename T, typename... Args>",
+          "std::unique_ptr<T> make(",
+          "    Args&&... args) {",
+          "  return std::make_unique<T>(",
+          "    std::forward<Args>(args)...);",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is a universal/forwarding reference versus an rvalue reference?",
+        "a": "`T&&` is a forwarding reference only when `T` is a deduced template parameter. In `void f(Widget&&)`, `Widget&&` is an rvalue reference. In `template<typename T> void f(T&&)`, `T&&` is a forwarding reference that binds to both lvalues and rvalues and deduces the reference type."
+      }
+    ]
+  },
+  {
+    "q": "Explain the object slicing problem and how to avoid it.",
+    "a": "Object slicing occurs when a derived-class object is copied into a base-class variable by value. The copy uses the base's copy constructor, discarding all derived-class members and virtual function overrides. The resulting base object no longer exhibits polymorphic behavior. The fix is to work with pointers or references to base, or use `std::unique_ptr<Base>` for heap-based polymorphism. Slicing is why polymorphic classes should typically have a deleted or protected copy constructor.",
+    "fj": "Slicing just means you lose some data — you can check `typeid` to recover it.",
+    "fs": "I make polymorphic base classes non-copyable by deleting or protecting the copy constructor, so slicing becomes a compile error rather than a silent runtime bug.",
+    "level": "Mid",
+    "asked": 18,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "slicing: derived → base by value",
+        "lines": [
+          "struct Base { virtual void f(); };",
+          "struct Der : Base {",
+          "  int extra;",
+          "  void f() override;",
+          "};",
+          "Der d;",
+          "Base b = d; // sliced!",
+          "b.f(); // calls Base::f, not Der::f"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "use reference/pointer — no slicing",
+        "lines": [
+          "Base& ref = d;",
+          "ref.f(); // correctly calls Der::f",
+          "",
+          "// Or store by unique_ptr:",
+          "std::unique_ptr<Base> p =",
+          "  std::make_unique<Der>();"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Does object slicing affect `std::vector<Base>`?",
+        "a": "Yes. A `vector<Base>` stores objects by value, so pushing a `Derived` slices it. Use `vector<unique_ptr<Base>>` or `vector<Base*>` for polymorphic collections."
+      }
+    ]
+  },
+  {
+    "q": "Why does a polymorphic base class need a virtual destructor?",
+    "a": "When you `delete` a derived-class object through a base-class pointer, the C++ standard says this is undefined behavior unless the base has a virtual destructor. Without `virtual ~Base()`, only the base destructor fires, leaking any resources the derived class owns. With `virtual ~Base()`, the vtable dispatch calls the derived destructor first, then the base destructor, correctly releasing all resources. The rule: if a class has any virtual functions, give it a virtual destructor.",
+    "fj": "Just add `virtual` to everything in the base class to be safe.",
+    "fs": "If a class is meant to be used polymorphically through a base pointer, it needs `virtual ~Base()` — otherwise `delete base_ptr` is UB regardless of what the derived class owns.",
+    "level": "Jr",
+    "asked": 35,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "UB: non-virtual dtor + delete via base",
+        "lines": [
+          "struct Base {",
+          "  ~Base() {} // NOT virtual",
+          "};",
+          "struct Der : Base {",
+          "  int* buf = new int[100];",
+          "  ~Der() { delete[] buf; }",
+          "};",
+          "Base* p = new Der;",
+          "delete p; // UB — ~Der never called"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "virtual dtor: correct dispatch",
+        "lines": [
+          "struct Base {",
+          "  virtual ~Base() = default;",
+          "};",
+          "// delete p → ~Der() → ~Base() ✓"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What about `= default` vs `{}`  for a virtual destructor?",
+        "a": "`virtual ~Base() = default;` is preferred — it explicitly opts in to the compiler-generated body, avoids suppressing move generation, and is self-documenting."
+      },
+      {
+        "q": "When is a non-virtual destructor acceptable in a base class?",
+        "a": "When the class is not meant to be used polymorphically via a base pointer — e.g., a CRTP base or a mixin that is never `delete`d through the base type. In that case you can omit `virtual` and pay no vtable overhead."
+      }
+    ]
+  },
+  {
+    "q": "How does a vtable work and what is the cost of a virtual call?",
+    "a": "For each class with virtual functions, the compiler generates a vtable: a static array of function pointers, one per virtual function slot. Each object of that class stores a hidden pointer to its class's vtable (the vptr), typically inserted as the first member. A virtual call dereferences the vptr, indexes into the vtable, and calls through the function pointer — two extra indirections versus a direct call. Costs: ~1–5 ns extra latency, possible instruction-cache miss on the function body, and the call site cannot be inlined by the compiler (unless devirtualized by the optimizer).",
+    "fj": "Virtual calls are basically free — modern CPUs predict branches well.",
+    "fs": "The vtable cost is the pointer dereference chain (vptr → vtable → function), but the real hidden cost is that the compiler cannot inline through virtual calls at the call site, which blocks other optimizations.",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "What is devirtualization?",
+        "a": "Devirtualization is when the compiler determines the exact concrete type at compile time and replaces the virtual dispatch with a direct call, enabling inlining. It's possible when the object's type is provably known — e.g., a stack-allocated `Der d; d.f()` or after a `dynamic_cast` check."
+      }
+    ]
+  },
+  {
+    "q": "Explain references vs pointers and const-correctness in C++.",
+    "a": "A reference is an alias for an existing object — it cannot be null, cannot be reseated, and must be initialized at declaration. A pointer holds an address, can be null, can be reseated, and supports pointer arithmetic. For function parameters that must not be null and won't be reseated, prefer references. `const` on a pointer: `const T*` means the pointee is read-only; `T* const` means the pointer itself is read-only; `const T* const` means both. `const` on member functions (`void f() const`) means the function does not modify `*this` and can be called on const objects.",
+    "fj": "References are just syntactic sugar for pointers.",
+    "fs": "I use references when the parameter must be non-null and non-reseated; I use `const&` for read-only access to avoid copies; pointers only when null is a valid state or reseating is needed.",
+    "level": "Jr",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "const pointer vocabulary",
+        "lines": [
+          "const int* p1;  // ptr to const int",
+          "int* const p2 = &x; // const ptr",
+          "const int* const p3 = &x;",
+          "                // const ptr to const",
+          "",
+          "void read(const Widget& w); // preferred",
+          "void own(Widget* w);        // nullable"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is `mutable` and when is it appropriate?",
+        "a": "`mutable` on a member allows it to be modified even in a `const` member function. The canonical use case is caching (lazy evaluation) and mutex members — the observable logical state doesn't change but internal representation does."
+      }
+    ]
+  },
+  {
+    "q": "What is a dangling reference and how does returning a reference to a local create one?",
+    "a": "A dangling reference is a reference (or pointer) that refers to an object whose lifetime has ended. The most common source is returning a reference to a local variable: the local is destroyed when the function returns, but the caller holds a reference to that destroyed memory. Accessing through the dangling reference is undefined behavior — the program may crash, silently read garbage, or appear to work. Compilers often warn but are not required to catch all cases.",
+    "fj": "I'll check the value immediately after calling the function before it gets overwritten.",
+    "fs": "Returning a reference to a local is always UB — the local's storage is gone after the return; I only return references to objects that outlive the call (members, static storage, or caller-owned objects).",
+    "level": "Jr",
+    "asked": 30,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "UB: ref to destroyed local",
+        "lines": [
+          "const std::string& bad() {",
+          "  std::string s = \"hello\";",
+          "  return s; // s destroyed here",
+          "}",
+          "auto& r = bad();",
+          "std::cout << r; // UB"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "return by value — safe",
+        "lines": [
+          "std::string good() {",
+          "  std::string s = \"hello\";",
+          "  return s; // NRVO / moved",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is a dangling capture in a lambda and how do you fix it?",
+    "a": "A lambda that captures a local variable by reference (`[&x]` or `[&]`) stores a reference to that variable. If the lambda outlives the captured variable — e.g., it is stored in a callback, passed to a thread, or stored in a `std::function` and called after the enclosing scope exits — the reference dangles and any use is undefined behavior. The fix is to capture by value (`[=]` or `[x]`) or to capture a `shared_ptr` to heap-allocated data that will definitely outlive the lambda.",
+    "fj": "Capture by reference is always faster so I do `[&]` everywhere.",
+    "fs": "Before storing a lambda I always ask: does this lambda outlive any captured reference? If yes, capture by value or by shared ownership.",
+    "level": "Mid",
+    "asked": 24,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "dangling ref capture in async callback",
+        "lines": [
+          "void schedule() {",
+          "  int result = 0;",
+          "  async_call([&result]() {",
+          "    // result is destroyed after",
+          "    // schedule() returns — UB",
+          "    result = 42;",
+          "  });",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "capture by value — safe",
+        "lines": [
+          "void schedule() {",
+          "  int result = 0;",
+          "  async_call([result]() mutable {",
+          "    result = 42; // own copy",
+          "  });",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does `[=]` capture in C++20 vs C++14?",
+        "a": "In C++20, `[=]` no longer implicitly captures `this` — you must write `[=, this]` or `[this]` explicitly. This was changed to prevent dangling captures of member variables through an implicit `this` capture."
+      }
+    ]
+  },
+  {
+    "q": "What is use-after-move and how do you prevent it?",
+    "a": "After a `std::move`, the source object is in a valid but unspecified state — reading from it is legal but yields undefined or at least unpredictable values. `std::vector` after a move is empty; `std::unique_ptr` after a move is null. Common pitfalls: moving a value into a container then using the original, or accidentally moving in a loop. Prevention: treat moved-from objects as write-only (reassign or destroy immediately), enable `-Wuse-after-move` (Clang), and use static analysis tools.",
+    "fj": "After `move`, the old object is destroyed so you can't use it at all.",
+    "fs": "After a move the source is 'valid but unspecified' — the C++ standard guarantees I can reassign or destroy it, but I enforce a rule of treating moved-from variables as write-only to prevent accidental reads.",
+    "level": "Mid",
+    "asked": 19,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "use-after-move: reading stale vector",
+        "lines": [
+          "std::vector<int> v = {1,2,3};",
+          "auto w = std::move(v);",
+          "// v is now empty",
+          "for (auto x : v) // reads empty v",
+          "  process(x);    // silent bug"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "reassign before reuse",
+        "lines": [
+          "v = load_data(); // refill before use",
+          "for (auto x : v)",
+          "  process(x);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What causes iterator invalidation on `std::vector::push_back`?",
+    "a": "When `push_back` causes `size()` to exceed `capacity()`, the vector allocates a new (typically 2×) buffer, moves all existing elements, and frees the old buffer. This invalidates all iterators, pointers, and references to elements. If `push_back` does not trigger reallocation, only the end iterator is invalidated. The fix is to call `reserve(n)` before a known batch of insertions to pre-allocate capacity, or to use indices instead of iterators if the vector may grow.",
+    "fj": "Iterators are just pointers, they'll update automatically when the vector reallocates.",
+    "fs": "I `reserve` before any loop that calls `push_back` on a vector I'm also iterating — this prevents the reallocation that silently invalidates all existing iterators.",
+    "level": "Mid",
+    "asked": 27,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "UB: iterator invalidated by push_back",
+        "lines": [
+          "std::vector<int> v = {1, 2, 3};",
+          "auto it = v.begin();",
+          "v.push_back(4); // may reallocate",
+          "*it; // UB if reallocation occurred"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "reserve to prevent reallocation",
+        "lines": [
+          "v.reserve(10); // guaranteed capacity",
+          "auto it = v.begin();",
+          "v.push_back(4); // no realloc",
+          "*it; // safe"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Does `std::list` or `std::map` have the same invalidation problem on insert?",
+        "a": "`std::list` and `std::map`/`set` never invalidate existing iterators on insertion — only the iterator to a removed element is invalidated on erase. `std::deque` invalidates all iterators on insertion at front/back that causes reallocation but preserves references."
+      }
+    ]
+  },
+  {
+    "q": "Compare `std::map` and `std::unordered_map` — when do you choose each?",
+    "a": "`std::map` is a red-black tree: O(log n) insert/lookup/erase, keys always sorted, iterators stable on insert/erase, predictable worst-case. `std::unordered_map` is a hash table: O(1) average insert/lookup/erase, keys unordered, iterators may be invalidated on rehash. Choose `map` when you need sorted iteration, range queries, or worst-case guarantees. Choose `unordered_map` when you need fast average-case lookups on large data sets and can provide a good hash. Always `reserve` an expected bucket count to avoid rehashing.",
+    "fj": "`unordered_map` is always faster so I just use that.",
+    "fs": "I reach for `unordered_map` with a reserved bucket count for hot lookup paths; `map` when I need ordering or range iteration — and I always profile because `map` cache locality can beat `unordered_map` at small sizes.",
+    "level": "Jr",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "reserve to avoid rehash",
+        "lines": [
+          "std::unordered_map<int,int> m;",
+          "m.reserve(10000); // pre-size buckets",
+          "for (auto& [k, v] : data)",
+          "  m[k] += v; // no rehash"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What are the most dangerous forms of undefined behavior in C++?",
+    "a": "The most practically dangerous forms are: signed integer overflow (the compiler assumes it never happens, enabling broken optimizations), out-of-bounds array access (silent memory corruption), use-after-free (attacker-exploitable memory corruption), reading an uninitialized variable (can produce any value or be optimized away entirely), and data races (any concurrent unsynchronized write is UB, giving the compiler license to reorder or eliminate code). UB is not 'implementation-defined' — the C++ standard imposes no constraint on what happens, so the optimizer can produce counterintuitive results.",
+    "fj": "UB usually just crashes or produces garbage — you can tell it happened.",
+    "fs": "The most insidious UB is the kind the optimizer exploits silently — signed overflow or null pointer dereference may not crash; the compiler may assume they cannot happen and eliminate the code paths that would catch them.",
+    "level": "Mid",
+    "asked": 24,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "UB: signed overflow — silent optimization",
+        "lines": [
+          "// Compiler assumes i+1 > i is always",
+          "// true (no overflow), so this loop",
+          "// may be optimized to infinite loop",
+          "for (int i = INT_MAX; i+1 > i; ++i)",
+          "  do_work();"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you detect UB in production C++ code?",
+        "a": "Compile with AddressSanitizer (`-fsanitize=address`) for memory errors and UBSan (`-fsanitize=undefined`) for arithmetic and type UB. In release builds, static analyzers (Clang-Tidy, PVS-Studio) catch many patterns at zero runtime cost."
+      }
+    ]
+  },
+  {
+    "q": "What is the signed integer overflow UB and what can the compiler do with it?",
+    "a": "The C++ standard defines signed integer overflow as undefined behavior. The compiler is therefore allowed to assume it never occurs and use this assumption to eliminate or transform code. Classic example: `x + 1 > x` is always `true` for signed `x` because the compiler assumes no overflow, so a loop `for(int i=0; i+1>i; ++i)` becomes infinite. Use `unsigned` arithmetic (with defined wrap-around), `__builtin_add_overflow`, or `std::numeric_limits` checks for safe overflow detection.",
+    "fj": "Signed integers just wrap around like unsigned ones — they all overflow at some point.",
+    "fs": "Signed overflow is license for the optimizer to delete your code, not just produce a wrong number — I use `-fsanitize=undefined` in CI to catch it and prefer unsigned or checked arithmetic in boundary-sensitive paths.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "UB: loop assumes no signed overflow",
+        "lines": [
+          "int x = INT_MAX;",
+          "if (x + 1 > x) { // always true (UB)",
+          "  // compiler may eliminate",
+          "  // the 'else' branch entirely",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "safe: unsigned or checked arithmetic",
+        "lines": [
+          "unsigned x = UINT_MAX;",
+          "// unsigned overflow is well-defined",
+          "// wraps to 0",
+          "if (x + 1u == 0) { ... }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain C++ templates: instantiation, type erasure, and SFINAE.",
+    "a": "A template is a blueprint; the compiler generates a concrete definition (instantiation) for each unique set of template arguments used. Implicit instantiation happens at the point of use; explicit instantiation can be forced in a translation unit. SFINAE (Substitution Failure Is Not An Error) means that if substituting template arguments produces an invalid expression, the compiler silently removes that overload from the candidate set rather than issuing an error — enabling compile-time dispatch. In C++20, concepts replace most SFINAE patterns with cleaner syntax and better error messages.",
+    "fj": "Templates just let you write generic code — the compiler copies the function for each type.",
+    "fs": "I use concepts in C++20 for type constraints — they give cleaner diagnostics than SFINAE and express intent directly; SFINAE via `enable_if` is the C++11/14 workaround I only touch when targeting older standards.",
+    "level": "Sr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "SFINAE (C++14) vs concept (C++20)",
+        "lines": [
+          "// C++14 SFINAE",
+          "template<typename T,",
+          "  typename = std::enable_if_t<",
+          "    std::is_integral_v<T>>>",
+          "T square(T x) { return x*x; }",
+          "",
+          "// C++20 concept — cleaner",
+          "template<std::integral T>",
+          "T square(T x) { return x*x; }"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is template argument deduction and where can it fail?",
+        "a": "The compiler deduces template arguments from function arguments. Deduction fails when the argument type doesn't uniquely determine the template parameter — e.g., passing an initializer list `{1,2,3}` to a `vector<T>` parameter. Explicit template arguments `f<int>(...)` bypass deduction."
+      }
+    ]
+  },
+  {
+    "q": "What are C++20 concepts and how do they improve on SFINAE?",
+    "a": "Concepts are named, Boolean predicates on template parameters evaluated at compile time. They appear in `requires` clauses or directly as type constraints. Unlike SFINAE, concepts produce human-readable error messages when a constraint is violated, they document intent at the declaration site, they participate in overload resolution directly (no `enable_if` gymnastics), and they can be composed with `&&` and `||`. Standard library concepts include `std::integral`, `std::floating_point`, `std::same_as`, `std::derived_from`, `std::invocable`.",
+    "fj": "Concepts are just type traits with nicer syntax.",
+    "fs": "Concepts are first-class constraints: they're checkable before instantiation, composable, and they turn a wall of template error text into a one-line 'constraint not satisfied' message — that alone is worth the upgrade.",
+    "level": "Sr",
+    "asked": 15,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "custom concept + constrained template",
+        "lines": [
+          "template<typename T>",
+          "concept Numeric =",
+          "  std::integral<T> ||",
+          "  std::floating_point<T>;",
+          "",
+          "template<Numeric T>",
+          "T add(T a, T b) { return a + b; }"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is `constexpr` and how does it differ from `const`?",
+    "a": "`const` means an object's value won't change after initialization but the initialization may occur at runtime. `constexpr` means the value or function can be evaluated at compile time when all inputs are compile-time constants. `constexpr` functions in C++14+ can contain loops and branches; in C++20 they can use `new`/`delete`, virtual calls, `try`/`catch`, and `std::string`/`vector`. `consteval` (C++20) mandates compile-time-only evaluation. Compile-time evaluation produces constants embedded in the binary, eliminating runtime work.",
+    "fj": "`constexpr` is just a faster version of `const`.",
+    "fs": "I use `constexpr` to push computation into the linker's output rather than the program's runtime — lookup tables, hash seeds, and policy values — and `consteval` to guarantee nothing slips to runtime.",
+    "level": "Mid",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "constexpr at compile time",
+        "lines": [
+          "constexpr int factorial(int n) {",
+          "  return n <= 1 ? 1 : n*factorial(n-1);",
+          "}",
+          "// evaluated at compile time:",
+          "constexpr int f5 = factorial(5); // 120",
+          "static_assert(f5 == 120);"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is `std::is_constant_evaluated()` (C++20)?",
+        "a": "`std::is_constant_evaluated()` returns `true` when called in a constant-evaluated context (during `constexpr` or `consteval` evaluation). It lets a single function body take a fast runtime path or a correct compile-time path — e.g., using a loop instead of recursion at runtime."
+      }
+    ]
+  },
+  {
+    "q": "How does C++'s memory model define a data race, and why is it undefined behavior?",
+    "a": "The C++11 memory model defines a data race as two concurrent accesses to the same memory location where at least one is a write and neither is atomic. Data races are undefined behavior — not just 'might produce a wrong value'. The compiler and CPU may reorder, cache, or eliminate loads and stores, assuming no races exist. A data race can corrupt control flow, not just data. The fix is to use `std::atomic<T>` for variables accessed from multiple threads, or protect access with a `std::mutex`.",
+    "fj": "Data races just mean you might read a stale value — you can add a `volatile` to fix it.",
+    "fs": "`volatile` is for hardware-mapped I/O, not thread synchronization — it prevents compiler reordering but not CPU reordering. Data races are UB at the C++ level, not just hardware-level weirdness; `std::atomic` or a mutex is the only correct fix.",
+    "level": "Sr",
+    "asked": 22,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "data race: UB not just stale read",
+        "lines": [
+          "int counter = 0; // shared",
+          "",
+          "// Thread 1",
+          "counter++;  // read-modify-write",
+          "// Thread 2",
+          "counter++;  // simultaneous — UB"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "atomic: well-defined concurrent increment",
+        "lines": [
+          "std::atomic<int> counter{0};",
+          "counter.fetch_add(1,",
+          "  std::memory_order_relaxed);"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When would you use `memory_order_relaxed` vs `memory_order_seq_cst`?",
+        "a": "`relaxed` gives no ordering guarantees beyond atomicity of the individual operation — safe for independent counters and statistics. `seq_cst` (the default) establishes a total order across all threads for all `seq_cst` operations, which is safe but the most expensive. Use `acquire`/`release` pairs for producer–consumer synchronization at lower cost than `seq_cst`."
+      }
+    ]
+  },
+  {
+    "q": "What is `std::mutex` and `std::lock_guard` — how does RAII apply to locking?",
+    "a": "`std::mutex` provides mutual exclusion: `lock()` blocks until the calling thread acquires the mutex; `unlock()` releases it. `std::lock_guard<std::mutex>` is a RAII wrapper that calls `lock()` in its constructor and `unlock()` in its destructor, guaranteeing the mutex is released even if an exception is thrown. `std::unique_lock` offers the same guarantee with additional flexibility (deferred locking, timed waits, manual unlock). Prefer `lock_guard` or `scoped_lock` (C++17, multi-mutex) for simple critical sections.",
+    "fj": "I just call `mutex.lock()` and `mutex.unlock()` around the critical section.",
+    "fs": "I always use `lock_guard` or `scoped_lock` — calling `lock()`/`unlock()` directly means any exception or early `return` in the critical section leaks the lock and deadlocks the next waiter.",
+    "level": "Mid",
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "RAII lock: released on any exit",
+        "lines": [
+          "std::mutex mtx;",
+          "int shared = 0;",
+          "",
+          "void increment() {",
+          "  std::lock_guard<std::mutex> g(mtx);",
+          "  ++shared;",
+          "} // mtx.unlock() called here always"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is `noexcept` and why does it matter for move operations and performance?",
+    "a": "`noexcept` is a specifier and an operator. As a specifier, it promises the function will not throw — if it does, `std::terminate` is called. As an operator, `noexcept(expr)` returns a compile-time boolean indicating whether `expr` is declared non-throwing. Containers like `std::vector` use `std::move_if_noexcept`: during reallocation they move elements only if the move constructor is `noexcept`; otherwise they copy to preserve the strong exception guarantee. Marking move constructors and swap functions `noexcept` is therefore critical for performance in STL containers.",
+    "fj": "`noexcept` is just documentation — the compiler ignores it at runtime.",
+    "fs": "`noexcept` on a move constructor is a performance contract to the STL: without it `vector` falls back to copying during reallocation, turning O(1) moves into O(n) copies.",
+    "level": "Sr",
+    "asked": 17,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "noexcept move enables STL optimization",
+        "lines": [
+          "class Buffer {",
+          "  int* data;",
+          "public:",
+          "  Buffer(Buffer&& o) noexcept",
+          "    : data(o.data) {",
+          "    o.data = nullptr;",
+          "  }",
+          "  // vector will MOVE, not copy"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Why is `new`/`delete` discouraged in modern C++ and what replaces them?",
+    "a": "Raw `new`/`delete` separate ownership from the object's scope, require manually matched `delete` calls, are exception-unsafe without explicit cleanup, and give no static ownership signal to readers. Modern replacements: `std::make_unique<T>(args)` for single-owner heap objects (C++14), `std::make_shared<T>(args)` for shared ownership, `std::vector`/`std::string` for dynamic arrays, and stack allocation for small/short-lived objects. The C++ Core Guidelines state 'never transfer ownership by a raw pointer'. Raw `new` is still valid inside custom allocator and RAII-wrapper implementations.",
+    "fj": "`new`/`delete` are fine as long as every `new` has a matching `delete`.",
+    "fs": "I treat raw owning `new` as a code smell in application code — it separates the allocation from the ownership contract; `make_unique` encodes 'I own this' in the type system.",
+    "level": "Jr",
+    "asked": 23,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "leak: exception skips delete",
+        "lines": [
+          "void process() {",
+          "  Widget* w = new Widget();",
+          "  risky(); // throws → leak",
+          "  delete w;",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "make_unique: RAII, no leak",
+        "lines": [
+          "void process() {",
+          "  auto w = std::make_unique<Widget>();",
+          "  risky(); // throws → ~Widget() fires",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does `std::vector` grow and what is amortized O(1) push_back?",
+    "a": "A `vector` doubles its capacity when full: it allocates a new buffer of size 2×, moves all existing elements, and frees the old buffer. Each element is moved at most O(log n) times across all doublings, giving amortized O(1) per `push_back`. The doubling factor is implementation-defined (GCC and Clang use 2×; MSVC uses 1.5×). `capacity()` returns the current buffer size; `size()` is the element count. Calling `reserve(n)` pre-allocates capacity and prevents all reallocation for up to `n` elements, also preserving iterator validity.",
+    "fj": "`push_back` is O(1) always — the vector just appends.",
+    "fs": "Amortized O(1) holds because doubling means each element is relocated at most log₂(n) times total — but I always `reserve` when I know the final size to eliminate that constant factor entirely.",
+    "level": "Jr",
+    "asked": 18,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "reserve prevents reallocation",
+        "lines": [
+          "std::vector<int> v;",
+          "v.reserve(1000); // one allocation",
+          "for (int i = 0; i < 1000; ++i)",
+          "  v.push_back(i); // no realloc"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is copy elision and NRVO?",
+    "a": "Copy elision is a compiler optimization (mandatory in C++17 for prvalues) that constructs the returned or thrown object directly in its final destination, skipping the copy or move constructor entirely. Named Return Value Optimization (NRVO) applies when a function returns a named local variable — the compiler constructs the object in the return-value slot. With guaranteed copy elision (C++17), returning a prvalue (`return Widget();`) always elides; NRVO is still optional but virtually all major compilers perform it. This means returning large objects by value is free in practice.",
+    "fj": "Returning a vector by value copies all its elements — always use output parameters.",
+    "fs": "In C++17 returning a prvalue by value is guaranteed zero-copy; NRVO makes named locals free too in every major compiler — I never pass output parameters just to avoid a copy.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "NRVO: no copy, direct construction",
+        "lines": [
+          "std::vector<int> make_data() {",
+          "  std::vector<int> v;",
+          "  v.reserve(1000);",
+          "  for (int i=0;i<1000;++i) v.push_back(i);",
+          "  return v; // NRVO: built in caller's slot",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between `static_cast`, `dynamic_cast`, `reinterpret_cast`, and `const_cast`?",
+    "a": "`static_cast` performs well-defined, checked-at-compile-time conversions (numeric promotions, up/down pointer casts where the hierarchy is known). `dynamic_cast` performs runtime-checked downcasts in polymorphic hierarchies; returns null (for pointers) or throws `std::bad_cast` (for references) if the object isn't the target type. `reinterpret_cast` is a bit-level reinterpretation with almost no guarantees — only a few uses are defined (round-tripping through `char*`/`void*`). `const_cast` adds or removes `const`/`volatile` qualifiers; writing through a pointer obtained by removing `const` from a genuinely const object is UB.",
+    "fj": "C-style `(int*)ptr` works fine — it's equivalent to `static_cast`.",
+    "fs": "C-style casts silently degrade to `reinterpret_cast` or `const_cast` without telling you — I always use named casts so the intent is explicit and `grep`-able.",
+    "level": "Mid",
+    "asked": 20,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "dynamic_cast safe downcast",
+        "lines": [
+          "Base* b = getObject();",
+          "if (auto* d = dynamic_cast<Der*>(b)) {",
+          "  d->derMethod(); // safe",
+          "} else {",
+          "  // b is not a Der",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain lambdas in C++: syntax, capture modes, and when to use `mutable`.",
+    "a": "A lambda is syntactic sugar for an anonymous functor with an `operator()`. Capture modes: `[]` captures nothing; `[=]` captures all locals by copy; `[&]` captures all by reference; `[x, &y]` mixes. By default, a by-value capture is `const` inside the lambda body — you cannot modify the copy. `mutable` removes that const-qualifier, allowing modification of the local copy. Captures are evaluated at lambda creation, so capturing by value takes a snapshot at that point. In C++14, generic lambdas (`auto` parameters) and init captures (`[v = std::move(w)]`) were added.",
+    "fj": "A lambda is just an inline function — `[&]` is always the right capture mode.",
+    "fs": "I default to explicit captures over `[&]` or `[=]` — listing captures documents dependencies and prevents accidentally capturing large objects or dangling references.",
+    "level": "Mid",
+    "asked": 22,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "mutable + init capture (move into lambda)",
+        "lines": [
+          "auto data = std::make_unique<Data>();",
+          "// move ownership into lambda",
+          "auto fn = [d = std::move(data)]() mutable {",
+          "  d->process();",
+          "  d.reset(); // OK: mutable",
+          "};"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is exception safety and what are the three guarantees?",
+    "a": "C++ functions can provide three exception-safety guarantees. Basic guarantee: if an exception is thrown, no resources are leaked and objects remain in a valid (possibly changed) state. Strong guarantee: if an exception is thrown, the program state is exactly as it was before the call (commit-or-rollback). Nothrow guarantee (enforced by `noexcept`): the function never throws. RAII provides basic safety by default. Implementing strong safety often requires the copy-and-swap idiom. The nothrow guarantee is required for swap, move operations, and destructors to enable safe STL usage.",
+    "fj": "I wrap everything in try/catch to handle exceptions.",
+    "fs": "I design for the strong guarantee using copy-and-swap or commit-then-swap patterns; destructors are always `noexcept` because an exception thrown from a destructor during stack unwinding calls `std::terminate`.",
+    "level": "Sr",
+    "asked": 16,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "copy-and-swap: strong guarantee",
+        "lines": [
+          "Widget& operator=(Widget rhs) {",
+          "  // rhs is a copy (may throw)",
+          "  swap(*this, rhs); // noexcept",
+          "  return *this;",
+          "  // old data freed by ~rhs",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is `std::optional` and when should you use it instead of a pointer or sentinel value?",
+    "a": "`std::optional<T>` (C++17) represents a value that may or may not be present, with no heap allocation — the object is stored inline. It makes the absence of a value explicit in the type system, unlike a pointer (which implies heap ownership) or a sentinel value (which is implicit and error-prone). Use it for function return types where failure is a normal outcome (`find`, `try_parse`), for optional constructor or function parameters, and to avoid `nullptr` as a return value from value-returning functions.",
+    "fj": "I just return a pointer and null-check it — `optional` is unnecessary complexity.",
+    "fs": "I use `optional` for 'nullable value semantics' — no allocation, no ownership implied, the type itself documents 'this might not be there', and callers can't forget to check.",
+    "level": "Mid",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "optional return: no sentinel needed",
+        "lines": [
+          "std::optional<int> parse_int(",
+          "    std::string_view s) {",
+          "  int v;",
+          "  if (std::from_chars(s.begin(),",
+          "      s.end(), v).ec == std::errc{})",
+          "    return v;",
+          "  return std::nullopt;",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is `std::string_view` and what dangling pitfall does it introduce?",
+    "a": "`std::string_view` (C++17) is a non-owning reference to a contiguous sequence of characters — a pointer and a length. It avoids copying string data when you only need to read, and it works with `std::string`, `const char*`, literals, and substrings. The critical pitfall: `string_view` does not own the data, so it can dangle if the underlying string is destroyed or reallocated. Never store a `string_view` returned from a temporary `string` expression; never return a `string_view` pointing to a local.",
+    "fj": "`string_view` is a drop-in replacement for `const string&` with better performance.",
+    "fs": "I use `string_view` for read-only string parameters and non-stored substrings — then I explicitly audit any storage of `string_view` to ensure the backing buffer outlives the view.",
+    "level": "Mid",
+    "asked": 17,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "dangling: view of temporary",
+        "lines": [
+          "std::string_view sv =",
+          "  std::string(\"hello\"); // temporary",
+          "// string destroyed; sv dangles",
+          "std::cout << sv; // UB"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "string_view of persisted string",
+        "lines": [
+          "std::string s = \"hello\";",
+          "std::string_view sv = s; // safe",
+          "// as long as s outlives sv"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between compile-time and runtime polymorphism in C++?",
+    "a": "Runtime polymorphism uses virtual functions and vtable dispatch: the call target is resolved at runtime based on the dynamic type of the object, enabling open extension via inheritance. Compile-time polymorphism uses templates (including CRTP) and function overloading: the call target is resolved at compile time, enabling inlining and zero overhead, but the set of types must be known at compile time. C++20 concepts constrain template arguments for cleaner compile-time polymorphism. The trade-off is flexibility (runtime) vs performance and type-safety (compile-time).",
+    "fj": "Templates are compile-time polymorphism, inheritance is runtime — just use whichever is easier.",
+    "fs": "I prefer compile-time polymorphism via templates when the type set is closed and hot-path performance matters; runtime polymorphism when I need to open the type set at link/load time (plugins, late binding).",
+    "level": "Sr",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "CRTP: zero-overhead static polymorphism",
+        "lines": [
+          "template<typename Der>",
+          "struct Base {",
+          "  void interface() {",
+          "    static_cast<Der*>(this)",
+          "      ->implementation();",
+          "  }",
+          "};"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is CRTP (Curiously Recurring Template Pattern) and what is it used for?",
+    "a": "CRTP is a pattern where a class inherits from a template instantiation of its own name: `struct Derived : Base<Derived>`. The base class can call derived-class methods via `static_cast<Derived*>(this)` without a virtual dispatch, enabling static (compile-time) polymorphism at zero runtime cost. Common uses: adding capabilities via mixins (e.g., `enable_shared_from_this`), implementing the Barton-Nackman trick for operators, and counter/singleton patterns. C++23 `deducing this` subsumes many CRTP uses.",
+    "fj": "CRTP is just a weird template trick — I'd use virtual functions instead.",
+    "fs": "CRTP lets me write interface-via-base without virtual dispatch overhead — I use it for mixins in performance-critical hierarchies; in C++23 I can often replace it with 'deducing this' which is cleaner.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "CRTP mixin: Comparable",
+        "lines": [
+          "template<typename T>",
+          "struct Comparable {",
+          "  bool operator!=(const T& o) const {",
+          "    return !static_cast<const T&>",
+          "           (*this).operator==(o);",
+          "  }",
+          "};"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How does `std::move` interact with a `const` object?",
+    "a": "`std::move` on a `const T` produces `const T&&`. There is no standard library move constructor that takes `const T&&` (move constructors take `T&&`), so the compiler silently falls back to the copy constructor taking `const T&`. The move is silently skipped — no error, no warning by default. This is a common mistake when storing items in `const` containers or marking member variables `const`. The cure: don't mark objects `const` if you intend to move them.",
+    "fj": "Moving a `const` object is a compile error.",
+    "fs": "`std::move` on `const T` produces `const T&&` and silently copies — `-Wpessimizing-move` or `-Wmove` can catch this; I mark objects `const` only when I'm done moving them.",
+    "level": "Sr",
+    "asked": 12,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "cpp",
+        "label": "silent copy: moving a const object",
+        "lines": [
+          "const std::vector<int> v = {1,2,3};",
+          "// std::move yields const vector&&",
+          "// no move ctor matches → COPIES",
+          "auto w = std::move(v);"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "cpp",
+        "label": "remove const to enable move",
+        "lines": [
+          "std::vector<int> v = {1,2,3};",
+          "auto w = std::move(v); // real move"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is `std::span` and how does it improve safety over pointer+size pairs?",
+    "a": "`std::span<T>` (C++20) is a non-owning view over a contiguous sequence: a pointer and a length. Unlike a raw `T*` + `size_t` pair, `span` keeps the size bundled, enabling bounds checking (in debug builds or with hardened STL), range-for iteration, and algorithm compatibility. A `span` can be constructed from arrays, `vector`, `array`, and raw pointers with an explicit size. Like `string_view`, it is non-owning — the lifetime of the pointed-to data must exceed the `span`.",
+    "fj": "I just pass a pointer and size separately — it's simpler.",
+    "fs": "I use `span` instead of pointer+size parameters — it's a vocabulary type that carries the bounds, works with range algorithms, and makes accidental size mismatches a type error.",
+    "level": "Mid",
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "span: safe contiguous view",
+        "lines": [
+          "void process(std::span<const int> data) {",
+          "  for (int x : data) // safe range-for",
+          "    use(x);",
+          "}",
+          "std::vector<int> v = {1,2,3};",
+          "process(v); // implicit span"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is type deduction with `auto` and `decltype` — where can deduction surprise you?",
+    "a": "`auto` deduces the type of a variable from its initializer, following template argument deduction rules (top-level `const` and references are stripped). `decltype(expr)` yields the declared type or expression type without stripping qualifiers. Surprises: `auto x = vec[0]` gives a copy, not a reference; `auto& x = vec[0]` is a reference but `vec[0]` may be `T&` or `T` depending on container. `decltype(auto)` (C++14) preserves the exact declared type of the initializer, useful in forwarding wrappers to preserve `T&` return types.",
+    "fj": "`auto` is just a convenience alias — it always gives you the same type you'd write explicitly.",
+    "fs": "`auto` strips ref and top-level `const` — so `auto x = expr` always gives a value copy; I write `auto&` or `const auto&` intentionally, and use `decltype(auto)` in return types of perfect-forwarding wrappers.",
+    "level": "Mid",
+    "asked": 13,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "auto strips reference — gotcha",
+        "lines": [
+          "std::vector<int> v = {1,2,3};",
+          "auto  x = v[0]; // int — copy",
+          "auto& y = v[0]; // int& — reference",
+          "",
+          "const int ci = 5;",
+          "auto  z = ci;   // int — const stripped"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "Explain `std::variant` and how it replaces tagged unions safely.",
+    "a": "`std::variant<T1,T2,...>` (C++17) is a type-safe discriminated union. It holds exactly one of the listed types at a time and tracks which one via an internal discriminant. Unlike a C-style `union`, accessing the wrong member is not UB — it throws `std::bad_variant_access`. `std::visit` with a callable (or overloaded set) dispatches on the active type, enabling exhaustive matching similar to sum types in Rust/Haskell. `std::holds_alternative<T>(v)` and `std::get<T>(v)` are the access primitives.",
+    "fj": "I'd just use a base pointer with `dynamic_cast` — unions are too dangerous.",
+    "fs": "I use `variant` with `std::visit` to express closed-set type alternatives cleanly — the compiler enforces exhaustiveness, unlike virtual dispatch which requires an `else` fall-through.",
+    "level": "Sr",
+    "asked": 11,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "variant + visit: exhaustive dispatch",
+        "lines": [
+          "using Result =",
+          "  std::variant<int, std::string>;",
+          "",
+          "std::visit([](auto&& v) {",
+          "  using T = std::decay_t<decltype(v)>;",
+          "  if constexpr (std::is_same_v<T,int>)",
+          "    std::cout << \"int: \" << v;",
+          "  else std::cout << \"str: \" << v;",
+          "}, result);"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "What is the 'as-if' rule and how does it relate to observable behavior and undefined behavior?",
+    "a": "The as-if rule states the compiler may perform any transformation that does not change the observable behavior of the program — defined as reads/writes to volatile objects, I/O, and atomic operations. The compiler can reorder, eliminate, or merge non-observable operations freely. When a program has undefined behavior, the as-if rule has no constraint to preserve: the compiler can assume UB never happens and use that to eliminate branches, hoist loads, or produce completely incorrect output. This is why UB is not 'just a wrong value' — it can corrupt logically unrelated code.",
+    "fj": "The compiler always generates code that matches what you wrote — it can only optimize obvious redundancies.",
+    "fs": "The as-if rule plus UB means the optimizer treats any code path containing UB as dead — it can legally delete your null check if it can prove dereferencing the pointer before the check would be UB if the pointer were null.",
+    "level": "Sr",
+    "asked": 10,
+    "followups": [
+      {
+        "q": "Give a concrete example where the as-if rule + UB changes observable behavior.",
+        "a": "If a function dereferences a pointer before a null check, the compiler can conclude the pointer must be non-null (otherwise the dereference would be UB), and eliminate the null check. The program then crashes or corrupts memory when a null pointer is passed, instead of safely returning early."
+      }
+    ]
+  },
+  {
+    "q": "Explain `std::atomic` fetch-and-add vs compare-and-swap — when do you need each?",
+    "a": "`fetch_add` atomically adds a value and returns the old value in one indivisible operation — ideal for monotonic counters, sequence numbers, and statistics. `compare_exchange_weak`/`strong` (CAS) atomically reads a value, compares it to an expected value, and writes a new value only if they match; otherwise it loads the current value into `expected`. CAS is the primitive for lock-free algorithms where you need to update a value only if it hasn't changed (ABA problem aside). `weak` may spuriously fail on some architectures; use it in retry loops. `strong` never spuriously fails but is slightly more expensive.",
+    "fj": "I'd use a mutex — atomics are too low-level and easy to get wrong.",
+    "fs": "For independent counters I use `fetch_add(1, relaxed)` — it's the fastest atomic. For anything requiring a read-modify-write on a composite state, I reach for CAS in a retry loop and always guard against the ABA problem.",
+    "level": "Sr",
+    "asked": 14,
+    "code": [
+      {
+        "lang": "cpp",
+        "label": "CAS retry loop: lock-free push",
+        "lines": [
+          "std::atomic<int> top{0};",
+          "void push(int val) {",
+          "  int old = top.load(",
+          "    std::memory_order_relaxed);",
+          "  while (!top.compare_exchange_weak(",
+          "    old, old + 1,",
+          "    std::memory_order_acq_rel)) {}",
+          "}"
+        ]
+      }
+    ]
+  }
+]
