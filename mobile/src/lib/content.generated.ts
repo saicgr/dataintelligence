@@ -69,6 +69,11 @@ import rust from './generated/rust.json';
 import cpp from './generated/cpp.json';
 import scala from './generated/scala.json';
 import flutter from './generated/flutter.json';
+import java from './generated/java.json';
+import markdown from './generated/markdown.json';
+// Domain tracks added from the JD backlog: capital-markets/trading + conversational/voice AI.
+import trading from './generated/trading.json';
+import voiceAi from './generated/voice-ai.json';
 
 export interface GeneratedCard {
   q: string;
@@ -80,7 +85,7 @@ export interface GeneratedCard {
   /** Optional real code examples shown under the answer (bug/fix or single snippet). */
   code?: {
     label?: string;
-    lang?: 'sql' | 'python' | 'pyspark' | 'airflow' | 'dbt' | 'ts' | 'js' | 'go' | 'rust' | 'scala' | 'cpp' | 'dart';
+    lang?: 'sql' | 'python' | 'pyspark' | 'airflow' | 'dbt' | 'ts' | 'js' | 'go' | 'rust' | 'scala' | 'cpp' | 'dart' | 'java' | 'md';
     lines: string[];
     accent?: 'bug' | 'fix';
   }[];
@@ -151,4 +156,9 @@ export const GENERATED: Record<string, GeneratedCard[]> = {
   cpp: cpp as unknown as GeneratedCard[],
   scala: scala as unknown as GeneratedCard[],
   flutter: flutter as unknown as GeneratedCard[],
+  java: java as unknown as GeneratedCard[],
+  markdown: markdown as unknown as GeneratedCard[],
+  // Domain tracks (JD backlog)
+  trading: trading as unknown as GeneratedCard[],
+  'voice-ai': voiceAi as unknown as GeneratedCard[],
 };

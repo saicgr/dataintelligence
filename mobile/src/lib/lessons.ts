@@ -1,4 +1,5 @@
 import { CODING_LESSONS } from './codingLessons';
+import { CODING_LESSONS_LANG } from './codingLessonsLang';
 import type { SessionCard } from './content';
 
 /**
@@ -19,6 +20,8 @@ export interface LessonCard extends SessionCard {
 export const LESSON_SEED: LessonCard[] = [
   // ── Dedicated coding tracks (Python Coding + SQL Coding) ───────────────────
   ...CODING_LESSONS,
+  // ── Language coding-practice drills (Go/Rust/Java/Node/PySpark/TypeScript) ──
+  ...CODING_LESSONS_LANG,
   // ── Spark On-Call (PySpark diagnosis) ──────────────────────────────────────
   {
     track: 'spark-oncall',

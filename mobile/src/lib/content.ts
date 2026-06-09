@@ -72,7 +72,9 @@ export type Lang =
   | 'rust'
   | 'scala'
   | 'cpp'
-  | 'dart';
+  | 'dart'
+  | 'java'
+  | 'md';
 
 /**
  * A labelled, read-only code example attached to a flip card's answer.
@@ -252,11 +254,15 @@ const RAW_TRACKS: Track[] = [
   { slug: 'cpp', name: 'C++', color: 'sysd', icon: '🧮', q: 0, domain: 'de', group: 'concept' },
   { slug: 'scala', name: 'Scala', color: 'spark', icon: '🔺', q: 0, domain: 'de', group: 'concept' },
   { slug: 'flutter', name: 'Flutter', color: 'sql', icon: '🦋', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'java', name: 'Java', color: 'dbt', icon: '☕', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'markdown', name: 'Markdown', color: 'sysd', icon: '📝', q: 0, domain: 'de', group: 'concept' },
   // ── Concept tracks: AI Engineering ──
   { slug: 'rag', name: 'RAG', color: 'rag', icon: '🔍', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'llms', name: 'LLMs', color: 'rag', icon: '🧠', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'agents', name: 'AI Agents', color: 'rag', icon: '🤖', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'agentic-ai', name: 'Agentic AI', color: 'rag', icon: '🕹️', q: 0, domain: 'ai', group: 'concept' },
+  { slug: 'voice-ai', name: 'Voice & Conversational AI', color: 'rag', icon: '🎙️', q: 0, domain: 'ai', group: 'concept' },
+  { slug: 'trading', name: 'Capital Markets & Trading', color: 'sql', icon: '📈', q: 0, domain: 'de', group: 'concept' },
   { slug: 'vectordb', name: 'Vector DB', color: 'sql', icon: '🧮', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'prompt', name: 'Prompt Eng', color: 'eval', icon: '💬', q: 0, domain: 'ai', group: 'concept' },
   { slug: 'evals', name: 'LLM Evals', color: 'eval', icon: '🧪', q: 0, domain: 'ai', group: 'concept' },
@@ -302,6 +308,12 @@ const RAW_TRACKS: Track[] = [
   // ── Coding units (assemble/querybuild lessons) ──
   { slug: 'python-drills', name: 'Python Coding', color: 'kafka', icon: '🐍', q: 0, domain: 'de', group: 'coding' },
   { slug: 'sql-coding', name: 'SQL Coding', color: 'sql', icon: '🧮', q: 0, domain: 'de', group: 'coding' },
+  { slug: 'pyspark-coding', name: 'PySpark Coding', color: 'spark', icon: '🔥', q: 0, domain: 'de', group: 'coding' },
+  { slug: 'typescript-coding', name: 'TypeScript Coding', color: 'sql', icon: '🟦', q: 0, domain: 'de', group: 'coding' },
+  { slug: 'nodejs-coding', name: 'Node.js Coding', color: 'kafka', icon: '🟢', q: 0, domain: 'de', group: 'coding' },
+  { slug: 'go-coding', name: 'Go Coding', color: 'kafka', icon: '🐹', q: 0, domain: 'de', group: 'coding' },
+  { slug: 'rust-coding', name: 'Rust Coding', color: 'dbt', icon: '🦀', q: 0, domain: 'de', group: 'coding' },
+  { slug: 'java-coding', name: 'Java Coding', color: 'dbt', icon: '☕', q: 0, domain: 'de', group: 'coding' },
   // ── On-call / production lesson units ──
   { slug: 'spark-oncall', name: 'Spark On-Call', color: 'spark', icon: '🔥', q: 0, domain: 'de', group: 'oncall' },
   { slug: 'cr-sql', name: 'SQL Bug Hunt', color: 'sql', icon: '🔎', q: 0, domain: 'de', group: 'oncall' },
@@ -351,9 +363,12 @@ const SKILL_CATEGORY_OF: Record<string, SkillCategory> = {
   // Languages (the coding skills)
   python: 'Languages', sql: 'Languages', pyspark: 'Languages', typescript: 'Languages',
   nodejs: 'Languages', go: 'Languages', rust: 'Languages', cpp: 'Languages',
-  scala: 'Languages', flutter: 'Languages',
+  scala: 'Languages', flutter: 'Languages', java: 'Languages', markdown: 'Foundations',
   // Interactive coding drills
   'python-drills': 'Coding practice', 'sql-coding': 'Coding practice',
+  'pyspark-coding': 'Coding practice', 'typescript-coding': 'Coding practice',
+  'nodejs-coding': 'Coding practice', 'go-coding': 'Coding practice',
+  'rust-coding': 'Coding practice', 'java-coding': 'Coding practice',
   // Data Engineering tooling
   spark: 'Data Engineering', kafka: 'Data Engineering', dbt: 'Data Engineering',
   airflow: 'Data Engineering', snowflake: 'Data Engineering', databricks: 'Data Engineering',
