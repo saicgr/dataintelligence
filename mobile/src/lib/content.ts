@@ -315,6 +315,80 @@ export const TRACKS: Track[] = RAW_TRACKS.map((t) => ({
   q: GENERATED[t.slug]?.length || seedLessonCount(t.slug),
 }));
 
+/**
+ * Skill categories — how the Library "Skills" tab is sectioned (a finer taxonomy than
+ * the de/ai domain split). Single source of truth: order below = render order; any slug
+ * not listed falls back to its domain bucket so new tracks still land somewhere sensible.
+ */
+export type SkillCategory =
+  | 'Languages'
+  | 'Coding practice'
+  | 'Data Engineering'
+  | 'AI Engineering'
+  | 'Cloud & Vendor AI'
+  | 'Analytics & BI'
+  | 'Foundations'
+  | 'Deploy & ship'
+  | 'On-call & reliability'
+  | 'Behavioral & craft';
+
+export const SKILL_CATEGORY_ORDER: SkillCategory[] = [
+  'Languages',
+  'Coding practice',
+  'Data Engineering',
+  'AI Engineering',
+  'Cloud & Vendor AI',
+  'Analytics & BI',
+  'Foundations',
+  'Deploy & ship',
+  'On-call & reliability',
+  'Behavioral & craft',
+];
+
+const SKILL_CATEGORY_OF: Record<string, SkillCategory> = {
+  // Languages (the coding skills)
+  python: 'Languages', sql: 'Languages', pyspark: 'Languages', typescript: 'Languages',
+  nodejs: 'Languages', go: 'Languages', rust: 'Languages', cpp: 'Languages',
+  scala: 'Languages', flutter: 'Languages',
+  // Interactive coding drills
+  'python-drills': 'Coding practice', 'sql-coding': 'Coding practice',
+  // Data Engineering tooling
+  spark: 'Data Engineering', kafka: 'Data Engineering', dbt: 'Data Engineering',
+  airflow: 'Data Engineering', snowflake: 'Data Engineering', databricks: 'Data Engineering',
+  modeling: 'Data Engineering', 'data-integration': 'Data Engineering', snaplogic: 'Data Engineering',
+  palantir: 'Data Engineering', aem: 'Data Engineering', workfront: 'Data Engineering',
+  // AI Engineering
+  rag: 'AI Engineering', llms: 'AI Engineering', agents: 'AI Engineering', 'agentic-ai': 'AI Engineering',
+  vectordb: 'AI Engineering', prompt: 'AI Engineering', evals: 'AI Engineering',
+  mlsys: 'AI Engineering', 'deep-learning': 'AI Engineering',
+  // Cloud & vendor GenAI
+  aws: 'Cloud & Vendor AI', gcp: 'Cloud & Vendor AI', azure: 'Cloud & Vendor AI',
+  bedrock: 'Cloud & Vendor AI', 'vertex-ai': 'Cloud & Vendor AI', 'azure-ai': 'Cloud & Vendor AI',
+  cortex: 'Cloud & Vendor AI', mosaic: 'Cloud & Vendor AI',
+  // Analytics & BI
+  bi: 'Analytics & BI', tableau: 'Analytics & BI', looker: 'Analytics & BI',
+  hex: 'Analytics & BI', statistics: 'Analytics & BI',
+  // Foundations (cross-cutting CS)
+  sysd: 'Foundations', architecture: 'Foundations', databases: 'Foundations',
+  apis: 'Foundations', security: 'Foundations',
+  // Deploy & ship
+  git: 'Deploy & ship', docker: 'Deploy & ship', kubernetes: 'Deploy & ship',
+  terraform: 'Deploy & ship', cicd: 'Deploy & ship', observability: 'Deploy & ship',
+  // On-call & reliability
+  'spark-oncall': 'On-call & reliability', 'airflow-oncall': 'On-call & reliability',
+  'cr-sql': 'On-call & reliability', 'data-reliability': 'On-call & reliability',
+  // Behavioral & craft
+  behavioral: 'Behavioral & craft', leadership: 'Behavioral & craft',
+  'interview-craft': 'Behavioral & craft', 'prompt-lab': 'Behavioral & craft',
+};
+
+/** Which Skills-tab section a subject track belongs to (falls back to its domain bucket). */
+export function skillCategory(slug: string): SkillCategory {
+  const explicit = SKILL_CATEGORY_OF[slug];
+  if (explicit) return explicit;
+  return trackBySlug(slug)?.domain === 'ai' ? 'AI Engineering' : 'Data Engineering';
+}
+
 export interface Category {
   key: string;
   name: string;
