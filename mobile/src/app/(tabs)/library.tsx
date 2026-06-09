@@ -50,7 +50,7 @@ export default function Library() {
 
       {/* Scrollable body */}
       <ScrollView
-        showsVerticalScrollIndicator={false}
+        showsVerticalScrollIndicator
         contentContainerStyle={{ paddingHorizontal: space.md, paddingBottom: 24, gap: space.md }}>
         {savedCount > 0 && !query && (
           <Pressable

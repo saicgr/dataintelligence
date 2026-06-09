@@ -10,6 +10,8 @@ import type { TrackColorKey } from './theme';
 
 // Re-export the Pillar 2 helpers so callers import everything content-related from here.
 export { freshCount, freshForTrack, freshPackCards, freshPackCount, freshSessionCards };
+// Lesson helpers re-exported so the track detail screen can render lesson-unit tracks.
+export { lessonsForTrack };
 
 /**
  * Bundled, read-only CORE content. Per-track question banks live in ./generated

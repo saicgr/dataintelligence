@@ -2,7 +2,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Pressable, View } from 'react-native';
 
-import { LEVELS, type Level, levelLabel, QRow, questionsFor, trackBySlug } from '../../lib/content';
+import { LEVELS, type Level, levelLabel, lessonTitle, lessonsForTrack, QRow, questionsFor, trackBySlug } from '../../lib/content';
 import { useStore } from '../../lib/store';
 import { radius, useTheme } from '../../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
@@ -19,6 +19,11 @@ export default function TrackDetail() {
   if (!t) return null;
   const col = track(t.color);
   const rows = questionsFor(t.slug);
+
+  // Coding-practice / on-call / craft units are interactive LESSONS, not flip-card Q&A — they
+  // have no GENERATED rows. Render their lesson trail instead of an empty question list.
+  if (rows.length === 0) return <LessonTrack slug={t.slug} />;
+
   const filtered = rows.filter((r) => lvl === 'All' || r[1] === lvl);
 
   return (
@@ -117,6 +122,77 @@ export default function TrackDetail() {
       {filtered.map((r, i) => (
         <QRowItem key={i} row={r} color={col} locked={i >= 2 && !unlocked} onLocked={() => router.push('/paywall')} />
       ))}
+    </Screen>
+  );
+}
+
+/** Interactive lesson-unit detail (coding practice / on-call / craft): a tappable lesson list. */
+function LessonTrack({ slug }: { slug: string }) {
+  const router = useRouter();
+  const { c, track } = useTheme();
+  const startLesson = useStore((s) => s.startLesson);
+  const t = trackBySlug(slug);
+  const lessons = lessonsForTrack(slug, Date.now());
+  if (!t) return null;
+  const col = track(t.color);
+  const open = (i: number) => {
+    startLesson(slug, i);
+    router.push('/');
+  };
+
+  return (
+    <Screen>
+      <Pressable onPress={() => router.back()}>
+        <T muted weight="700" size={13}>‹ Library</T>
+      </Pressable>
+
+      <Row style={{ gap: 12 }}>
+        <View
+          style={{
+            width: 46,
+            height: 46,
+            borderRadius: 13,
+            backgroundColor: col,
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}>
+          <T size={22}>{t.icon}</T>
+        </View>
+        <View style={{ flex: 1 }}>
+          <T size={20} weight="900">{t.name}</T>
+          <T muted size={12.5}>{lessons.length} interactive {lessons.length === 1 ? 'drill' : 'drills'} · tap to practice</T>
+        </View>
+      </Row>
+
+      {lessons.length > 0 && <Btn label="▶ Start practicing" onPress={() => open(0)} />}
+
+      <H2>Drills</H2>
+      {lessons.map((ln, i) => (
+        <Pressable key={ln.id ?? i} onPress={() => open(i)}>
+          <Card style={{ flexDirection: 'row', alignItems: 'center', gap: 11, padding: 12 }}>
+            <View
+              style={{
+                width: 30,
+                height: 30,
+                borderRadius: 9,
+                backgroundColor: col + '22',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}>
+              <T weight="900" size={13} color={col}>{i + 1}</T>
+            </View>
+            <View style={{ flex: 1 }}>
+              <T weight="800" size={13} style={{ lineHeight: 17 }}>{lessonTitle(slug, i)}</T>
+              {ln.tag ? <T muted size={11} style={{ marginTop: 1 }}>{ln.tag}</T> : null}
+            </View>
+            <T muted weight="800">›</T>
+          </Card>
+        </Pressable>
+      ))}
+
+      {lessons.length === 0 && (
+        <T muted size={13} style={{ marginTop: 8 }}>No drills yet — check back soon.</T>
+      )}
     </Screen>
   );
 }
