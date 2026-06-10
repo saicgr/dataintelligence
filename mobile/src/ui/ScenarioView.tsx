@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Pressable, TextInput, View } from 'react-native';
 
 import { SessionCard } from '../lib/content';
+import { coverage, suggestRating } from '../lib/keypoints';
 import { type PeerAnswer, submitScenarioAnswer, topPeerAnswers, upvotePeerAnswer } from '../lib/peerAnswers';
 import { useStore } from '../lib/store';
 import { Rating } from '../lib/srs';
@@ -10,18 +11,6 @@ import { Btn, Card, Chip, Row, T, TrackBadge } from './kit';
 import { RichAnswer } from './RichAnswer';
 
 const THINK_SECONDS = 90;
-
-/** Auto-detect which key points the typed answer covers (offline text parse, adjustable). */
-function coverage(text: string, rubric: string[]): boolean[] {
-  const txt = text.toLowerCase();
-  if (!txt.trim()) return rubric.map(() => false);
-  return rubric.map((item) => {
-    const kws = item.toLowerCase().match(/[a-z][a-z-]{4,}/g) ?? [];
-    if (!kws.length) return false;
-    const hits = kws.filter((k) => txt.includes(k)).length;
-    return hits >= Math.min(2, kws.length);
-  });
-}
 
 /**
  * Produce-before-reveal articulation card. Write (or dictate) your answer, commit, then the
@@ -85,7 +74,7 @@ export function ScenarioView({ card }: { card: SessionCard }) {
 
   const hit = checked.filter(Boolean).length;
   const ratio = rubric.length ? hit / rubric.length : 0;
-  const rating: Rating = ratio >= 1 ? 'easy' : ratio >= 0.6 ? 'good' : 'again';
+  const rating: Rating = suggestRating(ratio);
 
   return (
     <Card style={{ borderRadius: radius.xl, overflow: 'hidden', minHeight: 230 }}>

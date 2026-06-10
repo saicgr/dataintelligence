@@ -83,6 +83,24 @@ export async function pullFeedback(userId: string): Promise<FeedbackState> {
   return { feedback, savedIds };
 }
 
+/** Insert one card issue report (#7) — append-only; the founder reads these in Studio. */
+export async function pushReport(
+  userId: string,
+  cardId: string,
+  category: string,
+  note: string | null,
+  at: number
+): Promise<void> {
+  if (!supabase) return;
+  await supabase.from('card_reports').insert({
+    user_id: userId,
+    card_id: cardId,
+    category,
+    note,
+    created_at: new Date(at).toISOString(),
+  });
+}
+
 export async function insertDebrief(userId: string, d: DebriefInput): Promise<void> {
   if (!supabase) return;
   await supabase.from('debriefs').insert({

@@ -6,12 +6,13 @@ import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 
 
 import { answerFeedback, haptic, sfx } from '../lib/feedback';
 import { levelIndex } from '../lib/content';
+import { coverage, extractKeyPoints, suggestRating } from '../lib/keypoints';
 import { requestPermission } from '../lib/notifications';
 import { buildRecallCheck } from '../lib/recallCheck';
 import { dueLabel, dueWithin } from '../lib/srs';
 import { isProActive, useActiveDeck, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
-import { AnimatedProgressBar, CardEnter, Confetti, CountUp, FollowUpCue, Pop } from './anim';
+import { AnimatedProgressBar, CardEnter, Confetti, CountUp, Pop } from './anim';
 import { Btn, Card, Chip, Row, T, TrackBadge } from './kit';
 import { Mascot } from './Mascot';
 import { ResultFooter } from './ResultFooter';
@@ -83,6 +84,8 @@ function CardView() {
   // Recall check (#1): pick state survives the reveal so the suggested grade can ring a RateBtn.
   const [checkPick, setCheckPick] = useState<number | null>(null);
   const [checkOk, setCheckOk] = useState<boolean | null>(null);
+  // Jot coverage (#16): when you typed/dictated a recall attempt, score it against the key points.
+  const [jotTicks, setJotTicks] = useState<boolean[] | null>(null);
   const revealTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const jotRef = useRef<TextInput>(null);
   const tx = useSharedValue(0);
@@ -91,10 +94,22 @@ function CardView() {
     setJot('');
     setCheckPick(null);
     setCheckOk(null);
+    setJotTicks(null);
   }, [idx, tx]);
   useEffect(() => () => {
     if (revealTimer.current) clearTimeout(revealTimer.current);
   }, []);
+  const flipPoints = card && card.kind === 'flip' ? extractKeyPoints(card, 5) : [];
+  useEffect(() => {
+    if (reveal && jot.trim().length > 0 && flipPoints.length >= 2 && jotTicks == null) {
+      setJotTicks(coverage(jot, flipPoints));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reveal]);
+  const jotRatio = jotTicks && flipPoints.length ? jotTicks.filter(Boolean).length / flipPoints.length : null;
+  // The objective check wins; else the jot coverage suggests; else no suggestion.
+  const suggestedGrade =
+    checkOk != null ? (checkOk ? 'good' : 'again') : jotRatio != null ? suggestRating(jotRatio) : null;
 
   const pan = Gesture.Pan()
     .enabled(swipeable)
@@ -213,16 +228,46 @@ function CardView() {
                       {checkOk ? '✓ You spotted the senior take — suggested: Got it' : '✗ You picked the trap — suggested: Again'}
                     </T>
                   )}
-                  <Row style={{ gap: 9, marginTop: checkOk != null ? 8 : 14 }}>
-                    <RateBtn label="🔁 Again" sub={dueLabel('again')} kind="again" suggested={checkOk === false} onPress={() => { answerFeedback(false); rate('again'); }} />
-                    <RateBtn label="✅ Got it" sub={dueLabel('good')} kind="good" suggested={checkOk === true} onPress={() => { answerFeedback(true); rate('good'); }} />
-                    <RateBtn label="⚡ Easy" sub={dueLabel('easy')} kind="easy" onPress={() => { sfx.correct(); haptic.success(); rate('easy'); }} />
+                  {jotTicks != null && (
+                    <View style={{ marginTop: 12, gap: 7 }}>
+                      <T muted size={11.5} weight="800">
+                        Your recall covered {jotTicks.filter(Boolean).length}/{flipPoints.length} key points — tap to adjust
+                      </T>
+                      <Row style={{ flexWrap: 'wrap', gap: 6 }}>
+                        {flipPoints.map((p, i) => {
+                          const on = jotTicks[i];
+                          return (
+                            <Pressable
+                              key={i}
+                              onPress={() => setJotTicks((cur) => (cur ? cur.map((v, j) => (j === i ? !v : v)) : cur))}
+                              style={{
+                                borderWidth: 1.5,
+                                borderColor: on ? c.success : c.border,
+                                backgroundColor: on ? c.success + '14' : 'transparent',
+                                borderRadius: 999,
+                                paddingVertical: 5,
+                                paddingHorizontal: 10,
+                              }}>
+                              <T size={11} weight="700" color={on ? c.success : c.muted}>
+                                {on ? '✓ ' : ''}{p}
+                              </T>
+                            </Pressable>
+                          );
+                        })}
+                      </Row>
+                    </View>
+                  )}
+                  <Row style={{ gap: 9, marginTop: checkOk != null || jotTicks != null ? 8 : 14 }}>
+                    <RateBtn label="🔁 Again" sub={dueLabel('again')} kind="again" suggested={suggestedGrade === 'again'} onPress={() => { answerFeedback(false); rate('again'); }} />
+                    <RateBtn label="✅ Got it" sub={dueLabel('good')} kind="good" suggested={suggestedGrade === 'good'} onPress={() => { answerFeedback(true); rate('good'); }} />
+                    <RateBtn label="⚡ Easy" sub={dueLabel('easy')} kind="easy" suggested={suggestedGrade === 'easy'} onPress={() => { sfx.correct(); haptic.success(); rate('easy'); }} />
                   </Row>
                   <Row style={{ justifyContent: 'space-between', marginTop: 12 }}>
                     <T muted size={11.5} weight="800">← swipe: Again</T>
                     <T muted size={11.5} weight="800">Got it: swipe →</T>
                   </Row>
                   <FeedbackRow
+                    cardId={card.id}
                     saved={saved}
                     reaction={reaction}
                     onSave={() => toggleSave(card.id)}
@@ -323,17 +368,35 @@ function CardView() {
                 </View>
               )
             ) : (
-              <ChoiceBlock
-                card={card}
-                reveal={reveal}
-                lastChoice={lastChoice}
-                onChoose={choose}
-                onContinue={() => {
-                  const correctIdx = card.opts?.findIndex((o) => o.ok) ?? -1;
-                  const wrong = lastChoice != null && lastChoice !== correctIdx;
-                  rate(card.strict && wrong ? 'again' : 'good');
-                }}
-              />
+              <>
+                <ChoiceBlock
+                  card={card}
+                  reveal={reveal}
+                  lastChoice={lastChoice}
+                  onChoose={choose}
+                  onContinue={() => {
+                    // Tradeoff (#8): ANY defensible position is success; only indefensible picks lapse.
+                    if (card.tradeoff) {
+                      const defensible = lastChoice != null && !!card.opts?.[lastChoice]?.ok;
+                      rate(defensible ? 'good' : 'again');
+                      return;
+                    }
+                    const correctIdx = card.opts?.findIndex((o) => o.ok) ?? -1;
+                    const wrong = lastChoice != null && lastChoice !== correctIdx;
+                    rate(card.strict && wrong ? 'again' : 'good');
+                  }}
+                />
+                {reveal && (
+                  <FeedbackRow
+                    cardId={card.id}
+                    saved={saved}
+                    reaction={reaction}
+                    onSave={() => toggleSave(card.id)}
+                    onLike={() => setFeedback(card.id, 'like')}
+                    onDislike={() => setFeedback(card.id, 'dislike')}
+                  />
+                )}
+              </>
             )}
           </Card>
         </Animated.View>
@@ -384,6 +447,7 @@ function ChoiceBlock({
     fs: string;
     lines?: string[];
     followups?: { q: string; a: string }[];
+    tradeoff?: boolean;
   };
   reveal: boolean;
   lastChoice: number | null;
@@ -393,7 +457,8 @@ function ChoiceBlock({
   const { c, scheme } = useTheme();
   const opts = card.opts ?? [];
   const correctIdx = opts.findIndex((o) => o.ok);
-  const gotIt = lastChoice === correctIdx;
+  // Tradeoff (#8): any defensible (ok) pick counts — there's no single "correct" option.
+  const gotIt = card.tradeoff ? lastChoice != null && !!opts[lastChoice]?.ok : lastChoice === correctIdx;
   const fired = useRef(false);
   useEffect(() => {
     if (reveal && !fired.current) {
@@ -406,6 +471,14 @@ function ChoiceBlock({
 
   return (
     <View style={{ marginTop: 14, gap: 9 }}>
+      {card.tradeoff && (
+        <Row style={{ gap: 6 }}>
+          <T size={12}>⚖️</T>
+          <T size={11.5} weight="800" color={c.accentInk}>
+            Tradeoff call — several picks are defensible. Commit to a position.
+          </T>
+        </Row>
+      )}
       {card.lines ? <CodeBlock lines={card.lines} /> : null}
       {opts.map((o, i) => {
         let bd = c.border;
@@ -451,6 +524,11 @@ function ChoiceBlock({
               <T size={13} style={{ flex: 1, lineHeight: 18 }}>
                 {o.t}
               </T>
+              {reveal && card.tradeoff && i === lastChoice && o.ok && (
+                <View style={{ backgroundColor: c.success, borderRadius: 999, paddingVertical: 2, paddingHorizontal: 7, alignSelf: 'center' }}>
+                  <T color="#fff" weight="900" size={8.5}>YOUR POSITION</T>
+                </View>
+              )}
             </Pressable>
             {reveal && o.why ? (
               <T size={11.5} color={c.muted} style={{ marginTop: 4, marginLeft: 6, lineHeight: 16 }}>
@@ -468,7 +546,15 @@ function ChoiceBlock({
           <StuckHelp followups={card.followups} />
           <ResultFooter
             ok={gotIt}
-            message={gotIt ? undefined : 'A common trap — review the explanation above.'}
+            message={
+              gotIt
+                ? card.tradeoff
+                  ? 'Defensible — now read why the other positions hold too.'
+                  : undefined
+                : card.tradeoff
+                  ? 'That position doesn’t survive scrutiny here — read the whys above.'
+                  : 'A common trap — review the explanation above.'
+            }
             continueLabel="Continue →"
             onContinue={onContinue}
           />
@@ -499,18 +585,17 @@ function Reveal({
   publishedAt?: string;
   children?: React.ReactNode;
 }) {
-  const { c } = useTheme();
   return (
     <View style={{ marginTop: 14 }}>
       <RichAnswer text={answer} size={13} />
       {code?.length ? <CodePanels panels={code} /> : null}
       <RedFlag fj={fj} fs={fs} />
-      {followups?.length ? (
-        <>
-          <FollowUpCue color={c.accentInk} label="drill deeper" style={{ marginTop: 12 }} />
-          <Followups items={followups} />
-        </>
-      ) : null}
+      {/* #7b — depth on demand: follow-ups collapse behind one deliberate tap (shorter reveal). */}
+      <StuckHelp
+        followups={followups}
+        icon="🔎"
+        label={`Go deeper · ${followups?.length ?? 0} follow-up${(followups?.length ?? 0) === 1 ? '' : 's'}`}
+      />
       {sourceUrl ? <SourceRow url={sourceUrl} label={sourceLabel} publishedAt={publishedAt} /> : null}
       {children}
     </View>
@@ -569,7 +654,15 @@ function Followups({ items, hideHeader }: { items: { q: string; a: string }[]; h
  * pre-authored follow-up drill-downs — a different angle on the same idea. Flip cards already show
  * follow-ups inline; this brings the same help to choice/MCQ reveals where they were hidden.
  */
-function StuckHelp({ followups }: { followups?: { q: string; a: string }[] }) {
+function StuckHelp({
+  followups,
+  icon = '🤔',
+  label = 'Still stuck? Explain it another way',
+}: {
+  followups?: { q: string; a: string }[];
+  icon?: string;
+  label?: string;
+}) {
   const { c } = useTheme();
   const [open, setOpen] = useState(false);
   if (!followups?.length) return null;
@@ -591,9 +684,9 @@ function StuckHelp({ followups }: { followups?: { q: string; a: string }[] }) {
           paddingHorizontal: 12,
           backgroundColor: open ? c.surface : 'transparent',
         }}>
-        <T size={14}>🤔</T>
+        <T size={14}>{icon}</T>
         <T size={13} weight="800" style={{ flex: 1 }}>
-          Still stuck? Explain it another way
+          {label}
         </T>
         <T size={12.5} weight="800" color={c.accentInk}>
           {open ? '▾' : '▸'}
@@ -706,15 +799,18 @@ function RateBtn({
   );
 }
 
-/** Save / Like / Dislike — a content-quality + bookmark row below the SRS grade buttons.
- *  Save is independent of like/dislike; tapping the active reaction clears it (handled in the store). */
+/** Save / Like / Dislike / Report — a content-quality + bookmark row below the SRS grade buttons.
+ *  Save is independent of like/dislike; tapping the active reaction clears it (handled in the store).
+ *  The ⚠︎ pill (#7) expands an inline report panel — categories + optional note, reviewed by a human. */
 function FeedbackRow({
+  cardId,
   saved,
   reaction,
   onSave,
   onLike,
   onDislike,
 }: {
+  cardId: string;
   saved: boolean;
   reaction: 'like' | 'dislike' | undefined;
   onSave: () => void;
@@ -722,6 +818,8 @@ function FeedbackRow({
   onDislike: () => void;
 }) {
   const { c, scheme } = useTheme();
+  const reported = useStore((s) => !!s.reports[cardId]);
+  const [reportOpen, setReportOpen] = useState(false);
   const pill = (active: boolean, color: string) => ({
     flex: 1 as const,
     flexDirection: 'row' as const,
@@ -735,21 +833,105 @@ function FeedbackRow({
     backgroundColor: active ? (scheme === 'dark' ? color + '24' : color + '1a') : 'transparent',
   });
   const save = '#1c7ed6';
+  const warn = '#e8590c';
   return (
-    <Row style={{ gap: 9, marginTop: 12 }}>
-      <Pressable onPress={onSave} style={pill(saved, save)}>
-        <T size={12.5}>{saved ? '🔖' : '💾'}</T>
-        <T size={12} weight="800" color={saved ? save : c.muted}>{saved ? 'Saved' : 'Save'}</T>
-      </Pressable>
-      <Pressable onPress={onLike} style={pill(reaction === 'like', c.success)}>
-        <T size={12.5}>👍</T>
-        <T size={12} weight="800" color={reaction === 'like' ? c.success : c.muted}>Like</T>
-      </Pressable>
-      <Pressable onPress={onDislike} style={pill(reaction === 'dislike', c.danger)}>
-        <T size={12.5}>👎</T>
-        <T size={12} weight="800" color={reaction === 'dislike' ? c.danger : c.muted}>Dislike</T>
-      </Pressable>
-    </Row>
+    <View>
+      <Row style={{ gap: 9, marginTop: 12 }}>
+        <Pressable onPress={onSave} style={pill(saved, save)}>
+          <T size={12.5}>{saved ? '🔖' : '💾'}</T>
+          <T size={12} weight="800" color={saved ? save : c.muted}>{saved ? 'Saved' : 'Save'}</T>
+        </Pressable>
+        <Pressable onPress={onLike} style={pill(reaction === 'like', c.success)}>
+          <T size={12.5}>👍</T>
+          <T size={12} weight="800" color={reaction === 'like' ? c.success : c.muted}>Like</T>
+        </Pressable>
+        <Pressable onPress={onDislike} style={pill(reaction === 'dislike', c.danger)}>
+          <T size={12.5}>👎</T>
+          <T size={12} weight="800" color={reaction === 'dislike' ? c.danger : c.muted}>Dislike</T>
+        </Pressable>
+        <Pressable
+          onPress={() => setReportOpen((o) => !o)}
+          accessibilityLabel={reported ? 'Issue reported' : 'Report an issue with this card'}
+          style={pill(reported || reportOpen, warn)}>
+          <T size={12.5}>⚠️</T>
+          <T size={12} weight="800" color={reported || reportOpen ? warn : c.muted}>{reported ? 'Sent' : 'Issue'}</T>
+        </Pressable>
+      </Row>
+      {reportOpen && <ReportPanel cardId={cardId} reported={reported} onDone={() => setReportOpen(false)} />}
+    </View>
+  );
+}
+
+const REPORT_CATS: { cat: import('../lib/store').ReportCategory; label: string }[] = [
+  { cat: 'inaccurate', label: 'Inaccurate' },
+  { cat: 'outdated', label: 'Outdated' },
+  { cat: 'typo', label: 'Typo' },
+  { cat: 'unclear', label: 'Unclear' },
+  { cat: 'alt-answer', label: 'Better answer' },
+];
+
+/** Inline report form (#7) — category chips + optional note. A human reviews every report. */
+function ReportPanel({ cardId, reported, onDone }: { cardId: string; reported: boolean; onDone: () => void }) {
+  const { c } = useTheme();
+  const reportCard = useStore((s) => s.reportCard);
+  const [cat, setCat] = useState<import('../lib/store').ReportCategory | null>(null);
+  const [note, setNote] = useState('');
+  if (reported) {
+    return (
+      <T size={12} weight="700" color={c.success} style={{ marginTop: 10, textAlign: 'center' }}>
+        ✓ Reported — thanks. A human reviews every report.
+      </T>
+    );
+  }
+  return (
+    <View style={{ marginTop: 10, gap: 8 }}>
+      <T muted size={11.5} weight="800">What&apos;s wrong with this card?</T>
+      <Row style={{ flexWrap: 'wrap', gap: 7 }}>
+        {REPORT_CATS.map((rc) => (
+          <Pressable
+            key={rc.cat}
+            onPress={() => { haptic.selection(); setCat(rc.cat); }}
+            style={{
+              borderWidth: 1.5,
+              borderColor: cat === rc.cat ? c.accentInk : c.border,
+              backgroundColor: cat === rc.cat ? c.surface : 'transparent',
+              borderRadius: 999,
+              paddingVertical: 6,
+              paddingHorizontal: 11,
+            }}>
+            <T size={11.5} weight="800" color={cat === rc.cat ? c.accentInk : c.muted}>{rc.label}</T>
+          </Pressable>
+        ))}
+      </Row>
+      <TextInput
+        value={note}
+        onChangeText={setNote}
+        placeholder={cat === 'alt-answer' ? 'Your better answer…' : 'Anything else? (optional)'}
+        placeholderTextColor={c.muted}
+        multiline
+        style={{
+          borderWidth: 1.5,
+          borderColor: c.border,
+          borderRadius: radius.md,
+          padding: 10,
+          color: c.fg,
+          backgroundColor: c.surface,
+          minHeight: 48,
+          textAlignVertical: 'top',
+          fontSize: 12.5,
+        }}
+      />
+      <Btn
+        label="Send report"
+        variant="navy"
+        onPress={() => {
+          if (!cat) { haptic.error(); return; }
+          reportCard(cardId, cat, note);
+          haptic.success();
+          onDone();
+        }}
+      />
+    </View>
   );
 }
 

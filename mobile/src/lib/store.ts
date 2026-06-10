@@ -41,6 +41,7 @@ import {
   pullProgress,
   pushFeedback,
   pushProgress,
+  pushReport,
   pushStats,
   writeEntitlement,
 } from './sync';
@@ -223,6 +224,9 @@ interface State {
   clearLevelUp: () => void;
   markVoiceTried: () => void;
   markBadgesSeen: (ids: string[]) => void;
+  /** Remember the latest LIVE league standing (week rollover turns it into a result moment, #15). */
+  recordLeagueSnapshot: (snap: LeagueSnapshot) => void;
+  markLeagueResultShown: (week: string) => void;
   /** Record an objective correctness signal (recall check / voice key-point check) into session accuracy. */
   noteCheck: (ok: boolean) => void;
   clearHeroPulse: () => void;
@@ -249,8 +253,12 @@ interface State {
   doReveal: () => void;
   choose: (i: number) => void;
   rate: (r: Rating) => void;
+  /** Schedule-only grade for a card outside the live session (audio recall #16). No idx/streak side effects. */
+  rateById: (cardId: string, r: Rating) => void;
   toggleSave: (id: string) => void;
   setFeedback: (id: string, v: 'like' | 'dislike') => void;
+  /** File a content-quality report for a card (#7). Queued offline; pushed when signed in. */
+  reportCard: (id: string, cat: ReportCategory, note?: string) => void;
   replay: () => void;
   // backend-wired
   setUserId: (id: string | null) => void;
@@ -500,6 +508,8 @@ export const useStore = create<State>()(
       },
       markBadgesSeen: (ids) =>
         set((s) => ({ badgesSeen: [...new Set([...s.badgesSeen, ...ids])] })),
+      recordLeagueSnapshot: (leagueSnapshot) => set({ leagueSnapshot }),
+      markLeagueResultShown: (leagueResultShownWeek) => set({ leagueResultShownWeek }),
       noteCheck: (ok) =>
         set((s) => (ok ? { sessionHits: s.sessionHits + 1 } : { sessionMisses: s.sessionMisses + 1 })),
       clearHeroPulse: () => {
@@ -590,6 +600,14 @@ export const useStore = create<State>()(
 
       doReveal: () => set({ reveal: true }),
       choose: (i) => set({ reveal: true, lastChoice: i }),
+
+      rateById: (cardId, r) => {
+        const st = get();
+        const now = Date.now();
+        const progress = { ...st.progress, [cardId]: schedule(st.progress[cardId], r, now) };
+        set({ progress });
+        if (st.userId) void pushProgress(st.userId, progress);
+      },
 
       rate: (r) => {
         const st = get();
@@ -716,6 +734,20 @@ export const useStore = create<State>()(
         if (st.userId) void pushFeedback(st.userId, id, st.savedIds.includes(id), feedback[id] ?? null);
       },
 
+      reportCard: (id, cat, note) => {
+        const st = get();
+        const at = Date.now();
+        const reports = { ...st.reports, [id]: { cat, note: note?.trim() || undefined, at } };
+        track('card_reported', { cat });
+        if (st.userId) {
+          set({ reports });
+          void pushReport(st.userId, id, cat, note?.trim() || null, at);
+        } else {
+          // Signed out → queue; flushed on the next cloud hydrate (sign-in).
+          set({ reports, pendingReports: [...new Set([...st.pendingReports, id])] });
+        }
+      },
+
       replay: () => {
         set({ idx: 0, reveal: false, lastChoice: null });
         get().rebuildSession();
@@ -742,6 +774,15 @@ export const useStore = create<State>()(
           const owned = { ...get().owned };
           for (const id of serverIds) owned[id] = true;
           set(withOwned(owned));
+        }
+        // Flush card reports filed while signed out (#7).
+        const { pendingReports, reports } = get();
+        if (pendingReports.length) {
+          for (const cardId of pendingReports) {
+            const r = reports[cardId];
+            if (r) void pushReport(uid, cardId, r.cat, r.note ?? null, r.at);
+          }
+          set({ pendingReports: [] });
         }
         get().rebuildSession();
       },

@@ -21,24 +21,30 @@ import { LeagueBoard, TierBadge } from '../ui/LeagueBoard';
 export default function League() {
   const { c } = useTheme();
   const router = useRouter();
-  const xp = useStore((s) => s.xp);
+  const week = weekKey();
+  // THIS week's XP (resets each ISO week) — total xp on a weekly board overstated everyone.
+  const weeklyXp = useStore((s) => (s.weeklyXpWeek === week ? s.weeklyXp : 0));
   const userId = useStore((s) => s.userId);
+  const recordLeagueSnapshot = useStore((s) => s.recordLeagueSnapshot);
 
   const [board, setBoard] = useState<Leaderboard | null>(null);
-  const week = weekKey();
   const daysLeft = daysLeftInWeek();
 
   useEffect(() => {
     let alive = true;
-    // Weekly XP is approximated here from total xp (see INTEGRATION NOTES for a dedicated
-    // weeklyXp store field). fetchLeaderboard gracefully returns a local board when offline.
-    void fetchLeaderboard(userId, xp, 'You', week).then((b) => {
-      if (alive) setBoard(b);
+    // fetchLeaderboard gracefully returns a local sample board when offline / signed out.
+    void fetchLeaderboard(userId, weeklyXp, 'You', week).then((b) => {
+      if (!alive) return;
+      setBoard(b);
+      // Live standings feed the week-rollover result moment (#15).
+      if (b.live && b.me) {
+        recordLeagueSnapshot({ week: b.week, rank: b.me.rank, tier: tierForRank(b.me.rank, b.rows.length), size: b.rows.length });
+      }
     });
     return () => {
       alive = false;
     };
-  }, [userId, xp, week]);
+  }, [userId, weeklyXp, week, recordLeagueSnapshot]);
 
   const me = board?.me ?? null;
   const myTier = me ? tierForRank(me.rank, board?.rows.length) : 'Bronze';
@@ -139,8 +145,24 @@ export default function League() {
         </View>
       </Card>
 
+      {/* Honest sample-board banner (#15): say it's practice BEFORE the rows, with the fix. */}
+      {board && !board.live && (
+        <Card style={{ gap: 10 }}>
+          <Row style={{ gap: 9, alignItems: 'flex-start' }}>
+            <T size={18}>👀</T>
+            <View style={{ flex: 1 }}>
+              <T weight="800" size={13.5}>Practice board — these are sample players</T>
+              <T muted size={11.5} style={{ lineHeight: 16, marginTop: 2 }}>
+                Your XP is real; the rivals aren&apos;t yet. Sign in to compete on the live weekly board.
+              </T>
+            </View>
+          </Row>
+          <Btn label="Sign in to compete live →" variant="primary" onPress={() => router.push('/profile')} />
+        </Card>
+      )}
+
       {/* The ranked board */}
-      <Card>
+      <Card style={board && !board.live ? { opacity: 0.8 } : undefined}>
         {board ? (
           <LeagueBoard board={board} />
         ) : (
@@ -149,12 +171,6 @@ export default function League() {
           </T>
         )}
       </Card>
-
-      {board && !board.live && (
-        <T muted size={11} style={{ textAlign: 'center', lineHeight: 16 }}>
-          Showing a sample league. Sign in and configure sync to compete on the live weekly board.
-        </T>
-      )}
 
       <Btn label="⚡ Enter the weekly contest" variant="navy" onPress={() => router.push('/contest')} />
       <Btn label="Keep studying →" variant="primary" onPress={() => safeBack(router)} />

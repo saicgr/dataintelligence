@@ -91,6 +91,14 @@ export interface GeneratedCard {
   }[];
   /** Optional drill-down follow-up Q&As, revealed one tap deeper under the answer. */
   followups?: { q: string; a: string }[];
+  /** Optional MCQ format: when `opts` is present the card renders as a choice card. */
+  opts?: { t: string; ok: boolean; why?: string }[];
+  why?: string;
+  strict?: boolean;
+  /** Guided-tradeoff variant (#8): several ok:true positions, each `why` argues its side. */
+  tradeoff?: boolean;
+  /** Optional code shown above the options (choice cards). */
+  lines?: string[];
 }
 
 export const GENERATED: Record<string, GeneratedCard[]> = {

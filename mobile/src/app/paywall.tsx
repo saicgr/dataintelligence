@@ -20,7 +20,9 @@ import {
 import { useStore } from '../lib/store';
 import { radius, useTheme } from '../lib/theme';
 import { Btn, H2, Row, Screen, T } from '../ui/kit';
+import { FreshProof } from '../components/fresh-proof';
 import { HowProWorks } from '../components/how-pro-works';
+import { buildCramPlan, daysUntil } from '../lib/cramPlan';
 
 // Honest Free vs Pro: '✓' live, '—' not in tier, 'soon' = built-but-not-shipped (don't sell as live).
 const ROWS: [string, string, string][] = [
@@ -30,7 +32,7 @@ const ROWS: [string, string, string][] = [
   ['"Explain it out loud" scenarios · streak · offline', '✓', '✓'],
   ['Weekly "stay current" fresh drops', 'taste', '✓'],
   ['New cards per day', '15', 'unlimited'],
-  ['Weak-spot & adaptive scheduling', '—', '✓'],
+  ['Interview-aware scheduling — ramps to your date', '—', '✓'],
   ['JD analyzer — tracks to prep + your gaps', '—', '✓'],
   ['Most-asked-at-company lists', 'soon', 'soon'],
 ];
@@ -46,6 +48,8 @@ export default function Paywall() {
   const purchase = useStore((s) => s.purchase);
   const restore = useStore((s) => s.restore);
   const interviewIn = useStore((s) => s.interviewIn);
+  const interviewDate = useStore((s) => s.interviewDate);
+  const role = useStore((s) => s.role);
   const company = useStore((s) => s.targetCompany).split(',')[0]?.trim();
   const [plan, setPlan] = useState<PlanId>(SUB_YEARLY_ID); // yearly is the default (best value)
 
@@ -89,8 +93,13 @@ export default function Paywall() {
   }
 
   // ── Pro view (subscription, with a lifetime escape hatch) ───────────────────
-  const urgent =
-    interviewIn != null && interviewIn <= 7
+  // Interview-aware urgency: when a date is set, show the REAL ramp the plan would run
+  // (buildCramPlan already exists for the home plan card — same math, honest claim).
+  const planDays = daysUntil(interviewDate);
+  const cram = planDays != null && planDays > 0 ? buildCramPlan(interviewDate, role) : null;
+  const urgent = cram
+    ? `⏳ ${company || 'Your interview'} in ${planDays}d — Pro ramps ~${cram.totalCards} cards toward it, then tapers to a warm-up`
+    : interviewIn != null && interviewIn <= 7
       ? `⏳ ${company || 'Your interview'} is ~${interviewIn} days out — go in current`
       : '🆕 New cards every week — the deck never goes stale';
 
@@ -113,8 +122,14 @@ export default function Paywall() {
           Stay current. Every week.
         </T>
         <T color="#dcd7ff" size={12.5} style={{ marginTop: 4, textAlign: 'center', lineHeight: 18 }}>
-          Fresh interview cards on what just shipped — plus unlimited reps & smart scheduling.
+          Hand-verified cards on what shipped this week — dated, source-linked, retired when stale.
+          Plus interview-date ramp scheduling.
         </T>
+      </View>
+
+      {/* Proof before price: the actual latest fresh rows, not a claim. */}
+      <View style={{ backgroundColor: c.card, borderRadius: radius.lg, borderWidth: 1, borderColor: c.border, padding: 14 }}>
+        <FreshProof />
       </View>
 
       <View

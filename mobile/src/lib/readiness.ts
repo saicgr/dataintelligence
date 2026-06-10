@@ -5,7 +5,7 @@
  * Because P(recall) decays with elapsed time, the score *slides down* when you stop reviewing — the
  * spaced-repetition state made visible as loss aversion, the thing that pulls people back.
  */
-import { bankForTrack } from './content';
+import { bankForTrack, trackBySlug } from './content';
 import { ROLE_TRACKS } from './roles';
 import { CardState, pRecall, strength } from './srs';
 
@@ -22,6 +22,51 @@ export function readinessForRole(role: string, progress: Record<string, CardStat
     }
   }
   return total ? sum / total : 0;
+}
+
+/* ── Multi-axis readiness (#9) — the same score, bucketed into what interviews actually test ── */
+
+export type Axis = 'concepts' | 'handson' | 'sysdesign' | 'behavioral';
+export const AXIS_LABEL: Record<Axis, string> = {
+  concepts: 'Concepts',
+  handson: 'Hands-on',
+  sysdesign: 'System design',
+  behavioral: 'Behavioral',
+};
+const AXIS_ORDER: Axis[] = ['concepts', 'handson', 'sysdesign', 'behavioral'];
+
+/** Track slug → axis: explicit overrides first, then the track's Learn-path group. */
+function axisForTrack(slug: string): Axis {
+  if (slug === 'sysd' || slug === 'architecture') return 'sysdesign';
+  const group = trackBySlug(slug)?.group;
+  if (group === 'coding' || group === 'oncall' || group === 'deploy') return 'handson';
+  if (group === 'behavioral' || group === 'craft') return 'behavioral';
+  return 'concepts';
+}
+
+/** Per-axis readiness for a role — same 0.6·mastery + 0.4·P(recall) pass, bucketed by axis. */
+export function readinessAxes(
+  role: string,
+  progress: Record<string, CardState>,
+  now: number
+): { axis: Axis; label: string; value: number; total: number }[] {
+  const tracks = ROLE_TRACKS[role] ?? [];
+  const sum: Record<Axis, number> = { concepts: 0, handson: 0, sysdesign: 0, behavioral: 0 };
+  const total: Record<Axis, number> = { concepts: 0, handson: 0, sysdesign: 0, behavioral: 0 };
+  for (const slug of tracks) {
+    const axis = axisForTrack(slug);
+    for (const card of bankForTrack(slug)) {
+      total[axis]++;
+      const st = progress[card.id];
+      if (st && st.reps > 0) sum[axis] += 0.6 * strength(st) + 0.4 * pRecall(st, now);
+    }
+  }
+  return AXIS_ORDER.filter((a) => total[a] > 0).map((a) => ({
+    axis: a,
+    label: AXIS_LABEL[a],
+    value: sum[a] / total[a],
+    total: total[a],
+  }));
 }
 
 /** A short, honest label for a readiness fraction (0..1). */

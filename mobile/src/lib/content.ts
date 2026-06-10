@@ -198,6 +198,9 @@ export interface SessionCard {
   opts?: ChoiceOption[];
   why?: string;
   strict?: boolean; // code-choice cards: a wrong first pick rates 'again' (not 'good')
+  // Guided tradeoff (#8): a design call with SEVERAL defensible (ok:true) options — picking any
+  // of them is success; the learning is in each option's `why`. Indefensible picks rate 'again'.
+  tradeoff?: boolean;
   // code panel (choice extension / shared display)
   lines?: string[];
   lang?: Lang;
@@ -530,7 +533,8 @@ const levelTag = levelLabel;
 function cardFromGenerated(t: Track, c: GeneratedCard, i: number): SessionCard {
   return {
     id: `${t.slug}-${i}`,
-    kind: 'flip',
+    // Cards with options render as MCQs (incl. the Staff tradeoff variant); the rest flip.
+    kind: c.opts?.length ? 'choice' : 'flip',
     tk: t.color,
     tool: t.name,
     tag: levelTag(c.level),
@@ -541,6 +545,11 @@ function cardFromGenerated(t: Track, c: GeneratedCard, i: number): SessionCard {
     fs: c.fs,
     code: c.code,
     followups: c.followups,
+    opts: c.opts,
+    why: c.why,
+    strict: c.strict,
+    tradeoff: c.tradeoff,
+    lines: c.lines,
   };
 }
 

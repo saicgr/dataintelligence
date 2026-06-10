@@ -4,8 +4,9 @@ import { View } from 'react-native';
 
 import { computeBadges } from '../../lib/badges';
 import { tracksForRole } from '../../lib/content';
+import { daysLeftInWeek, fetchLeaderboard, type Leaderboard, tierForRank, weekKey } from '../../lib/leagues';
 import { mostAskedAtCompany, type MostAskedTopic } from '../../lib/peerAnswers';
-import { readinessForRole, readinessLabel } from '../../lib/readiness';
+import { readinessAxes, readinessForRole, readinessLabel } from '../../lib/readiness';
 import { ROLES } from '../../lib/roles';
 import { level, useStore, xpInLevel } from '../../lib/store';
 import { useTheme } from '../../lib/theme';
@@ -70,7 +71,7 @@ export default function Progress() {
         <T muted size={12.5} style={{ textAlign: 'center' }}>
           Level {level(xp)} · {xpInLevel(xp)}/1000 XP to Level {level(xp) + 1}
         </T>
-        <Btn label="🏆 Weekly league" variant="navy" onPress={() => router.push('/league' as Href)} />
+        <LeagueStrip onOpen={() => router.push('/league' as Href)} />
         {mastered ? (
           <Btn
             label={`🏅 Claim ${mastered.name} certificate`}
@@ -122,6 +123,34 @@ export default function Progress() {
   );
 }
 
+/** Live league position surfaced on Progress (#15) — rank · tier · XP · time left, one tap to the board. */
+function LeagueStrip({ onOpen }: { onOpen: () => void }) {
+  const week = weekKey();
+  const weeklyXp = useStore((s) => (s.weeklyXpWeek === week ? s.weeklyXp : 0));
+  const userId = useStore((s) => s.userId);
+  const recordLeagueSnapshot = useStore((s) => s.recordLeagueSnapshot);
+  const [board, setBoard] = useState<Leaderboard | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void fetchLeaderboard(userId, weeklyXp, 'You', week).then((b) => {
+      if (!alive) return;
+      setBoard(b);
+      if (b.live && b.me) {
+        recordLeagueSnapshot({ week: b.week, rank: b.me.rank, tier: tierForRank(b.me.rank, b.rows.length), size: b.rows.length });
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, [userId, weeklyXp, week, recordLeagueSnapshot]);
+  const me = board?.me ?? null;
+  const label =
+    board && me
+      ? `🏆 #${me.rank} in ${tierForRank(me.rank, board.rows.length)} · ${me.xp} XP · ${daysLeftInWeek()}d left${board.live ? '' : ' · practice'} ›`
+      : '🏆 Weekly league';
+  return <Btn label={label} variant="navy" onPress={onOpen} />;
+}
+
 /** Achievement badges (plan #8) — earned ones in full color, locked ones dimmed. */
 function BadgesCard({ badges }: { badges: ReturnType<typeof computeBadges> }) {
   const { c } = useTheme();
@@ -163,6 +192,8 @@ function ReadinessCard({ role, progress }: { role: string; progress: Parameters<
   const { c } = useTheme();
   // Recompute when progress changes; pRecall is time-based so it naturally drifts between sessions.
   const r = useMemo(() => readinessForRole(role, progress, Date.now()), [role, progress]);
+  // Multi-axis breakdown (#9): the same score split into what interviews actually test.
+  const axes = useMemo(() => readinessAxes(role, progress, Date.now()), [role, progress]);
   const pct = Math.round(r * 100);
   const roleName = ROLES.find((x) => x.key === role)?.name ?? 'this role';
   const tone = r >= 0.8 ? c.success : r >= 0.3 ? c.accent : c.warn;
@@ -178,6 +209,24 @@ function ReadinessCard({ role, progress }: { role: string; progress: Parameters<
         <T size={30} weight="900" color={tone}>{pct}%</T>
       </Row>
       <AnimatedProgressBar value={r} color={tone} track={c.border} height={10} />
+      {axes.length > 1 && (
+        <View style={{ gap: 7, marginTop: 2 }}>
+          {axes.map((a) => (
+            <Row key={a.axis} style={{ gap: 8 }}>
+              <T size={11} weight="800" muted style={{ width: 86 }}>{a.label}</T>
+              <View style={{ flex: 1 }}>
+                <AnimatedProgressBar
+                  value={a.value}
+                  color={a.value >= 0.8 ? c.success : a.value >= 0.3 ? c.accent : c.warn}
+                  track={c.border}
+                  height={6}
+                />
+              </View>
+              <T size={11} weight="800" muted style={{ width: 32, textAlign: 'right' }}>{Math.round(a.value * 100)}%</T>
+            </Row>
+          ))}
+        </View>
+      )}
       <T muted size={11.5} style={{ lineHeight: 16 }}>
         {readinessLabel(r)} · readiness slides if you stop reviewing — keep your due cards clear to hold it.
       </T>

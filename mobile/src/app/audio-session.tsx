@@ -23,6 +23,8 @@ import {
   type SessionCard,
 } from '../lib/content';
 import { haptic } from '../lib/feedback';
+import { extractKeyPoints, suggestRating } from '../lib/keypoints';
+import type { Rating } from '../lib/srs';
 import { isProActive, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
 import { isAvailable, speak, stop as ttsStop } from '../lib/tts';
@@ -30,8 +32,10 @@ import { Btn, Card, H2, Row, Screen, T } from '../ui/kit';
 
 /** Seconds the "answer out loud" prompt holds before the answer is read. */
 const ANSWER_PAUSE_MS = 7000;
+/** Hands-free grace: untouched grade screens auto-advance (pocket mode never stalls). */
+const GRADE_TIMEOUT_MS = 8000;
 
-type Phase = 'idle' | 'question' | 'thinking' | 'answer' | 'done';
+type Phase = 'idle' | 'question' | 'thinking' | 'answer' | 'grade' | 'done';
 
 /** Render any card kind down to a plain question + answer string for speech. */
 function speakable(card: SessionCard): { q: string; a: string } {
@@ -75,9 +79,14 @@ export default function AudioSession() {
   const [idx, setIdx] = useState(0);
   const [phase, setPhase] = useState<Phase>('idle');
   const [paused, setPaused] = useState(false);
+  // Grade phase (#16): which key points the user says they covered.
+  const [ticks, setTicks] = useState<boolean[]>([]);
+  const [points, setPoints] = useState<string[]>([]);
+  const rateById = useStore((s) => s.rateById);
   const pausedRef = useRef(false);
   const cancelled = useRef(false);
   const pauseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gradeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const available = isAvailable();
   const card = deck[idx];
@@ -98,6 +107,7 @@ export default function AudioSession() {
     return () => {
       cancelled.current = true;
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
+      if (gradeTimer.current) clearTimeout(gradeTimer.current);
       ttsStop();
     };
   }, []);
@@ -107,7 +117,24 @@ export default function AudioSession() {
       pauseTimer.current = setTimeout(resolve, ms);
     });
 
-  // Drive one card through question → think-pause → answer, then advance.
+  const advance = useCallback(
+    (from: number) => {
+      const next = from + 1;
+      if (next >= deck.length) {
+        setPhase('done');
+        void speak('Session complete. Nice work.');
+        haptic.success();
+        return;
+      }
+      haptic.light();
+      setIdx(next);
+      void runCard(next);
+    },
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+    [deck]
+  );
+
+  // Drive one card through question → think-pause → answer → self-grade, then advance.
   const runCard = useCallback(
     async (i: number) => {
       const cd = deck[i];
@@ -128,20 +155,36 @@ export default function AudioSession() {
       await speak(a);
       if (cancelled.current || pausedRef.current) return;
 
-      // Auto-advance.
-      const next = i + 1;
-      if (next >= deck.length) {
-        setPhase('done');
-        void speak('Session complete. Nice work.');
-        haptic.success();
+      // The "did I nail it?" payoff (#16): tick the key points you covered, grade lands in SRS.
+      const pts = extractKeyPoints(cd, 5);
+      if (pts.length >= 2) {
+        setPoints(pts);
+        setTicks(pts.map(() => false));
+        setPhase('grade');
+        void speak('Which key points did you cover? Tap them, then grade yourself.');
+        // Pure hands-free flow never stalls: untouched grade screens advance unrated.
+        gradeTimer.current = setTimeout(() => advance(i), GRADE_TIMEOUT_MS);
         return;
       }
-      haptic.light();
-      setIdx(next);
-      void runCard(next);
+      advance(i);
     },
-    [deck]
+    [deck, advance]
   );
+
+  /** Any grade-screen touch cancels the hands-free auto-advance. */
+  const holdGrade = () => {
+    if (gradeTimer.current) {
+      clearTimeout(gradeTimer.current);
+      gradeTimer.current = null;
+    }
+  };
+
+  const finishGrade = (r: Rating | null) => {
+    holdGrade();
+    if (r && card) rateById(card.id, r);
+    if (r) haptic.success();
+    advance(idx);
+  };
 
   const start = () => {
     cancelled.current = false;
@@ -168,6 +211,7 @@ export default function AudioSession() {
 
   const skip = () => {
     if (pauseTimer.current) clearTimeout(pauseTimer.current);
+    holdGrade();
     ttsStop();
     haptic.light();
     const next = idx + 1;
@@ -193,8 +237,12 @@ export default function AudioSession() {
     question: 'Listen to the question',
     thinking: 'Answer out loud',
     answer: 'Here is a strong answer',
+    grade: 'Did you nail it? Tap what you covered',
     done: 'All done',
   };
+
+  const covered = ticks.filter(Boolean).length;
+  const suggested = points.length ? suggestRating(covered / points.length) : null;
 
   return (
     <Screen scroll={false}>
@@ -231,13 +279,36 @@ export default function AudioSession() {
             <T weight="900" size={20} style={{ textAlign: 'center' }}>
               {phaseLabel[phase]}
             </T>
-            {card && phase !== 'idle' && phase !== 'done' && (
+            {card && phase !== 'idle' && phase !== 'done' && phase !== 'grade' && (
               <T
                 muted={phase === 'thinking'}
                 size={15}
                 style={{ textAlign: 'center', lineHeight: 22, paddingHorizontal: 6 }}>
                 {phase === 'answer' ? speakable(card).a : speakable(card).q}
               </T>
+            )}
+            {phase === 'grade' && (
+              <View style={{ alignSelf: 'stretch', gap: 9 }}>
+                {points.map((p, i) => {
+                  const on = ticks[i];
+                  return (
+                    <Btn
+                      key={i}
+                      label={`${on ? '☑' : '☐'}  ${p}`}
+                      variant={on ? 'green' : 'neutral'}
+                      onPress={() => {
+                        holdGrade();
+                        haptic.light();
+                        setTicks((cur) => cur.map((v, j) => (j === i ? !v : v)));
+                      }}
+                      style={{ paddingVertical: 14 }}
+                    />
+                  );
+                })}
+                <T weight="800" size={13} style={{ textAlign: 'center' }} color={covered / Math.max(1, points.length) >= 0.6 ? c.success : c.muted}>
+                  You covered {covered}/{points.length} key points
+                </T>
+              </View>
             )}
             {!soundOn && phase !== 'idle' && (
               <T size={11} color={c.warn}>App sound is off — voice still plays via the system.</T>
@@ -265,6 +336,21 @@ export default function AudioSession() {
               />
               <Btn label="Done" variant="green" onPress={exit} style={{ flex: 1, paddingVertical: 20 }} />
             </Row>
+          ) : phase === 'grade' ? (
+            <View style={{ gap: 10 }}>
+              <Row style={{ gap: 10 }}>
+                {(['again', 'good', 'easy'] as const).map((r) => (
+                  <Btn
+                    key={r}
+                    label={`${r === 'again' ? '🔁 Again' : r === 'good' ? '✅ Good' : '⚡ Easy'}${suggested === r ? ' ←' : ''}`}
+                    variant={r === 'again' ? 'neutral' : r === 'good' ? 'green' : 'navy'}
+                    onPress={() => finishGrade(r)}
+                    style={{ flex: 1, paddingVertical: 20, borderRadius: radius.lg, ...(suggested === r && { borderWidth: 3, borderColor: c.fg }) }}
+                  />
+                ))}
+              </Row>
+              <Btn label="Skip grading →" variant="ghost" onPress={() => finishGrade(null)} />
+            </View>
           ) : (
             <Row style={{ gap: 10 }}>
               <Btn

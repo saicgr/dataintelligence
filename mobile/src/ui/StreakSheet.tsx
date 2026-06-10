@@ -24,7 +24,7 @@ const GOALS = [
 ];
 
 export function StreakSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { c, scheme } = useTheme();
+  const { scheme } = useTheme();
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { height: winH } = useWindowDimensions();

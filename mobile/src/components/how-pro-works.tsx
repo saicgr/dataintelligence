@@ -8,7 +8,7 @@ import { Row, T } from '../ui/kit';
 const STEPS: [string, string][] = [
   ['We track what ships', 'New Claude, OpenAI & AWS features the week they land.'],
   ['Fresh cards drop weekly', 'Turned into real interview Q&A — your deck never goes stale.'],
-  ['Smart scheduling', 'Your weak spots resurface right before you would forget them.'],
+  ['Interview-aware scheduling', 'Set your date — sessions ramp toward it, weak spots resurface first, then taper to a warm-up the day before.'],
 ];
 
 /**

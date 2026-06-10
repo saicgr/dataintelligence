@@ -10,13 +10,18 @@ import Animated, { FadeIn, FadeOut, ZoomIn } from 'react-native-reanimated';
 
 import { type Badge, computeBadges } from '../lib/badges';
 import { haptic, sfx } from '../lib/feedback';
+import { nextWeekTier, weekKey, zoneForRank } from '../lib/leagues';
 import { useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
 import { Confetti } from './anim';
 import { T } from './kit';
 
 /** Transient celebration moments rendered by this bridge (each self-dismisses). */
-type Moment = { kind: 'firstCard' } | { kind: 'goalMet'; goal: number };
+type Moment =
+  | { kind: 'firstCard' }
+  | { kind: 'goalMet'; goal: number }
+  | { kind: 'promote'; tier: string; rank: number }
+  | { kind: 'relegate'; tier: string };
 
 export function FeedbackBridge() {
   const ev = useStore((s) => s.lastEvent);
@@ -59,6 +64,27 @@ export function FeedbackBridge() {
     }
     clear();
   }, [ev, clear, dailyGoal]);
+
+  // Weekly league result (#15): a LIVE snapshot from a previous week resolves once per new week.
+  const leagueSnapshot = useStore((s) => s.leagueSnapshot);
+  const leagueResultShownWeek = useStore((s) => s.leagueResultShownWeek);
+  const markLeagueResultShown = useStore((s) => s.markLeagueResultShown);
+  useEffect(() => {
+    const wk = weekKey();
+    if (!leagueSnapshot || leagueSnapshot.week === wk || leagueResultShownWeek === wk) return;
+    markLeagueResultShown(wk);
+    const zone = zoneForRank(leagueSnapshot.rank, leagueSnapshot.size);
+    if (zone === 'hold') return; // no fanfare for holding — just a fresh week
+    const tier = nextWeekTier(leagueSnapshot.rank, leagueSnapshot.size);
+    if (zone === 'promote') {
+      sfx.levelUp();
+      haptic.success();
+      setMoment({ kind: 'promote', tier, rank: leagueSnapshot.rank });
+    } else {
+      haptic.light();
+      setMoment({ kind: 'relegate', tier });
+    }
+  }, [leagueSnapshot, leagueResultShownWeek, markLeagueResultShown]);
 
   return (
     <>
@@ -162,7 +188,11 @@ function MomentOverlay({ moment, onDone }: { moment: Moment; onDone: () => void 
   const copy =
     moment.kind === 'firstCard'
       ? { emoji: '🎉', title: 'First card down!', sub: 'That’s the loop — rate honestly, the app does the scheduling.' }
-      : { emoji: '🎯', title: 'Daily goal hit!', sub: `${moment.goal} cards today — streak safe. Anything extra is gravy.` };
+      : moment.kind === 'goalMet'
+        ? { emoji: '🎯', title: 'Daily goal hit!', sub: `${moment.goal} cards today — streak safe. Anything extra is gravy.` }
+        : moment.kind === 'promote'
+          ? { emoji: '🏆', title: `Promoted to ${moment.tier}!`, sub: `You finished #${moment.rank} last week — new league starts now.` }
+          : { emoji: '🍂', title: `Back to ${moment.tier}`, sub: 'You slipped a tier — this week is a completely fresh board.' };
 
   return (
     <Animated.View
