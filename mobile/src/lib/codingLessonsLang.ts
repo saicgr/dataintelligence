@@ -1,11 +1,13 @@
 import type { LessonCard } from './lessons';
 import type { TrackColorKey } from './theme';
 
+import codingCpp from './generated/coding-cpp.json';
 import codingGo from './generated/coding-go.json';
 import codingRust from './generated/coding-rust.json';
 import codingJava from './generated/coding-java.json';
 import codingNode from './generated/coding-nodejs.json';
 import codingPyspark from './generated/coding-pyspark.json';
+import codingScala from './generated/coding-scala.json';
 import codingTs from './generated/coding-typescript.json';
 
 /**
@@ -32,4 +34,6 @@ export const CODING_LESSONS_LANG: LessonCard[] = [
   ...build('nodejs-coding', 'kafka', codingNode),
   ...build('pyspark-coding', 'spark', codingPyspark),
   ...build('typescript-coding', 'sql', codingTs),
+  ...build('cpp-coding', 'sysd', codingCpp),
+  ...build('scala-coding', 'spark', codingScala),
 ];

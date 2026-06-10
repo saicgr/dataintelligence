@@ -1452,5 +1452,181 @@
         "a": "Use the `golang.org/x/tools/go/analysis` framework. Define an `analysis.Analyzer` with a `Run` function that receives `*analysis.Pass`. Use `pass.ResultOf` to access type info, `pass.Files` for the AST, and `pass.Reportf` to emit diagnostics. Wire it into a `multichecker.Main` binary that `golangci-lint` can invoke as a plugin via the `custom` linter config. A well-scoped custom linter (e.g., 'every exported function must accept context.Context as first arg') can be written in under 100 lines and run in milliseconds — it is one of Go's most underused platform engineering tools."
       }
     ]
+  },
+  {
+    "q": "How do you diagnose and fix a goroutine leak in a production Go service at scale?",
+    "a": "Start with the goroutine count metric (`runtime.NumGoroutine()`) exposed on `/metrics` — a monotonically rising gauge that doesn't plateau after load stabilises is the smoking gun. To identify which goroutines are leaking, hit the pprof goroutine endpoint: `curl -s http://localhost:6060/debug/pprof/goroutine?debug=2` dumps a full stack trace of every live goroutine grouped by state. In code, integrate `go.uber.org/goleak` in integration tests (`goleak.VerifyTestMain`) to catch leaks before they reach production. Root causes at scale are almost always: (1) goroutines blocked on a channel with no matching sender/receiver and no `ctx.Done()` case; (2) `http.Client` calls without timeouts that block forever on a slow upstream; (3) `time.After` leaks inside `select` where the timer goroutine is never GC'd because the channel is never drained. For each, the fix is the same shape: add context propagation, set explicit timeouts, and ensure every goroutine has an exit condition reachable from the cancellation path.",
+    "fj": "I restart the service when goroutines pile up — it fixes itself.",
+    "fs": "Diagnosis order matters: metric alert → goroutine stack dump → goleak in tests closes the loop so the same class of leak cannot regress. A restart is a mask, not a fix — the leak will recur at the same traffic level.",
+    "level": "Staff",
+    "asked": 18,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Leak: no ctx on HTTP fetch",
+        "lines": [
+          "func fetchForever(url string) {",
+          "    go func() {",
+          "        // no timeout, blocks on slow host",
+          "        resp, _ := http.Get(url)",
+          "        defer resp.Body.Close()",
+          "    }()",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Bounded fetch with context",
+        "lines": [
+          "func fetch(ctx context.Context,",
+          "    url string) error {",
+          "    req, _ := http.NewRequestWithContext(",
+          "        ctx, http.MethodGet, url, nil,",
+          "    )",
+          "    resp, err :=",
+          "      http.DefaultClient.Do(req)",
+          "    if err != nil { return err }",
+          "    defer resp.Body.Close()",
+          "    return nil",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you use pprof's goroutine endpoint in production without exposing it publicly?",
+        "a": "Bind the pprof mux to a separate internal port (e.g., 6060) that is only reachable within the cluster via a sidecar or kubectl port-forward. Never expose pprof on the public listener — it reveals full stack traces and can be used to infer business logic. In Kubernetes, add a `containerPort: 6060` with no `Service` exposure and use `kubectl port-forward pod/xxx 6060:6060` for on-demand debugging."
+      },
+      {
+        "q": "What is the difference between goroutine profile and heap profile in pprof?",
+        "a": "The goroutine profile (`/debug/pprof/goroutine`) shows currently live goroutines and their stack traces — useful for leak detection and identifying blocked goroutines. The heap profile (`/debug/pprof/heap`) shows live heap allocations sampled at a configurable rate — useful for memory growth and GC pressure diagnosis. For leak investigation start with goroutine; for OOM or high-memory start with heap alloc_space."
+      }
+    ]
+  },
+  {
+    "q": "When do you choose channels over mutexes (and vice versa) for coordinating concurrent Go components at service scale?",
+    "a": "The Go proverb 'share memory by communicating' is a guideline, not a law — channels and mutexes solve different problems. Use channels when: you are transferring ownership of data between goroutines (a job queue, a results pipeline); you want backpressure (a bounded channel blocks the sender when the consumer is slow); or you need to multiplex multiple event sources with `select`. Use mutexes when: multiple goroutines need concurrent read access to shared state (a cache, a config map) — `sync.RWMutex` allows concurrent reads cheaply; ownership stays in one place and you just need safe mutation. In practice: for a read-heavy config cache, `RWMutex` is 3–5x faster under high read load than a channel-based design because channels serialize through a single goroutine. For a pipeline where data flows forward and is never re-read, channels give you backpressure and composability for free. Red flag: a mutex that protects a channel, or a channel used to shuttle a pointer to shared mutable state without transferring ownership — both indicate confused ownership and are error-prone at scale.",
+    "fj": "I use channels everywhere because that's the Go way.",
+    "fs": "Channels are not universally better — a channel-based cache requires a dedicated goroutine that serializes all reads, turning a O(1) map read into a goroutine context switch. For high-read low-write state, RWMutex wins on latency and CPU. The design question is: are you transferring ownership, or protecting shared access?",
+    "level": "Staff",
+    "asked": 14,
+    "followups": [
+      {
+        "q": "What is the 'channel as API boundary' antipattern and when does it cause problems?",
+        "a": "Exposing a channel in a public struct or function signature makes callers responsible for knowing whether to close it, how to drain it on cancellation, and whether it is buffered — none of which they can discover without reading implementation code. At scale this creates subtle bugs: callers forget to drain on cancel, causing goroutine leaks in the library. The fix is to hide channels behind method calls (`Send(ctx, v)`, `Receive(ctx)`) that encapsulate ownership and handle cancellation internally."
+      },
+      {
+        "q": "When would you use sync/atomic over both channels and mutexes?",
+        "a": "`sync/atomic` is appropriate for a single scalar (int64 counter, uint32 flag, pointer) that needs lockless concurrent update. It is faster than a mutex for a single-field invariant because it avoids OS-level locking. Use it for metrics counters, circuit-breaker state flags, or a hot-path config pointer loaded with `atomic.LoadPointer`. It cannot protect multi-field invariants — if you need to update two related fields consistently, use a mutex or a copy-on-write struct swapped with `atomic.StorePointer`."
+      }
+    ]
+  },
+  {
+    "q": "How do you design and execute a Go version upgrade policy across a fleet of 50+ microservices?",
+    "a": "I run a three-phase policy aligned to Go's biannual release cadence. Phase 1 — **Evaluate** (week 1–2 after GA): the platform team reads the release notes for behavioural changes (loop semantics, GC changes, toolchain breaking changes) and runs the full test suite of our most critical services against the new version in CI. Phase 2 — **Staged rollout** (weeks 3–8): services are grouped by blast radius — internal tooling first, data pipelines second, customer-facing APIs last. Each group upgrades its `go` directive in `go.mod` and its base image tag, CI must pass, and it runs for one week in production before the next group starts. Phase 3 — **Enforcement** (week 10): the previous version is removed from the approved toolchain list; any remaining service gets a 2-week automatic PR from a platform bot. Exceptions require a filed ticket with a scheduled date. I keep a `toolchain_matrix.yaml` in the platform repo listing every service, its current Go version, and the upgrade PR link — this is the single source of truth reviewed in the quarterly platform review.",
+    "fj": "I update the Dockerfile base image and run go mod tidy when a new Go version comes out.",
+    "fs": "An ad-hoc upgrade is fine for one service. At 50+, the risk is that a behavioural change (like the 1.22 loop variable fix) silently changes semantics in only some services because they upgraded at different times, making cross-service behaviour inconsistent. The policy enforces a narrow upgrade window so the entire fleet moves together within 10 weeks.",
+    "level": "Principal",
+    "asked": 12,
+    "followups": [
+      {
+        "q": "How do you handle a Go version that introduces a behavioural change your codebase depends on?",
+        "a": "First, identify all affected sites using `go vet`, custom analysis passes, or grep for the specific pattern. Write a regression test that exercises the old behaviour and confirm it fails on the new version. Then decide: fix the code to be behaviour-neutral (preferred), or use a build tag to branch on Go version. Document the decision in the ADR for the upgrade. I always choose code-fix over build tags — build tags create permanent maintenance debt and can't be linted away."
+      }
+    ]
+  },
+  {
+    "q": "How do you architect a Go monorepo or multi-module strategy for a 100-engineer org, including shared library governance?",
+    "a": "At 100 engineers the critical question is: do teams share a single `go.mod` (monorepo) or maintain per-service modules (polyrepo)? I have run both. Monorepo with a single `go.mod`: every service uses the same version of every dependency — no diamond dependency problems, atomic cross-service refactors, but a single slow CI build and a risk that one team's upgrade blocks all others. Multi-module monorepo (Google-style): each service has its own `go.mod` under the repo root; a `go.work` file stitches them for local development. This is the better default at scale — teams move at their own pace, but you need a toolchain layer: a shared `tools/` directory with pinned linter and code-gen versions, a platform-maintained `platform/go.mod` for the internal shared libraries (`platform/logging`, `platform/tracing`, `platform/config`), and a Renovate bot that synchronises the platform library version across all service `go.mod` files weekly. Governance of shared libraries: the owning team must version with semantic versioning, maintain a `CHANGELOG.md`, provide a migration guide for any breaking change, and give a 4-week deprecation notice before removing any exported symbol. I track adherence via a monthly platform health report that checks `govulncheck`, dep count, and whether any service is more than two minor versions behind the platform lib.",
+    "fj": "I put everything in one go.mod so everyone uses the same versions.",
+    "fs": "One go.mod sounds simple but creates invisible coupling — a patch upgrade that breaks service A now blocks service B's unrelated release. At scale, the coupling cost outweighs the simplicity. The multi-module monorepo with a platform library pattern gives you the code sharing of a monorepo with the autonomy of a polyrepo, but it requires disciplined governance or the shared libs rot.",
+    "level": "Principal",
+    "asked": 10,
+    "followups": [
+      {
+        "q": "How do you prevent internal shared Go libraries from accumulating breaking changes that block consuming teams?",
+        "a": "Enforce the open-closed principle at the module level: new functionality is added in additive, non-breaking ways (new functions, new optional fields in config structs using functional options). Breaking changes require a major version bump and a new import path. I gate breaking changes behind a required migration PR from the library owner that updates all internal consumers before the change merges — the library never has a breaking change without a simultaneous fix in every user. For large internal libraries I also maintain a `v1` compatibility shim that stays frozen so teams that cannot migrate immediately are not blocked."
+      }
+    ]
+  },
+  {
+    "q": "How do you standardise error handling conventions across a Go organisation — from sentinel errors to error types to wrapping discipline?",
+    "a": "I establish three explicit tiers enforced by linter and code review. Tier 1 — **Sentinel errors** (`var ErrNotFound = errors.New(...)`) live in domain packages, are always wrapped with `%w` by callers, and are always checked with `errors.Is`. Tier 2 — **Typed errors** implement the `error` interface and carry structured fields; callers use `errors.As` to extract them. Tier 3 — **Wrapped context strings** via `fmt.Errorf(\"op %s: %w\", key, err)` add call-site context at every layer boundary. The rule is: every function that calls another package's function must wrap the error with its own package and function name — this creates a stack of context that reads like a call trace. I enforce this with a custom `go/analysis` linter that flags any `return err` where `err` came from a foreign package without wrapping. Equally important: `errors.New` strings start with lowercase and have no punctuation (Go convention), and sentinel errors are the only exported errors — typed errors stay unexported until there is a documented consumer need.",
+    "fj": "I just return errors up the stack with return err and add a log line.",
+    "fs": "Bare `return err` across package boundaries loses call-site context — by the time the error surfaces in a log it has no breadcrumbs. The wrapping discipline gives you a deterministic, greppable error chain: `userService.Create: repo.Insert: pq: duplicate key value violates unique constraint`. That string tells you the full call path without a stack trace.",
+    "level": "Principal",
+    "asked": 11,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "go",
+        "label": "Context stripped at boundary",
+        "lines": [
+          "func (s *Service) Create(",
+          "    ctx context.Context,",
+          "    u User,",
+          ") error {",
+          "    err := s.repo.Insert(ctx, u)",
+          "    return err // no context added",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "go",
+        "label": "Wrap at every boundary",
+        "lines": [
+          "func (s *Service) Create(",
+          "    ctx context.Context,",
+          "    u User,",
+          ") error {",
+          "    if err := s.repo.Insert(ctx, u);",
+          "        err != nil {",
+          "        return fmt.Errorf(",
+          "            \"service.Create %s: %w\",",
+          "            u.ID, err,",
+          "        )",
+          "    }",
+          "    return nil",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you prevent error string duplication when every layer wraps with its own prefix?",
+        "a": "Use a naming convention based on `package.Function` — e.g., `userservice.Create`, `userrepo.Insert`. Because Go package names are unique within a module, these prefixes naturally form a non-colliding error chain. Run a lint rule that checks the wrap prefix matches the calling function name. For gRPC services, map typed errors to status codes at the transport boundary using a single `toStatus(err error) *status.Status` converter — this is the only place that inspects error types for wire encoding, keeping the rest of the service clean."
+      }
+    ]
+  },
+  {
+    "q": "How do you standardise observability conventions for Go services across an org — traces, metrics, and logs — so on-call engineers can debug any service the same way?",
+    "a": "I publish an internal `platform/obs` library that every service imports instead of calling OTel or Prometheus APIs directly. It provides: (1) `obs.NewLogger(ctx)` that returns an `*slog.Logger` pre-seeded with `trace_id`, `service`, `env` from the context; (2) `obs.NewMeter(name)` that returns a pre-configured Prometheus registry following our label conventions (service, endpoint, status_class); (3) `obs.StartSpan(ctx, name)` wrapping OTel with our standard attribute set (db.system, http.method, etc.). Conventions baked into the library: every HTTP/gRPC handler middleware injects a trace span and a logger into the context at request start; every outgoing call must propagate the context; log levels use only INFO/WARN/ERROR with a structured `error` field (no string formatting of errors into the message). I enforce adoption via a bootstrapping template (`cookiecutter` or `gonew`) that pre-wires `platform/obs` — new services start correct by default. Quarterly I run a compliance checker that verifies: does the service expose `/metrics`? does it export traces to Tempo? does it have a `SLO.yaml` registered in the platform catalog? Non-compliant services appear in the platform health report with owner tags.",
+    "fj": "I add Prometheus metrics to each service and tell teams to do the same.",
+    "fs": "Ad-hoc instrumentation means every service has different metric names, different log formats, and different span attribute keys — on-call engineers can't build muscle memory across services. The platform library bakes the conventions into the import so compliance is the path of least resistance, not a policy to remember.",
+    "level": "Principal",
+    "asked": 9,
+    "followups": [
+      {
+        "q": "How do you handle the tension between teams wanting custom observability and the platform enforcing a standard library?",
+        "a": "I treat `platform/obs` as a thin facade, not a lock-in. The library wraps OTel interfaces, so teams that need custom span processors or exporters can inject them at the provider level without forking the library. For metric naming, I expose an extension point: `obs.NewMeter` accepts functional options so teams can add custom labels within a documented namespace (e.g., `team.custom.*`). The rule is: platform-mandated labels are immutable, team-specific labels are additive. This satisfies both compliance and team autonomy."
+      }
+    ]
+  },
+  {
+    "q": "How do you make the case for — and execute — a migration from a fragmented polyrepo Go dependency landscape to a governed shared internal library ecosystem?",
+    "a": "The business case I build has three components: **security** (govulncheck on 50 repos currently shows 12 unpatched CVEs because teams upgrade independently), **reliability** (4 production incidents in Q3 traced to divergent error-handling conventions that produced unroutable errors at service boundaries), and **velocity** (new service bootstrap takes 3 days because engineers copy-paste boilerplate from different repos). I then run a dependency audit: `grep -r 'import \"' */internal | sort | uniq -c | sort -rn` to find the top 20 cross-service duplicated packages. Those become the first candidates for `platform/` extraction. Execution: (1) create `platform/` as a new module; (2) extract the highest-ROI packages first (logging, HTTP middleware, config loading) with a compatibility shim so existing callers need zero-line changes; (3) open automated PRs in each service repo updating the import path; (4) measure and publish: lines of duplicated code eliminated, CVE response time before vs. after, service bootstrap time. The measurement step is what sustains executive support for the multi-quarter effort. I staff this as a 20%-time guild contribution rather than a dedicated team — it prevents the platform from becoming a bottleneck and keeps the knowledge distributed.",
+    "fj": "I create a shared utils package and tell teams to use it.",
+    "fs": "A shared utils package without governance becomes a grab-bag that accumulates the same problems it was meant to solve — undocumented breaking changes, no owners, and teams forking it anyway. The governance layer (changelog, semver, migration guides, adoption metrics) is what makes the difference between a one-time improvement and a lasting platform capability.",
+    "level": "Principal",
+    "asked": 8,
+    "followups": [
+      {
+        "q": "How do you measure the ROI of a shared Go platform library investment to justify continued resourcing?",
+        "a": "Track four metrics: (1) CVE mean time to remediation — did it drop from weeks to days because patching one library fixes all consumers? (2) Service bootstrap time — time from 'create repo' to 'first production deployment' before vs. after the template. (3) Incident contribution rate — what percentage of P1/P2 incidents had a root cause attributable to divergent library usage (measure via post-mortem tags). (4) Dependency duplication ratio — `(lines in platform/ × consumer count) / (lines that would exist without sharing)`. Present these quarterly to engineering leadership alongside the unrealised roadmap items that became possible because teams spent less time on boilerplate."
+      }
+    ]
   }
 ]

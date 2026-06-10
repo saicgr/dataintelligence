@@ -678,5 +678,161 @@
     "fj": "Tech debt gets addressed after all features are done.",
     "fs": "Phase by outcome: carry cost → velocity → architecture. 20% sprint allocation for debt. Four lagging indicators (MTTO, deploy frequency, CFR, CVE age) make progress visible to leadership.",
     "level": "Principal"
+  },
+  {
+    "q": "How do you manage JIT warmup latency spikes in a latency-critical Java service?",
+    "a": "Tiered compilation (-XX:+TieredCompilation, default on) means the first minutes of traffic are interpreted or lightly compiled, causing p99 latency spikes. Mitigate with: (1) AppCDS / Class Data Sharing (-XX:+UseAppCDS, -XX:SharedArchiveFile) — pre-shares class metadata across JVM instances, cutting startup 20-40 %. (2) AOT compilation for frequently called stubs via `-XX:+UseAOT` (Java 17 experimental) or GraalVM's PGO native image for CLI. (3) Controlled warmup in deployment: send synthetic traffic or replay a captured production trace before flipping load-balancer weight. (4) JFR Method Profiling event pinpoints exactly which methods are still in C1 tier during the ramp. Never skip warmup when serving latency SLOs on fresh pods.",
+    "fj": "Java just gets faster over time — warmup fixes itself.",
+    "fs": "Use AppCDS to share class metadata and synthetic traffic replay before weight cut-over. JFR method profiling shows exactly which methods are in C1 tier during the latency cliff.",
+    "level": "Staff",
+    "asked": 12,
+    "followups": [
+      {
+        "q": "How does Class Data Sharing reduce warmup latency?",
+        "a": "AppCDS maps a pre-built archive of parsed class metadata and bytecode into a read-only shared memory region. All JVM instances on the host mmap the same pages, avoiding repeated parsing and verification — cutting class-loading time by 20-40 % and meaningfully shrinking the JIT ramp window."
+      },
+      {
+        "q": "What is the risk of using GraalVM native image to eliminate warmup?",
+        "a": "Native image requires closed-world assumption: reflection, dynamic proxies, and runtime class loading must be fully declared in config files at build time. Spring Boot's AOT engine generates most of this automatically, but third-party libraries with unexpected reflection can fail at startup. Build time increases 5-10x. Only justified when cold-start latency is a hard business requirement (e.g., AWS Lambda, CLI tools)."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement backpressure in a Java async pipeline to prevent memory blow-up under load?",
+    "a": "Unchecked `CompletableFuture` fan-out submits tasks faster than workers drain them, growing the thread pool's unbounded queue until OOM. Apply backpressure at the submission boundary: use a bounded `ThreadPoolExecutor` with a `LinkedBlockingQueue(capacity)` and a `CallerRunsPolicy` — when the queue is full the calling thread blocks, naturally throttling the producer. For reactive pipelines (Reactor/RxJava) use `onBackpressureBuffer(N)` with `DROP_OLDEST` or `onBackpressureLatest` to cap buffering. In Kafka consumers, pause partition consumption (`consumer.pause()`) when your downstream processing lag exceeds a threshold. Monitor executor queue depth as a leading indicator of imminent OOM.",
+    "fj": "Just make the thread pool bigger when tasks pile up.",
+    "fs": "Bounded executor queue + CallerRunsPolicy throttles the producer inline. In reactive pipelines use onBackpressureBuffer with an explicit overflow strategy. Queue depth is the leading OOM indicator.",
+    "level": "Staff",
+    "asked": 14,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "java",
+        "label": "unbounded queue — OOM risk",
+        "lines": [
+          "// Executors.newFixedThreadPool uses",
+          "// LinkedBlockingQueue() — NO capacity!",
+          "ExecutorService exec =",
+          "  Executors.newFixedThreadPool(8);",
+          "// tasks pile up unboundedly",
+          "for (Event e : stream) {",
+          "  exec.submit(() -> process(e));",
+          "}"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "java",
+        "lines": [
+          "ExecutorService exec =",
+          "  new ThreadPoolExecutor(",
+          "    8, 8, 0L, MILLISECONDS,",
+          "    new LinkedBlockingQueue<>(500),",
+          "    new CallerRunsPolicy()",
+          "  );",
+          "// caller blocks when queue full",
+          "for (Event e : stream) {",
+          "  exec.submit(() -> process(e));",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is CallerRunsPolicy better than AbortPolicy for backpressure?",
+        "a": "AbortPolicy throws RejectedExecutionException, requiring the caller to catch and retry — often with a busy-spin or sleep loop that wastes CPU. CallerRunsPolicy runs the task on the submitting thread, which is already blocked from submitting more work, creating clean flow-control without exceptions or retries."
+      }
+    ]
+  },
+  {
+    "q": "How do you standardise GC policy across hundreds of Java services with varying heap sizes and SLA tiers?",
+    "a": "First, classify services into SLA tiers: Tier-1 (p99 < 50 ms), Tier-2 (p99 < 500 ms), Tier-3 (batch, throughput-first). Publish a GC standard per tier: Tier-1 must use ZGC with `-XX:SoftMaxHeapSize` set to 70 % of `-Xmx`; Tier-2 uses G1 with `-XX:MaxGCPauseMillis=200`; Tier-3 uses Parallel GC or G1 default. Encode defaults in a platform-provided base Docker image ENV layer and a shared Maven/Gradle JVM-args plugin so teams inherit settings without manual flags. Enforce via a runtime GC policy auditor (a sidecar or startup hook) that reads `ManagementFactory.getGarbageCollectorMXBeans()` and emits a non-fatal alert when a service's actual GC differs from its declared tier. Review aggregate GC pause percentiles from your observability platform quarterly; move services between tiers as their profiles change.",
+    "fj": "Developers should pick their own GC — they know their service best.",
+    "fs": "Tier services by SLA → publish GC standard per tier → bake into base image ENV → sidecar auditor enforces at runtime → quarterly review of GC percentiles drives tier migrations.",
+    "level": "Principal",
+    "asked": 10,
+    "followups": [
+      {
+        "q": "How do you prevent a Tier-1 service from accidentally reverting to G1 after a base image update?",
+        "a": "The startup GC auditor checks `ManagementFactory.getGarbageCollectorMXBeans()` names. If the actual collector does not match the service's declared tier annotation, it logs a WARN and emits a Datadog/Prometheus metric `jvm.gc.tier_mismatch=1`. A zero-tolerance alert fires within 5 minutes of the first scrape, triggering a PagerDuty to the owning team. Combined with PR gate checks on Dockerfile changes, accidental reversions are caught before production traffic."
+      }
+    ]
+  },
+  {
+    "q": "How do you safely deprecate and retire a shared internal Java library used by 30+ services?",
+    "a": "Phase the retirement over 6-12 months. Phase 1 — announce and measure: add a `@Deprecated` Javadoc with the sunset date and migration target; add a compile-time warning via annotation processor; instrument usage telemetry (a static initialiser incrementing a Micrometer counter tagged by caller service JAR name so you have an impact map). Phase 2 — provide migration paths: publish an OpenRewrite recipe that mechanically transforms call sites; write a migration guide with before/after; offer pair-programming sessions for complex cases. Phase 3 — enforce: add a Maven Enforcer `<bannedDependencies>` rule that fails CI if any service imports the old artifact after the sunset date. Phase 4 — remove: archive the repo and unpublish from Nexus after all services pass CI enforcement. The counter telemetry from Phase 1 is your forcing function — never go dark on a library that still shows live calls.",
+    "fj": "Just delete the library — teams will find out when their builds break.",
+    "fs": "Announce → measure live call telemetry → provide OpenRewrite migration recipe → enforce with Maven Enforcer CI gate → archive after zero telemetry. Never remove before telemetry reaches zero.",
+    "level": "Principal",
+    "asked": 8,
+    "followups": [
+      {
+        "q": "What do you do when one team refuses to migrate and is blocking the library retirement?",
+        "a": "Escalate through engineering management with the telemetry data showing their service as the sole remaining blocker. Offer a time-boxed 2-week pairing sprint funded by the platform team. If the library has a security CVE, this becomes a severity-1 incident response: the platform team forks the call sites for them and opens a PR, removing the refusal as an option."
+      }
+    ]
+  },
+  {
+    "q": "How do you design classloader isolation for a Java plugin architecture that must load untrusted or versioned third-party code?",
+    "a": "Give each plugin its own `URLClassLoader` with the plugin JAR and its dependencies as the classpath, parented to the application classloader for shared APIs only. Use parent-last (child-first) delegation to let plugins override transitive dependencies without affecting the host. Define a narrow plugin API contract (a module-info or a separate api.jar) so the host never directly references plugin classes. To unload a plugin, null all references to its classloader and call GC — classloaders and their loaded classes are GC'd when unreachable, but any static field in a plugin class that holds a host-side reference will pin the classloader (a classloader leak). Isolate plugin execution in a try-catch that catches `Throwable` so a plugin crash does not kill the host JVM. For stronger isolation across tenants, consider JPMS modules or separate JVM processes.",
+    "fj": "Just put all plugins on the main classpath — classloaders are only for app servers.",
+    "fs": "Child-first URLClassLoader per plugin + narrow API contract + null all references to unload + catch Throwable at the plugin boundary. Static back-references from plugin classes pin the classloader — the primary leak source.",
+    "level": "Principal",
+    "asked": 9,
+    "code": [
+      {
+        "accent": "neutral",
+        "lang": "java",
+        "label": "per-plugin classloader",
+        "lines": [
+          "URL[] jars = pluginJarUrls();",
+          "ClassLoader parent =",
+          "  getClass().getClassLoader();",
+          "URLClassLoader loader =",
+          "  new URLClassLoader(jars, parent);",
+          "Class<?> cls = loader.loadClass(",
+          "  \"com.acme.plugin.MyPlugin\");",
+          "PluginApi p = (PluginApi)",
+          "  cls.getDeclaredConstructor()",
+          "     .newInstance();",
+          "// to unload: set loader = null",
+          "// + GC clears all plugin classes"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does Java Platform Module System (JPMS) change this picture?",
+        "a": "JPMS adds module boundaries enforced by the JVM: a plugin module can declare its dependencies explicitly and the host controls exactly which packages it exports. Strong encapsulation prevents plugins from accessing internal host packages via reflection by default. However, dynamic module loading at runtime (loading plugin JARs as modules post-startup) requires `ModuleLayer` and `Configuration` APIs, which are more complex than `URLClassLoader`. For most plugin architectures, URLClassLoader remains simpler; JPMS modules shine for internal modularisation of the host itself."
+      }
+    ]
+  },
+  {
+    "q": "How do you execute a monolith strangler at the JVM level — extracting bounded contexts from a shared Java WAR into independent deployable services?",
+    "a": "The strangler fig pattern applied at the JVM layer has four stages. Stage 1 — Seam identification: use dependency-analysis tools (JDepend, ArchUnit) to map the existing package coupling graph; find clusters with low coupling across a boundary — those are your extraction candidates. Stage 2 — In-process modularisation: move the target context into a separate Maven/Gradle module within the same WAR, enforce with ArchUnit rules that prevent it from importing other bounded contexts except via a defined API interface. Stage 3 — Dual-mode proxy: introduce a feature-flag-driven service façade in the monolith that either calls the local implementation or issues an HTTP/gRPC call to the new standalone service; run both in parallel to verify parity (shadow mode). Stage 4 — Cut over and strangle: once shadow traffic shows matching results for 99.9 % of requests over 72 hours, flip the flag to remote-only and delete the in-process implementation. Common JVM-specific hazards: shared `static` caches that must be externalised before extraction, shared database transactions that must be converted to eventual consistency (saga/outbox), and shared JVM classpath classes that must become explicit API contracts.",
+    "fj": "Just call the new service from the monolith — refactoring the packaging is optional.",
+    "fs": "Seam analysis → in-process module with ArchUnit boundaries → dual-mode shadow proxy with parity checks → cut over after 72 h of matching results. Externalise statics and shared DB transactions before extraction.",
+    "level": "Principal",
+    "asked": 13,
+    "followups": [
+      {
+        "q": "How do you handle a database table shared between the monolith and the extracted service during the transition?",
+        "a": "Apply the Shared Database pattern temporarily during shadow mode: both the monolith and new service read/write the same schema, schema ownership stays with the monolith. Simultaneously, the new service publishes domain events via an outbox table. After cut-over, run a migration window where the monolith reads from the new service's API instead of the table directly, then migrate the table ownership and stop cross-service direct DB access."
+      }
+    ]
+  },
+  {
+    "q": "How do you define and enforce a latency SLO policy for JVM services that accounts for GC pause budgets?",
+    "a": "GC pauses are part of your latency budget — failing to account for them makes SLOs unachievable. Derive the policy in three steps. First, characterise pause behaviour per GC tier with load testing: measure p99 and p99.9 GC pause duration under peak allocation rate using JFR GarbageCollection events. Second, set the SLO ceiling to 2x the observed p99.9 GC pause to give headroom: e.g., if ZGC p99.9 pause = 3 ms, a p99 request SLO < 50 ms is defensible; if G1 p99.9 = 80 ms, a < 50 ms SLO is structurally unachievable. Third, publish a service-contract template that separates GC-pause budget from network/compute budget, requiring each team to show both allocations sum to the SLO. Track SLO burn rate in your observability platform with separate alerts for GC-pause-driven violations vs. downstream-latency violations so on-call knows which bucket to investigate first.",
+    "fj": "Set the SLO based on the happy path; GC pauses are just occasional blips.",
+    "fs": "SLO = GC pause budget + compute + network. Measure p99.9 GC pause under peak load; set SLO ceiling at 2x that. Separate GC-driven vs. downstream alerts so on-call routes correctly.",
+    "level": "Principal",
+    "asked": 11,
+    "followups": [
+      {
+        "q": "A Tier-1 service on ZGC still misses its p99 SLO during peak traffic. GC pauses are under 2 ms. What do you investigate next?",
+        "a": "With GC cleared, the latency is compute or I/O bound. Check: (1) thread pool saturation — executor queue depth spike at peak; (2) downstream service p99 degradation pulling the composite latency above SLO; (3) CPU throttling in Kubernetes — `container_cpu_throttled_seconds` metric indicating cgroup CPU limit exhaustion; (4) network retransmits or connection-pool starvation to databases."
+      }
+    ]
   }
 ]

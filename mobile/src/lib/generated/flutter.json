@@ -1925,5 +1925,119 @@
         "a": "I use a 'golden path' model: the platform team provides opinionated, well-supported defaults (routing, auth, analytics) that feature teams use with zero config. Feature teams that have a legitimate reason to deviate file a 'path exception' ADR — if it benefits more than one team, the platform team absorbs it into the golden path; if it is truly one-team-specific, the feature team owns the maintenance burden. The platform team publishes a public roadmap so feature teams can plan around upcoming breaking changes. Feature team satisfaction with the platform team is measured quarterly by a 2-question survey (net promoter score + open text) that feeds directly into the platform team's OKRs — making the platform team accountable to their internal customers."
       }
     ]
+  },
+  {
+    "q": "How do you set and enforce a Flutter SDK upgrade cadence policy across a fleet of production apps owned by multiple teams?",
+    "a": "An ad-hoc upgrade policy means some apps lag the Flutter stable channel by a year, accumulating security debt and plugin incompatibilities. I establish a fleet-wide policy with four components: (1) **Upgrade window** — the fleet upgrades to a new Flutter stable minor within 8 weeks of release; patch updates (bug fixes, security) within 2 weeks. The window is generous enough that teams can plan it into a sprint but tight enough to prevent permanent fragmentation. (2) **Upgrade lead** — the mobile platform team owns the upgrade ADR, runs the upgrade in a shared `template-app` first, documents breaking changes against the org's pinned packages, and publishes a migration guide before the window opens. (3) **Enforcement** — a CI lint step reads `flutter --version` from `pubspec.yaml`'s Flutter SDK constraint and fails the build if the app is more than one minor behind the org's current pinned version. This surfaces stragglers before they become a security incident. (4) **Breaking-change triage** — each new stable release is evaluated against the org's package dependency graph using `dart pub deps --json` and an automated compatibility script; any package that would break is tracked as a P1 issue assigned to the package owner before the upgrade window opens, so teams are not blocked at upgrade time.",
+    "fj": "We upgrade Flutter when something breaks, otherwise why bother?",
+    "fs": "An upgrade policy is a security and maintenance contract. I fix the cadence (8-week minor, 2-week patch), publish migration guides before the window, and enforce the constraint in CI so stragglers surface early — not when a plugin drops support for the old SDK.",
+    "level": "Principal",
+    "asked": 8,
+    "followups": [
+      {
+        "q": "How do you handle a breaking SDK upgrade that requires a coordinated change across 12 app repos simultaneously?",
+        "a": "I treat it as an internal migration project: the platform team publishes a migration branch in the template-app and each shared package simultaneously. A Melos script runs `melos exec -- flutter pub upgrade` across all packages in dependency order and opens draft PRs. Each feature team merges their app PR against the pre-migrated platform packages; the merge window is opened for all teams on the same day to minimize the time any app is on a mixed version. A postmortem after the first large-scale migration captures lessons that update the upgrade policy."
+      },
+      {
+        "q": "What is the Flutter stable, beta, and master channel strategy, and when would you recommend an org pin to beta?",
+        "a": "The stable channel receives tested, monthly patch releases and quarterly minor releases — the right choice for production apps. Beta receives the next release candidate about 6 weeks before stable; pin to beta only if you need a specific bug fix or feature (e.g., a new Impeller capability) that is blocking a release and the risk of pre-stable code is acceptable, with a plan to move to stable once it ships. Master is nightly and unsuitable for production. Some orgs run their QA environment on beta to catch compatibility issues before stable drops."
+      }
+    ]
+  },
+  {
+    "q": "How do you define and enforce app-size and cold-start latency budgets across a multi-app Flutter org?",
+    "a": "App size and startup latency degrade silently — each feature adds 50 KB or 5 ms, and a year later the app is 30 MB heavier and 800 ms slower. I treat them as first-class budget constraints. **Size budgets**: establish per-app targets (e.g., Android AAB download size ≤ 15 MB, iOS IPA ≤ 25 MB) based on market data — in emerging markets, apps over 25 MB see a 30–40% install drop. CI uploads the release AAB to a size-tracking service (Firebase App Distribution or a custom S3 bucket with a size-diff script) and fails the build if the download size delta exceeds +200 KB per PR. The `flutter build appbundle --analyze-size` output is archived per build for trend analysis. **Startup budgets**: define cold-start p95 ≤ 2.5 s on a mid-range Android (Pixel 4a-class) and ≤ 1.8 s on iPhone 12. Measure in Firebase Performance Monitoring using a `Trace` around `main()` to the first meaningful frame. A weekly dashboard compares cohort p50/p95 against the budget; a regression of >150 ms triggers a P1 investigation. Size violations are typically from uncompressed image assets, unused `dart:mirrors` / reflection, or a new pub.dev package that pulls in a large native SDK. Startup regressions are typically from `initState` doing synchronous I/O or a new plugin's native `Application.onCreate` code.",
+    "fj": "App size doesn't matter much; users have plenty of storage now.",
+    "fs": "Size and startup budgets are product metrics, not just engineering vanity. I enforce them in CI (size delta gate per PR) and in production (Firebase Performance p95 dashboard with a regression alert). The root causes are almost always uncompressed assets, heavy packages, or synchronous init code.",
+    "level": "Principal",
+    "asked": 7,
+    "code": [
+      {
+        "label": "Startup trace instrumentation",
+        "lang": "dart",
+        "lines": [
+          "// main.dart — measure cold start",
+          "void main() async {",
+          "  WidgetsFlutterBinding",
+          "      .ensureInitialized();",
+          "  final trace =",
+          "    FirebasePerformance.instance",
+          "    .newTrace('cold_start');",
+          "  await trace.start();",
+          "  await _initServices();",
+          "  runApp(const App());",
+          "  // Stop trace on first frame",
+          "  WidgetsBinding.instance",
+          "    .addPostFrameCallback((_) async {",
+          "      await trace.stop();",
+          "    });",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is `flutter build appbundle --analyze-size` and how do you interpret the output?",
+        "a": "`--analyze-size` produces a size analysis JSON (and optional DevTools treemap visualization) that breaks the AAB into: Dart snapshot (AOT compiled code), assets, native libraries, and resources. A large Dart snapshot usually indicates dead code that tree-shaking missed (often due to dynamic dispatch or reflection) or an unexpectedly large transitive package. The assets section catches uncompressed PNG/WebP files. Comparing the treemap between two releases shows exactly which package or asset drove a size increase."
+      },
+      {
+        "q": "How do you reduce Flutter app startup latency when `initState` and plugin initialization are the bottleneck?",
+        "a": "Profile startup with `flutter run --trace-startup` which emits a JSON timeline showing Flutter engine init, first Dart frame, and each plugin's `onCreate`/`didFinishLaunching` time. Move non-critical plugin initialization out of the synchronous startup path using `Future.microtask(() => initPlugin())` so it defers to after the first frame. For truly heavy initialization (DB migrations, auth token refresh), show a splash screen while the async work completes. On Android, investigate each plugin's `Application.onCreate` for synchronous disk I/O or network calls — these are common offenders."
+      }
+    ]
+  },
+  {
+    "q": "What is your plugin supply-chain risk policy for a regulated or security-sensitive Flutter app fleet?",
+    "a": "A Flutter app's attack surface includes every pub.dev package's native code — a compromised Kotlin or Swift file in a transitive dependency can exfiltrate tokens, intercept SSL, or abuse permissions. I implement a four-layer policy. (1) **Approved package registry** — maintain an internal `approved-packages.yaml` listing every allowed direct dependency with the approved version range and the security reviewer who signed off. A CI check fails any PR that introduces a package not on the list; adding a package requires a pull request to the registry with a security review checklist filled in. (2) **Native code audit** — any package touching auth, storage, networking, or camera/mic must have its Kotlin/Swift/ObjC code reviewed by a mobile security engineer before approval. Automated tools (`semgrep` with mobile rulesets) scan for `NSURLSessionDelegate` override patterns (SSL pinning bypasses), `addJavascriptInterface` misuse, and world-readable file permission settings. (3) **Transitive dependency lock** — `pubspec.lock` is committed and a CI check fails if `pubspec.lock` changes without a corresponding entry in the PR's change log. This prevents silent dependency hoisting attacks. (4) **Vulnerability monitoring** — subscribe to `pub.dev`'s security advisories feed and to `osv.dev` Dart ecosystem alerts. A weekly CI job runs `dart pub audit` (available in Dart 3.4+) and Slack-alerts on any new CVE affecting the approved package set.",
+    "fj": "I trust pub.dev's moderation; the packages are safe if they have lots of downloads.",
+    "fs": "Download count is not a security signal. I run an approved-registry gate in CI, audit native code on every security-sensitive package, commit pubspec.lock, and run `dart pub audit` weekly. A CVE in a transitive dependency you don't know about is indistinguishable from a deliberate supply-chain attack.",
+    "level": "Principal",
+    "asked": 6,
+    "followups": [
+      {
+        "q": "How does `dart pub audit` work and what are its current limitations?",
+        "a": "`dart pub audit` (Dart SDK 3.4+) queries the OSV (Open Source Vulnerabilities) database for known CVEs in your direct and transitive dependencies and prints a report. Its current limitations are that (1) the OSV Dart ecosystem index is less comprehensive than the npm or Go equivalents — many native-code vulnerabilities in Kotlin/Swift plugins are not reflected in the Dart package record; (2) it reports at the package level, not the transitive-call level — you must still manually assess whether your code path reaches the vulnerable code; (3) it does not assess native code in the `android/` or `ios/` directories of a plugin. Supplement it with `semgrep` native-code scans and manual review for high-risk packages."
+      },
+      {
+        "q": "What specific CI check would you add to detect pubspec.lock tampering without a matching PR justification?",
+        "a": "Add a GitHub Actions step that runs `git diff --name-only HEAD~1` and checks whether `pubspec.lock` changed. If it did, the step requires a file named `deps-change-justification.md` in the PR or a specific label applied by a platform-team member. This is a light-weight process gate — it does not block automation (Dependabot or Renovate PRs include the justification by convention in their PR description), but it makes silent lock-file changes visible. For stricter environments, require the lock file diff to be reviewed by a CODEOWNERS entry pointing to the security team."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern a shared Flutter design system and component library across 6+ product teams and 3 apps — ownership, versioning, breaking-change policy, and adoption enforcement?",
+    "a": "A shared design system without governance becomes three competing design systems within a year. The model I use has five pillars. (1) **Dedicated ownership** — the design system is owned by a platform team (2–3 engineers + a design lead), not by a feature team on the side. They have a public backlog, a quarterly roadmap, and an SLA: P1 bugs fixed within 48 hours, new component requests triaged within one sprint. (2) **Semantic versioning with a deprecation runway** — every breaking API change (a renamed prop, a removed variant) is first deprecated in a minor release with an `@Deprecated` annotation that points to the migration guide. The breaking removal happens in the next major version, minimum 4 weeks after the deprecation. Feature teams receive automated PR comments (via a GitHub Actions `pub outdated` check) when they are behind the current major version. (3) **Component contribution model** — feature teams can propose new components by opening a design proposal issue. The design system team reviews for generality (does it serve ≥2 teams?), accessibility compliance, and token adherence. Accepted proposals are developed by the platform team; rejected ones are approved as local components owned by the proposing team. (4) **Visual regression testing** — every component has a Golden test (`matchesGoldenFile`). A CI job on the design system repo runs Golden tests on each PR; failures require designer sign-off before merge. (5) **Adoption enforcement** — a `custom_lint` rule flags direct `Color(0xFF...)` literals and raw `TextStyle` constructions outside the design system package. Any violation is a CI warning that becomes a hard error after a 30-day grace period.",
+    "fj": "I'd just share a Figma file and trust developers to match it by eye.",
+    "fs": "Governance is what separates a design system from a shared styles file. Dedicated ownership, semver with deprecation runway, contribution triage, Golden-test visual regression, and a lint rule that makes non-compliance visible — these five pillars make the design system a force multiplier rather than a maintenance burden.",
+    "level": "Principal",
+    "asked": 9,
+    "followups": [
+      {
+        "q": "How do you handle the design system's own dependency on Flutter SDK upgrades without blocking feature teams?",
+        "a": "The design system is upgraded to the new Flutter SDK before the org-wide upgrade window opens, as part of the upgrade lead's role. The platform team cuts a new minor release of the design system tagged with the new Flutter SDK constraint (e.g., `sdk: '>=3.7.0 <4.0.0'`). Feature teams that upgrade Flutter within the upgrade window get the new design system version automatically if they are tracking `^` ranges. Feature teams on the old SDK retain the previous minor until their upgrade is complete. The design system never carries a hard lower-SDK bound that is lower than the org's current floor — this prevents feature teams from silently depending on an old SDK version via the design system's constraint."
+      },
+      {
+        "q": "What is a Golden test in Flutter and what are its maintenance pitfalls at scale?",
+        "a": "A Golden test calls `matchesGoldenFile('component_name.png')` inside a `testWidgets` block; Flutter renders the widget to a PNG and compares it pixel-by-pixel against a committed reference image. On failure, a diff image is generated. Maintenance pitfalls: (1) Goldens are OS- and font-renderer-specific — a Golden generated on macOS will fail on a Linux CI runner due to subpixel font rendering differences. Mitigate by running Golden tests only on a fixed Docker image with pinned fonts. (2) Any Flutter SDK upgrade that changes rendering (especially Impeller changes) requires a mass Golden update — automate this with a `flutter test --update-goldens` CI job that opens a PR with the updated images for designer review. (3) Golden files add binary noise to git history — store them in Git LFS."
+      }
+    ]
+  },
+  {
+    "q": "A multi-app org (consumer app, enterprise app, kiosk app) is evaluating whether to continue investing in Flutter or migrate all three to native. What decision framework and success criteria do you apply?",
+    "a": "This is a multi-million-dollar decision that cannot be answered by benchmarks alone. My framework has six evaluation dimensions. (1) **Platform feature lag** — audit each app's use of OS APIs released in the last 12 months (iOS interactive widgets, Android predictive back, Dynamic Island) and measure how long it took the Flutter ecosystem to support each. If the lag is routinely >3 months for business-critical features, native becomes cheaper than workarounds. (2) **Crash and ANR/watchdog rates** — compare Flutter crash-free session rate against industry benchmarks for the app category. If Flutter-specific crashes (Dart null errors, plugin exceptions) account for >15% of total crashes, evaluate whether native would eliminate them or just replace them with different crashes. (3) **Developer experience** — survey the mobile engineering team: build times, hot-reload reliability, debugger quality, and hire-ability. A team that spends 20% of sprint time fighting Flutter tooling is paying a hidden tax. (4) **TCO model** — build a 3-year cost model: Flutter = one cross-platform team + N plugin maintenance engineers; native = 2 platform teams × 3 apps = 6 team-years. Quantify where Flutter actually saves headcount versus where native interop complexity consumes it. (5) **Migration cost** — a realistic estimate for migrating three mature apps to native is 18–30 months; any TCO saving must exceed that investment plus the risk of regression. (6) **Strategic alignment** — if the org plans to add a web or desktop surface, Flutter's six-platform story is a durable asset; native mobile expertise is not. Present all six dimensions with a recommendation and explicit assumptions; avoid single-metric decisions.",
+    "fj": "Just pick whichever framework is trendier this year and migrate everything.",
+    "fs": "A framework migration decision requires a TCO model, a platform-feature-lag audit, crash attribution analysis, and a realistic migration cost estimate. I present all six dimensions to leadership with explicit assumptions and a go/no-go threshold — not a gut call.",
+    "level": "Principal",
+    "asked": 12,
+    "followups": [
+      {
+        "q": "How do you structure the business case for staying on Flutter when leadership is attracted to native after reading a viral 'we left Flutter' blog post?",
+        "a": "Blog posts describe one team's specific constraints, not yours. I prepare a counter-brief with three sections: (a) what the cited team's actual problems were and whether they apply to our codebase (common reasons: heavy PlatformView usage, a niche plugin gap, a team that was already native-expert); (b) our own data — crash rates, deploy frequency, feature lead time, and developer NPS for Flutter vs our pre-Flutter native history; (c) the migration cost estimate with a break-even timeline. If the break-even exceeds 2 years, the burden of proof is on migration. I also propose a targeted spike: if the concern is a specific platform API gap, have one engineer prototype it in Flutter for 2 weeks. A concrete prototype beats a blog post every time."
+      },
+      {
+        "q": "What metrics would you track in production to continuously validate that Flutter remains the right investment for all three apps?",
+        "a": "I track four categories monthly: (1) **Reliability** — crash-free session rate, ANR rate, Flutter-engine crash count separately from Dart-layer exceptions; (2) **Performance** — cold-start p95 per app per platform, frame drop rate (jank frames > 16ms) from Firebase Performance; (3) **Velocity** — features shipped per sprint, hot-patch deploy frequency, and build time p50; (4) **Ecosystem health** — count of direct dependencies that are more than one major version behind their latest, and count of open GitHub issues in critical plugins. These metrics feed a quarterly mobile platform health report that the principal presents to the VP of Engineering — making the investment decision transparent and evidence-based rather than periodic and reactive."
+      }
+    ]
   }
 ]

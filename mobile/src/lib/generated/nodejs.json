@@ -2163,5 +2163,190 @@
         "a": "File an RFC (request for comment) document describing the use case, the proposed boundary violation, and the long-term plan to fix the underlying design. If approved, add a targeted ESLint `// eslint-disable-next-line` with a comment linking to the RFC ticket. The RFC serves as the ADR for the exception and creates a paper trail. Automated scripts that grep for disable comments and verify they have linked tickets keep the exception count visible."
       }
     ]
+  },
+  {
+    "q": "How do you diagnose an unexplained heap growth (potential memory leak) on a Node.js service in production without causing downtime?",
+    "a": "Start with process-level signals: `process.memoryUsage().heapUsed` trending upward over hours via your APM confirms the leak. First, check the obvious — listener count on key EventEmitters (`emitter.listenerCount()`), Map/Set sizes exposed as gauges, and timer counts (`process._getActiveHandles().length`). If those are clean, take two V8 heap snapshots minutes apart using `--inspect` via SSH tunnel (or trigger via an admin route: `v8.writeHeapSnapshot()`), download them, and diff in Chrome DevTools 'Objects allocated between snapshots' view. The dominant retained-object type points to the root. Common culprits: closures inside `AsyncLocalStorage.run()` that capture the full request object, `require.cache` pollution from hot-reload tooling left in prod, or an LRU cache whose TTL was accidentally removed. Fix, deploy, verify the heap growth line flattens. Gate the fix with a heap-size alert threshold at 80% of `--max-old-space-size`.",
+    "fj": "I'd restart the service on a schedule to reset memory, then investigate slowly.",
+    "fs": "Scheduled restarts mask the bug and cause availability gaps. Two heap snapshots diffed in DevTools have found every leak I've ever debugged — the 'Objects between snapshots' view is the sharpest diagnostic tool available.",
+    "level": "Staff",
+    "asked": 14,
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "ts",
+        "label": "Admin route: trigger heap snapshot",
+        "lines": [
+          "import v8 from 'node:v8';",
+          "import path from 'node:path';",
+          "",
+          "// gate behind internal-only auth",
+          "app.get('/admin/heapdump', (_, res) => {",
+          "  const file = v8.writeHeapSnapshot(",
+          "    path.join('/tmp', `heap-${Date.now()}.heapsnapshot`)",
+          "  );",
+          "  res.json({ file });",
+          "});"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does `--heap-prof` differ from a heap snapshot for diagnosing leaks?",
+        "a": "`--heap-prof` records a V8 heap sampling profile (allocation flamegraph) — it shows WHERE allocations originate in the call stack, not what is retained. A heap snapshot shows WHAT is alive at a point in time. For leaks use snapshots to find the retained type, then use `--heap-prof` to find the allocation site. They are complementary."
+      },
+      {
+        "q": "What does a spike in `process._getActiveHandles().length` indicate?",
+        "a": "It means Node has open handles (sockets, file descriptors, timers) preventing the event loop from exiting. In a long-running server it points to leaked sockets (keep-alive connections never destroyed), uncanceled `setInterval` references, or `fs.watch` listeners not removed. Log the types: `process._getActiveHandles().map(h => h.constructor.name)` to classify the leaking handle type."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a dep-security posture for a Node.js service fleet — from npm audit policy through supply-chain incident response?",
+    "a": "Security posture has three layers. **Day-to-day governance**: Renovate or Dependabot auto-raises PRs for patch/minor dependency bumps on a weekly cadence; major bumps require a human PR. `npm audit --audit-level=high` runs in every CI pipeline and fails the build on high/critical CVEs — moderate findings go to a backlog, not a build gate (too many false positives). **Lockfile policy**: commit `package-lock.json` (or `pnpm-lock.yaml`) to version control; CI runs with `npm ci` (not `npm install`) so the lockfile is authoritative. Enable Sigstore provenance on all npm publishes for internal packages (Node 18+, `npm publish --provenance`). **Supply-chain incident response**: when a left-pad or colors-style event occurs — (1) identify affected services via `npm ls <package>` in the monorepo within minutes; (2) pin the last known-good version in the lockfile via `npm install pkg@X.Y.Z --save-exact`; (3) evaluate whether to vendor the dependency or replace it; (4) post-incident, add the package to a `pnpm.neverBuiltDependencies` or `npm ignore-scripts` list if it ran install scripts. An internal package mirror (Verdaccio, GitHub Packages) provides the last line of defence — even if npm registry is down or a package is yanked, the mirror retains the last good version.",
+    "fj": "I'd run npm audit weekly and fix anything critical — that's enough.",
+    "fs": "npm audit alone reacts to published CVEs, which lag exploit availability by days to weeks. The lockfile + provenance + mirror stack is what makes the posture proactive rather than reactive.",
+    "level": "Staff",
+    "asked": 11,
+    "followups": [
+      {
+        "q": "How do you evaluate whether a transitive dependency CVE actually affects your service?",
+        "a": "Check whether your code ever reaches the vulnerable code path: (1) does the vulnerable function get called, (2) with attacker-controlled input? `npm audit` often flags a `moderate` CVE in a dev-only dependency that never ships to production — filter by `--omit=dev`. Use `npm audit --json | jq` to inspect the dependency chain and confirm whether the vulnerable package is in the production bundle at all."
+      },
+      {
+        "q": "What is Socket.dev and how does it differ from npm audit?",
+        "a": "Socket.dev analyzes packages for supply-chain risk signals beyond known CVEs: install scripts that run network requests, obfuscated code, new maintainers added recently, typosquatting patterns, and dependency confusion vectors. `npm audit` only checks against the npm advisory database (published CVEs). Socket catches the class of attacks that haven't yet been CVE'd — the 'malicious package' category that left-pad-style events represent."
+      }
+    ]
+  },
+  {
+    "q": "How do you define and enforce an org-wide Node.js service reliability contract — SLOs, error budgets, and on-call runbooks at Principal level?",
+    "a": "Reliability engineering at org scale needs three artifacts per service: an SLO declaration, an error budget policy, and a runbook. **SLO declaration**: each service owner publishes availability and latency SLOs in a machine-readable registry (YAML in the repo, ingested by the SLO platform). Typical baseline: 99.9% availability, p99 latency < 500 ms, measured over 30-day rolling window. Node.js-specific SLI choices: HTTP error rate (5xx / total), event-loop p99 lag as a proxy for latency degradation, and unhandled rejection rate (signals code-level error handling gaps). **Error budget policy**: when 50% of the monthly error budget is consumed, the team pauses new feature work and prioritizes reliability; at 100% consumed the team is in SRE-directed firefighting mode with mandatory post-incident reviews. **Runbooks**: each service has a `runbook/` directory in the repo with page-specific Markdown files linked from alerts. Runbook sections: symptoms, likely causes, diagnostic commands (exact `kubectl`, `psql`, or `curl` commands), escalation path. Node-specific runbook entries: event-loop saturation (run `clinic flame` against a pod), memory leak (trigger heap snapshot via the admin route), DB pool exhaustion (`SELECT count(*) FROM pg_stat_activity GROUP BY state`). **Governance**: SLO compliance is a quarterly engineering review agenda item; teams with chronic error budget burns go on a reliability sprint with Principal-level pairing.",
+    "fj": "I'd set up Datadog monitors for 5xx rate and page the on-call — that's a reliability system.",
+    "fs": "Monitors without SLOs tell you something broke; SLOs with error budgets tell you whether you have earned the right to ship features. The budget policy is the governance mechanism that makes the SLO real rather than decorative.",
+    "level": "Principal",
+    "asked": 8,
+    "followups": [
+      {
+        "q": "How do you calculate the error budget burn rate and why does it matter more than the raw error rate?",
+        "a": "Burn rate = (current error rate) / (1 - SLO target). A 99.9% SLO allows 0.1% errors. If your current error rate is 1%, burn rate = 1 / 0.1 = 10x — you will exhaust the monthly budget in 3 days (30 / 10). Burn rate normalizes the error rate against the budget, making it immediately actionable: a burn rate above 1x means you are on track to exhaust the budget before the window ends."
+      },
+      {
+        "q": "How do you measure event-loop p99 lag as an SLI in a Prometheus-based stack?",
+        "a": "Use `prom-client`'s `Histogram` with `monitorEventLoopDelay` feeding it: sample lag every 100 ms and record in a histogram. Export as `nodejs_eventloop_lag_seconds` with buckets at 0.01, 0.05, 0.1, 0.25, 0.5, 1. Prometheus query for p99: `histogram_quantile(0.99, rate(nodejs_eventloop_lag_seconds_bucket[5m]))`. Alert when p99 > 0.05 s sustained for 2 minutes."
+      }
+    ]
+  },
+  {
+    "q": "What is your org-wide strategy for adopting pnpm and Turborepo across 40+ Node.js services in a monorepo, and what are the migration risks?",
+    "a": "Migration has four phases with concrete go/no-go gates. **Phase 1 — Evaluation (2 weeks)**: benchmark `pnpm install` vs `npm ci` on the monorepo; measure disk usage reduction (symlinked store typically saves 40–60%); verify all services build cleanly with pnpm's stricter phantom-dependency detection. **Phase 2 — Tooling** (1 sprint): add `pnpm-workspace.yaml`; set `node-linker=hoisted` as a transitional mode for packages that rely on phantom deps (then eliminate those deps); introduce a `pnpm.overrides` entry for any duplicate packages. Add Turborepo `turbo.json` with a `build→test→lint` pipeline and a shared remote cache (Vercel or self-hosted S3). **Phase 3 — Service migration** (4–6 weeks): migrate services in dependency order (leaves first); lock the main branch and require new services to start with pnpm. **Migration risks**: phantom dependency failures (packages that `require` a dep not in their own `package.json` but hoisted by npm) — fix by adding explicit deps. Private package registry compatibility — test Verdaccio/GitHub Packages auth with pnpm. CI runner cache invalidation — pnpm's content-addressable store needs a different cache key than npm's `node_modules`. **Go/no-go gate**: all services' CI green + performance benchmark showing ≥30% reduction in install time before switching main-branch default.",
+    "fj": "I'd use npm workspaces — it's built in and doesn't require new tooling.",
+    "fs": "npm workspaces lack phantom-dep enforcement and don't have a remote task cache. At 40+ services the CI time savings from Turborepo's affected-only scheduling and remote cache pay back the migration cost within 2 sprints.",
+    "level": "Principal",
+    "asked": 9,
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "json",
+        "label": "turbo.json pipeline with remote cache",
+        "lines": [
+          "{",
+          "  \"$schema\":",
+          "    \"https://turbo.build/schema.json\",",
+          "  \"remoteCache\": { \"enabled\": true },",
+          "  \"tasks\": {",
+          "    \"build\": {",
+          "      \"dependsOn\": [\"^build\"],",
+          "      \"outputs\": [\"dist/**\"]",
+          "    },",
+          "    \"test\": { \"dependsOn\": [\"build\"] },",
+          "    \"lint\": {}",
+          "  }",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does pnpm's content-addressable store prevent duplicate installs across packages?",
+        "a": "pnpm stores each package version exactly once in a global content-addressable store (`~/.pnpm-store`). `node_modules` in each package contain hard links (or junctions on Windows) to the store rather than copies. If 40 services all depend on `lodash@4.17.21`, the actual files exist only once on disk. This eliminates the disk explosion that npm/yarn create with deeply nested `node_modules` trees."
+      },
+      {
+        "q": "What is a phantom dependency and why does pnpm's default strict mode surface them?",
+        "a": "A phantom dependency is a package that a service `require`s or `import`s but does NOT list in its own `package.json` — it works only because npm/yarn hoist it into the root `node_modules`. pnpm's default `node-linker=pnpm` uses a symlinked structure where each package can only see its own declared dependencies. Any phantom dependency fails with `MODULE_NOT_FOUND` immediately, forcing teams to make implicit deps explicit — improving correctness and portability."
+      }
+    ]
+  },
+  {
+    "q": "How do you mandate and roll out TypeScript adoption across a Node.js engineering org that still has 60% JavaScript services?",
+    "a": "Mandate rollout requires social, tooling, and governance components — technical enforcement alone creates resentment. **Social**: publish a dated ADR ('By 2026-Q2, all production services must be TypeScript') with a rationale grounded in real incidents (type errors caught in prod, refactoring bugs). Get principal engineers to sign off publicly. **Tooling bootstrap**: provide a `create-ts-service` scaffolding CLI that generates a pre-configured `tsconfig.json` (strict mode off initially), `ts-jest` config, `tsup` build, and a sample NestJS or Fastify service. Zero-friction onboarding is the adoption lever. **Gradual strictness ladder**: start with `\"strict\": false`, `\"noImplicitAny\": true` only. Schedule annual tightening: add `strictNullChecks` → `strictPropertyInitialization` → full `strict: true`. Each step is a monorepo-wide PR with automated fixes from `ts-migrate` or `ts-codemigrate`. **JS services migration**: use `allowJs: true` + `checkJs: true` as the first step — get type errors reported without rewriting. Then rename `.js` → `.ts` incrementally per file. Gate: all NEW services must be TypeScript from day 1 (enforced by the scaffolding CLI defaulting to TS and CI rejecting `*.js` entry points outside a legacy allowlist). **Sunset**: legacy JS services are added to an explicit allowlist with an owner and a target migration date; the allowlist shrinks quarterly.",
+    "fj": "I'd make TypeScript optional and let teams choose — forced adoption causes resistance.",
+    "fs": "Optional adoption creates a permanent split codebase. The correct balance is mandatory for new services (low friction) and a supported migration path for existing ones — not a free pass to stay on JS indefinitely.",
+    "level": "Principal",
+    "asked": 8,
+    "followups": [
+      {
+        "q": "What does `ts-migrate` do and what are its limitations?",
+        "a": "`ts-migrate` is a Airbnb-developed codemod that renames `.js` files to `.ts` and inserts `@ts-ignore` comments on every type error, producing a compilable but not type-safe result. It is a starting point, not a finish line. After running it, teams incrementally remove `@ts-ignore` comments and add proper types. The key metric is `@ts-ignore` count decreasing over time, tracked in CI."
+      },
+      {
+        "q": "How do you enforce that `tsconfig.json` strict settings are not loosened in service-level overrides?",
+        "a": "Publish a shared `@company/tsconfig` package that extends from `tsconfig/strict.json`. Services extend it: `{ \"extends\": \"@company/tsconfig/strict\" }`. A custom ESLint rule or CI script validates that service-level `tsconfig.json` files do not re-declare stricter-off flags like `\"strict\": false`. This ensures the shared base cannot be silently circumvented."
+      }
+    ]
+  },
+  {
+    "q": "How do you respond to a supply-chain compromise on a widely-used internal Node.js utility package (analogous to the left-pad or colors incidents)?",
+    "a": "A supply-chain incident has four phases with concrete time-bounds. **T+0 – Detection (< 15 min)**: automated npm audit CI gate fails across services; GitHub/Dependabot Advisory alert arrives; alternatively an engineer flags unexpected behaviour. Immediately file a P0 incident. **T+15 – Blast-radius assessment (< 1 hr)**: run `pnpm ls <package> --depth=Infinity` across the monorepo to enumerate all affected services and which version they pin. If the compromised package runs an install script, any service that ran `npm install` after the compromised publish is potentially affected — audit CI build logs for timeline. Treat any service that installed the compromised version as potentially executing attacker code; rotate secrets and tokens for those services. **T+1hr – Containment**: pin all affected services to the last clean version (`npm install pkg@GOOD_VER --save-exact`); merge and deploy with a fast-track review. If the package is non-essential, remove it. Push the fixed version of the internal package if you own it. **T+4hr – Eradication and hardening**: add the package to the internal mirror's blocklist at the compromised version range; enable `ignore-scripts` in `.npmrc` for packages that don't need install scripts; require provenance attestation for all internal publishes going forward; add the package to a post-mortem review. **Post-incident**: publish a blameless post-mortem; update the incident runbook with lessons; evaluate vendoring critical utilities.",
+    "fj": "I'd pin the package version in package.json and re-deploy — done in an hour.",
+    "fs": "Pinning is containment, not eradication. If the compromised version ran during a `npm install` in CI, the build environment may have executed attacker code — credential rotation and build environment isolation are the hard parts that teams miss.",
+    "level": "Principal",
+    "asked": 7,
+    "followups": [
+      {
+        "q": "How does `ignore-scripts` in `.npmrc` mitigate supply-chain risk?",
+        "a": "Many malicious npm packages execute their payload in `postinstall` or `preinstall` scripts. Setting `ignore-scripts=true` in `.npmrc` prevents any lifecycle scripts from running during install. This blocks the most common attack vector. The tradeoff: packages that require compilation (native addons) won't work — maintain an explicit allowlist via `pnpm.onlyBuiltDependencies` or `npm.optional` scripts for packages that legitimately need install scripts."
+      },
+      {
+        "q": "What is Sigstore/npm provenance and how does it improve the supply chain?",
+        "a": "Since npm 9.5 / Node 18+, `npm publish --provenance` generates a Sigstore attestation linking the published package to the exact GitHub Actions workflow run, commit SHA, and repository that built it. Consumers can verify with `npm audit signatures`. This prevents a compromised npm account from publishing a malicious version without the attestation showing it came from an unexpected build environment — it makes the publish-to-registry step auditable and tamper-evident."
+      }
+    ]
+  },
+  {
+    "q": "How do you make the platform decision between serverless (Lambda/Cloud Functions) and containers (ECS/GKE) for a Node.js org's compute strategy?",
+    "a": "The decision is multi-dimensional and should be made at the workload level, not the org level — most mature orgs run both. Evaluate on five axes. **Cold-start tolerance**: Lambda Node.js cold starts are 200–800 ms with a full NestJS app; for latency-sensitive synchronous APIs this is a non-starter without provisioned concurrency. For async workers (queue consumers, cron jobs, webhook handlers) cold starts are irrelevant. **Statelessness**: Lambda forces stateless design — no in-process caches, no WebSocket connections, no sticky state. This is a forcing function for correctness but a rewrite cost for existing stateful services. **Cost model**: serverless is cheaper for spiky, low-average traffic (pay per invocation); containers are cheaper for steady high-throughput (pay for reserved capacity). Break-even is roughly 1M–5M invocations/month depending on memory settings. **Ops complexity**: Lambda removes cluster management, node pool scaling, and OS patching; ECS/GKE requires platform engineering investment but offers full observability, custom runtimes, and no vendor lock-in. **Node.js-specific**: Lambda ships a managed Node runtime but lags Active LTS by months — you may be forced onto Node 20 long after 22 is LTS. Containers let you control the exact image. Decision heuristic: new async/event-driven workloads → Lambda; existing stateful services or latency-sensitive APIs → containers; mixed traffic → containers with KEDA-based autoscaling to Lambda-like cost curves.",
+    "fj": "I'd use Lambda for everything — it's cheaper and you don't manage servers.",
+    "fs": "Lambda is cheaper only for the right traffic shape. A 24/7 API on Lambda with provisioned concurrency often costs 3–5x the equivalent ECS Fargate spot. I run the cost model for both before committing.",
+    "level": "Principal",
+    "asked": 10,
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "ts",
+        "label": "Lambda cold-start: minimize bundle size",
+        "lines": [
+          "// esbuild: exclude aws-sdk (provided)",
+          "// esbuild src/handler.ts",
+          "//   --bundle --platform=node",
+          "//   --target=node22",
+          "//   --external:@aws-sdk/*",
+          "//   --minify --outfile=dist/handler.js",
+          "//",
+          "// Result: ~200KB vs 15MB with full NestJS",
+          "// cold start: ~120ms vs ~600ms"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you manage Node.js Lambda runtime version upgrades across hundreds of functions?",
+        "a": "Define the runtime in a shared IaC module (Terraform module or CDK Construct) and update it in one place. Use Lambda's `UpdateFunctionConfiguration` via a CI pipeline that targets all functions matching a tag. Set a Lambda deprecation alarm: AWS notifies you when a runtime is reaching EOL — treat that as a hard deadline. Test with `lambda:InvokeFunction` in a staging account before fleet-wide rollout."
+      },
+      {
+        "q": "What is KEDA and how does it bring Lambda-like autoscaling to containers?",
+        "a": "KEDA (Kubernetes Event-Driven Autoscaler) scales Kubernetes Deployments based on external event sources — SQS queue depth, Kafka consumer lag, Redis list length, or HTTP request rate via Prometheus metrics. At zero events it scales to zero pods (Lambda-like cost). At high event volume it scales to hundreds. This gives containers the cost profile of serverless for event-driven workloads while retaining container flexibility (custom runtimes, WebSockets, in-process caches)."
+      }
+    ]
   }
 ]

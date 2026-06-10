@@ -3158,5 +3158,217 @@
         "a": "The contract package exports only serialisable data interfaces and discriminated-union result types — no class implementations, no utility functions, no framework imports. Group types by domain (user, pipeline, report) rather than by endpoint, so each consuming package imports only the domains it needs. Enforce package boundaries with `eslint-plugin-import` no-restricted-imports rules that prevent `packages/contracts` from importing from application packages."
       }
     ]
+  },
+  {
+    "q": "How do you design variance-correct branded types for a shared TypeScript library so callers cannot accidentally subvert the brand through structural compatibility?",
+    "a": "Branded types work by adding a phantom property that cannot be forged through normal construction. The key Staff-level concern is variance: a covariant branded container like `Box<UserId>` must not be assignable to `Box<OrderId>` even though both are `Box<string>`. Achieve this by making the brand a `unique symbol` declared with `declare const` in a separate brands file and imported as a type, so each brand symbol is a distinct type-level identity. For container covariance, annotate the phantom as `readonly` on the specific brand intersection, not on a shared generic slot. In the shared library, export only the factory function and the type — never the brand symbol — so external packages cannot construct a fake brand.",
+    "fs": "Use `unique symbol` per brand declared in a shared brands file; export only the factory and the type; keep phantoms `readonly` so covariant containers stay brand-distinct.",
+    "fj": "Using a plain string literal tag `'__brand': 'UserId'` which is structurally forged by assigning a plain object with the same literal, defeating the nominal safety entirely.",
+    "level": "Staff",
+    "asked": 7,
+    "code": [
+      {
+        "label": "variance-correct unique symbol brand",
+        "lang": "ts",
+        "accent": "fix",
+        "lines": [
+          "// brands.ts — exported as type only",
+          "declare const _userId: unique symbol",
+          "declare const _orderId: unique symbol",
+          "export type UserId =",
+          "  string & { readonly [_userId]: never }",
+          "export type OrderId =",
+          "  string & { readonly [_orderId]: never }",
+          "export const mkUserId =",
+          "  (s: string) => s as UserId",
+          "// mkOrderId(uid) — compile error: brands differ"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is a string-literal tag (`'__brand': 'UserId'`) insufficient for a production brand, and what can an attacker (or a careless colleague) do to break it?",
+        "a": "The tag is just a structurally-matched property. Any object literal `{ '': value, '__brand': 'UserId' }` typed as `{ __brand: 'UserId' }` is assignable to the brand, and a spread or `Object.assign` on a plain string type that happens to carry the tag literal also satisfies it. A `unique symbol` cannot be forged because its identity is tied to a specific `const` declaration, not a value, so no external code can produce a matching symbol type."
+      },
+      {
+        "q": "How do you handle a branded type in a shared library that serialises to JSON and deserialises back?",
+        "a": "During serialisation, the brand phantom is erased (it never existed at runtime), so the JSON is a plain string. During deserialisation, wrap the JSON value with the factory: `mkUserId(raw.userId)`. Gate the factory with a runtime assertion if needed (`if (typeof s !== 'string') throw ...`). The brand is purely a compile-time guard; nothing special is needed for JSON round-trips beyond routing all construction through the factory."
+      },
+      {
+        "q": "When does variance in generic containers interact with brands to create unexpected assignability?",
+        "a": "A covariant generic `Container<T>` allows `Container<UserId>` to be assigned to `Container<string>` because `UserId extends string`. This can inadvertently allow writing a `UserId` to a `Container<OrderId>` if the container is invariant in name only. Make mutation containers invariant by using `-readonly` on the inner type or by structuring the phantom so neither `UserId extends OrderId` nor the reverse is true (ensured by distinct `unique symbol` tags)."
+      }
+    ]
+  },
+  {
+    "q": "When do complex conditional types hurt more than they help, and what are the practical refactoring strategies?",
+    "a": "Conditional types hurt when they: (1) generate millions of type instantiations causing multi-second editor lag (detectable via `--generateTrace`); (2) produce unreadable error messages because the resolved type is a huge nested conditional that the IDE shows expanded; (3) require deep nesting or mutual recursion that hits the 100-level recursion limit; (4) encode logic that runtime validation already handles, making the type an expensive promise that callers must still guard anyway. Refactoring strategies: hoist the conditional behind a named alias to trigger memoisation; replace a distributive conditional with explicit mapped type + `as never` key filtering; surface a simpler overloaded function signature instead of a conditional return type; or accept a slightly looser type and rely on narrowing at the call site. The Staff judgment call is weighing the maintainability and performance cost against the precision gain.",
+    "fs": "Complex conditionals hurt via trace-visible instantiation counts, opaque errors, and recursion limits; refactor by memoising with aliases, using mapped + key-filter, or simplifying to overloads.",
+    "fj": "Adding another layer of conditional type nesting to fix an edge case instead of checking the trace to confirm the type is not already costing 10× the check time.",
+    "level": "Staff",
+    "asked": 6,
+    "code": [
+      {
+        "label": "expensive conditional vs memoised alias",
+        "lang": "ts",
+        "accent": "bug",
+        "lines": [
+          "// SLOW: re-expands at every call site",
+          "type Flatten<T> =",
+          "  T extends Array<infer E>",
+          "    ? Flatten<E> : T",
+          "",
+          "// FASTER: TS caches the inner step",
+          "type FlattenOnce<T> =",
+          "  T extends Array<infer E> ? E : T",
+          "type Flatten2<T> =",
+          "  T extends Array<any>",
+          "    ? Flatten2<FlattenOnce<T>> : T"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you measure the performance cost of a conditional type before and after a refactor?",
+        "a": "Run `tsc --generateTrace out/` on the file that exercises the type, then open `out/types.json` and filter by the type's name. The `instantiationCount` field shows how many times it was expanded. After refactoring, re-run and compare. A well-memoised alias type reduces counts by an order of magnitude because TS caches the resolved alias rather than re-expanding the body for each new `T`."
+      },
+      {
+        "q": "When is an overloaded function signature a better alternative to a conditional return type?",
+        "a": "When the number of variants is small and each combination has a distinct, readable type — say two or three overloads — overloads give cleaner IDE completions and error messages than a conditional like `T extends string ? A : T extends number ? B : C`. Overloads are also immune to the instantiation explosion problem because the compiler checks the implementation signature once, not for every call-site instantiation."
+      }
+    ]
+  },
+  {
+    "q": "How do you establish and enforce a runtime validation strategy (Zod vs codegen) for an organisation that needs both browser bundle size constraints and server-side schema evolution?",
+    "a": "The organisation-level choice depends on two axes: who owns the schema (producer or consumer?) and where validation runs (browser, edge, server). Zod is runtime-first: schemas are TypeScript values that produce both types and validators, ideal when types originate in TypeScript and the bundle overhead (<14 kB gzipped) is acceptable. Codegen (protobuf+ts-proto, JSON Schema+quicktype, OpenAPI+openapi-typescript) is schema-first: a canonical IDL drives generated TypeScript types and validators, ideal for multi-language APIs where the contract is owned by a backend team in a different language. For a mixed org, the Staff/Principal pattern is: (1) all internal TypeScript-only APIs use Zod with shared schemas in `packages/contracts`; (2) external/cross-language APIs use codegen from the authoritative schema; (3) browser bundles tree-shake Zod per-page or use a lighter validator (valibot, ~1 kB) for client-side forms. The critical governance rule: validation code must live in one layer and not be duplicated — either derive from a shared schema or accept that drift is unavoidable.",
+    "fs": "Zod for TypeScript-owned contracts; codegen for cross-language schemas; lighter validators (valibot) for bundle-sensitive browser code; enforce one authoritative layer — no drift.",
+    "fj": "Using Zod on the frontend for every form field including tiny ones, importing the full library in every page bundle, without measuring the bundle cost or considering valibot.",
+    "level": "Principal",
+    "asked": 8,
+    "followups": [
+      {
+        "q": "How do you version a Zod schema in a shared library when breaking changes must not block dependent packages?",
+        "a": "Treat the schema package like a published API: use semver, never mutate `z.object` fields in a non-major release, and model schema evolution explicitly with `.optional()` on new fields. For consumers that need migration time, publish `v1/` and `v2/` sub-paths in the `exports` map so each package opts in to the new version independently. Document field additions as minor versions and field removals or type changes as major versions — identical to TypeScript type semver policy."
+      },
+      {
+        "q": "What is the 'parse, don't validate' principle, and why does it change how you structure TypeScript types around Zod schemas?",
+        "a": "Parse-don't-validate means the validated output should be a different, richer type than the raw input — not just the same type with a boolean flag. In Zod, `z.string().email()` produces a `string` at the type level, but you can brand the output: `z.string().email().transform(s => s as Email)`. After parsing, the type carries proof of validation; before parsing, it is raw input. This prevents mixing raw and validated data, which is the correct TypeScript discipline for trust boundaries."
+      }
+    ]
+  },
+  {
+    "q": "How do you define and maintain type-stability guarantees for a public-facing TypeScript library (semver for types)?",
+    "a": "Type-stability means a minor version bump must not break existing valid caller code. The principal's responsibility is to define the stability guarantee explicitly in the library README and enforce it with tooling. Use `@arethetypeswrong/cli` to verify that module resolution works correctly for all consumer TypeScript configs. Use `are-the-types-wrong` in CI and `dtslint` or manual type tests (`import { fn } from './'; fn(arg) satisfies ReturnType`) as regression tests. Breaking changes that affect types: removing an exported symbol, narrowing a parameter type, widening a return type (may break code that relied on the narrow type), renaming an interface, or changing variance. Add `@public`/`@beta`/`@internal` JSDoc tags so consumers know which parts of the API surface have stability promises. Principal discipline: the type changelog must accompany every release PR, and breaking type changes trigger a major version even if the runtime code is backward-compatible.",
+    "fs": "Semver for types: narrowing params, widening returns, removing exports, and variance changes are all breaking; enforce with `attw`, `dtslint`, and explicit stability tags per export.",
+    "fj": "Treating type changes as non-breaking as long as the JavaScript runtime output is unchanged, then receiving consumer bug reports when a `ReturnType<typeof fn>` in their code no longer compiles.",
+    "level": "Principal",
+    "asked": 9,
+    "code": [
+      {
+        "label": "Type regression test using satisfies",
+        "lang": "ts",
+        "accent": "fix",
+        "lines": [
+          "// type-tests/index.ts",
+          "// run via tsc --noEmit in CI",
+          "import { parseUser } from '../src'",
+          "",
+          "// assert exact return shape is preserved",
+          "declare const raw: unknown",
+          "const u = parseUser(raw)",
+          "u satisfies {",
+          "  id: string",
+          "  email: string",
+          "  createdAt: Date",
+          "}",
+          "// compile error on shape change"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is a 'type widening' breaking change, and why is it counter-intuitive to most engineers?",
+        "a": "If a library function returned `'asc' | 'desc'` and is widened to `string`, callers whose code used `switch (result)` with exhaustive checks on those literals will now get a compile error in the `default: assertNever(result)` branch because the switch is no longer exhaustive. Widening the return type breaks downstream exhaustive consumers. This is the opposite of the runtime intuition that 'more options is always backward-compatible'."
+      },
+      {
+        "q": "How do you test that a type change did NOT occur between versions in CI?",
+        "a": "Check in a `type-tests/` directory with `satisfies`-based assertions against the expected shape. These files are type-checked with `tsc --noEmit` in CI. On a version bump PR, any change to a tested shape surface is visible as a diff in the test file. If the tests still pass but the shape changed in a way not yet tested, `dtslint` snapshot tests or `expect-type` assertions catch the gap by failing on unexpected `assignable` / `not-assignable` changes."
+      }
+    ]
+  },
+  {
+    "q": "How do you sequence a TypeScript adoption mandate across an organisation of 80+ engineers that currently has mixed JS/TS, and what are the escape hatches that prevent mandate fatigue?",
+    "a": "A successful adoption mandate requires a sequenced rollout, not a flag day. Phase 1: make TypeScript the default for all new code by updating project generators and CI templates. Phase 2: require `strict: true` on all newly-created packages — existing packages inherit a looser base until explicitly opted in. Phase 3: mandate `strictNullChecks` on a domain-by-domain schedule (starting with the highest-churn domain first to maximise value, not the smallest to game the metric). Phase 4: add `noUncheckedIndexedAccess` org-wide after Phase 3 is complete. Escape hatches that prevent fatigue: (1) any package owner can defer Phase 3 by one quarter with a written justification tracked in the TS WG's ADR log; (2) exploratory packages (data science notebooks, one-off scripts) are permanently exempt but cannot be imported by non-exempt packages; (3) external contractor code enters at Phase 1, not Phase 3, to reduce onboarding friction. The escape hatch process must be transparent and time-limited — open-ended deferrals become permanent.",
+    "fs": "Sequence: new-code defaults → strict on new packages → strictNullChecks domain-by-domain → advanced flags; provide time-limited deferrals and a permanent exploratory-code exemption.",
+    "fj": "Issuing a mandate that all 80+ engineers must migrate to strict TypeScript by a hard deadline with no deferrals, producing mass `@ts-nocheck` adoption to meet the deadline instead of real migration.",
+    "level": "Principal",
+    "asked": 10,
+    "followups": [
+      {
+        "q": "How do you measure the business impact of TypeScript adoption to justify the investment to non-engineering stakeholders?",
+        "a": "Track: (1) post-deploy incident rate on TypeScript-migrated vs un-migrated services (null dereferences, wrong type passed to API); (2) PR review cycle time on TS files vs JS files (type annotations reduce reviewer cognitive load); (3) onboarding time for new engineers (TS-typed codebases have measurable faster ramp-up). Collect a 90-day baseline before the mandate and compare at 6 months. The most compelling metric for stakeholders is incident reduction on migrated surfaces."
+      },
+      {
+        "q": "What governance mechanism prevents the escape-hatch deferral process from becoming a permanent loophole?",
+        "a": "Each deferral is recorded in the WG ADR log with a named owner, an expiry date (max one quarter), and a documented reason. At expiry, the owner must either complete the migration or apply for a second deferral with a new justification. Three consecutive deferrals trigger an automatic escalation to engineering leadership. The log is public within the engineering org so there is social accountability — teams can see which packages have been deferred for six or more months."
+      }
+    ]
+  },
+  {
+    "q": "How do you standardise a runtime TypeScript version upgrade policy across 30+ packages with independently-owned semver dependencies in a monorepo?",
+    "a": "A TypeScript version is a shared singleton in a monorepo: all packages compile with the same `tsc` binary, so an upgrade either works for everyone or blocks CI for everyone. The policy must address: (1) who decides when to upgrade (the TS WG, not individual teams); (2) how to evaluate the upgrade (run `tsc` on every package in CI against the new version on a branch, triage errors into 'real bugs', 'inference improvements', and 'upstream TS regressions'); (3) what the rollout timeline is (a 4-week evaluation window, a 2-week fix window, a 1-week canary, then monorepo-wide bump in a single PR); (4) how to handle packages with locked transitive peer-deps on an older `typescript` version (add a `resolutions` or `overrides` entry in the root lockfile for the duration and file a deprecation notice to the package maintainer). The principal engineers own the upgrade evaluation, write the triage brief, and sign off on the rollout. Package owners own fixing errors in their domain during the fix window.",
+    "fs": "TS upgrade is a monorepo-wide event owned by the WG: evaluate on a branch, triage errors, fix in a 2-week window, canary, then single PR rollout — individual packages cannot pin their own TS version.",
+    "fj": "Letting teams pin different TypeScript versions in per-package `devDependencies`, producing a scenario where `tsc` runs different compiler versions across the monorepo and types are not consistent.",
+    "level": "Principal",
+    "asked": 7,
+    "followups": [
+      {
+        "q": "What categories of TypeScript version change most commonly break existing code, and how do you triage them quickly?",
+        "a": "The three common break categories: (a) inference improvements — TS now infers a narrower or more precise type where `any` was implicit; fix by adding an explicit annotation; (b) control-flow changes — a guard that was previously narrowing is no longer accepted; fix by rewriting the guard; (c) strictness flag expansion — a previously-ignored case is now checked under an existing strict flag. For each, the fix is mechanical and codemods cover most cases. Genuine regressions (TS is wrong) require an issue report and a workaround for the duration."
+      },
+      {
+        "q": "How do you handle a transitive dependency whose published types only compile on an older TypeScript version?",
+        "a": "Short-term: use `skipLibCheck: true` in the package's tsconfig to suppress declaration errors from that dependency, accepting that type-checking for its public API is incomplete. Medium-term: contribute a fix to the upstream package or maintain a local patch via `patch-package`. Long-term: evaluate whether the dependency can be replaced. Document the skip in a comment referencing the upstream issue number so the workaround is revisited when the upstream ships a fix."
+      }
+    ]
+  },
+  {
+    "q": "How do you make a platform team's TypeScript build-tooling decisions (esbuild vs tsc vs SWC) consistent across a large monorepo and evolve them without breaking teams?",
+    "a": "The platform team owns three layers: (1) the base tsconfig (`tsconfig.base.json`) that all packages extend and that encodes the organisation's strictness floor; (2) the build pipeline wrapper (a shared Turborepo task or Nx executor) that teams call — they do not write their own build scripts; (3) a compatibility contract: the wrapper's output must be valid TypeScript declarations consumable by `moduleResolution: node16` and `bundler`. Within the wrapper, the platform team can swap from `tsc` emit to `esbuild` + `tsc --emitDeclarationOnly` without teams noticing, as long as the output contract holds. The key discipline for evolution: never change the base tsconfig in a way that produces new type errors without running a monorepo-wide check and providing an automated codemod or amnesty period. Changes to the build wrapper are gated by a canary adoption pattern: one team per domain adopts the new wrapper version for two weeks before a monorepo-wide rollout.",
+    "fs": "Platform team owns base tsconfig + build wrapper; teams call the wrapper, not raw tools; wrapper internals can swap esbuild/tsc/swc as long as the declaration output contract holds; canary rollout gates all changes.",
+    "fj": "Letting each team own their build script and toolchain version, leading to 20 different tsconfig variants and a build tooling fragmentation that blocks coordinated version upgrades.",
+    "level": "Principal",
+    "asked": 8,
+    "code": [
+      {
+        "label": "Hybrid declaration emit — esbuild + tsc",
+        "lang": "ts",
+        "accent": "fix",
+        "lines": [
+          "// platform build wrapper (Turborepo task)",
+          "// fast JS/CJS/ESM emit via esbuild",
+          "esbuild src/index.ts --outdir=dist \\",
+          "  --format=esm --platform=node",
+          "",
+          "// declarations: emitDeclarationOnly",
+          "tsc --project tsconfig.build.json \\",
+          "  --emitDeclarationOnly",
+          "  --outDir dist/types",
+          "",
+          "// consumers import dist/index.js",
+          "// TS resolves dist/types/index.d.ts"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is `isolatedDeclarations` (TS 5.5) and how does it enable parallel declaration emit without full type inference?",
+        "a": "`isolatedDeclarations` requires every exported symbol to have an explicit type annotation so each file's declarations can be generated without running global inference. This makes declaration emit embarrassingly parallel: a tool like `oxc-transform` or `swc` can emit each file's `.d.ts` in isolation without seeing the whole program. The cost is annotation burden on exports; the gain is declaration emit that scales linearly with file count rather than quadratically with the type graph."
+      },
+      {
+        "q": "How do you ensure a build-tooling change from tsc to esbuild does not silently change the behaviour of const enums or namespaces?",
+        "a": "Enforce `erasableSyntaxOnly: true` in the base tsconfig before migrating the build tool. This bans `const enum`, runtime namespaces, and parameter properties — the constructs that `tsc` and esbuild handle differently. With the base tsconfig banning them, any package that used them must migrate before the build tool switch, so the switch itself introduces no behavioural change. CI catches violations during the enforcement phase."
+      }
+    ]
   }
 ]

@@ -67,6 +67,14 @@ export const ROLES: RoleDef[] = [
   { key: 'be', name: 'Backend Engineer', emoji: '🧩', family: 'Data & SWE', blurb: 'APIs, databases, services, scale' },
   { key: 'mobile', name: 'Mobile Engineer', emoji: '📱', family: 'Data & SWE', blurb: 'Flutter/Dart, app architecture, async', tag: 'new' },
   { key: 'applied-data-eng', name: 'Applied Data Engineer', emoji: '🛠️', family: 'Data & SWE', blurb: 'Pipelines + ML-ready data + reliability', tag: 'rising' },
+  // Language-led developer roles (interviews lead with the language + its drills)
+  { key: 'java-dev', name: 'Java Developer', emoji: '☕', family: 'Software Engineering', blurb: 'JVM, services, concurrency', tag: 'new' },
+  { key: 'python-dev', name: 'Python Developer', emoji: '🐍', family: 'Software Engineering', blurb: 'Python services, APIs, async, testing', tag: 'new' },
+  { key: 'ts-dev', name: 'TypeScript / Node.js Developer', emoji: '🟦', family: 'Software Engineering', blurb: 'TS, Node services, APIs, event loop', tag: 'new' },
+  { key: 'go-dev', name: 'Go Developer', emoji: '🐹', family: 'Software Engineering', blurb: 'Go services, goroutines, channels', tag: 'new' },
+  { key: 'rust-dev', name: 'Rust Developer', emoji: '🦀', family: 'Software Engineering', blurb: 'Ownership, async Rust, systems code', tag: 'new' },
+  { key: 'cpp-dev', name: 'C++ Developer', emoji: '🧮', family: 'Software Engineering', blurb: 'Modern C++, memory, performance', tag: 'new' },
+  { key: 'scala-dev', name: 'Scala Developer', emoji: '🔺', family: 'Software Engineering', blurb: 'Scala, FP, Spark, JVM', tag: 'new' },
   // AI / ML
   { key: 'ai', name: 'AI Engineer', emoji: '🤖', family: 'AI & ML', blurb: 'LLMs, RAG, agents, prompts' },
   { key: 'ml', name: 'ML Engineer', emoji: '🧠', family: 'AI & ML', blurb: 'Training, serving, ML systems' },
@@ -121,6 +129,13 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   'looker-dev': ['sql-coding', 'looker', 'bi', 'sql', 'dbt', 'modeling', 'gcp', 'git', ...CRAFT],
   swe: ['python-drills', 'sql-coding', 'python', 'typescript', 'nodejs', 'go', 'rust', 'cpp', 'sysd', 'sql', 'architecture', ...SHIP, 'kubernetes', 'observability', ...CRAFT],
   mobile: ['flutter', 'typescript', 'nodejs', 'apis', 'sysd', 'sql', 'architecture', ...SHIP, 'observability', ...CRAFT],
+  'java-dev': ['java-coding', 'java', 'apis', 'databases', 'sql', 'sysd', 'architecture', ...SHIP, 'observability', ...CRAFT],
+  'python-dev': ['python-drills', 'sql-coding', 'python', 'apis', 'databases', 'sql', 'sysd', 'architecture', ...SHIP, 'observability', ...CRAFT],
+  'ts-dev': ['typescript-coding', 'nodejs-coding', 'typescript', 'nodejs', 'apis', 'databases', 'sql', 'sysd', 'architecture', ...SHIP, 'observability', ...CRAFT],
+  'go-dev': ['go-coding', 'go', 'apis', 'databases', 'sql', 'sysd', 'architecture', ...SHIP, 'kubernetes', 'observability', ...CRAFT],
+  'rust-dev': ['rust-coding', 'rust', 'apis', 'databases', 'sysd', 'architecture', ...SHIP, 'observability', ...CRAFT],
+  'cpp-dev': ['cpp-coding', 'cpp', 'apis', 'databases', 'sysd', 'architecture', ...SHIP, 'observability', ...CRAFT],
+  'scala-dev': ['scala-coding', 'scala', 'spark', 'kafka', 'sql-coding', 'sql', 'sysd', 'architecture', ...SHIP, 'observability', ...CRAFT],
   ai: ['python-drills', 'llms', 'rag', 'agents', 'agentic-ai', 'vectordb', 'prompt', 'evals', 'python', 'mlsys', ...SHIP, 'prompt-lab', ...CRAFT],
   'applied-ai-eng': ['python-drills', 'llms', 'rag', 'agents', 'agentic-ai', 'prompt', 'evals', 'vectordb', 'python', 'mlsys', 'sql', ...SHIP, 'prompt-lab', ...CRAFT],
   'applied-data-eng': ['python-drills', 'sql-coding', 'python', 'scala', 'sql', 'spark', 'pyspark', 'snowflake', 'databricks', 'airflow', 'dbt', 'modeling', 'mlsys', 'data-reliability', ...SHIP, 'observability', ...CRAFT],
@@ -152,8 +167,50 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   all: [], // resolved dynamically to every track in content.ts
 };
 
-export const ROLE_FAMILIES = ['All', 'Data & SWE', 'AI & ML', 'BI & Analytics', 'Platform', 'Architect', 'AWS', 'GCP', 'Azure', 'Vendor'];
+export const ROLE_FAMILIES = ['All', 'Data & SWE', 'Software Engineering', 'AI & ML', 'BI & Analytics', 'Platform', 'Architect', 'AWS', 'GCP', 'Azure', 'Vendor'];
 
 export function roleByKey(key: RoleKey): RoleDef | undefined {
   return ROLES.find((r) => r.key === key);
+}
+
+/* ── Role-aware Learn-path ordering ──────────────────────────────────────────
+ * The section order and the pinned "Your path" cores are how the selected role
+ * actually changes what you see first (the onboarding "built from this" promise). */
+
+// Universal bundles + generic drill tracks: every role has them, so they never
+// define a role's identity and don't belong in its pinned cores.
+const NON_CORE = new Set([
+  ...SHIP, ...CRAFT, 'python-drills', 'sql-coding', 'java-coding',
+  'typescript-coding', 'nodejs-coding', 'go-coding', 'rust-coding',
+  'cpp-coding', 'scala-coding', 'pyspark-coding',
+]);
+
+/** Roles whose interviews lead with hands-on coding — they keep the coding-first default. */
+const CODING_FIRST = new Set<RoleKey>([
+  'swe', 'be', 'mobile', 'fde', 'aem-dev', 'palantir-fde',
+  'java-dev', 'python-dev', 'ts-dev', 'go-dev', 'rust-dev', 'cpp-dev', 'scala-dev',
+]);
+/** Infra-centric roles — their day job is Deploy & ship + On-call, so those lead. */
+const OPS_FIRST = new Set<RoleKey>(['platform', 'devops', 'sre', 'security', 'mlops']);
+
+const leadWith = (heads: Group[]): Group[] => [...heads, ...GROUP_ORDER.filter((g) => !heads.includes(g))];
+
+/** Section order for a role's Learn path. Unknown roles and 'all' fall back to the default. */
+export function groupOrderForRole(role: RoleKey): Group[] {
+  if (role === 'all' || !ROLE_TRACKS[role] || CODING_FIRST.has(role)) return GROUP_ORDER;
+  if (OPS_FIRST.has(role)) return leadWith(['deploy', 'oncall']);
+  // Everything else (data / AI / BI / vendor / cloud / architect) is concept-led —
+  // the tracks that define the role live in Concepts.
+  return leadWith(['concept', 'coding']);
+}
+
+/**
+ * The role's headline tracks — the first picks of its registry order minus
+ * universals/drills. Drives the pinned "Your path" section. Empty for 'all'
+ * (its track list resolves dynamically) and for unknown roles.
+ */
+export function coreTracksForRole(role: RoleKey): string[] {
+  const list = ROLE_TRACKS[role];
+  if (!list || list.length === 0) return [];
+  return list.filter((slug) => !NON_CORE.has(slug)).slice(0, 4);
 }

@@ -314,6 +314,8 @@ const RAW_TRACKS: Track[] = [
   { slug: 'go-coding', name: 'Go Coding', color: 'kafka', icon: '🐹', q: 0, domain: 'de', group: 'coding' },
   { slug: 'rust-coding', name: 'Rust Coding', color: 'dbt', icon: '🦀', q: 0, domain: 'de', group: 'coding' },
   { slug: 'java-coding', name: 'Java Coding', color: 'dbt', icon: '☕', q: 0, domain: 'de', group: 'coding' },
+  { slug: 'cpp-coding', name: 'C++ Coding', color: 'sysd', icon: '🧮', q: 0, domain: 'de', group: 'coding' },
+  { slug: 'scala-coding', name: 'Scala Coding', color: 'spark', icon: '🔺', q: 0, domain: 'de', group: 'coding' },
   // ── On-call / production lesson units ──
   { slug: 'spark-oncall', name: 'Spark On-Call', color: 'spark', icon: '🔥', q: 0, domain: 'de', group: 'oncall' },
   { slug: 'cr-sql', name: 'SQL Bug Hunt', color: 'sql', icon: '🔎', q: 0, domain: 'de', group: 'oncall' },
@@ -369,6 +371,7 @@ const SKILL_CATEGORY_OF: Record<string, SkillCategory> = {
   'pyspark-coding': 'Coding practice', 'typescript-coding': 'Coding practice',
   'nodejs-coding': 'Coding practice', 'go-coding': 'Coding practice',
   'rust-coding': 'Coding practice', 'java-coding': 'Coding practice',
+  'cpp-coding': 'Coding practice', 'scala-coding': 'Coding practice',
   // Data Engineering tooling
   spark: 'Data Engineering', kafka: 'Data Engineering', dbt: 'Data Engineering',
   airflow: 'Data Engineering', snowflake: 'Data Engineering', databricks: 'Data Engineering',

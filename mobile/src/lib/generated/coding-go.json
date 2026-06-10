@@ -193,5 +193,341 @@
     "why": "An unbuffered channel blocks the sender until a receiver is ready. With no receiver, the goroutine deadlocks. A buffer of 1 lets the send complete immediately; add a receiver elsewhere when the value must be consumed.",
     "fj": "\"Move the send to a goroutine — that unblocks the main function.\"",
     "fs": "\"Buffer size 1 decouples sender from receiver; a goroutine-only fix just moves the leak.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Jr",
+    "level": "Jr",
+    "tool": "Go",
+    "q": "What does this program print?",
+    "lang": "go",
+    "lines": [
+      "x := 1",
+      "if x := x + 10; x > 5 {",
+      "  fmt.Println(x)",
+      "}",
+      "fmt.Println(x)"
+    ],
+    "opts": [
+      { "t": "11 then 1", "ok": true },
+      { "t": "11 then 11", "ok": false, "why": ":= inside the if creates a new x scoped to the if block; outer x is unchanged." },
+      { "t": "1 then 1", "ok": false, "why": "The if condition uses := which shadows x; the condition is true (11 > 5), so 11 is printed first." },
+      { "t": "Compile error — x declared twice", "ok": false, "why": "Go allows := to shadow an outer variable in an inner scope; it is legal and common." }
+    ],
+    "why": "The short variable declaration in the if initializer creates a new x scoped to that if block. Prints 11 inside the block, then the outer x (still 1) after. This := shadowing silently hides mutations.",
+    "fj": "\":= inside if updates the outer variable.\"",
+    "fs": "\":= in an if initializer always creates a new block-scoped variable; outer scope is untouched.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Jr",
+    "level": "Jr",
+    "tool": "Go",
+    "q": "Does modifying v inside range change the slice?",
+    "lang": "go",
+    "lines": [
+      "nums := []int{1, 2, 3}",
+      "for _, v := range nums {",
+      "  v *= 2",
+      "}",
+      "fmt.Println(nums)"
+    ],
+    "opts": [
+      { "t": "[1 2 3] — range gives a copy; nums is unchanged", "ok": true },
+      { "t": "[2 4 6] — v is a reference into nums", "ok": false, "why": "range copies each element into v; mutating v does not affect the slice." },
+      { "t": "Panic — cannot modify a range variable", "ok": false, "why": "Modifying v is legal; it just has no effect on the original slice because v is a copy." }
+    ],
+    "why": "The range loop copies each element into v. Mutating v only changes the local copy. To modify elements in place use a numeric index: nums[i] *= 2.",
+    "fj": "\"v is an alias into the slice, so *= updates it.\"",
+    "fs": "\"range always copies the value; use the index to write back to the slice.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Sr",
+    "level": "Sr",
+    "tool": "Go",
+    "q": "What is wrong with this WaitGroup usage?",
+    "lang": "go",
+    "lines": [
+      "var wg sync.WaitGroup",
+      "for i := 0; i < 3; i++ {",
+      "  go func() {",
+      "    wg.Add(1)",
+      "    defer wg.Done()",
+      "    work(i)",
+      "  }()",
+      "}",
+      "wg.Wait()"
+    ],
+    "opts": [
+      { "t": "wg.Add(1) is inside the goroutine; wg.Wait() may return before all goroutines start", "ok": true },
+      { "t": "wg.Done() must be called before work(i) returns", "ok": false, "why": "defer wg.Done() runs after work returns, which is correct; the issue is Add placement." },
+      { "t": "sync.WaitGroup cannot be used inside goroutines", "ok": false, "why": "WaitGroup is designed for goroutine coordination; the bug is the race on Add." }
+    ],
+    "why": "wg.Add must be called before the goroutine launches so the counter is incremented before Wait is reached. With Add inside the goroutine, the scheduler may run wg.Wait() before any goroutine calls Add, causing Wait to return immediately.",
+    "fj": "\"Add can go anywhere inside the goroutine.\"",
+    "fs": "\"Call wg.Add(1) before go func() so the counter is set before Wait can see zero.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Sr",
+    "level": "Sr",
+    "tool": "Go",
+    "q": "This defer runs in a loop. What is the problem?",
+    "lang": "go",
+    "lines": [
+      "func processAll(ids []int) error {",
+      "  for _, id := range ids {",
+      "    tx, err := db.Begin()",
+      "    if err != nil {",
+      "      return err",
+      "    }",
+      "    defer tx.Rollback()",
+      "    if err := doWork(tx, id); err != nil {",
+      "      return err",
+      "    }",
+      "    tx.Commit()",
+      "  }",
+      "  return nil",
+      "}"
+    ],
+    "opts": [
+      { "t": "All Rollback calls are deferred until processAll returns, so DB connections accumulate across iterations", "ok": true },
+      { "t": "tx.Commit() should be deferred too", "ok": false, "why": "Deferring Commit would run after Rollback, likely on an already-closed transaction." },
+      { "t": "Rollback after Commit is harmless and this is idiomatic", "ok": false, "why": "Post-commit Rollback is a no-op, but the real bug is accumulating open transactions." }
+    ],
+    "why": "defer is function-scoped, so tx.Rollback() for every iteration queues up and fires only when processAll returns. Each loop iteration holds an open transaction. Fix: wrap the body in a helper function or closure that returns an error, keeping defer scoped to that inner call.",
+    "fj": "\"defer at the top of a loop body runs at the end of each iteration.\"",
+    "fs": "\"defer is function-scoped; extract loop body to a function so defer fires per iteration.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Staff",
+    "level": "Staff",
+    "tool": "Go",
+    "q": "This middleware leaks goroutines in production. What is the bug?",
+    "lang": "go",
+    "lines": [
+      "func Middleware(next http.Handler)",
+      "    http.Handler {",
+      "  return http.HandlerFunc(",
+      "    func(w http.ResponseWriter,",
+      "         r *http.Request) {",
+      "      ctx := r.Context()",
+      "      ch := make(chan Result)",
+      "      go func() {",
+      "        ch <- compute(ctx)",
+      "      }()",
+      "      select {",
+      "      case res := <-ch:",
+      "        render(w, res)",
+      "      case <-ctx.Done():",
+      "        http.Error(w, \"cancelled\",",
+      "          499)",
+      "      }",
+      "    })",
+      "}"
+    ],
+    "opts": [
+      { "t": "When ctx is cancelled, the goroutine blocks on ch <- compute(ctx) forever because nobody reads ch", "ok": true },
+      { "t": "compute should not receive ctx; it causes a data race", "ok": false, "why": "Passing ctx to compute is correct and idiomatic; the leak is the unbuffered channel after cancel." },
+      { "t": "select should use default to avoid blocking", "ok": false, "why": "A default case would return immediately before compute finishes; it does not fix the goroutine leak." }
+    ],
+    "why": "When the client disconnects, ctx.Done() fires and the handler returns. But compute(ctx) may still be running and tries to send on ch — nobody reads it anymore, so the goroutine leaks. Fix: make ch buffered (size 1) so the goroutine can send even after the handler has moved on.",
+    "fj": "\"The goroutine will stop because ctx is cancelled.\"",
+    "fs": "\"ctx cancellation stops compute eventually, but the send on ch still blocks; buffer ch with size 1.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Staff",
+    "level": "Staff",
+    "tool": "Go",
+    "q": "A latency spike appears after this code runs for hours. What is the subtle bug?",
+    "lang": "go",
+    "lines": [
+      "func poll(ctx context.Context) {",
+      "  for {",
+      "    select {",
+      "    case <-ctx.Done():",
+      "      return",
+      "    case <-time.After(",
+      "        500 * time.Millisecond):",
+      "      doWork()",
+      "    }",
+      "  }",
+      "}"
+    ],
+    "opts": [
+      { "t": "time.After creates a new timer each iteration; unevaluated timers accumulate until GC runs", "ok": true },
+      { "t": "doWork() blocks the select and delays the next tick", "ok": false, "why": "doWork blocking delays timing but does not cause a memory leak or GC pressure over time." },
+      { "t": "select has two cases so only one fires per iteration; the other leaks", "ok": false, "why": "select always drains exactly one case; the issue is the Timer value created by time.After not being stopped." }
+    ],
+    "why": "time.After(d) allocates a time.Timer internally. If the ctx.Done() case fires first, the unused timer is not garbage-collected until it fires (500 ms later), but creating one per tight loop iteration causes rapid timer heap growth and GC pressure. Fix: create a time.NewTicker or use time.NewTimer outside the loop and Reset it.",
+    "fj": "\"time.After is just a channel; it's cleaned up immediately.\"",
+    "fs": "\"time.After allocates a Timer that only GCs after it fires; use a Ticker or NewTimer+Reset in loops.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Staff",
+    "level": "Staff",
+    "tool": "Go",
+    "q": "A function processes a 1 GB log chunk and returns a 10-byte summary. Memory stays high. Why?",
+    "lang": "go",
+    "lines": [
+      "func summarize(log []byte) []byte {",
+      "  return log[:10]",
+      "}"
+    ],
+    "opts": [
+      { "t": "The returned slice shares the backing array of log; the 1 GB array is pinned in memory", "ok": true },
+      { "t": "log[:10] allocates a new 10-byte slice; the original is freed normally", "ok": false, "why": "Slicing never copies; the sub-slice header still points to the original backing array." },
+      { "t": "The GC collects log once summarize returns because it is no longer referenced", "ok": false, "why": "The returned sub-slice holds a reference to the backing array; GC cannot collect it." }
+    ],
+    "why": "log[:10] returns a slice header whose Data pointer points into the original 1 GB array. As long as the caller holds the result, the full array stays alive. Fix: return a copy — out := make([]byte, 10); copy(out, log[:10]); return out.",
+    "fj": "\"The sub-slice is 10 bytes, so only 10 bytes are kept.\"",
+    "fs": "\"Any sub-slice pins the entire backing array; always copy when the parent array is large.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Staff",
+    "level": "Staff",
+    "tool": "Go",
+    "q": "A mutex is embedded in a struct passed by value. What goes wrong?",
+    "lang": "go",
+    "lines": [
+      "type Cache struct {",
+      "  sync.Mutex",
+      "  data map[string]int",
+      "}",
+      "",
+      "func update(c Cache) {",
+      "  c.Lock()",
+      "  defer c.Unlock()",
+      "  c.data[\"k\"] = 1",
+      "}"
+    ],
+    "opts": [
+      { "t": "update receives a copy of Cache; locking the copy does not protect the original", "ok": true },
+      { "t": "Embedding sync.Mutex is invalid; use a pointer field instead", "ok": false, "why": "Embedding sync.Mutex is idiomatic Go; the bug is passing the struct by value, not the embedding style." },
+      { "t": "c.Lock() will deadlock because Mutex is embedded", "ok": false, "why": "Embedded Mutex promotion works correctly; no deadlock occurs — but the lock is on the copy, not the original." }
+    ],
+    "why": "sync.Mutex must not be copied after first use. Passing Cache by value copies the mutex state. The lock in update is on a separate copy, so concurrent callers of the original are unprotected. Fix: change the signature to func update(c *Cache).",
+    "fj": "\"Embedding a Mutex means locking works on any copy of the struct.\"",
+    "fs": "\"A copied Mutex is a different Mutex; always pass structs with embedded Mutexes by pointer.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Principal",
+    "level": "Principal",
+    "tool": "Go",
+    "q": "This shared library function has an org-wide blast-radius flaw. What is it?",
+    "lang": "go",
+    "lines": [
+      "// package registry (shared library)",
+      "var handlers =",
+      "  map[string]Handler{}",
+      "",
+      "func Register(",
+      "  name string, h Handler) {",
+      "  handlers[name] = h",
+      "}",
+      "",
+      "func Dispatch(",
+      "  name string) Handler {",
+      "  return handlers[name]",
+      "}"
+    ],
+    "opts": [
+      { "t": "handlers is a package-level mutable map with no synchronisation; concurrent Register/Dispatch calls race", "ok": true },
+      { "t": "Returning Handler directly is unsafe; callers should receive a copy", "ok": false, "why": "Handler is an interface (a pointer-like value); returning it is fine. The race is on the unsynchronised map." },
+      { "t": "The map should be initialised with make in an init() function", "ok": false, "why": "The composite literal initialises the map correctly; the bug is the missing mutex, not the initialisation style." }
+    ],
+    "why": "A package-level map mutated by Register while Dispatch reads it is a data race under the Go memory model. Any service importing this library that calls Register (e.g., at startup) and Dispatch (e.g., at request time) concurrently will crash. Fix: protect with sync.RWMutex, or use sync.Map.",
+    "fj": "\"Package-level maps are safe because Go initialises them at startup.\"",
+    "fs": "\"Package-level mutable maps shared across goroutines require a RWMutex; a race here takes down every importing service.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Principal",
+    "level": "Principal",
+    "tool": "Go",
+    "q": "A shared library uses init() to register itself. What is the org-wide risk?",
+    "lang": "go",
+    "lines": [
+      "// package telemetry (shared lib)",
+      "func init() {",
+      "  conn, err :=",
+      "    net.Dial(\"tcp\",",
+      "      \"metrics:9090\")",
+      "  if err != nil {",
+      "    panic(err)",
+      "  }",
+      "  globalConn = conn",
+      "}"
+    ],
+    "opts": [
+      { "t": "init() panics if the metrics host is unreachable, crashing every binary that imports this package", "ok": true },
+      { "t": "init() runs after main(), so the connection is established too late", "ok": false, "why": "init() runs before main(); timing is not the problem here." },
+      { "t": "net.Dial should not be called in init() because the network is not initialised yet", "ok": false, "why": "The network stack is available at init() time; the risk is the unconditional panic on failure." }
+    ],
+    "why": "Putting I/O and panic inside init() is a library anti-pattern. Any binary — including test runners, CLIs, and microservices — that imports this package will panic at startup if metrics:9090 is unreachable. This is an org-wide availability blast radius. Libraries should expose an explicit Init(cfg) or New() that callers invoke deliberately and can handle errors from.",
+    "fj": "\"init() is the right place to set up shared connections so they're ready before main.\"",
+    "fs": "\"init() that panics on I/O failure crashes every importer; expose an explicit constructor that returns an error.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Principal",
+    "level": "Principal",
+    "tool": "Go",
+    "q": "A shared HTTP helper spawns a goroutine per request. What is the systemic risk?",
+    "lang": "go",
+    "lines": [
+      "// package httputil (shared lib)",
+      "func TraceRequest(",
+      "  r *http.Request) {",
+      "  go func() {",
+      "    payload := buildTrace(r)",
+      "    traceClient.Send(payload)",
+      "  }()",
+      "}"
+    ],
+    "opts": [
+      { "t": "Under high load each request spawns an unbounded goroutine; memory and scheduler pressure cause service-wide OOM", "ok": true },
+      { "t": "traceClient.Send may race with other goroutines reading r", "ok": false, "why": "buildTrace copies needed fields before the goroutine diverges; the main issue is unbounded goroutine growth." },
+      { "t": "The goroutine leaks because r is captured by reference and may outlive the request", "ok": false, "why": "r is a pointer that outlives the handler; it does not leak. The scalability flaw is the unbounded goroutines." }
+    ],
+    "why": "Every request spawns a new goroutine with no backpressure. At 10k RPS the service creates 10k goroutines/s. Each goroutine costs ~4 KB stack; traceClient.Send adds latency variability. The fix is a bounded worker pool or a buffered channel queue with a fixed number of senders. Any service importing this helper inherits the behaviour.",
+    "fj": "\"Goroutines are cheap; spawning one per request is the idiomatic Go pattern.\"",
+    "fs": "\"Goroutines are cheap individually but unbounded spawn per request causes OOM at scale; use a bounded pool.\""
+  },
+  {
+    "kind": "choice",
+    "tag": "Spot the bug · Principal",
+    "level": "Principal",
+    "tool": "Go",
+    "q": "A shared error helper silently drops errors. What is the blast-radius risk?",
+    "lang": "go",
+    "lines": [
+      "// package dbutil (shared lib)",
+      "func MustExec(",
+      "  db *sql.DB,",
+      "  query string,",
+      "  args ...any) {",
+      "  _, err := db.Exec(",
+      "    query, args...)",
+      "  if err != nil {",
+      "    log.Printf(",
+      "      \"exec error: %v\", err)",
+      "  }",
+      "}"
+    ],
+    "opts": [
+      { "t": "Errors are only logged; callers cannot detect failure, so silent data loss propagates org-wide", "ok": true },
+      { "t": "log.Printf is not safe for concurrent use and will race", "ok": false, "why": "The standard log package is goroutine-safe; the problem is swallowing the error, not logger safety." },
+      { "t": "MustExec should panic on error like database/sql conventions suggest", "ok": false, "why": "Panicking on every DB error would crash request handlers; returning the error is the correct contract." }
+    ],
+    "why": "MustExec logs the error but returns nothing; every caller treats the mutation as successful. In audit trails, financial ledgers, or idempotency tables this means silent data loss. Naming it Must signals it will panic (Go convention), but it neither panics nor returns errors. Fix: rename to TryExec and return error, or panic explicitly if that is the intended contract. Org-wide adoption amplifies each silent failure.",
+    "fj": "\"Logging the error is enough; callers don't need to check it every time.\"",
+    "fs": "\"Swallowed errors are invisible to callers; in a shared library this silently corrupts data across every service that imports it.\""
   }
 ]

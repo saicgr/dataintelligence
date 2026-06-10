@@ -1272,5 +1272,207 @@
         "a": "Go. The service has no stated memory, latency, or safety boundary requirements that justify Rust's adoption cost. Go's goroutine model, standard library HTTP server, and `net/http` tooling are production-proven for this exact use case. The team can ship in weeks rather than months, onboarding is trivial, and the hiring pool is larger. If the service later shows GC pause or memory issues in production, that's the concrete signal to evaluate a Rust rewrite for the specific hot path — not a speculative pre-optimisation."
       }
     ]
+  },
+  {
+    "q": "When do you choose Tokio's `current_thread` runtime over the multi-threaded scheduler, and how do you right-size the blocking thread pool?",
+    "a": "Use `current_thread` (single-OS-thread event loop) when all futures are `!Send` — for example, browser Wasm targets, CLI tools with short-lived work, or servers using `LocalSet` for per-connection non-Send state. The multi-thread scheduler runs tasks on a work-stealing thread pool sized to CPU count by default; it maximises CPU utilisation for I/O-bound services but requires all futures crossing task boundaries to be `Send`. Blocking thread pool (`spawn_blocking`) defaults to 512 threads — sufficient for sporadic blocking I/O but wasteful if overused. I tune it with `Builder::max_blocking_threads` based on `tokio-console`'s blocking-thread saturation metric. A common mistake is setting it to CPU count by analogy with async workers; the blocking pool should be sized to worst-case concurrent blocking calls, not CPU cores.",
+    "fj": "I just use the default multi-thread runtime for everything.",
+    "fs": "The key split is `Send`-ability of futures vs blocking call rate. I choose the scheduler first (multi vs single thread), then tune `max_blocking_threads` empirically with `tokio-console`, not by guessing at a number.",
+    "level": "Staff",
+    "asked": 12,
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "rust",
+        "label": "current_thread + LocalSet",
+        "lines": [
+          "use tokio::runtime::Builder;",
+          "use tokio::task::LocalSet;",
+          "",
+          "fn main() {",
+          "    let rt = Builder::new_current_thread()",
+          "        .enable_all()",
+          "        .build()",
+          "        .unwrap();",
+          "    let local = LocalSet::new();",
+          "    local.block_on(&rt, async {",
+          "        // !Send futures allowed here",
+          "        tokio::task::spawn_local(",
+          "            non_send_task()",
+          "        ).await.unwrap();",
+          "    });",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is work-stealing in Tokio's multi-thread scheduler and when does it help?",
+        "a": "Each worker thread has a local run queue. When a worker exhausts its queue it steals tasks from another worker's queue. This prevents one overloaded thread from becoming a bottleneck when others are idle — common when tasks have unequal durations. Work-stealing helps most under bursty, uneven load. It adds a small overhead (atomic compare-exchange on the steal path) that matters only when tasks are extremely fine-grained and short; in that case batching tasks into slightly coarser units recovers the overhead."
+      },
+      {
+        "q": "How do you diagnose a Tokio executor thread that is consistently at 100% CPU?",
+        "a": "First I check `tokio-console` for tasks with high poll counts and long poll durations — a task polling for microseconds in a tight loop without yielding (a busy-wait) starves other tasks on the same thread. Common culprits: a `loop {}` with no `.await`, a CPU-heavy computation inline in an async block, or a blocking call (`std::fs`, `std::net`) that was not wrapped in `spawn_blocking`. The fix is either `spawn_blocking` for blocking work or inserting `tokio::task::yield_now().await` in tight CPU loops to give the scheduler a chance to run other tasks."
+      }
+    ]
+  },
+  {
+    "q": "How do you architect lifetime relationships in a large codebase to avoid lifetime parameter explosion across dozens of types?",
+    "a": "Lifetime proliferation occurs when every type that stores a reference needs its own `'a` parameter, which then infects every type that contains it. Three strategies contain this. First, **arena allocation** (`bumpalo` or `typed-arena`): all objects are allocated from a single arena with one lifetime `'arena`; the arena owns everything, so inter-object references share the same lifetime without propagating it through the call graph. Second, **owned data at boundaries**: types that cross module or thread boundaries hold owned data (`String`, `Vec`, `Arc`) rather than references; borrowed types are short-lived, local, and never escape the function. Third, **index-based data structures**: store objects in a `Vec` and refer to them by `usize` index rather than reference — completely sidesteps borrow lifetime tracking at the cost of explicit bounds checking. I use lifetime parameters only when zero-copy parsing or tight-loop performance requires it, and I isolate those types in a dedicated `views` module.",
+    "fj": "I just add `'a` to every struct that holds a reference and let the compiler sort it out.",
+    "fs": "Adding `'a` everywhere is the path to unmaintainable code. I decide at the module boundary: is this a short-lived view (borrows OK) or a long-lived node in a graph (owned or indexed)? That decision keeps lifetimes local and prevents them leaking into unrelated types.",
+    "level": "Staff",
+    "asked": 9,
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "rust",
+        "label": "arena allocation with bumpalo",
+        "lines": [
+          "use bumpalo::Bump;",
+          "",
+          "struct Node<'a> {",
+          "    val: i32,",
+          "    next: Option<&'a Node<'a>>,",
+          "}",
+          "",
+          "fn build_list(arena: &Bump) {",
+          "    let n1 = arena.alloc(Node {",
+          "        val: 1,",
+          "        next: None,",
+          "    });",
+          "    let n2 = arena.alloc(Node {",
+          "        val: 2,",
+          "        next: Some(n1),",
+          "    });",
+          "    // n1, n2 share 'arena lifetime",
+          "    // no Rc/Box needed",
+          "    let _ = n2;",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When is index-based data structure preferable to arena allocation?",
+        "a": "Arena allocation still requires a lifetime parameter threading through every type that holds a node reference. Index-based structures use `usize` and completely eliminate lifetime parameters — the trade-off is bounds-check overhead and the need to manage a stable index namespace (deletions leave holes unless you use a slot map like the `slotmap` crate). I prefer index-based when the graph is long-lived, mutable, and shared across many modules; arenas when the graph is short-lived and read-heavy after construction."
+      }
+    ]
+  },
+  {
+    "q": "How do you introduce Rust into a primarily C++ organisation: where do you start, how do you staff it, and what bridging strategy do you use?",
+    "a": "**Where to start**: not a rewrite — a new, isolated service or a compute-intensive library with a clean C API surface. Ideal first targets are latency-critical microservices with no shared mutable state (stateless parser, codec, rule engine) or a new tooling binary used internally. Avoid any Rust project that requires deep interop with C++ template-heavy code on day one — the `cxx` crate handles it but the cognitive load is high for new Rust engineers. **Staffing**: I hire one or two experienced Rust engineers first (they set the idiom baseline and review PRs) before expecting the C++ team to self-serve. Plan for 3–4 months before a C++ engineer writes production Rust independently; provide Rustlings, a guided first PR pairing, and a Slack channel with a fast feedback loop. **Bridging strategy**: `cxx` (the Jon Turney/GNOME project) for bidirectional, safe C++↔Rust interop with zero-overhead generated shims; `bindgen` for consuming opaque C headers; `cbindgen` for exposing Rust to C callers. For CMake-heavy projects, `corrosion` integrates Rust `cargo build` into CMake as a first-class build target. The key commitment: the Rust service must be deployable and monitorable with the same infra tooling the C++ team already uses — same observability stack, same deploy pipeline — or you create a two-tier ops burden.",
+    "fj": "Just start with a full Rust rewrite of the most complex C++ service.",
+    "fs": "Rewrites as the entry point have the worst risk-to-value ratio. The first Rust project must be small enough to ship in 2–3 months and impactful enough to generate visible wins that justify the investment. A rewrite of a complex C++ service is neither.",
+    "level": "Principal",
+    "asked": 8,
+    "followups": [
+      {
+        "q": "What is the `cxx` crate and how does it differ from raw FFI via `bindgen`?",
+        "a": "`cxx` generates type-safe C++/Rust bridge code from a shared interface definition written in Rust. It exposes a restricted type system (no raw pointers in the bridge) and generates both the Rust and C++ side of the FFI, so the contract is checked at compile time on both sides. `bindgen` generates unsafe Rust bindings from C/C++ headers — you get raw pointer types and must write the safe wrapper yourself. `cxx` is better when you control both codebases; `bindgen` is better for third-party C libraries where you can't modify headers."
+      }
+    ]
+  },
+  {
+    "q": "What is `cargo vet`, how do you bootstrap a trust chain for it, and how does it differ from `cargo audit`?",
+    "a": "`cargo vet` is Mozilla's supply-chain auditing tool that requires every dependency version in `Cargo.lock` to be explicitly audited or trusted through a chain of imported attestations. Each audit entry in `supply-chain/audits.toml` asserts that a human reviewed the crate source and attests a specific criteria (e.g., `safe-to-deploy`, `safe-to-run`). **Bootstrapping**: run `cargo vet init`, which marks all current dependencies as exempted (trusted without audit), then start auditing new dependencies as they are added — existing exemptions shrink over time as engineers complete audits. **Importing trust chains**: `cargo vet import mozilla` pulls Mozilla's published audit set, instantly covering thousands of widely-used crates reviewed by their security team. You can import from any org that publishes an `audits.toml`. **vs `cargo audit`**: `cargo audit` checks against the RustSec advisory database for *known* CVEs — reactive, post-disclosure. `cargo vet` is proactive — it requires human review of source code *before* a version enters your build. They are complementary: `cargo audit` catches known vulnerabilities in already-trusted code; `cargo vet` prevents untrusted code from entering at all.",
+    "fj": "cargo audit is enough — it catches all the security issues.",
+    "fs": "`cargo audit` only knows about published CVEs. A malicious or buggy crate can sit in your transitive dependency tree for months before a CVE is filed — if ever. `cargo vet` closes that window by requiring pre-merge review. The import mechanism makes bootstrapping tractable; you're not starting from zero.",
+    "level": "Principal",
+    "asked": 7,
+    "followups": [
+      {
+        "q": "How do you handle a dependency that hasn't been audited yet and is blocking a release?",
+        "a": "You have two options. First, add a time-boxed exemption with a comment explaining why — `cargo vet add-exemption <crate> <version>` — committing to audit it in the next sprint. Second, perform a delta audit: if the crate was previously audited at an older version, `cargo vet diff <crate> <old> <new>` shows only the changed lines, dramatically reducing the review burden for patch and minor updates. I treat unreviewed exemptions as tech debt tracked in the team's backlog, and I set a policy that no exemption is older than one quarter."
+      }
+    ]
+  },
+  {
+    "q": "How do you set and communicate MSRV (minimum supported Rust version) policy across a multi-team Rust organisation?",
+    "a": "MSRV is the oldest `rustc` version your crate guarantees to compile with. For **library crates** exposed externally, a low MSRV (e.g., Rust 1.65) maximises compatibility with downstream users who may be on stable-but-old toolchains; I encode it as `rust-version = \"1.65\"` in `Cargo.toml` and enforce it in CI with `rustup toolchain install 1.65 && cargo +1.65 check`. For **internal binary crates** and workspace services, I set MSRV to 'latest stable minus 2 releases' — this lets teams use recent language features (let-else, GATs, `impl Trait` in fn position) without chasing nightlies, while giving CI time to validate before upgrades. **Upgrade cadence**: I designate one day per quarter as 'Rust toolchain day' — all teams bump to the latest stable simultaneously using a coordinated PR with `rustup update stable && cargo update` — rather than ad-hoc bumps that fragment the org. A single `rust-toolchain.toml` at the workspace root pins the exact toolchain version so every engineer and CI worker uses identical `rustc`, `clippy`, and `rustfmt` versions, eliminating 'works on my machine' lint divergence.",
+    "fj": "Just use whatever version you installed last and upgrade when you feel like it.",
+    "fs": "MSRV drift is a silent tax. Two teams on different `rustc` versions generate different clippy warnings, different error messages, and different code-gen. A single `rust-toolchain.toml` at the repo root eliminates this with zero ongoing cost.",
+    "level": "Principal",
+    "asked": 6,
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "toml",
+        "label": "rust-toolchain.toml + Cargo.toml MSRV",
+        "lines": [
+          "# rust-toolchain.toml",
+          "[toolchain]",
+          "channel = \"1.80.0\"",
+          "components = [",
+          "  \"rustfmt\",",
+          "  \"clippy\",",
+          "]",
+          "",
+          "# Cargo.toml (library)",
+          "[package]",
+          "name = \"my-lib\"",
+          "rust-version = \"1.70\""
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a dependency that bumps its own MSRV in a patch release, breaking your CI?",
+        "a": "Pin the dependency to the last compatible version in `Cargo.toml` (`my-dep = \"=1.2.3\"`) and open an issue with the upstream crate about their semver violation — MSRV bumps in patch releases violate the community convention that patch versions should not break existing users. In parallel, evaluate whether your own MSRV can be raised; if the new feature in the upstream crate is valuable and your users can accept a higher MSRV, bumping is often the right long-term fix. Track the pinned version as tech debt with a comment explaining why it is pinned."
+      }
+    ]
+  },
+  {
+    "q": "A legacy C++ service owns a critical hot path. Walk through your decision framework for rewrite-vs-wrap, the technical options, and how you sequence the work.",
+    "a": "**Decision framework — ask three questions.** (1) Is the C++ service's behaviour fully specified by tests or a protocol document, or is the source code the only spec? If the latter, a rewrite risks silent behavioural divergence — wrap first to build a test harness against the C++ binary, then rewrite against that harness. (2) Is the hot path a self-contained unit (a codec, a parser, a compute kernel) or deeply entangled with C++ object lifecycles and templates? Self-contained = rewrite candidate; entangled = wrap first. (3) What is the operational risk tolerance? A wrap is conservative (C++ stays authoritative, Rust calls it); a rewrite is higher risk but removes the C++ build toolchain from the dependency graph. **Wrap path**: use `bindgen` to generate Rust bindings from the C++ public header (exposed as `extern \"C\"`), build a safe Rust wrapper crate, and deploy Rust as the caller. Keep C++ as the source of truth until the Rust replacement is proven. **Rewrite path**: extract the C++ module to a standalone library with a C API (`extern \"C\"` boundary), write exhaustive tests against the C version, rewrite in Rust, run both implementations in shadow mode with output diffing at the C API boundary until confidence is high, then cut over. **Sequencing**: instrumentation → test harness → shadow run → canary → full cutover — never flip the switch without a shadow phase. Every stage has a defined rollback trigger (error rate delta, latency regression).",
+    "fj": "Rust is memory safe so just rewrite and the bugs will be gone.",
+    "fs": "Memory safety is not the same as behavioural correctness. A Rust rewrite can be memory-safe and still produce wrong outputs because it subtly misunderstood an edge case in the C++ logic. The shadow-run phase is non-negotiable for any service with observable business semantics.",
+    "level": "Principal",
+    "asked": 8,
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "rust",
+        "label": "shadow-mode output diffing sketch",
+        "lines": [
+          "async fn process(input: &[u8])",
+          "    -> Result<Output, Error>",
+          "{",
+          "    let cpp_out = cpp_service",
+          "        .call(input).await?;",
+          "    let rust_out = rust_impl(input)?;",
+          "    if cpp_out != rust_out {",
+          "        metrics::inc(",
+          "            \"shadow_diff_count\");",
+          "        log::warn!(",
+          "          \"diff: {:?} vs {:?}\",",
+          "          cpp_out, rust_out);",
+          "    }",
+          "    // still return C++ result",
+          "    Ok(cpp_out)",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle C++ template-heavy code that has no clean C API surface?",
+        "a": "Template-heavy C++ (e.g., Eigen, Abseil containers) is difficult to expose via `extern \"C\"` because template instantiations don't have stable linkage names and can't be addressed as C symbols. Options: (1) Write a thin C++ shim layer (`extern \"C\"` wrapper functions) that instantiates the templates for the specific types you need — this is manual but precise. (2) Use the `cxx` crate, which supports a subset of C++ types (`std::string`, `std::vector<T>`, opaque C++ types) via generated bridge code. (3) Accept that the tightest template-heavy paths may not be rewrite candidates and focus Rust effort on the adjacent I/O and orchestration code instead."
+      }
+    ]
+  },
+  {
+    "q": "How do you build Rust hiring and training pipelines when Rust engineers are scarce? What's the tradeoff between growing vs recruiting?",
+    "a": "**Growing internally** is almost always the better first bet when you already have strong systems engineers in C, C++, Go, or Python. The profile that ramps fastest: engineers who understand memory layout, have debugged segfaults, and think in terms of ownership (C++ RAII background is the closest analogue). Ramp time to independent productivity is 2–4 months for this profile; plan for 6 months before they review others' Rust code confidently. Internal training programme: Rustlings (1 week), a real scoped ticket with pair-programming (weeks 2–3), mandatory reading of 'The Rust Book' + 'Async Rust', and a team study group on 'Rustonomicon' for anyone writing unsafe. **Hiring externally**: the Rust talent market is thin — fewer than Go or Python by a factor of 5–10 depending on region. Titles like 'Systems Engineer' or 'Low-Latency Engineer' (C++/Go background) convert better than searching for 'Rust Engineer' directly. Treat the Rust coding screen as a learning opportunity, not a gate — a strong C++ engineer who has read the Book for two weeks will struggle with lifetimes but show the reasoning patterns you need. **Hiring traps**: hiring someone purely because they know Rust but lack systems thinking; hiring a Rust specialist into a team with no Rust support structure (they burn out mentoring). **My rule**: staff one experienced Rust engineer per four engineers on the project minimum; below that ratio the knowledge bottleneck becomes a blocking dependency on one person.",
+    "fj": "Just hire Rust engineers from job boards — that's easier than training.",
+    "fs": "The supply of experienced Rust engineers is structurally limited by the language's age. Building internal capability from strong systems engineers is more reliable, produces better cultural fit, and creates org-wide fluency rather than a specialist silo.",
+    "level": "Principal",
+    "asked": 6,
+    "followups": [
+      {
+        "q": "How do you evaluate a candidate who claims Rust experience but has only written hobby projects?",
+        "a": "I focus the screen on reasoning about ownership and lifetime trade-offs rather than syntax recall — hobby Rust projects cover syntax well but rarely production concerns. I ask them to walk through a design decision (why `Arc<Mutex<T>>` vs a channel for shared state, how they'd structure a safe FFI wrapper) and watch whether they articulate the invariants and failure modes rather than just stating the answer. I also ask what they'd do differently on their hobby project today — genuine learners have a clear list of things they'd improve; people padding a resume don't."
+      }
+    ]
   }
 ]

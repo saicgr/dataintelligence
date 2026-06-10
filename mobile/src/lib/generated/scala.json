@@ -1500,5 +1500,168 @@
         "a": "MiMa (Migration Manager) compares the public API of two JAR versions at the bytecode level. It detects: removed classes/methods/fields, changed method signatures, changed access modifiers, and changed generic type parameters. For Scala specifically it understands Scala-specific encoding (traits compiled to interfaces + impl classes, case class `copy`, `unapply`, etc.) and reports violations in terms of Scala source concepts, not raw JVM descriptors. Run it via the `sbt-mima-plugin`: set `mimaPreviousArtifacts := Set(organization.value %% name.value % lastReleasedVersion)` and `mimaReportBinaryIssues` becomes a standard task."
       }
     ]
+  },
+  {
+    "q": "How do you diagnose and resolve ambiguous or diverging implicit/given resolution in a large Scala codebase?",
+    "a": "The compiler error 'ambiguous implicit values' or 'diverging implicit expansion' is the symptom of one of three root causes: multiple equal-priority instances in scope, a recursive implicit that matches its own search, or a type class derivation loop (e.g., Shapeless `Generic` triggering itself). Diagnosis steps: (1) add `-Xlog-implicits` (Scala 2) or `-explain` (Scala 3) to the failing file — the compiler prints the full search tree, showing every candidate and why each was accepted or rejected; (2) use the `sourcecode` library or `implicitly[Show[T]]` directly at the call site to force the compiler to reveal what it found; (3) for derivation loops, `reify { showInstance }` in Scala 2 or `Expr.summon` in Scala 3 macros to inspect the derived instance. Resolution: the correct fix is almost always narrowing scope — move one instance behind an explicit import, give one instance higher priority via inheritance depth, or switch from a blanket `given` to a more specific one. Avoid 'fix' by adding more implicits; each addition increases resolution time and the chance of future ambiguity.",
+    "fj": "I just add another import until it compiles.",
+    "fs": "In a large codebase implicit resolution time compounds: sbt incremental compilation can spend 30-40% of its time on implicit search in heavily-derived code. I audit with `-Ytime-phases` (Scala 3) to find which files are slow, then check if the slowness comes from derivation (`given` derivation with many alternatives is O(n) in the number of candidates). Moving derivations to explicit `derives` clauses or pre-deriving into companion objects speeds up compilation and makes the resolution path transparent.",
+    "level": "Staff",
+    "asked": 10,
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "scala",
+        "label": "ambiguous given instances",
+        "lines": [
+          "// Two equally-ranked instances:",
+          "given Show[Int] = n => s\"Int($n)\"",
+          "given Show[Int] = n => n.toString",
+          "",
+          "def display[A: Show](a: A) =",
+          "  summon[Show[A]].show(a)",
+          "",
+          "display(42)",
+          "// Error: ambiguous given"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "scala",
+        "label": "single canonical instance",
+        "lines": [
+          "// One instance in companion object:",
+          "object Show:",
+          "  given showInt: Show[Int] =",
+          "    n => s\"Int($n)\"",
+          "",
+          "// Local override via explicit import:",
+          "import Show.showInt",
+          "display(42) // unambiguous"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does implicit resolution priority work via inheritance in Scala 2 and given prioritization in Scala 3?",
+        "a": "In Scala 2, an implicit defined in a subtype beats one in a supertype — libraries exploit this: place a low-priority fallback in a trait (`LowPriority`), extend it in the companion, and put the specific instance in the companion. The specific instance wins because the companion is a 'closer' scope. In Scala 3 the same principle applies to `given` definitions: a `given` in the companion object has higher priority than one in a supertrait of the companion. When debugging, the compiler's implicit search always starts at the innermost scope and walks outward — the first match wins."
+      },
+      {
+        "q": "What causes 'diverging implicit expansion' and how do you fix it?",
+        "a": "Diverging expansion means the compiler entered an infinite search loop — typically a type class derivation where instance A needs instance B which needs instance A again. The fix is to add an explicit base-case `given` that terminates the recursion before the loop starts, or to break the cycle by using `lazy given` so the forward reference resolves after all instances are registered. In Shapeless-heavy codebases, divergence often signals a missing `Generic` or `LabelledGeneric` instance for a type — adding `derives Generic` resolves it."
+      }
+    ]
+  },
+  {
+    "q": "How do you choose between Cats Effect, ZIO, and plain Futures as the effect system for a new Scala service team?",
+    "a": "The decision has four dimensions: team FP maturity, ecosystem fit, operational complexity, and long-term maintainability. Plain `Future`: appropriate when the team has strong Java/Kotlin backgrounds and FP adoption is incremental; the immediate hire pool is larger, but `Future` is eagerly evaluated, lacks structured concurrency, and makes cancellation and resource finalization manual — production bugs from unhandled thread leaks are common at scale. Cats Effect 3 (`IO`): mature, battle-tested in the Typelevel ecosystem; `IO` is lazy and referentially transparent; structured concurrency via fibers; `Resource[F, A]` handles lifecycle; enormous library support (http4s, fs2, Doobie, Skunk). The learning curve is real for non-FP engineers but amortizes over 6-12 months. ZIO 2: similar guarantees to Cats Effect with a different ergonomics philosophy — ZIO's error channel is type-parameterized (`ZIO[R, E, A]`), which forces explicit error modeling but adds type noise; ZIO has strong built-in dependency injection via `ZLayer`; the ZIO ecosystem (ZIO HTTP, ZIO Kafka, ZIO Schema) is growing but less mature than Typelevel. Recommendation: for teams with FP experience already using Cats, default to Cats Effect 3; for greenfield teams that want ZIO's explicit error types and DI layer, ZIO 2 is viable but requires committing to the ZIO ecosystem; for teams that must interop heavily with existing Java code and have short ramp budgets, plain `Future` with `scala.concurrent.blocking` discipline is the pragmatic choice.",
+    "fj": "I'd use Futures because they're simpler and everyone knows them.",
+    "fs": "The hidden cost of plain `Future` is that every production incident with async code becomes an archaeology project — no structured cancellation, no fiber traces, no guaranteed resource finalization. I've migrated two services from `Future` to Cats Effect `IO` after production incidents: in both cases the bug was a `Future` that started but was never awaited, leaking a connection indefinitely. `IO` makes this impossible by construction. My default for any new service in 2026 is Cats Effect 3 — the ecosystem support alone (http4s, fs2-kafka, Doobie) means we're never integrating libraries with incompatible effect types.",
+    "level": "Staff",
+    "asked": 9,
+    "followups": [
+      {
+        "q": "How do you interoperate between a Cats Effect IO codebase and a ZIO-based library?",
+        "a": "Use the `zio-interop-cats` library, which provides `CatsEffect` instances for ZIO's `Task` type, making it a valid `Async[F]` for Cats Effect type classes. You can call ZIO code from a Cats Effect codebase via `.toEffect[IO]` and vice versa via `ZIO.fromEffect`. The interop layer works well but has overhead — avoid crossing the boundary in hot paths. Long-term, standardize on one effect system per service; interop is a migration bridge, not a permanent architecture."
+      },
+      {
+        "q": "What is structured concurrency in Cats Effect 3 and why does it prevent resource leaks?",
+        "a": "Structured concurrency means every fiber has a parent, and when the parent is cancelled or completed, all child fibers are also cancelled before the parent exits. In practice: `Concurrent[F].both(fa, fb)` starts two fibers and guarantees both are cancelled if either fails or if the outer scope is cancelled. This prevents the 'fire and forget Future' pattern where a launched computation outlives its expected lifetime. `Resource[F, A]` extends this to lifecycle: acquire and release are a unit — releasing always happens, even on cancellation."
+      }
+    ]
+  },
+  {
+    "q": "How do you standardize Spark platform versions and cluster configurations across a multi-team data org to prevent pipeline fragmentation?",
+    "a": "Fragmentation happens when teams independently pin Spark versions, Scala versions, and library sets in their own build files. The outcome: incompatible serialization formats, conflicting Delta Lake protocol versions, and on-call engineers unable to debug a colleague's job because the execution model differs. Standardization requires: (1) a central Platform BOM (Bill of Materials) published as an sbt/Maven artifact pinning Spark, Scala, Delta Lake, and approved connector versions — all team `build.sbt` files import it; (2) a single cluster image (AMI or Docker image for EMR/Databricks) built and tested by the platform team, versioned, and promoted through environments — teams submit jobs against the platform image, not their own; (3) a Spark configuration reference (`spark-defaults.conf` shared repository) with baseline settings for shuffle partitions, adaptive query execution, memory fractions, and serializer (Kryo vs Java) — teams can override in their SparkSession for job-specific tuning but document the override in a PR comment; (4) a breaking-change policy: Spark major-version upgrades are platform team-driven, announced 6 weeks ahead, with a two-sprint migration window where both old and new platform versions run in parallel for teams to test. The governance anti-pattern: letting teams run 'just this one job on Spark 3.4 while the platform is on 3.2' — Delta Lake protocol upgrades between Spark versions make tables written on 3.4 unreadable on 3.2, silently corrupting cross-team data contracts.",
+    "fj": "I'd let teams use whichever Spark version works for their job.",
+    "fs": "The Delta Lake protocol version trap is the killer. Delta tables written with writer version 3 features (row-level deletes, column mapping) cannot be read by Spark versions that only support writer version 2. Once one team upgrades and writes to a shared table, every downstream consumer either upgrades or loses access — with no warning in the logs other than a confusing ProtocolChangedException. I enforce platform BOM with a CI check: any `build.sbt` that overrides the Spark version triggers a mandatory platform-team review. The overhead is one review per quarter; the cost of not doing it was a 6-hour production incident at a previous employer.",
+    "level": "Principal",
+    "asked": 7,
+    "followups": [
+      {
+        "q": "How do you handle the Delta Lake protocol upgrade problem when multiple teams share tables?",
+        "a": "Delta Lake protocol upgrades are irreversible on a table — once a writer uses a newer protocol, older readers fail. The safe pattern: run `DESCRIBE DETAIL` on shared tables before any Spark/Delta upgrade to record current `minReaderVersion` and `minWriterVersion`. In the platform upgrade window, upgrade readers first (all consumers), then upgrade writers (producers). Use Delta's `delta.minReaderVersion` table property to explicitly cap the protocol if you need to maintain backward compatibility during the migration window. For cross-team tables governed by a data contract, treat a protocol upgrade as a breaking schema change — require consumer sign-off before upgrading."
+      }
+    ]
+  },
+  {
+    "q": "How do you manage the hiring and training risk of advanced Scala FP styles, and what should a principal-level Scala style guide enforce vs. leave to team discretion?",
+    "a": "The core tension is expressiveness vs. approachability. Advanced patterns — tagless final, free monads, optics (Monocle), type-level programming with Shapeless/Magnolia — make expert engineers highly productive but create a knowledge cliff: a mid-level engineer from a Java background reads the codebase and sees an alien language. Style guide philosophy at principal level: standardize patterns where inconsistency creates bugs or interop costs; leave room for team autonomy where the choice is aesthetic. Mandatory standards: (1) effect system choice (IO vs Future — one per service, no mixing); (2) error modeling convention (`Either[AppError, A]` vs exceptions — choose one and enforce via Scalafix rule banning `throw` outside explicitly designated boundaries); (3) tagless final algebra naming and module structure (consistent `Algebra[F[_]]` trait + companion with `make` factory); (4) no macro usage in application code (only in designated library modules, reviewed by principal); (5) Scalafmt config is non-negotiable — code style debates are banned. Discretionary: which lens library (Monocle vs manual `copy`), whether to use `cats.data.State` vs explicit state threading, test framework (MUnit vs ScalaTest). Hiring practice: in interviews, probe for understanding of variance, type classes, and for-comprehension desugaring — these are teachable-in-weeks concepts; require demonstrated understanding as a filter, not mastery. Reserve advanced tagless final questions for senior+ roles.",
+    "fj": "I'd just hire good engineers and let them learn FP on the job.",
+    "fs": "The 'learn FP on the job' approach fails in high-throughput orgs because new engineers write Java-in-Scala — `var`, mutable maps, `null` checks, `throw` — which then propagates because no style guide rejects it in review. The style guide is the answer: a Scalafix rule that bans `throw` in application modules and flags `var` outside explicitly annotated blocks catches the Java habits at PR time, before they become production code. I've run two style guide rollouts: the engineers who initially resist always come around after one production incident that a linter would have caught.",
+    "level": "Principal",
+    "asked": 6,
+    "followups": [
+      {
+        "q": "How do you level-set FP training for a cohort of 10 engineers joining from Java/Python backgrounds?",
+        "a": "A 4-week structured onboarding, not self-directed: Week 1 covers `Option`/`Either`/`Try`, `for`-comprehensions, and case classes — the 90% of production Scala that can be learned from Java intuitions. Week 2 introduces type classes and implicits/given with worked examples from the actual codebase (not textbook Cats). Week 3 focuses on the effect system in use (Cats Effect IO or Future): fiber model, `Resource`, `Ref` for shared state. Week 4 is a pairing sprint where each new engineer refactors a real piece of code reviewed by a senior. The key measure: first PR merged without major FP-related review comments. Most engineers hit this in 3-5 weeks; outliers who don't by week 8 need a direct conversation about fit."
+      }
+    ]
+  },
+  {
+    "q": "How do you manage library ecosystem governance after a major Scala version churn — specifically the fragmentation that occurred during the Scala 2→3 transition period?",
+    "a": "The 2020-2024 Scala 2→3 transition created a three-year window where ecosystem libraries were in one of four states: Scala 2 only, cross-compiled but experimental on Scala 3, Scala 3 only (e.g., Scala 3 macro rewrites), or abandoned with no Scala 3 roadmap. At the principal level, managing this requires an explicit library lifecycle policy. Step 1: audit every library dependency and tag it as 'migrated', 'cross-published', 'blocked-on-macro', or 'abandoned'. 'Blocked-on-macro' means the library uses Scala 2 macros (Shapeless 2, Scala 2 macros for Circe derivation) and cannot compile under Scala 3 without a rewrite. These are the migration blockers — find replacement libraries (Shapeless 3, Circe with `derives` in Scala 3) or fund the port. Step 2: categorize dependencies by business criticality and replaceability. An abandoned library used only for testing (e.g., a custom matcher library) can be replaced quickly; an abandoned library in a core serialization path is a multi-sprint effort. Step 3: establish a sunset policy for libraries not publishing Scala 3 artifacts after a given date — typically 12 months after the org's Scala 3 target date. Libraries past sunset are replaced in the next sprint cycle, not deferred. Step 4: for libraries that are cross-compiled but have known behavioral differences under Scala 3 (e.g., macro-derived codecs behaving differently due to `given` derivation order), create regression test suites run against both Scala 2.13 and Scala 3 builds in CI. This catches behavioral divergence before the Scala 2 build is retired.",
+    "fj": "I'd upgrade libraries as they release Scala 3 versions and fix issues as they come up.",
+    "fs": "Reactive library upgrades create the worst possible upgrade experience: teams upgrade piecemeal, discover behavioral differences (usually in codec derivation or macro-generated code) in production, and spend debugging time that should have been caught in a controlled migration window. The audit and lifecycle policy converts a reactive fire-drill into a planned migration. The most important governance lever I've found: requiring every library in the org's BOM to have a documented Scala 3 upgrade path before the org sets a Scala 3 migration date. Setting the date without the path is how organizations miss their target by 12+ months.",
+    "level": "Principal",
+    "asked": 5,
+    "followups": [
+      {
+        "q": "How does Shapeless 3 differ from Shapeless 2 and why does the difference matter for a Scala 2→3 migration?",
+        "a": "Shapeless 2 is built on Scala 2 macros (`scala.reflect`) for generic derivation — it cannot compile under Scala 3. Shapeless 3 is a ground-up rewrite using Scala 3's `Mirror` type class and `inline` metaprogramming, providing similar `Generic`/`HList`-style capabilities via `scala3-migration`-compatible code. The practical difference: libraries that use Shapeless 2 for automatic codec derivation (some versions of Circe, Doobie's generic module, PureConfig) must either adopt Shapeless 3, switch to `Mirror`-based derivation directly, or remain Scala 2 only. This is the macro surface audit that blocks most real migrations."
+      }
+    ]
+  },
+  {
+    "q": "How do you sequence a Scala 2→3 fleet migration across 30+ services in a large engineering org, and how do you manage rollback risk?",
+    "a": "A fleet migration at 30+ services cannot be done service-by-service without a coordination framework — ad-hoc upgrades create version islands where shared libraries must publish for both Scala versions indefinitely, doubling release overhead. The coordinated approach has five phases. Phase 0 — audit: inventory all services, classify each by migration complexity (no macros, macro libraries only, custom macros — each tier is a different complexity class). Phase 1 — platform readiness: the shared library BOM publishes Scala 3 artifacts; all tier-0 libraries are cross-compiled; macro-heavy libraries have documented Scala 3 equivalents. Phase 2 — pioneer cohort: 3-5 volunteer services (chosen for low macro surface) migrate first and run in production for 60 days, surfacing unknown issues. Pioneer findings feed a public migration playbook. Phase 3 — wave rollout: services migrate in cohorts of 8-10, sequenced by complexity tier. Platform team embeds one migration-experienced engineer per cohort for the first sprint. Phase 4 — cutover: all services migrated; cross-published shared libraries drop the Scala 2 build, halving CI overhead. Rollback risk: because each service has its own deployment artifact, rollback is per-service — a Scala 3 service that fails in production reverts its own deployment. The risk is cross-service: if service A (Scala 3) writes a shared Kafka topic with a Scala 3-compiled Avro schema, and service B (still Scala 2) reads it with the old schema registry, there may be a deserialization mismatch. Mitigate by running schema compatibility checks in the schema registry before migration; treat schema evolution as a separate concern from language version.",
+    "fj": "I'd upgrade services one by one and fix problems as they appear.",
+    "fs": "Service-by-service without coordination means shared libraries stay cross-published for 2+ years — that is 2x CI overhead, 2x release testing, and doubled library author burden. The cohort model with a published playbook drops the average service migration from 3 sprints (first-mover) to 1 sprint (late cohort) because every gotcha is already documented. The hardest coordination problem is the shared schema: Avro and Protobuf schemas compiled by Scalapb or Avro4s have slightly different default derivations between Scala 2 and 3 — audit every shared schema contract before migrating either the producer or consumer, not after.",
+    "level": "Principal",
+    "asked": 6,
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "scala",
+        "label": "cross-publish BOM for both versions",
+        "lines": [
+          "// shared-bom/build.sbt",
+          "ThisBuild / crossScalaVersions :=",
+          "  Seq(\"2.13.14\", \"3.4.2\")",
+          "",
+          "// Publish both artifacts:",
+          "// platform-bom_2.13-1.0.0.jar",
+          "// platform-bom_3-1.0.0.jar",
+          "",
+          "// Pioneer services use _3 artifact;",
+          "// legacy services still use _2.13.",
+          "// Both supported until Phase 4 cutover."
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a service that cannot migrate because it depends on a third-party library with no Scala 3 artifact?",
+        "a": "Three options in priority order. First, check whether the library's Java artifact (plain JAR, no Scala version suffix) can be used — many Java libraries work fine as Scala 3 dependencies. Second, check if a compatible Scala 3 replacement library exists (e.g., Enumeratum → Scala 3 native `enum`, PureConfig → `ciris` or PureConfig Scala 3 build). Third, if the library is genuinely unmaintained and irreplaceable, the service stays on Scala 2.13 until the library is replaced — document this as a 'migration blocker' in the fleet audit and track it as a tech debt item with an owner and deadline. Never force-migrate a service past a hard blocker by patching the library locally — that creates a fork you will have to maintain forever."
+      }
+    ]
+  },
+  {
+    "q": "When should a data engineering org converge new services onto Kotlin or Java instead of continuing to invest in Scala, and what are the concrete tipping points?",
+    "a": "Converging away from Scala is a rational choice under four concrete conditions. First, the team's Spark workloads are predominantly Python: if >70% of pipeline work is in PySpark notebooks or dbt, adding a Scala service layer adds language context-switching cost with no productivity gain — Kotlin or Python services that call Spark via REST (Databricks Connect, Livy) or produce Avro/Parquet files are simpler. Second, the hire pipeline is consistently taking >90 days for Scala engineers: at that pace a 10-person team has a 2-person average vacancy, which means existing engineers are overloaded; switching the service layer to Kotlin (familiar to Android/Java engineers) immediately opens a 3x larger candidate pool. Third, the majority of new services are CRUD APIs with no complex type-level requirements: for an event-sourced microservice calling Postgres, the ceremony of tagless final adds no correctness guarantee that a well-tested Kotlin coroutines service does not also provide; the simpler code is the correct choice. Fourth, the org is standardizing JVM tooling around Gradle + IntelliJ IDEA: sbt's unique build model adds friction when the rest of the org uses Gradle; if the org is consolidating build infrastructure, sbt is an outlier. The Scala moat that survives all four conditions: Spark-native optimization. If any team is writing Catalyst extensions, custom Spark data sources, or Spark internals-adjacent code, Scala is non-negotiable — those APIs are Scala-first and the Python layer has meaningful limitations. The honest principal-level answer: 'keep Scala for Spark, evaluate Kotlin for service layer' is a defensible and increasingly common architecture in 2026.",
+    "fj": "Scala is better so I'd keep using it unless the team really struggles.",
+    "fs": "Personal preference for Scala is not a principal-level argument. The argument must be framed as total cost of ownership over a 3-year horizon: hire cost, ramp time, library maintenance burden, and operational complexity. I've made the recommendation to converge two teams onto Kotlin for service APIs — not because Scala is worse, but because those teams' work was 90% REST endpoint + Postgres, and the Scala FP ceremony was creating bugs, not preventing them. The Spark pipelines stayed Scala. The boundary between 'Scala data layer' and 'Kotlin service layer' with a shared Avro schema contract is a clean architecture that lets each language do what it does best.",
+    "level": "Principal",
+    "asked": 8,
+    "followups": [
+      {
+        "q": "How do you share data models between a Scala Spark pipeline and a Kotlin service layer in the same org?",
+        "a": "The cleanest boundary is a schema-first contract: define data models in Avro or Protobuf IDL (`.avsc` / `.proto` files), committed to a shared schema repository, and generate case classes for Scala and data classes for Kotlin using avro4s/ScalaPB on the Scala side and avro-tools/protoc-gen-kotlin on the Kotlin side. Both generated artifacts are published from the same IDL version, so the schema is the single source of truth. Avoid sharing a Scala library of case classes directly with a Kotlin service — Kotlin can consume Scala JARs but the ergonomics are poor (Scala collections, Option types, and implicit-heavy APIs don't translate cleanly to idiomatic Kotlin)."
+      },
+      {
+        "q": "What is Databricks Connect and how does it change the Scala-vs-Python tradeoff for data services?",
+        "a": "Databricks Connect (v2, available from DBR 13.x) allows a local Python or Scala process to submit DataFrame operations to a remote Databricks cluster, receiving results as Arrow batches. This means a Python service can run Spark-quality analytical queries without embedding a Spark runtime. It shifts the language tradeoff: previously, 'I need Spark performance' meant 'I need Scala or PySpark in a cluster'. With Databricks Connect, a Kotlin/Python REST service can delegate heavy computation to the cluster while keeping the service layer in the team's preferred language. The limitation: only DataFrame/SQL operations are supported remotely; Scala RDD-level or Catalyst extension code must still run on the cluster, in Scala."
+      }
+    ]
   }
 ]
