@@ -6,6 +6,7 @@ import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 
 
 import { answerFeedback, haptic, sfx } from '../lib/feedback';
 import { requestPermission } from '../lib/notifications';
+import { buildRecallCheck } from '../lib/recallCheck';
 import { dueLabel, dueWithin } from '../lib/srs';
 import { isProActive, useActiveDeck, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
@@ -68,6 +69,7 @@ function CardView() {
   const toggleSave = useStore((s) => s.toggleSave);
   const setFeedback = useStore((s) => s.setFeedback);
   const markVoiceTried = useStore((s) => s.markVoiceTried);
+  const noteCheck = useStore((s) => s.noteCheck);
 
   const card = deck[idx];
   const saved = useStore((s) => (card ? s.savedIds.includes(card.id) : false));
@@ -77,12 +79,21 @@ function CardView() {
   const swipeable = !!card && card.kind === 'flip' && reveal;
 
   const [jot, setJot] = useState('');
+  // Recall check (#1): pick state survives the reveal so the suggested grade can ring a RateBtn.
+  const [checkPick, setCheckPick] = useState<number | null>(null);
+  const [checkOk, setCheckOk] = useState<boolean | null>(null);
+  const revealTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const jotRef = useRef<TextInput>(null);
   const tx = useSharedValue(0);
   useEffect(() => {
     tx.value = 0;
     setJot('');
+    setCheckPick(null);
+    setCheckOk(null);
   }, [idx, tx]);
+  useEffect(() => () => {
+    if (revealTimer.current) clearTimeout(revealTimer.current);
+  }, []);
 
   const pan = Gesture.Pan()
     .enabled(swipeable)
@@ -195,9 +206,14 @@ function CardView() {
                   sourceUrl={card.sourceUrl}
                   sourceLabel={card.sourceLabel}
                   publishedAt={card.publishedAt}>
-                  <Row style={{ gap: 9, marginTop: 14 }}>
-                    <RateBtn label="🔁 Again" sub={dueLabel('again')} kind="again" onPress={() => { answerFeedback(false); rate('again'); }} />
-                    <RateBtn label="✅ Got it" sub={dueLabel('good')} kind="good" onPress={() => { answerFeedback(true); rate('good'); }} />
+                  {checkOk != null && (
+                    <T muted size={11.5} weight="800" style={{ marginTop: 12 }}>
+                      {checkOk ? '✓ You spotted the senior take — suggested: Got it' : '✗ You picked the trap — suggested: Again'}
+                    </T>
+                  )}
+                  <Row style={{ gap: 9, marginTop: checkOk != null ? 8 : 14 }}>
+                    <RateBtn label="🔁 Again" sub={dueLabel('again')} kind="again" suggested={checkOk === false} onPress={() => { answerFeedback(false); rate('again'); }} />
+                    <RateBtn label="✅ Got it" sub={dueLabel('good')} kind="good" suggested={checkOk === true} onPress={() => { answerFeedback(true); rate('good'); }} />
                     <RateBtn label="⚡ Easy" sub={dueLabel('easy')} kind="easy" onPress={() => { sfx.correct(); haptic.success(); rate('easy'); }} />
                   </Row>
                   <Row style={{ justifyContent: 'space-between', marginTop: 12 }}>
@@ -254,10 +270,54 @@ function CardView() {
                       <T size={20}>🎙</T>
                     </Pressable>
                   </View>
-                  <Btn label="Reveal answer" variant="navy" onPress={doReveal} />
-                  <T muted size={11.5} style={{ textAlign: 'center', marginTop: 10 }}>
-                    Type, or tap 🎙 and use your keyboard&apos;s dictation — then reveal &amp; rate.
-                  </T>
+                  {(() => {
+                    const check = buildRecallCheck(card, deck);
+                    if (!check) {
+                      return (
+                        <>
+                          <Btn label="Reveal answer" variant="navy" onPress={doReveal} />
+                          <T muted size={11.5} style={{ textAlign: 'center', marginTop: 10 }}>
+                            Type, or tap 🎙 and use your keyboard&apos;s dictation — then reveal &amp; rate.
+                          </T>
+                        </>
+                      );
+                    }
+                    return (
+                      <View style={{ gap: 8 }}>
+                        <T weight="800" size={12.5}>{check.prompt}</T>
+                        {check.opts.map((o, i) => {
+                          const picked = checkPick === i;
+                          const showState = checkPick != null;
+                          const bd = showState && o.ok ? c.success : picked ? c.danger : c.border;
+                          return (
+                            <Pressable
+                              key={i}
+                              disabled={checkPick != null}
+                              onPress={() => {
+                                setCheckPick(i);
+                                setCheckOk(o.ok);
+                                noteCheck(o.ok);
+                                answerFeedback(o.ok);
+                                revealTimer.current = setTimeout(doReveal, 550);
+                              }}
+                              style={{
+                                borderWidth: 2,
+                                borderColor: bd,
+                                borderRadius: radius.md,
+                                padding: 12,
+                                backgroundColor: showState && o.ok ? c.success + '14' : picked ? c.danger + '12' : c.surface,
+                                opacity: showState && !o.ok && !picked ? 0.55 : 1,
+                              }}>
+                              <T size={12.5} style={{ lineHeight: 18 }}>{o.t}</T>
+                            </Pressable>
+                          );
+                        })}
+                        <Pressable onPress={doReveal} hitSlop={6} style={{ alignSelf: 'center', marginTop: 2 }}>
+                          <T muted size={11.5} weight="800">skip → just reveal</T>
+                        </Pressable>
+                      </View>
+                    );
+                  })()}
                 </View>
               )
             ) : (
@@ -592,11 +652,14 @@ function RateBtn({
   label,
   sub,
   kind,
+  suggested,
   onPress,
 }: {
   label: string;
   sub: string;
   kind: 'again' | 'good' | 'easy';
+  /** Ring this button as the recall-check-suggested grade (self-grade stays authoritative). */
+  suggested?: boolean;
   onPress: () => void;
 }) {
   const { c, scheme } = useTheme();
@@ -611,6 +674,8 @@ function RateBtn({
         paddingHorizontal: 6,
         backgroundColor: scheme === 'dark' ? color + '24' : color + '1f',
         alignItems: 'center',
+        borderWidth: suggested ? 2 : 0,
+        borderColor: suggested ? color : 'transparent',
       }}>
       <T weight="800" size={13} color={color}>
         {label}
