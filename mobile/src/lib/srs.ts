@@ -43,6 +43,16 @@ export function dueLabel(rating: Rating): string {
   return { again: 'in <10 min', good: 'in 2 days', easy: 'in 5 days' }[rating];
 }
 
+/** How many cards come due within the next `days` days (the "N due tomorrow" hook). */
+export function dueWithin(progress: Record<string, CardState>, now: number, days: number): number {
+  let n = 0;
+  for (const id in progress) {
+    const due = progress[id].due;
+    if (due > now && due <= now + days * DAY) n++;
+  }
+  return n;
+}
+
 // ── Adaptive selection ("smart scheduling" / Birdbrain-style) ───────────────
 
 /** 0..1 estimate of how well-known a card is (mastery). */

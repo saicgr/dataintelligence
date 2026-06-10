@@ -35,9 +35,9 @@ import {
 } from '../../lib/content';
 import { basicsForRole } from '../../lib/basics';
 import { daysLeftInWeek } from '../../lib/leagues';
-import { GROUP_LABEL, GROUP_ORDER, roleByKey } from '../../lib/roles';
+import { coreTracksForRole, GROUP_LABEL, groupOrderForRole, roleByKey } from '../../lib/roles';
 import { CardState } from '../../lib/srs';
-import { isDev, level, useStore, xpInLevel } from '../../lib/store';
+import { isDev, isProActive, level, useStore, xpInLevel } from '../../lib/store';
 import { radius, space, useTheme } from '../../lib/theme';
 import { haptic, sfx } from '../../lib/feedback';
 import { AnimatedProgressBar, CardEnter, CountUp, PressableScale, Shake } from '../../ui/anim';
@@ -46,6 +46,7 @@ import { InterviewPlanCard } from '../../ui/InterviewPlanCard';
 import { QuestStrip } from '../../ui/QuestStrip';
 import { RolePicker } from '../../ui/RolePicker';
 import { SessionView } from '../../ui/SessionView';
+import { StreakSheet } from '../../ui/StreakSheet';
 
 // On web the app is clamped to a centered phone column (see _layout); RN <Modal> escapes that,
 // so web-only styles below re-center sheet content to the same width.
@@ -90,8 +91,7 @@ function LearnPath() {
   const progress = useStore((st) => st.progress);
   const role = useStore((st) => st.role);
   const userLevel = useStore((st) => st.userLevel);
-  const unlocked = useStore((st) => st.unlocked);
-  const devMode = useStore((st) => st.devMode);
+  const unlocked = useStore(isProActive);
   const startSingle = useStore((st) => st.startSingle);
   const due = useStore((st) => st.sessionMeta.due);
   const interviewDate = useStore((st) => st.interviewDate);
@@ -99,6 +99,7 @@ function LearnPath() {
   const startFresh = useStore((st) => st.startFresh);
   const startDiagnostic = useStore((st) => st.startDiagnostic);
   const [showSettings, setShowSettings] = useState(false);
+  const [showStreak, setShowStreak] = useState(false);
   // Search is visible by default (not hidden behind the header glass); the icon just toggles it off.
   const [searchOpen, setSearchOpen] = useState(true);
   const [q, setQ] = useState('');
@@ -106,6 +107,7 @@ function LearnPath() {
   const action = nextAction(role, progress, due);
   const scrollRef = useRef<ScrollView>(null);
   const trackY = useRef<Record<string, number>>({});
+  const sectionY = useRef<Record<string, number>>({});
   const scrollSV = useSharedValue(0);
   const [viewportH, setViewportH] = useState(0);
   const [contentH, setContentH] = useState(0);
@@ -114,15 +116,23 @@ function LearnPath() {
   const match = (t: Track) => !query || t.name.toLowerCase().includes(query) || t.slug.toLowerCase().includes(query);
   // Role + level filtered: a track shows only if it has cards at the chosen level ("All levels" = all).
   const roleTracks = tracksForRoleAtLevel(role, userLevel).filter(match);
-  const grouped = GROUP_ORDER.map((g) => ({ g, tracks: roleTracks.filter((t) => t.group === g) })).filter(
-    (x) => x.tracks.length > 0
-  );
-  const shown = grouped.flatMap((x) => x.tracks);
+  // Personalization: the role's headline tracks pin to a "Your path" section on top, and the
+  // section order itself is role-aware (AI/data roles lead with Concepts, infra with Deploy…).
+  // Both collapse while searching — results take over and pinned dupes would only confuse.
+  const coreSlugs = query ? [] : coreTracksForRole(role);
+  const coreTracks = coreSlugs
+    .map((slug) => roleTracks.find((t) => t.slug === slug)) // intersect: respects the level filter
+    .filter((t): t is Track => !!t);
+  const coreSet = new Set(coreTracks.map((t) => t.slug));
+  const grouped = groupOrderForRole(role)
+    .map((g) => ({ g, tracks: roleTracks.filter((t) => t.group === g && !coreSet.has(t.slug)) }))
+    .filter((x) => x.tracks.length > 0);
+  const shown = [...coreTracks, ...grouped.flatMap((x) => x.tracks)];
   // Question-level search: typing a phrase also surfaces matching cards across the role's tracks,
   // so you can jump straight into a remembered question instead of hunting through tracks.
   const cardHits = query.length >= 2 ? searchCards(query, role) : [];
   // Free users taste the first 2 cards of any track (matches the track screen); the rest are Pro.
-  const canOpen = (h: CardHit) => unlocked || (__DEV__ && devMode) || h.idxInTrack < 2;
+  const canOpen = (h: CardHit) => unlocked || h.idxInTrack < 2;
   const openHit = (h: CardHit) => (canOpen(h) ? startSingle(h.card.id) : router.push('/paywall'));
 
   // Collapsed by default — the Continue hero already surfaces the current lesson, so the
@@ -132,6 +142,14 @@ function LearnPath() {
 
   const measure = (slug: string) => (e: { nativeEvent: { layout: { y: number } } }) => {
     trackY.current[slug] = e.nativeEvent.layout.y;
+  };
+  const measureSection = (key: string) => (e: { nativeEvent: { layout: { y: number } } }) => {
+    sectionY.current[key] = e.nativeEvent.layout.y;
+  };
+  // Jump chip → scroll to the section header. Unmeasured (not yet laid out) → no-op, never jump to 0.
+  const jumpToSection = (key: string) => {
+    const y = sectionY.current[key];
+    if (y != null) scrollRef.current?.scrollTo({ y: Math.max(0, y), animated: true });
   };
   const renderUnit = (t: Track) => (
     <View key={t.slug} onLayout={measure(t.slug)}>
@@ -144,6 +162,7 @@ function LearnPath() {
       <Header
         onMenu={() => setShowSettings(true)}
         onSearch={() => setSearchOpen((v) => !v)}
+        onStreak={() => setShowStreak(true)}
         searchOpen={searchOpen}
       />
       {searchOpen && (
@@ -173,6 +192,20 @@ function LearnPath() {
             style={{ flex: 1, paddingVertical: 9, color: c.fg, fontSize: 13.5 }}
           />
         </View>
+      )}
+
+      {/* Section jump bar — always visible above the long path; hidden while searching. */}
+      {!query && (coreTracks.length > 0 || grouped.length > 1) && (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={{ flexGrow: 0 }}
+          contentContainerStyle={{ gap: 6, paddingHorizontal: space.md, paddingVertical: 6 }}>
+          {coreTracks.length > 0 && <SectionChip label="⭐ Your path" onPress={() => jumpToSection('core')} />}
+          {grouped.map(({ g }) => (
+            <SectionChip key={g} label={GROUP_LABEL[g]} onPress={() => jumpToSection(g)} />
+          ))}
+        </ScrollView>
       )}
 
       <View style={{ flex: 1 }}>
@@ -209,9 +242,20 @@ function LearnPath() {
             <CardEnter delay={90}>
               <ContestBanner />
             </CardEnter>
-            {grouped.map(({ g, tracks }, gi) => (
+            {/* Pinned "Your path": the role's headline tracks, in its registry priority order. */}
+            {coreTracks.length > 0 && (
+              <Fragment>
+                <View onLayout={measureSection('core')}>
+                  <H2 style={{ marginTop: 6 }}>⭐ Your {roleByKey(role)?.name ?? 'role'} path</H2>
+                </View>
+                {coreTracks.map(renderUnit)}
+              </Fragment>
+            )}
+            {grouped.map(({ g, tracks }) => (
               <Fragment key={g}>
-                <H2 style={{ marginTop: gi === 0 ? 6 : 6 }}>{GROUP_LABEL[g]}</H2>
+                <View onLayout={measureSection(g)}>
+                  <H2 style={{ marginTop: 6 }}>{GROUP_LABEL[g]}</H2>
+                </View>
                 {tracks.map(renderUnit)}
               </Fragment>
             ))}
@@ -292,6 +336,7 @@ function LearnPath() {
         />
       </View>
       <SettingsSheet open={showSettings} onClose={() => setShowSettings(false)} />
+      <StreakSheet open={showStreak} onClose={() => setShowStreak(false)} />
     </SafeAreaView>
   );
 }
@@ -380,6 +425,20 @@ function Scrollbar({
   );
 }
 
+/** A compact pill in the jump bar — scrolls the path to its section. */
+function SectionChip({ label, onPress }: { label: string; onPress: () => void }) {
+  const { c } = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`Jump to ${label}`}
+      style={{ borderWidth: 1, borderColor: c.border, backgroundColor: c.card, borderRadius: 999, paddingVertical: 5, paddingHorizontal: 11 }}>
+      <T weight="800" size={11.5}>{label}</T>
+    </Pressable>
+  );
+}
+
 function Streak() {
   const streak = useStore((st) => st.streak);
   const xp = useStore((st) => st.xp);
@@ -393,7 +452,17 @@ function Streak() {
   );
 }
 
-function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch: () => void; searchOpen: boolean }) {
+function Header({
+  onMenu,
+  onSearch,
+  onStreak,
+  searchOpen,
+}: {
+  onMenu: () => void;
+  onSearch: () => void;
+  onStreak: () => void;
+  searchOpen: boolean;
+}) {
   const { c } = useTheme();
   const xp = useStore((st) => st.xp);
   const streak = useStore((st) => st.streak);
@@ -419,20 +488,29 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
           Field<T color="#f76707" weight="800" size={17}>Notes</T>
         </T>
         <View style={{ flex: 1 }} />
-        {freezes > 0 && <T weight="800" size={13} color="#4dabf7">🧊 {freezes}</T>}
-        {/* Hide the demotivating "🔥 0" — only celebrate a live streak. */}
-        {streak > 0 && (
-          <Row style={{ gap: 2 }}>
-            <T weight="800" size={14} color="#f76707">🔥</T>
-            <CountUp to={streak} style={{ fontWeight: '800', fontSize: 14, color: '#f76707' }} />
+        {/* The whole streak cluster is tappable → StreakSheet (freezes, rest days, daily goal). */}
+        <PressableScale
+          onPress={onStreak}
+          hapticStyle="selection"
+          scaleTo={0.96}
+          accessibilityLabel="Streak details — freezes, rest days and daily goal">
+          <Row style={{ gap: 8 }}>
+            {freezes > 0 && <T weight="800" size={13} color="#4dabf7">🧊 {freezes}</T>}
+            {/* Hide the demotivating "🔥 0" — only celebrate a live streak. */}
+            {streak > 0 && (
+              <Row style={{ gap: 2 }}>
+                <T weight="800" size={14} color="#f76707">🔥</T>
+                <CountUp to={streak} style={{ fontWeight: '800', fontSize: 14, color: '#f76707' }} />
+              </Row>
+            )}
+            <Row style={{ gap: 3 }}>
+              <T weight="800" size={13} color={goalMet ? c.success : c.muted}>🎯</T>
+              <T weight="800" size={13} color={goalMet ? c.success : c.muted}>
+                {goalMet ? 'Done' : `${cardsToday}/${dailyGoal}`}
+              </T>
+            </Row>
           </Row>
-        )}
-        <Row style={{ gap: 3 }}>
-          <T weight="800" size={13} color={goalMet ? c.success : c.muted}>🎯</T>
-          <T weight="800" size={13} color={goalMet ? c.success : c.muted}>
-            {goalMet ? 'Done' : `${cardsToday}/${dailyGoal}`}
-          </T>
-        </Row>
+        </PressableScale>
         {/* Level as a circular coin with a ring — reads as a "level badge", not a mystery bar.
             A thin fill at the base shows XP progress toward the next level. */}
         <View
@@ -456,7 +534,11 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
         {/* Dev-only: flip the whole Learn path between the curated User view and the full Dev view.
             `__DEV__`-gated so it never renders (and can never engage) in a production build. */}
         {__DEV__ && (
-          <Pressable onPress={() => setDevMode(!devMode)} hitSlop={8}>
+          <Pressable
+            onPress={() => setDevMode(!devMode)}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={devMode ? 'Dev mode on — tap for user view' : 'User view — tap for dev mode'}>
             <View
               style={{
                 backgroundColor: devMode ? '#e8453c' : 'transparent',
@@ -471,10 +553,10 @@ function Header({ onMenu, onSearch, searchOpen }: { onMenu: () => void; onSearch
             </View>
           </Pressable>
         )}
-        <Pressable onPress={onSearch} hitSlop={8}>
+        <Pressable onPress={onSearch} hitSlop={8} accessibilityRole="button" accessibilityLabel={searchOpen ? 'Hide search' : 'Search tracks and questions'}>
           <T weight="900" size={15} color={searchOpen ? '#f76707' : c.muted}>🔍</T>
         </Pressable>
-        <Pressable onPress={onMenu} hitSlop={8}>
+        <Pressable onPress={onMenu} hitSlop={8} accessibilityRole="button" accessibilityLabel="Role and prep settings">
           <T weight="900" size={18} color={c.muted}>⋯</T>
         </Pressable>
       </Row>
@@ -491,12 +573,14 @@ function RoleHeader({ role, onPress }: { role: string; onPress: () => void }) {
   // Skip it for the catch-all "all" role ("Senior Explore all tracks" makes no sense) and when no level is set.
   const name = def?.name ?? 'Pick a role';
   const titled = def && role !== 'all' && userLevel ? `${levelLabel(userLevel)} ${name}` : name;
+  // "Preparing as Explore all tracks" reads broken — the catch-all gets its own phrasing.
+  const heading = role === 'all' ? 'Exploring all tracks' : `Preparing as ${titled}`;
   return (
-    <PressableScale onPress={onPress} hapticStyle="selection" scaleTo={0.99}>
+    <PressableScale onPress={onPress} hapticStyle="selection" scaleTo={0.99} accessibilityLabel={`${heading} — change role, level, or goal`}>
       <Row style={{ justifyContent: 'space-between', paddingVertical: 2 }}>
         <Row style={{ gap: 6, flex: 1 }}>
           <T size={15}>{def?.emoji ?? '🎯'}</T>
-          <T weight="800" size={13}>Preparing as {titled}</T>
+          <T weight="800" size={13}>{heading}</T>
         </Row>
         <T weight="800" size={12} color={c.muted}>change ›</T>
       </Row>
@@ -566,13 +650,28 @@ function ContinueHero({ action: a }: { action: NextAction }) {
   const startLesson = useStore((s) => s.startLesson);
   const startDaily = useStore((s) => s.startDaily);
   const startBasics = useStore((s) => s.startBasics);
+  const heroPulse = useStore((s) => s.heroPulse);
+  const clearHeroPulse = useStore((s) => s.clearHeroPulse);
+  const reduced = useReducedMotion();
+  // Post-onboarding one-shot: a gentle breathing scale so the first next-action is unmissable.
+  const pulse = useSharedValue(1);
+  useEffect(() => {
+    if (heroPulse && !reduced) {
+      pulse.value = withRepeat(withTiming(1.022, { duration: 850 }), -1, true);
+    } else {
+      pulse.value = withTiming(1, { duration: 200 });
+    }
+  }, [heroPulse, reduced, pulse]);
+  const pulseStyle = useAnimatedStyle(() => ({ transform: [{ scale: pulse.value }] }));
   const color = a.colorKind === 'navy' ? c.navy : a.colorKind === 'success' ? c.success : track(a.colorKey ?? 'spark');
   const onPress = () => {
+    clearHeroPulse();
     if (a.kind === 'lesson' && a.slug != null && a.idx != null) startLesson(a.slug, a.idx);
     else if (a.kind === 'review') startDaily();
     else startBasics();
   };
   return (
+    <Animated.View style={pulseStyle}>
     <PressableScale onPress={onPress} sound>
       <View style={{ borderRadius: radius.lg, padding: 16, backgroundColor: color, overflow: 'hidden' }}>
         <Row style={{ gap: 13 }}>
@@ -595,6 +694,7 @@ function ContinueHero({ action: a }: { action: NextAction }) {
         )}
       </View>
     </PressableScale>
+    </Animated.View>
   );
 }
 
@@ -624,14 +724,15 @@ function DailyStrip({ heroKind }: { heroKind: NextAction['kind'] }) {
   const due = useStore((s) => s.sessionMeta.due);
   const startDaily = useStore((s) => s.startDaily);
   const startFresh = useStore((s) => s.startFresh);
-  const unlocked = useStore((s) => s.unlocked);
+  const unlocked = useStore(isProActive);
   // "Stay current" stays VISIBLE whenever the role has any live fresh cards — it's a permanent place to
   // review what shipped (manual or auto adds land here). The badge counts only the NEW (unseen) ones.
   const freshDeck = freshSessionCards(Date.now(), roleDomain(role));
   const freshUnseen = freshDeck.filter((cd) => (progress[cd.id]?.reps ?? 0) === 0).length;
-  const pills: { key: string; icon: string; label: string; n: number; onPress: () => void; color: string }[] = [];
+  const pills: { key: string; icon: string; label: string; n: number; onPress: () => void; color: string; pro?: boolean; a11y?: string }[] = [];
   if (heroKind !== 'review') pills.push({ key: 'review', icon: '📚', label: 'Review', n: due, onPress: startDaily, color: c.navy });
-  // "Stay current" full stream is Pro (subscription). Locked → route to the paywall instead of the deck.
+  // "Stay current" full stream is Pro (subscription). Locked → route to the paywall instead of the deck;
+  // an explicit PRO chip (not just the small 🔒) says so before the tap.
   if (freshDeck.length > 0)
     pills.push({
       key: 'fresh',
@@ -640,15 +741,22 @@ function DailyStrip({ heroKind }: { heroKind: NextAction['kind'] }) {
       n: unlocked ? freshUnseen : 0,
       onPress: unlocked ? startFresh : () => router.push('/paywall'),
       color: track('rag'),
+      pro: !unlocked,
+      a11y: unlocked ? 'Stay current — review fresh cards' : 'Stay current — Pro feature, opens the paywall',
     });
   if (pills.length === 0) return null;
   return (
     <Row style={{ gap: space.sm }}>
       {pills.map((p) => (
-        <PressableScale key={p.key} onPress={p.onPress} style={{ flex: 1 }}>
+        <PressableScale key={p.key} onPress={p.onPress} style={{ flex: 1 }} accessibilityLabel={p.a11y ?? p.label}>
           <Row style={{ gap: 8, borderRadius: radius.md, paddingVertical: 11, paddingHorizontal: 12, backgroundColor: c.card, borderWidth: 1, borderColor: c.border }}>
             <T size={15}>{p.icon}</T>
             <T weight="800" size={12.5} style={{ flex: 1 }}>{p.label}</T>
+            {p.pro && (
+              <View style={{ backgroundColor: p.color, borderRadius: 999, paddingVertical: 2, paddingHorizontal: 7 }}>
+                <T color="#fff" weight="900" size={9}>PRO</T>
+              </View>
+            )}
             {p.n > 0 && (
               <View style={{ minWidth: 21, height: 21, borderRadius: 11, paddingHorizontal: 6, backgroundColor: p.color, alignItems: 'center', justifyContent: 'center' }}>
                 <T color="#fff" weight="900" size={10.5}>{p.n}</T>
@@ -858,7 +966,11 @@ function Unit({
 
   return (
     <View style={{ marginBottom: open ? 12 : 8 }}>
-      <PressableScale onPress={onToggle} hapticStyle="selection" scaleTo={0.985}>
+      <PressableScale
+        onPress={onToggle}
+        hapticStyle="selection"
+        scaleTo={0.985}
+        accessibilityLabel={`${t.name} — ${doneCount} of ${count} lessons done, ${cards} cards. ${open ? 'Collapse' : 'Expand'}`}>
         <Row style={{ backgroundColor: c.card, borderWidth: 1, borderColor: open ? col : c.border, borderRadius: radius.md, padding: 10 }}>
           <View style={{ width: 38, height: 38, borderRadius: 11, backgroundColor: col, alignItems: 'center', justifyContent: 'center' }}>
             <T size={19}>{t.icon}</T>
@@ -912,6 +1024,9 @@ function Unit({
               <View style={{ width: '100%', height: 56, alignItems: 'center', justifyContent: 'center' }}>
                 <Shake trigger={shake.i === i ? shake.n : 0}>
                 <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Lesson ${i + 1}: ${title}${st.done ? ' — done' : locked ? ' — locked' : ''}`}
+                  accessibilityState={{ disabled: locked }}
                   onPress={() => {
                     if (locked) {
                       // Locked → tell the user why with a shake + error buzz instead of a dead tap.
@@ -953,6 +1068,8 @@ function Unit({
                 <Pressable
                   onPress={() => peekable && setPeek((p) => (p === i ? null : i))}
                   hitSlop={6}
+                  accessibilityRole="button"
+                  accessibilityLabel={`${title} — ${peek === i ? 'hide' : 'show'} questions`}
                   style={{
                     position: 'absolute',
                     maxWidth: 132,
@@ -1002,6 +1119,9 @@ function Unit({
               <View style={{ alignItems: 'center' }}>
                 <View style={{ width: 4, height: 16, borderRadius: 2, backgroundColor: cpDone ? col : c.border, opacity: cpDone ? 1 : 0.55 }} />
                 <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={cpDone ? `Chapter ${chapterIdx + 1} cleared` : `Checkpoint, chapter ${chapterIdx + 1}${chapterDone || dev ? '' : ' — locked'}`}
+                  accessibilityState={{ disabled: !(chapterDone || dev) }}
                   onPress={() => {
                     const available = chapterDone || dev;
                     if (!available) { haptic.error(); return; }

@@ -36,8 +36,9 @@ export default function Library() {
 
   return (
     <SafeAreaView edges={['top']} style={{ flex: 1, backgroundColor: c.surface }}>
-      {/* Tabs pinned at the top */}
-      <View style={{ paddingHorizontal: space.md, paddingTop: space.md, paddingBottom: space.sm }}>
+      {/* Heading + tabs pinned at the top — the page previously started mid-content with no title. */}
+      <View style={{ paddingHorizontal: space.md, paddingTop: space.md, paddingBottom: space.sm, gap: 10 }}>
+        <T size={22} weight="900" accessibilityRole="header">Library</T>
         <Segmented
           value={tab}
           onChange={(v) => setTab(v as Tab)}
@@ -54,6 +55,8 @@ export default function Library() {
         contentContainerStyle={{ paddingHorizontal: space.md, paddingBottom: 24, gap: space.md }}>
         {savedCount > 0 && !query && (
           <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Saved — ${savedCount} bookmarked card${savedCount === 1 ? '' : 's'}, tap to review`}
             onPress={() => {
               startSaved();
               router.push('/');
@@ -158,6 +161,8 @@ function Tile({ track, onPress }: { track: Track; onPress: () => void }) {
   return (
     <Pressable
       onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`${track.name} — ${track.q} questions`}
       style={{
         flexGrow: 1,
         flexBasis: '46%',

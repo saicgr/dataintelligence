@@ -1,6 +1,6 @@
 import { useRouter } from 'expo-router';
 import { ReactNode, useEffect, useRef, useState } from 'react';
-import { type LayoutChangeEvent, type NativeScrollEvent, type NativeSyntheticEvent, Pressable, ScrollView, TextInput, View } from 'react-native';
+import { type LayoutChangeEvent, type NativeScrollEvent, type NativeSyntheticEvent, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import Animated, {
   Easing,
   FadeIn,
@@ -17,7 +17,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { daysUntil } from '../lib/cramPlan';
 import { LEVELS, levelLabel, type Level } from '../lib/content';
-import { haptic } from '../lib/feedback';
+import { haptic, sfx } from '../lib/feedback';
 import { ROLES } from '../lib/roles';
 import { Mode, useStore } from '../lib/store';
 import { mono, radius, space, useTheme } from '../lib/theme';
@@ -27,7 +27,7 @@ import { Mascot } from '../ui/Mascot';
 import { RoleSelect } from '../ui/RoleSelect';
 
 const ORANGE = '#f76707'; // bright brand orange — decorative fills only (hero band, dots). Text uses c.accentInk.
-const STEPS = 4;
+const STEPS = 5;
 
 /**
  * Do-first first-run flow: short showcase → tailor (role + goal, so the demo can match) →
@@ -45,7 +45,7 @@ export default function Onboarding() {
 
   const finish = () => {
     complete(role, mode, level);
-    router.replace('/'); // push permission is now primed after the first completed session, not here
+    setStep(4); // celebrate, then land on the Learn path (push permission is primed after the first session)
   };
 
   const cta: Record<number, { label: string; onPress: () => void }> = {
@@ -53,6 +53,7 @@ export default function Onboarding() {
     1: { label: 'Try a real one →', onPress: () => setStep(2) },
     2: { label: 'Build my path →', onPress: () => setStep(3) },
     3: { label: 'Start free →', onPress: finish },
+    4: { label: 'Start my first lesson →', onPress: () => router.replace('/') },
   };
 
   // Floating "scroll for more" cue: shown only when content runs below the fold, and it
@@ -73,7 +74,7 @@ export default function Onboarding() {
     <SafeAreaView style={{ flex: 1, backgroundColor: c.surface }}>
       {/* Top bar: back · progress dots · skip */}
       <Row style={{ paddingHorizontal: space.md, paddingTop: 6, height: 34 }}>
-        {step > 0 ? (
+        {step > 0 && step < 4 ? (
           <Pressable accessibilityRole="button" accessibilityLabel="Go back" onPress={() => setStep((s) => s - 1)} hitSlop={10}>
             <T size={15} weight="900" color={c.muted}>‹ Back</T>
           </Pressable>
@@ -110,7 +111,8 @@ export default function Onboarding() {
           {step === 0 && <Showcase c={c} />}
           {step === 1 && <Tailor c={c} role={role} setRole={setRole} mode={mode} setMode={setMode} level={level} setLevel={setLevel} />}
           {step === 2 && <TryOne c={c} role={role} level={level} />}
-          {step === 3 && <FounderNote c={c} />}
+          {step === 3 && <FounderNote c={c} mode={mode} />}
+          {step === 4 && <Celebrate c={c} role={role} />}
         </CardEnter>
       </ScrollView>
 
@@ -181,12 +183,24 @@ function RotatingPhrase({ items, color }: { items: string[]; color: string }) {
     const id = setInterval(() => setI((p) => (p + 1) % items.length), 2400);
     return () => clearInterval(id);
   }, [reduced, items.length]);
+  // Web: reanimated entering/exiting on a key-swapped absolute Text can fail to paint,
+  // leaving the 30px box EMPTY under "WHETHER YOU'RE" (shipped that way once). A static
+  // in-flow Text still rotates via the interval and can never render blank.
+  if (Platform.OS === 'web' || reduced) {
+    return (
+      <View style={{ height: 30, justifyContent: 'center', alignSelf: 'stretch' }}>
+        <Text numberOfLines={1} style={{ width: '100%', textAlign: 'center', fontSize: 19, fontWeight: '900', color }}>
+          {items[i]}
+        </Text>
+      </View>
+    );
+  }
   return (
     <View style={{ height: 30, overflow: 'hidden', justifyContent: 'center', alignSelf: 'stretch' }}>
       <Animated.Text
         key={i}
-        entering={reduced ? undefined : FadeInDown.duration(320).easing(Easing.out(Easing.cubic))}
-        exiting={reduced ? undefined : FadeOutUp.duration(320).easing(Easing.in(Easing.cubic))}
+        entering={FadeInDown.duration(320).easing(Easing.out(Easing.cubic))}
+        exiting={FadeOutUp.duration(320).easing(Easing.in(Easing.cubic))}
         numberOfLines={1}
         adjustsFontSizeToFit
         style={{ position: 'absolute', width: '100%', textAlign: 'center', fontSize: 21, fontWeight: '900', color }}>
@@ -291,6 +305,9 @@ function Tailor({ c, role, setRole, mode, setMode, level, setLevel }: { c: C; ro
       <View style={{ gap: 5 }}>
         <T size={22} weight="900">Let&apos;s tailor it to you.</T>
         <T muted size={13} style={{ lineHeight: 19 }}>Your path, daily session, and fresh stream are built from this.</T>
+        <T muted size={11.5} style={{ lineHeight: 16, marginTop: 2 }}>
+          Coming from another background? Pick the role you&apos;re aiming for — the path ramps you up from the fundamentals.
+        </T>
       </View>
 
       <View style={{ gap: 9 }}>
@@ -300,14 +317,15 @@ function Tailor({ c, role, setRole, mode, setMode, level, setLevel }: { c: C; ro
 
       <View style={{ gap: 9 }}>
         <T weight="800" size={13}>What level are you targeting?</T>
+        {/* Explain BEFORE the pills — what picking one means shouldn't be a post-hoc footnote. */}
+        <T muted size={11.5} style={{ lineHeight: 16 }}>
+          Sets the difficulty of your daily cards. Change it anytime, and switch to “All levels” in Settings.
+        </T>
         <LevelPicker
           options={LEVELS.map((value) => ({ label: levelLabel(value), value }))}
           value={level}
           onChange={setLevel}
         />
-        <T muted size={11.5} style={{ lineHeight: 16 }}>
-          Sets the difficulty of your daily cards. Change it anytime, and switch to “All levels” in Settings.
-        </T>
       </View>
 
       <View style={{ gap: 9 }}>
@@ -320,8 +338,11 @@ function Tailor({ c, role, setRole, mode, setMode, level, setLevel }: { c: C; ro
           value={mode}
           onChange={(v) => setMode(v as Mode)}
         />
+        {/* Helper text tracks the selected mode — a static line read as a bug in review. */}
         <T muted size={11.5} style={{ lineHeight: 16 }}>
-          Cram surfaces high-yield cards first. Stay-current paces you with spaced review.
+          {mode === 'cram'
+            ? 'Cram surfaces high-yield cards first so you peak by interview day.'
+            : 'Stay-current paces you with spaced review and weekly fresh drops on what just shipped.'}
         </T>
       </View>
 
@@ -548,26 +569,30 @@ const TRY: Record<TryFamily, Record<DemoLevel, TryConfig>> = {
     },
   },
   swe: {
+    // Genuinely junior + confidence-building: an everyday API decision, not prod debugging.
+    // (The old N+1 question here read as mid/senior to first-time juniors — bad first impression.)
     Jr: {
       tool: 'Backend', icon: '💻', iconBg: '#4263eb',
-      q: 'A list endpoint is slow and your logs show one DB query per row returned. What is this?',
+      q: 'A user requests a profile that doesn’t exist. What should your API return?',
       opts: [
-        { t: 'An N+1 query — fix it with a single JOIN / IN, or eager-load', ok: true },
-        { t: 'The JSON response is just too large', ok: false },
-        { t: 'The server needs more RAM', ok: false },
+        { t: '404 Not Found — with a clear error body', ok: true },
+        { t: '200 OK with an empty object, just to be safe', ok: false },
+        { t: '500 Internal Server Error', ok: false },
       ],
       verdict: (
         <T size={13} style={{ lineHeight: 20 }}>
-          One query per item is the classic <T weight="800">N+1</T>. Batch it into a single query (JOIN / <T weight="800">WHERE id IN (…)</T>) instead of looping.
+          A <T weight="800">200 with an empty body</T> hides the problem from the caller, and a <T weight="800">500</T> blames
+          your server. <T weight="800">404</T> tells the truth: the resource isn&apos;t there.
         </T>
       ),
-      fixPrompt: 'Order the fix:',
-      fixLines: ['Spot the N+1 (one query per row in the trace)', 'Collect the ids you need', 'Fetch them in one JOIN / IN query', 'Map results back in memory'],
+      fixPrompt: 'Order the request handling:',
+      fixLines: ['Validate the id from the request', 'Look the user up in the database', 'Found → return 200 with the user', 'Missing → return 404 with a clear error'],
       fixPool: [2, 0, 3, 1],
-      fixSuccess: '✓ One query, not N.',
+      fixSuccess: '✓ Honest, debuggable API.',
       fixExplain: (
         <T size={13} style={{ lineHeight: 20 }}>
-          Replace the per-row loop with a single set-based query, then stitch the results in code — one round-trip instead of N.
+          Right status codes are how clients (and you, at 2am) know what happened: <T weight="800">4xx</T> = caller&apos;s
+          issue, <T weight="800">5xx</T> = yours.
         </T>
       ),
     },
@@ -991,7 +1016,10 @@ function TryOne({ c, role, level }: { c: C; role: string; level: Level }) {
 }
 
 /* ── Step 3: a short, human founder's note ─────────────────────────────────── */
-function FounderNote({ c }: { c: C }) {
+function FounderNote({ c, mode }: { c: C; mode?: Mode }) {
+  // "I hope it gets you the offer" only fits interviewers — stay-current users aren't job hunting.
+  // Unset mode (step order changes) defaults to the cram line.
+  const closing = mode === 'maintain' ? 'I hope it keeps you sharp for whatever comes next.' : 'I hope it gets you the offer.';
   return (
     <View style={{ gap: space.lg, marginTop: 8 }}>
       <Row style={{ gap: 12 }}>
@@ -1009,7 +1037,7 @@ function FounderNote({ c }: { c: C }) {
           I bombed interviews where I <T weight="800">knew the material</T> but froze the moment someone asked “…but why?”. The grind out there drills trivia, not the production reasoning that actually gets you the offer.
         </T>
         <T size={14} style={{ lineHeight: 22 }} color={c.fg}>
-          So I built the prep I wish I&apos;d had: <T weight="800">real questions, the reasoning behind them,</T> and the stuff that shipped last week. Free to start. I hope it gets you the offer.
+          So I built the prep I wish I&apos;d had: <T weight="800">real questions, the reasoning behind them,</T> and the stuff that shipped last week. Free to start. {closing}
         </T>
         <T size={13.5} weight="900" color={c.accentInk}>— Chetan, FieldNotes</T>
       </View>
@@ -1017,6 +1045,41 @@ function FounderNote({ c }: { c: C }) {
       <T muted size={12} style={{ textAlign: 'center', lineHeight: 18 }}>
         Tap below and your tailored path is ready on the other side.
       </T>
+    </View>
+  );
+}
+
+/** Step 4 — celebration: onboarding is complete, the path is built, momentum is high. */
+function Celebrate({ c, role }: { c: C; role: string }) {
+  const roleName = ROLES.find((r) => r.key === role)?.name ?? 'your';
+  useEffect(() => {
+    sfx.complete();
+    haptic.success();
+  }, []);
+  return (
+    <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', gap: 14, paddingVertical: 30 }}>
+      <Confetti count={22} />
+      <Mascot mood="celebrate" size={120} />
+      <T weight="900" size={26} style={{ textAlign: 'center' }}>
+        Your {roleName} path is ready 🎉
+      </T>
+      <T muted size={14} style={{ textAlign: 'center', lineHeight: 21, maxWidth: 300 }}>
+        Real interview questions, tuned to your level. The first lesson takes about 3 minutes — start now while it&apos;s warm.
+      </T>
+      <View
+        style={{
+          marginTop: 8,
+          backgroundColor: c.card,
+          borderWidth: 1,
+          borderColor: c.border,
+          borderRadius: radius.md,
+          paddingVertical: 10,
+          paddingHorizontal: 16,
+        }}>
+        <T size={12.5} weight="700" color={c.muted}>
+          🔥 Day 1 starts today — one session keeps the streak.
+        </T>
+      </View>
     </View>
   );
 }

@@ -5,7 +5,7 @@ import { Linking, Pressable, TextInput, View } from 'react-native';
 
 import { daysUntil } from '../lib/cramPlan';
 import { analyzeJd, JdResult } from '../lib/jd';
-import { useStore } from '../lib/store';
+import { isProActive, useStore } from '../lib/store';
 import { radius, useTheme } from '../lib/theme';
 import { InterviewPlanCard } from '../ui/InterviewPlanCard';
 import { Btn, Card, H2, Row, Screen, T } from '../ui/kit';
@@ -16,7 +16,7 @@ const WEB_URL = 'https://fieldnotes.dev/jd';
 export default function JD() {
   const router = useRouter();
   const { c, track } = useTheme();
-  const unlocked = useStore((s) => s.unlocked);
+  const unlocked = useStore(isProActive);
   const progress = useStore((s) => s.progress);
   const setRole = useStore((s) => s.setRole);
   const interviewDate = useStore((s) => s.interviewDate);

@@ -5,7 +5,7 @@ import { Alert, Pressable, Switch, TextInput, View } from 'react-native';
 import { appleAvailable, signInWithApple, signInWithEmail, signInWithGoogle, signOut } from '../../lib/auth';
 import { hasSupabase } from '../../lib/env';
 import { haptic } from '../../lib/feedback';
-import { PACKS, SUB_YEARLY_PER_MONTH } from '../../lib/products';
+import { PACKS, SUB_YEARLY_PER_MONTH, SUB_YEARLY_PRICE } from '../../lib/products';
 import { useStore } from '../../lib/store';
 import { ACCENTS, type AccentKey, radius, useTheme } from '../../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
@@ -85,9 +85,10 @@ export default function Profile() {
             <View style={{ marginTop: 12 }}>
               <HowProWorks onPurple />
             </View>
+            {/* Spell out the real charge — "$2.50/mo" alone reads like a monthly plan. */}
             <Row style={{ marginTop: 12, alignItems: 'baseline', gap: 6 }}>
               <T color="#fff" size={26} weight="900">{SUB_YEARLY_PER_MONTH}</T>
-              <T color="#dcd7ff" size={13} weight="700">/mo · billed yearly</T>
+              <T color="#dcd7ff" size={13} weight="700">/mo · billed as {SUB_YEARLY_PRICE}/yr</T>
             </Row>
             <Btn label="See plans →" style={{ marginTop: 12 }} onPress={() => router.push('/paywall')} />
           </>

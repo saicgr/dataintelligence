@@ -1,9 +1,10 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { safeBack } from '../lib/nav';
 import { useEffect, useState } from 'react';
-import { Pressable, View } from 'react-native';
+import { Linking, Platform, Pressable, View } from 'react-native';
 
 import { track as logEvent } from '../lib/analytics';
+import { ENV } from '../lib/env';
 import {
   BASE_PRODUCT_ID,
   LIFETIME_ANCHOR,
@@ -56,7 +57,7 @@ export default function Paywall() {
   if (pack) {
     return (
       <Screen>
-        <Pressable onPress={() => safeBack(router)}>
+        <Pressable onPress={() => safeBack(router)} accessibilityRole="button" accessibilityLabel="Close paywall">
           <T muted weight="700" size={13}>‹ Close</T>
         </Pressable>
         <View style={{ borderRadius: radius.xl, padding: 22, backgroundColor: track('rag'), alignItems: 'center' }}>
@@ -82,6 +83,7 @@ export default function Paywall() {
           />
         )}
         <Btn label="Restore purchases" variant="ghost" onPress={async () => { await restore(); safeBack(router); }} />
+        <LegalLinks />
       </Screen>
     );
   }
@@ -101,7 +103,7 @@ export default function Paywall() {
 
   return (
     <Screen>
-      <Pressable onPress={() => safeBack(router)}>
+      <Pressable onPress={() => safeBack(router)} accessibilityRole="button" accessibilityLabel="Close paywall">
         <T muted weight="700" size={13}>‹ Close</T>
       </Pressable>
 
@@ -194,7 +196,42 @@ export default function Paywall() {
         Subscriptions auto-renew until cancelled — manage in your {` `}store account. Lifetime is a one-time
         purchase. The web workbench (live coding + AI coach) is a separate plan.
       </T>
+      <LegalLinks />
     </Screen>
+  );
+}
+
+/** Apple's standard EULA covers auto-renewing subs sold through the App Store. */
+const APPLE_EULA_URL = 'https://www.apple.com/legal/internet-services/itunes/dev/stdeula/';
+
+/**
+ * Terms / Privacy (+ iOS EULA) — store guidelines and consumer law require these
+ * anywhere we sell auto-renewing subscriptions. URLs come from ENV.webUrl
+ * (EXPO_PUBLIC_WEB_URL), which must point at the deployed web app.
+ */
+function LegalLinks() {
+  const { c } = useTheme();
+  const open = (url: string) => () => {
+    Linking.openURL(url).catch(() => {}); // offline / no handler → silently no-op, never crash the paywall
+  };
+  const links: { label: string; url: string }[] = [
+    { label: 'Terms', url: `${ENV.webUrl}/terms` },
+    { label: 'Privacy', url: `${ENV.webUrl}/privacy` },
+    ...(Platform.OS === 'ios' ? [{ label: 'EULA', url: APPLE_EULA_URL }] : []),
+  ];
+  return (
+    <Row style={{ justifyContent: 'center', gap: 6, paddingBottom: 4 }}>
+      {links.map((l, i) => (
+        <Row key={l.label} style={{ gap: 6 }}>
+          {i > 0 && <T muted size={11}>·</T>}
+          <Pressable onPress={open(l.url)} accessibilityRole="link" accessibilityLabel={`Open ${l.label}`} hitSlop={8}>
+            <T size={11.5} weight="700" style={{ textDecorationLine: 'underline' }} color={c.muted}>
+              {l.label}
+            </T>
+          </Pressable>
+        </Row>
+      ))}
+    </Row>
   );
 }
 
@@ -218,7 +255,11 @@ function PlanCard({
   const { c, track } = useTheme();
   const accent = track('rag');
   return (
-    <Pressable onPress={onPress}>
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="radio"
+      accessibilityLabel={`${title} plan — ${price}, ${sub}`}
+      accessibilityState={{ checked: selected }}>
       <Row
         style={{
           borderRadius: radius.md,

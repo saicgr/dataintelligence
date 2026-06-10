@@ -62,6 +62,8 @@ export function H2({ children, style }: { children: ReactNode; style?: StyleProp
   const { c } = useTheme();
   return (
     <Text
+      accessibilityRole="header"
+      aria-level={2}
       style={[
         { color: c.muted, fontSize: 12, fontWeight: '800', letterSpacing: 0.6, textTransform: 'uppercase' },
         style,
@@ -79,6 +81,7 @@ export function T({
   color,
   style,
   numberOfLines,
+  accessibilityRole,
 }: {
   children: ReactNode;
   muted?: boolean;
@@ -87,11 +90,13 @@ export function T({
   color?: string;
   style?: StyleProp<TextStyle>;
   numberOfLines?: number;
+  accessibilityRole?: 'header' | 'text';
 }) {
   const { c } = useTheme();
   return (
     <Text
       numberOfLines={numberOfLines}
+      accessibilityRole={accessibilityRole}
       style={[{ color: color ?? (muted ? c.muted : c.fg), fontWeight: weight, fontSize: size }, style]}>
       {children}
     </Text>
@@ -247,12 +252,15 @@ export function Segmented({
 }) {
   const { c } = useTheme();
   return (
-    <View style={{ flexDirection: 'row', gap: 6, backgroundColor: c.border, borderRadius: 13, padding: 4 }}>
+    <View accessibilityRole="tablist" style={{ flexDirection: 'row', gap: 6, backgroundColor: c.border, borderRadius: 13, padding: 4 }}>
       {options.map((o) => {
         const on = o.value === value;
         return (
           <Pressable
             key={o.value}
+            accessibilityRole="tab"
+            accessibilityLabel={o.label}
+            accessibilityState={{ selected: on }}
             onPress={() => onChange(o.value)}
             style={{
               flex: 1,

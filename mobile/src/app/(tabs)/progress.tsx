@@ -20,6 +20,10 @@ export default function Progress() {
   const progress = useStore((s) => s.progress);
   const streak = useStore((s) => s.streak);
   const lastMockScore = useStore((s) => s.lastMockScore);
+  const savedIds = useStore((s) => s.savedIds);
+  const checkpointsDone = useStore((s) => s.checkpointsDone);
+  const voiceTried = useStore((s) => s.voiceTried);
+  const markBadgesSeen = useStore((s) => s.markBadgesSeen);
   const company = useStore((s) => s.targetCompany);
   const [asked, setAsked] = useState<MostAskedTopic[]>([]);
   useEffect(() => {
@@ -35,7 +39,22 @@ export default function Progress() {
     name: t.name,
     pct: t.q ? Math.min(100, Math.round((seenByTrack(t.slug) / t.q) * 100)) : 0,
   }));
-  const badges = computeBadges({ streak, xp, progress, lastMockScore, trackCoverage });
+  const badges = computeBadges({
+    streak,
+    xp,
+    progress,
+    lastMockScore,
+    trackCoverage,
+    savedCount: savedIds.length,
+    checkpointsDone: checkpointsDone.length,
+    voiceTried,
+  });
+  // The badge grid is on screen here — anything earned counts as seen (no toast needed).
+  const earnedIds = badges.filter((b) => b.earned).map((b) => b.id);
+  useEffect(() => {
+    if (earnedIds.length) markBadgesSeen(earnedIds);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [earnedIds.join(',')]);
 
   // Certificate eligibility: a fully-covered track, else interview-ready role readiness.
   const mastered = trackCoverage.find((t) => t.pct >= 100);

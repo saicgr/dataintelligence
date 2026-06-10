@@ -17,7 +17,7 @@ import { type JudgeResult } from '../lib/judge';
 import { judgeSql } from '../lib/judge/sql';
 import { buildProgram, judgeFromStdout, PyodideHost, type PyodideHandle } from '../lib/judge/pyodide';
 import { haptic, sfx } from '../lib/feedback';
-import { FREE_CODE_RUNS, useStore } from '../lib/store';
+import { FREE_CODE_RUNS, isProActive, useStore } from '../lib/store';
 import { mono, radius, useTheme } from '../lib/theme';
 import { Confetti } from '../ui/anim';
 import { CodeBlock } from '../ui/CodeBlock';
@@ -90,7 +90,7 @@ function Editor({
   const [busy, setBusy] = useState(false);
   const [showHints, setShowHints] = useState(false);
   // Free users get FREE_CODE_RUNS runs/day; Pro is unlimited. Runs are 100% on-device — the cap is an upgrade hook.
-  const unlocked = useStore((s) => s.unlocked);
+  const unlocked = useStore(isProActive);
   const bumpCodeRun = useStore((s) => s.bumpCodeRun);
   const codeRunsToday = useStore((s) => s.codeRunsToday);
   const codeRunDay = useStore((s) => s.codeRunDay);

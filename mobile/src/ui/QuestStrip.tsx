@@ -1,18 +1,20 @@
 /**
- * QuestStrip — a horizontal shelf of today's three Daily Quests, each a small card with its own
- * progress bar + a checkmark when done. Renders under the DailyStrip on the Learn home.
+ * QuestStrip — today's three Daily Quests as a vertical stack of full-width rows
+ * (icon → full label + progress bar → live n/goal count), so nothing is ever clipped
+ * and every quest is one tap away. Renders under the DailyStrip on the Learn home.
  *
  * Live progress is read from the store (cardsToday / dailyGoal / questProgress). Quest completion
  * is computed by the pure helpers in lib/quests, seeded by today's day string so the trio rotates
  * daily and is identical across devices. The store gates `questProgress` per day (questDay); this
  * component is a pure view — it never writes. Optionally accept already-completed ids via props.
  */
-import { ScrollView, View } from 'react-native';
+import { View } from 'react-native';
 
 import {
   questDayKey,
   questDone,
   questFraction,
+  questProgressValue,
   type Quest,
   type QuestId,
   type QuestProgressInputs,
@@ -62,67 +64,76 @@ export function QuestStrip({
           {doneCount}/{quests.length}
         </T>
       </Row>
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={{ gap: space.sm, paddingRight: space.sm }}>
-        {quests.map((q, i) => (
-          <CardEnter key={q.id} delay={i * 50}>
-            <QuestCard quest={q} done={isDone(q)} frac={override ? (override.has(q.id) ? 1 : 0) : questFraction(q.id, inputs)} onPress={onPressQuest} />
-          </CardEnter>
-        ))}
-      </ScrollView>
+      {quests.map((q, i) => (
+        <CardEnter key={q.id} delay={i * 50}>
+          <QuestRow
+            quest={q}
+            done={isDone(q)}
+            frac={override ? (override.has(q.id) ? 1 : 0) : questFraction(q.id, inputs)}
+            value={override ? (override.has(q.id) ? q.goal : 0) : questProgressValue(q.id, inputs)}
+            onPress={onPressQuest}
+          />
+        </CardEnter>
+      ))}
     </View>
   );
 }
 
-function QuestCard({
+function QuestRow({
   quest,
   done,
   frac,
+  value,
   onPress,
 }: {
   quest: Quest;
   done: boolean;
   frac: number;
+  value: number;
   onPress?: (q: Quest) => void;
 }) {
   const { c } = useTheme();
   return (
-    <PressableScale onPress={onPress ? () => onPress(quest) : undefined} disabled={!onPress} scaleTo={0.97}>
-      <View
+    <PressableScale
+      onPress={onPress ? () => onPress(quest) : undefined}
+      disabled={!onPress}
+      scaleTo={0.98}
+      accessibilityLabel={`Quest: ${quest.label} — ${done ? 'done' : `${value} of ${quest.goal}`}`}>
+      <Row
         style={{
-          width: 152,
           borderRadius: radius.md,
           padding: 12,
           backgroundColor: c.card,
           borderWidth: 1,
           borderColor: done ? c.success : c.border,
-          gap: 9,
+          gap: 12,
+          alignItems: 'center',
         }}>
-        <Row style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}>
-          <View
-            style={{
-              width: 34,
-              height: 34,
-              borderRadius: 11,
-              backgroundColor: done ? c.success : c.surface,
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}>
-            <T size={17}>{done ? '✓' : quest.icon}</T>
+        <View
+          style={{
+            width: 38,
+            height: 38,
+            borderRadius: 12,
+            backgroundColor: done ? c.success : c.surface,
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}>
+          <T size={18}>{done ? '✓' : quest.icon}</T>
+        </View>
+        <View style={{ flex: 1, gap: 7 }}>
+          <T weight="800" size={13}>{quest.label}</T>
+          <AnimatedProgressBar value={frac} color={done ? c.success : c.accent} track={c.border} height={6} />
+        </View>
+        {done ? (
+          <View style={{ backgroundColor: c.success, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 3 }}>
+            <T color="#fff" weight="900" size={9}>DONE</T>
           </View>
-          {done && (
-            <View style={{ backgroundColor: c.success, borderRadius: 999, paddingHorizontal: 7, paddingVertical: 2 }}>
-              <T color="#fff" weight="900" size={9}>DONE</T>
-            </View>
-          )}
-        </Row>
-        <T weight="800" size={12.5} style={{ minHeight: 34 }}>
-          {quest.label}
-        </T>
-        <AnimatedProgressBar value={frac} color={done ? c.success : c.accent} track={c.border} height={6} />
-      </View>
+        ) : (
+          <T weight="800" size={12} muted>
+            {value}/{quest.goal}
+          </T>
+        )}
+      </Row>
     </PressableScale>
   );
 }

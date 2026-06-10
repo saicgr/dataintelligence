@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { Pressable, View } from 'react-native';
 
 import { LEVELS, type Level, levelLabel, lessonTitle, lessonsForTrack, QRow, questionsFor, trackBySlug } from '../../lib/content';
-import { useStore } from '../../lib/store';
+import { isProActive, useStore } from '../../lib/store';
 import { radius, useTheme } from '../../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
 
@@ -13,7 +13,7 @@ export default function TrackDetail() {
   const router = useRouter();
   const { c, track } = useTheme();
   const startTrack = useStore((s) => s.startTrack);
-  const unlocked = useStore((s) => s.unlocked);
+  const unlocked = useStore(isProActive);
   const [lvl, setLvl] = useState<Level | 'All'>('All');
 
   const t = trackBySlug(slug ?? '');

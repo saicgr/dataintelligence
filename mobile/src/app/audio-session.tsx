@@ -23,7 +23,7 @@ import {
   type SessionCard,
 } from '../lib/content';
 import { haptic } from '../lib/feedback';
-import { useStore } from '../lib/store';
+import { isProActive, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
 import { isAvailable, speak, stop as ttsStop } from '../lib/tts';
 import { Btn, Card, H2, Row, Screen, T } from '../ui/kit';
@@ -51,8 +51,13 @@ export default function AudioSession() {
   const { c } = useTheme();
   const role = useStore((s) => s.role);
   const progress = useStore((s) => s.progress);
-  const unlocked = useStore((s) => s.unlocked);
+  const unlocked = useStore(isProActive);
   const soundOn = useStore((s) => s.sound);
+  const markVoiceTried = useStore((s) => s.markVoiceTried);
+  // Opening voice recall at all earns the 🎙 badge.
+  useEffect(() => {
+    markVoiceTried();
+  }, [markVoiceTried]);
 
   // Build a private copy of today's deck (does not touch sessionDeck/idx).
   const deckRef = useRef<SessionCard[]>([]);

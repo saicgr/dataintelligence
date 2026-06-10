@@ -6,10 +6,10 @@ import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 
 
 import { answerFeedback, haptic, sfx } from '../lib/feedback';
 import { requestPermission } from '../lib/notifications';
-import { dueLabel } from '../lib/srs';
-import { useActiveDeck, useStore } from '../lib/store';
+import { dueLabel, dueWithin } from '../lib/srs';
+import { isProActive, useActiveDeck, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
-import { AnimatedProgressBar, CardEnter, Confetti, FollowUpCue } from './anim';
+import { AnimatedProgressBar, CardEnter, Confetti, CountUp, FollowUpCue, Pop } from './anim';
 import { Btn, Card, Chip, Row, T, TrackBadge } from './kit';
 import { Mascot } from './Mascot';
 import { ResultFooter } from './ResultFooter';
@@ -64,9 +64,10 @@ function CardView() {
   const doReveal = useStore((s) => s.doReveal);
   const choose = useStore((s) => s.choose);
   const rate = useStore((s) => s.rate);
-  const unlocked = useStore((s) => s.unlocked);
+  const unlocked = useStore(isProActive);
   const toggleSave = useStore((s) => s.toggleSave);
   const setFeedback = useStore((s) => s.setFeedback);
+  const markVoiceTried = useStore((s) => s.markVoiceTried);
 
   const card = deck[idx];
   const saved = useStore((s) => (card ? s.savedIds.includes(card.id) : false));
@@ -235,7 +236,10 @@ function CardView() {
                       }}
                     />
                     <Pressable
-                      onPress={() => jotRef.current?.focus()}
+                      onPress={() => {
+                        markVoiceTried();
+                        jotRef.current?.focus();
+                      }}
                       hitSlop={6}
                       style={{
                         width: 46,
@@ -693,14 +697,25 @@ function NotifPrime() {
   );
 }
 
+/** End-of-session summary (#12): what you earned, how you did, and tomorrow's hook. */
 function Done() {
   const router = useRouter();
+  const { c } = useTheme();
+  const deck = useActiveDeck();
   const replay = useStore((s) => s.replay);
+  const endSession = useStore((s) => s.endSession);
   const freezes = useStore((s) => s.freezes);
   const playful = useStore((s) => s.playful);
   const cardsToday = useStore((s) => s.cardsToday);
   const dailyGoal = useStore((s) => s.dailyGoal);
+  const sessionXp = useStore((s) => s.sessionXp);
+  const sessionHits = useStore((s) => s.sessionHits);
+  const sessionMisses = useStore((s) => s.sessionMisses);
+  const progress = useStore((s) => s.progress);
   const goalMet = cardsToday >= dailyGoal;
+  const checks = sessionHits + sessionMisses;
+  const accuracy = checks > 0 ? Math.round((sessionHits / checks) * 100) : null;
+  const dueTomorrow = dueWithin(progress, Date.now(), 1);
   return (
     <View style={{ gap: space.md }}>
       {playful ? <Confetti /> : null}
@@ -709,22 +724,66 @@ function Done() {
       <Card style={{ alignItems: 'center', padding: 24 }}>
       {playful ? <Mascot mood="celebrate" size={96} /> : <T size={38}>✓</T>}
       <T size={22} weight="900" style={{ marginTop: 6 }}>
-        {goalMet ? 'Daily goal complete' : 'All caught up for today'}
+        {goalMet ? 'Daily goal complete' : 'Session complete'}
       </T>
-      <T muted size={13} style={{ marginTop: 5, textAlign: 'center', lineHeight: 20 }}>
-        Nothing else is due — your next cards are scheduled for tomorrow.
-      </T>
-      <Row style={{ marginTop: 14, justifyContent: 'center', flexWrap: 'wrap' }}>
+      <Row style={{ marginTop: 14, gap: 9, alignSelf: 'stretch' }}>
+        <Pop trigger={sessionXp} style={{ flex: 1 }}>
+          <StatTile label="XP earned" color="#e8590c">
+            <Row style={{ gap: 2, justifyContent: 'center' }}>
+              <T weight="900" size={20} color="#e8590c">+</T>
+              <CountUp to={sessionXp} style={{ fontWeight: '900', fontSize: 20, color: '#e8590c' }} />
+            </Row>
+          </StatTile>
+        </Pop>
+        <StatTile label="Cards" color="#1c7ed6">
+          <T weight="900" size={20} color="#1c7ed6">{deck.length}</T>
+        </StatTile>
+        {accuracy != null && (
+          <StatTile label="Accuracy" color={accuracy >= 70 ? c.success : c.warn}>
+            <T weight="900" size={20} color={accuracy >= 70 ? c.success : c.warn}>{accuracy}%</T>
+          </StatTile>
+        )}
+      </Row>
+      <Row style={{ marginTop: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
         <Chip label={`📈 ${Math.min(cardsToday, dailyGoal)}/${dailyGoal} today`} kind="amber" />
         {freezes > 0 && <Chip label={`🧊 ${freezes} freeze${freezes > 1 ? 's' : ''}`} kind="amber" />}
       </Row>
-      <View style={{ marginTop: 18, alignSelf: 'stretch', gap: 10 }}>
+      <T muted size={12.5} style={{ marginTop: 12, textAlign: 'center', lineHeight: 19 }}>
+        {dueTomorrow > 0
+          ? `📅 ${dueTomorrow} card${dueTomorrow > 1 ? 's' : ''} due tomorrow — come back to keep them fresh.`
+          : '📅 Nothing due yet — fresh cards land tomorrow.'}
+      </T>
+      <View style={{ marginTop: 16, alignSelf: 'stretch', gap: 10 }}>
+        <Btn label="Done — see you tomorrow" variant="primary" onPress={endSession} />
         <Btn label="📣 Share my streak" variant="navy" onPress={() => router.push('/share')} />
         <Btn label="📝 Just interviewed? Log a debrief" variant="ghost" onPress={() => router.push('/debrief')} />
         <Btn label="📚 Browse the library" variant="ghost" onPress={() => router.push('/library')} />
         <Btn label="↻ Replay this set" variant="ghost" onPress={replay} />
       </View>
       </Card>
+    </View>
+  );
+}
+
+function StatTile({ label, color, children }: { label: string; color: string; children: React.ReactNode }) {
+  const { c, scheme } = useTheme();
+  return (
+    <View
+      style={{
+        flex: 1,
+        borderRadius: radius.md,
+        paddingVertical: 12,
+        paddingHorizontal: 6,
+        alignItems: 'center',
+        gap: 2,
+        backgroundColor: scheme === 'dark' ? color + '1f' : color + '14',
+        borderWidth: 1,
+        borderColor: color + '44',
+      }}>
+      {children}
+      <T size={10} weight="800" color={c.muted} style={{ letterSpacing: 0.3, textTransform: 'uppercase' }}>
+        {label}
+      </T>
     </View>
   );
 }

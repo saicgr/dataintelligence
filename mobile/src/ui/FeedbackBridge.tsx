@@ -1,21 +1,29 @@
 /**
  * Headless bridge: turns store-owned feedback events (session complete, streak up,
- * level up) into sound + haptics, and renders a self-dismissing Level-Up overlay.
+ * level up, first card, daily goal, badge unlocks) into sound + haptics, and renders
+ * the self-dismissing celebration overlays / badge toast.
  * Mounted once in the (tabs) layout so it overlays every tab + the session player.
  */
-import { useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Dimensions, Pressable, View } from 'react-native';
 import Animated, { FadeIn, FadeOut, ZoomIn } from 'react-native-reanimated';
 
+import { type Badge, computeBadges } from '../lib/badges';
 import { haptic, sfx } from '../lib/feedback';
 import { useStore } from '../lib/store';
-import { radius, useTheme } from '../lib/theme';
+import { radius, space, useTheme } from '../lib/theme';
+import { Confetti } from './anim';
 import { T } from './kit';
+
+/** Transient celebration moments rendered by this bridge (each self-dismisses). */
+type Moment = { kind: 'firstCard' } | { kind: 'goalMet'; goal: number };
 
 export function FeedbackBridge() {
   const ev = useStore((s) => s.lastEvent);
   const clear = useStore((s) => s.clearEvent);
   const levelUpTo = useStore((s) => s.levelUpTo);
+  const dailyGoal = useStore((s) => s.dailyGoal);
+  const [moment, setMoment] = useState<Moment | null>(null);
 
   useEffect(() => {
     if (!ev) return;
@@ -32,14 +40,165 @@ export function FeedbackBridge() {
         sfx.levelUp();
         haptic.success();
         break;
+      case 'firstCard':
+        sfx.streak();
+        haptic.success();
+        setMoment({ kind: 'firstCard' });
+        break;
+      case 'goalMet':
+        sfx.streak();
+        haptic.success();
+        setMoment({ kind: 'goalMet', goal: dailyGoal });
+        break;
+      case 'badge':
+        sfx.levelUp();
+        haptic.success();
+        break;
       default:
         break;
     }
     clear();
-  }, [ev, clear]);
+  }, [ev, clear, dailyGoal]);
 
-  if (levelUpTo == null) return null;
-  return <LevelUpOverlay level={levelUpTo} />;
+  return (
+    <>
+      <BadgeToastWatcher />
+      {moment != null && <MomentOverlay moment={moment} onDone={() => setMoment(null)} />}
+      {levelUpTo != null && <LevelUpOverlay level={levelUpTo} />}
+    </>
+  );
+}
+
+/**
+ * Watches for session end (inSession true→false) and toasts newly earned badges.
+ * Track-mastery needs coverage data, so it's diffed on the Progress tab instead —
+ * the badge grid is on screen there, so no toast is needed.
+ */
+function BadgeToastWatcher() {
+  const inSession = useStore((s) => s.inSession);
+  const prev = useRef(inSession);
+  const [toast, setToast] = useState<{ badge: Badge; extra: number } | null>(null);
+
+  useEffect(() => {
+    const wasInSession = prev.current;
+    prev.current = inSession;
+    if (!wasInSession || inSession) return; // only on true→false
+    const s = useStore.getState();
+    const earned = computeBadges({
+      streak: s.streak,
+      xp: s.xp,
+      progress: s.progress,
+      lastMockScore: s.lastMockScore,
+      trackCoverage: [],
+      savedCount: s.savedIds.length,
+      checkpointsDone: s.checkpointsDone.length,
+      voiceTried: s.voiceTried,
+    }).filter((b) => b.earned);
+    const fresh = earned.filter((b) => !s.badgesSeen.includes(b.id));
+    if (fresh.length === 0) return;
+    s.markBadgesSeen(fresh.map((b) => b.id));
+    s.emit('badge');
+    setToast({ badge: fresh[0], extra: fresh.length - 1 });
+  }, [inSession]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 2800);
+    return () => clearTimeout(id);
+  }, [toast]);
+
+  if (!toast) return null;
+  return <BadgeToast badge={toast.badge} extra={toast.extra} onDismiss={() => setToast(null)} />;
+}
+
+function BadgeToast({ badge, extra, onDismiss }: { badge: Badge; extra: number; onDismiss: () => void }) {
+  const { c } = useTheme();
+  return (
+    <Animated.View
+      entering={ZoomIn.springify().damping(12)}
+      exiting={FadeOut.duration(200)}
+      style={{ position: 'absolute', top: 64, left: 0, right: 0, alignItems: 'center', zIndex: 1100 }}>
+      <Pressable onPress={onDismiss}>
+        <View
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 10,
+            backgroundColor: c.card,
+            borderWidth: 1.5,
+            borderColor: c.accent,
+            borderRadius: 999,
+            paddingVertical: 10,
+            paddingHorizontal: 16,
+            shadowColor: '#000',
+            shadowOpacity: 0.18,
+            shadowRadius: 12,
+            shadowOffset: { width: 0, height: 4 },
+            elevation: 6,
+          }}>
+          <T size={22}>{badge.icon}</T>
+          <View>
+            <T weight="900" size={13}>Achievement unlocked</T>
+            <T muted size={11.5} weight="700">
+              {badge.label}
+              {extra > 0 ? ` · +${extra} more` : ''}
+            </T>
+          </View>
+        </View>
+      </Pressable>
+    </Animated.View>
+  );
+}
+
+/** Small centered celebration for first-card / daily-goal moments (auto-dismisses). */
+function MomentOverlay({ moment, onDone }: { moment: Moment; onDone: () => void }) {
+  const { c } = useTheme();
+  useEffect(() => {
+    const id = setTimeout(onDone, 2200);
+    return () => clearTimeout(id);
+  }, [onDone]);
+
+  const { width, height } = Dimensions.get('window');
+  const copy =
+    moment.kind === 'firstCard'
+      ? { emoji: '🎉', title: 'First card down!', sub: 'That’s the loop — rate honestly, the app does the scheduling.' }
+      : { emoji: '🎯', title: 'Daily goal hit!', sub: `${moment.goal} cards today — streak safe. Anything extra is gravy.` };
+
+  return (
+    <Animated.View
+      entering={FadeIn.duration(150)}
+      exiting={FadeOut.duration(220)}
+      style={{
+        position: 'absolute',
+        width,
+        height,
+        top: 0,
+        left: 0,
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: 'rgba(8,12,20,0.45)',
+        zIndex: 1000,
+      }}>
+      <Confetti />
+      <Pressable style={{ position: 'absolute', width, height }} onPress={onDone} />
+      <Animated.View
+        entering={ZoomIn.springify().damping(11)}
+        style={{
+          backgroundColor: c.card,
+          borderRadius: radius.xl,
+          paddingVertical: 26,
+          paddingHorizontal: 30,
+          alignItems: 'center',
+          gap: 6,
+          maxWidth: 320,
+          marginHorizontal: space.md,
+        }}>
+        <T size={50}>{copy.emoji}</T>
+        <T weight="900" size={22}>{copy.title}</T>
+        <T muted size={13} style={{ textAlign: 'center', lineHeight: 18 }}>{copy.sub}</T>
+      </Animated.View>
+    </Animated.View>
+  );
 }
 
 function LevelUpOverlay({ level }: { level: number }) {

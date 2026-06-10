@@ -1,4 +1,5 @@
 import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from 'expo-router';
+import Head from 'expo-router/head';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 import { Platform, useColorScheme, View } from 'react-native';
@@ -59,6 +60,11 @@ export default function RootLayout() {
   useBootstrap();
   return (
     <GestureHandlerRootView style={[{ flex: 1 }, isWeb && { backgroundColor: '#0b0f15', alignItems: 'center' }]}>
+      {/* Runtime <title> for web — the router's head manager otherwise overrides the
+          +html.tsx shell title with an empty one. No-op on native. */}
+      <Head>
+        <title>FieldNotes — Data & AI interview prep</title>
+      </Head>
       <View
         style={
           isWeb

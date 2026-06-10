@@ -155,7 +155,7 @@ export function useTheme(): Theme {
   const tc = trackColors[scheme] as Record<string, string>;
   // Accent picker: a Pro swatch only applies when the user is entitled (live Pro + signed-in account).
   const accentKey = useStore((s) => s.accentKey);
-  const entitled = useStore((s) => s.unlocked && !!s.userId);
+  const entitled = useStore((s) => (s.unlocked || (__DEV__ && s.devMode)) && !!s.userId);
   const sw = resolveAccent(accentKey, scheme, entitled);
   const c: Palette = { ...palette[scheme], accent: sw.accent, onAccent: sw.onAccent, accentInk: sw.accentInk };
   return {

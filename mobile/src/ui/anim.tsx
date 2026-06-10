@@ -3,7 +3,7 @@
  * reanimated. Every component honors the OS "reduce motion" setting.
  */
 import { ReactNode, useEffect, useRef, useState } from 'react';
-import { Pressable, StyleProp, Text, TextStyle, View, ViewStyle } from 'react-native';
+import { type AccessibilityRole, Pressable, StyleProp, Text, TextStyle, View, ViewStyle } from 'react-native';
 import Animated, {
   Easing,
   FadeInDown,
@@ -101,6 +101,8 @@ export function PressableScale({
   hapticStyle = 'light',
   sound = false,
   disabled = false,
+  accessibilityRole = 'button',
+  accessibilityLabel,
 }: {
   onPress?: () => void;
   children: ReactNode;
@@ -109,6 +111,10 @@ export function PressableScale({
   hapticStyle?: 'light' | 'selection' | 'none';
   sound?: boolean;
   disabled?: boolean;
+  // Defaults to "button" so every tap target reads as one to screen readers (on web: role="button").
+  // Pass a different role for non-button wrappers — never nest two button roles.
+  accessibilityRole?: AccessibilityRole;
+  accessibilityLabel?: string;
 }) {
   const s = useSharedValue(1);
   const reduced = useReducedMotion();
@@ -117,6 +123,9 @@ export function PressableScale({
   return (
     <AnimatedPressable
       disabled={disabled}
+      accessibilityRole={accessibilityRole}
+      accessibilityLabel={accessibilityLabel}
+      accessibilityState={{ disabled }}
       onPressIn={() => {
         if (!reduced) s.value = withTiming(scaleTo, { duration: 70, easing: Easing.out(Easing.quad) });
       }}

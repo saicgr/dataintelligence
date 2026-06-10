@@ -5,7 +5,7 @@ import { View } from 'react-native';
 import { COMPANY_SETS, COMPANY_KEYS } from '../../lib/companySets';
 import { tracksForRole } from '../../lib/content';
 import { haptic, sfx } from '../../lib/feedback';
-import { FREE_CODE_RUNS, useStore } from '../../lib/store';
+import { FREE_CODE_RUNS, isProActive, useStore } from '../../lib/store';
 import { radius, useTheme } from '../../lib/theme';
 import { CardEnter, PressableScale, Shake } from '../../ui/anim';
 import { Card, H2, Row, Screen, T } from '../../ui/kit';
@@ -19,7 +19,7 @@ export default function Practice() {
   const startWeakspot = useStore((s) => s.startWeakspot);
   const startSaved = useStore((s) => s.startSaved);
   const savedCount = useStore((s) => s.savedIds.length);
-  const unlocked = useStore((s) => s.unlocked);
+  const unlocked = useStore(isProActive);
   const tracks = tracksForRole(role);
 
   const drill = (slug: string) => {
