@@ -1023,5 +1023,226 @@
         "a": "With small samples the prior meaningfully pulls the posterior, so an overconfident prior can manufacture a 'winner' the data doesn't support, while a weak prior lets the data lead and just regularizes early noise. As data accumulates the likelihood dominates and the prior washes out. Best practice is a weakly informative prior plus a sensitivity check that conclusions don't hinge on it."
       }
     ]
+  },
+  {
+    "q": "How would you architect an org-wide experimentation platform that scales to thousands of concurrent A/B tests?",
+    "a": "The platform needs three independent layers. First, an assignment service that hashes user IDs deterministically per experiment so concurrent experiments don't interfere and re-assignment is consistent across devices and sessions; use a consistent hashing ring or a namespace-keyed HMAC. Second, a logging pipeline that emits an immutable, source-of-truth assignment event the moment a user is bucketed, separate from click or metric events, so sample-ratio mismatches are detectable by joining assignments to observations. Third, a computation and reporting layer (typically Spark or BigQuery) that joins experiments, assignments, and metric events, running variance reduction via CUPED, applying sequential or fixed-horizon tests, and publishing results with automatic SRM alerts. Governance rules—maximum concurrent tests per surface, mutual-exclusion groups, holdout cells, and mandatory power calculations—are encoded in a central experiment registry that the assignment service reads at startup, preventing ad-hoc tests that share biased traffic.",
+    "fs": "Separate deterministic assignment, immutable logging, and an analytics computation layer; govern via a central registry with mutual-exclusion groups, holdouts, and mandatory power gates.",
+    "fj": "Just add an experiment ID to each row in the event table; that's the whole platform.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Deterministic bucket assignment",
+        "lang": "python",
+        "lines": [
+          "import hashlib",
+          "def bucket(user_id: str, exp_id: str,",
+          "           n_buckets=1000) -> int:",
+          "    key = f'{exp_id}:{user_id}'",
+          "    digest = hashlib.md5(",
+          "        key.encode()).hexdigest()",
+          "    return int(digest, 16) % n_buckets"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do mutual-exclusion groups and holdouts prevent cross-experiment contamination?",
+        "a": "Mutual-exclusion groups partition the user base into disjoint traffic slices so each user can only be enrolled in one experiment within a group at a time, preventing interaction effects between tests on the same surface. A holdout cell reserves a percentage of traffic never exposed to any experiment, giving a long-running baseline to measure the compounding effect of all shipped changes over time. Both are configured in the registry, and the assignment service enforces them before randomizing within an experiment."
+      },
+      {
+        "q": "What is CUPED and why does it dramatically cut the required sample size?",
+        "a": "CUPED (Controlled-experiment Using Pre-Experiment Data) uses a covariate measured before the experiment, like the user's pre-period metric value, to reduce within-group variance. The adjusted metric is the raw metric minus theta times the covariate, where theta minimizes residual variance. Because pre-period behavior explains a large fraction of post-period behavior, variance can drop 30–60%, which at fixed power shrinks the required sample by the same fraction, shortening experiment runtimes by weeks."
+      },
+      {
+        "q": "How do you prevent an experiment registry from becoming a bureaucratic bottleneck?",
+        "a": "Design the registry so low-risk experiments—small traffic fractions, well-understood surfaces, rollback-friendly changes—are auto-approved after passing schema validation and a power check. High-risk experiments that touch payments, core recommendation, or large traffic require a human review gate. Self-service UI with instant feedback on power and collision checks lets most teams move fast while guardrails block only genuinely risky launches."
+      }
+    ]
+  },
+  {
+    "q": "How do you establish and enforce org-wide A/B testing standards across dozens of independent product teams?",
+    "a": "Standards fail if they live only in a wiki. Embed them into the experimentation platform itself: mandatory power calculation before traffic allocation (the platform blocks launch without it), automated SRM detection on every experiment with a required investigation before results are read, and a single pre-registered primary metric per experiment with secondary metrics clearly labeled exploratory. Publish a centralized stats curriculum, pairing statistical education with platform onboarding so teams understand why the gates exist. Create an Experimentation Review Board with rotating statistician reviewers who audit high-stakes decisions, provide templates for common test types, and handle escalations. Track adherence as an OKR: false-positive rate estimated from A/A tests, fraction of tests with pre-registered metrics, and SRM resolution time.",
+    "fs": "Bake standards into platform gates (power checks, SRM alerts, primary metric pre-registration) rather than wikis; enforce via automated blocks and an advisory review board tracking adherence as an OKR.",
+    "fj": "Send an email with the standards doc and trust teams to follow it.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you use A/A tests to monitor the health of the experimentation platform itself?",
+        "a": "In an A/A test both arms receive identical experiences, so the true treatment effect is exactly zero. Running A/A tests continuously on a sample of traffic reveals whether the platform's randomization is balanced (SRM check), whether the metric computation has bugs (significantly non-zero results), and what the empirical false-positive rate is (fraction of A/A tests with p<0.05 should be near alpha). A calibrated false-positive rate above alpha is a platform-level alarm requiring investigation."
+      },
+      {
+        "q": "When a product team disputes a statistically non-significant result, how do you facilitate the decision?",
+        "a": "Run an equivalence test (TOST) to determine whether the observed effect is bounded within a practically negligible region; if yes, you can positively conclude no meaningful difference, which is different from a non-significant result. Present the confidence interval, not just the p-value, so the team can judge the range of plausible effects relative to their minimum meaningful threshold. If the interval is too wide to conclude anything, the honest answer is the study is underpowered and the team should commit to running longer or resizing."
+      },
+      {
+        "q": "How do you measure the ROI of the experimentation platform to justify infrastructure investment?",
+        "a": "Track the counterfactual: how many significant experiments shipped features that moved the primary business metric (revenue, retention, DAU), and by how much, attributable specifically to a clean test rather than a gut-feel launch. Compare the cost of a biased rollout—say, shipping a feature that silently hurt retention—against the platform cost. Estimate the time-to-decision reduction from CUPED and sequential testing reducing experiment runtimes, and multiply by engineering-team opportunity cost per day."
+      }
+    ]
+  },
+  {
+    "q": "How do you lead a causal inference program when the business unit wants to move faster than rigorous experimentation allows?",
+    "a": "The tension is real and the resolution is portfolio-based: some decisions need RCT rigor, most can tolerate quasi-experimental confidence, and a few can run on observational analysis with honest uncertainty bounds. Build a decision taxonomy: high-stakes, irreversible, or large-traffic decisions (ranking changes, pricing) require a full experiment; medium-stakes changes qualify for a shorter sequential test or a regression discontinuity if a threshold exists; low-stakes, reversible changes can launch with a holdout analysis and an agreed rollback trigger. Invest in the quasi-experimental toolkit—DiD, synthetic control, propensity weighting—so the team can give fast, credible answers with honest assumptions documented. Crucially, publish the assumption list for every analysis: what would have to be true for this estimate to be right. That transparency lets decision-makers knowingly accept risk rather than being surprised by it.",
+    "fs": "Build a decision taxonomy (RCT for high stakes, quasi-experimental for medium, observational with explicit assumptions for speed); make assumptions auditable so stakeholders consciously accept uncertainty.",
+    "fj": "Skip experiments when velocity matters; observational data tells you everything you need quickly.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is a synthetic control and when does it outperform difference-in-differences?",
+        "a": "A synthetic control builds a weighted combination of control units that best matches the treated unit's pre-treatment trajectory, then uses that composite as the counterfactual. It outperforms standard DiD when there is only one or a few treated units (a single market, country, or store), when pre-treatment fit is better achieved by weighting than by assuming parallel trends across all controls, and when there are many control units available to construct the composite. Its transparency, showing which controls got weight and how well the pre-period is matched, is also a strength for stakeholder communication."
+      },
+      {
+        "q": "How do you document and communicate causal assumptions to non-technical decision-makers?",
+        "a": "Use a one-page 'assumption register' alongside every observational analysis: list each identifying assumption in plain language (e.g., 'users just above the threshold are similar to users just below'), describe what evidence supports it, describe what would break it, and rate the risk. Walk stakeholders through one concrete scenario where the assumption fails and show how the estimate would change. This converts an invisible statistical assumption into a legible business risk that a VP or PM can actually evaluate."
+      },
+      {
+        "q": "How does the potential-outcomes (Rubin causal model) framework sharpen causal reasoning in practice?",
+        "a": "The potential-outcomes framework forces you to define Y(1) and Y(0)—what the outcome would be for each unit under treatment and control—before touching data, which makes the causal question precise. It immediately surfaces SUTVA (no interference, no hidden variants), the ignorability assumption needed for observational analysis, and the fact that you only ever observe one potential outcome per unit (the fundamental problem of causal inference). Thinking in these terms catches vague questions ('does feature X work') and converts them into estimable quantities with identified assumptions."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a metric and guardrail framework for a platform team serving many internal product teams?",
+    "a": "Start by distinguishing metric types: North Star metrics that the whole company steers by, team OKR metrics, guardrail metrics (health signals that must not regress), and diagnostic metrics used for debugging but not for decisions. Guardrails deserve special treatment—they should fire automatically in every experiment report as a 'harm check,' with the threshold (e.g., p99 latency) pre-negotiated across infra and product so there is no negotiation pressure in the moment. The framework should specify: the metric definition in code (idempotent query, clear denominator, de-duplication rules), the statistical test used, the minimum detectable change that counts as a regression, and who owns the on-call response. Encode all of this in a metric catalog queryable by the experiment platform, so adding a guardrail to an experiment is a one-line config change, not a custom analysis.",
+    "fs": "Separate North Star, team OKR, guardrail, and diagnostic metrics; pre-negotiate guardrail thresholds and encode metric definitions in a queryable catalog so experiments inherit them automatically.",
+    "fj": "Any metric the team cares about is a guardrail; just add them all and see which ones fire.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you prevent guardrail metric creep, where every team adds their own and the count explodes?",
+        "a": "Apply a governance rule: a guardrail must be owned by an on-call rotation willing to respond within a defined SLA when it fires; if no owner, it's a diagnostic, not a guardrail. Review the guardrail list quarterly and retire metrics that haven't fired or haven't been acted on in four quarters. This keeps the guardrail list honest, short, and credible—a list of 50 guardrails that nobody acts on trains teams to ignore them all."
+      },
+      {
+        "q": "What makes a good experiment-level guardrail different from a monitoring alert?",
+        "a": "A monitoring alert fires on absolute thresholds in production (p99 latency > 500ms right now). An experiment guardrail compares the metric distribution between control and treatment arms relative to the pre-experiment baseline, normalized for traffic, and asks whether treatment caused a regression. It accounts for experiment-specific confounders and variance, so it fires on causal harm, not normal traffic fluctuation. Both are needed; they answer different questions."
+      },
+      {
+        "q": "How do you handle a case where the North Star metric and a guardrail are in genuine tension?",
+        "a": "This is a strategic decision, not a statistical one, but statistics must frame it clearly: quantify the North Star gain in absolute and practical terms, quantify the guardrail regression and its likely long-term consequence (e.g., 0.5% retention drop compounds over a year), and present the tradeoff to leadership with a time horizon. The platform team's role is to ensure the tradeoff is visible and informed, not to make it. Document the decision with the data so it can be revisited."
+      }
+    ]
+  },
+  {
+    "q": "What is variance reduction at scale, and which techniques beyond CUPED are used in mature experimentation programs?",
+    "a": "Variance reduction aims to detect smaller effects with fewer users by reducing the noise in the metric estimate without introducing bias. CUPED uses pre-experiment covariates to partial out predictable variance, typically cutting required sample by 30–60%. CUPAC (Control Using Predicted As Covariates) replaces the raw pre-period value with a model-predicted outcome, capturing nonlinear relationships and multi-variate history and often outperforming plain CUPED when there are rich features. Stratified sampling assigns traffic within pre-defined strata (device, country, user-tenure bucket), ensuring balanced composition and further reducing between-stratum variance. Switchback and interleaving designs—where the same user sees both arms at different times or rankings—trade within-subject comparisons for lower variance, at the cost of carryover effects and more complex analysis. Delta method and ratio metrics require additional variance corrections when the denominator is also a random variable. In practice, mature platforms compose several of these: CUPAC reduces metric variance, stratification balances composition, sequential testing handles monitoring, and the delta method handles ratio metrics.",
+    "fs": "Mature programs layer CUPED/CUPAC (covariate adjustment), stratification, within-subject designs, and delta-method corrections for ratio metrics to cut required sample sizes without bias.",
+    "fj": "The only way to detect smaller effects is to run longer experiments.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "CUPED adjusted metric",
+        "lang": "python",
+        "lines": [
+          "import numpy as np",
+          "# theta minimises residual variance",
+          "cov = np.cov(Y, X_pre)[0, 1]",
+          "theta = cov / X_pre.var(ddof=1)",
+          "Y_cuped = Y - theta * (X_pre",
+          "          - X_pre.mean())",
+          "# Use Y_cuped in place of Y"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does CUPAC typically outperform plain CUPED, and what is the risk?",
+        "a": "Plain CUPED uses the raw pre-period metric, which correlates linearly with the outcome. CUPAC trains a model on historical data to predict the post-period metric using many features, capturing nonlinear patterns, multiple prior periods, and behavioral segments. Better prediction means higher explained variance and more variance reduction. The risk is leakage: if the model is trained on data that includes post-experiment information or future outcomes, the covariate is biased and so is the adjusted metric. Careful hold-out discipline in model training is essential."
+      },
+      {
+        "q": "When are switchback designs appropriate and what analysis adjustment do they require?",
+        "a": "Switchback designs alternate a single unit (a region, a time slot, a single user in the case of within-user switching) between control and treatment over periods, so each unit serves as its own control. They work well for marketplace supply-demand effects where user-level randomization causes spillover, and for settings where per-period effects are relatively independent. The analysis must account for time-period random effects (often via a mixed model) and carryover, where the previous arm's effect bleeds into the current period."
+      },
+      {
+        "q": "What is the delta method and when is it needed for ratio metrics?",
+        "a": "The delta method approximates the variance of a nonlinear function of random variables using a first-order Taylor expansion. For a ratio metric like revenue per session (sum of revenue over sum of sessions), both numerator and denominator are random, so naive variance is wrong; the delta method gives the correct asymptotic variance using the covariance between numerator and denominator. It's needed whenever your metric is a ratio and observations aren't i.i.d. at the denominator level, which is almost always in practice."
+      }
+    ]
+  },
+  {
+    "q": "How do you build a causal inference competency across a data science org that previously did only descriptive analytics?",
+    "a": "The migration from descriptive to causal has three parallel tracks. Curriculum: embed causal thinking into the data science onboarding, pairing it with a consistent toolchain (DoWhy, econML, or an internal wrapper) and a set of worked examples grounded in the company's actual data, not textbook datasets. Infrastructure: build or integrate an experiment platform with guardrail automation, CUPED by default, and a metric catalog, so the right defaults are structural rather than relying on individual discipline. Culture: require causal framing in decision documents—'what is the counterfactual we are comparing against'—and create a peer-review forum where analysts critique identification strategies the way engineers review code. The org's trust calibration matters: if a post-hoc observational analysis led to a visible product failure, name it and use it as a case study so the cost of weak identification becomes concrete.",
+    "fs": "Build causal competency through curriculum grounded in real company examples, structural defaults in the experiment platform, and a cultural norm of peer-reviewing identification strategies.",
+    "fj": "Just hire one causal expert and they'll raise the whole org's standards through osmosis.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you make causal review scalable when you can't have a statistician review every analysis?",
+        "a": "Build a tiered review model: self-serve templates handle the majority of simple experiment analyses with automated checks; a 'causal checklist' embedded in the analysis doc template catches common assumption violations without human review; statistician review is reserved for novel identification strategies, regulatory decisions, or analyses that will drive a large resource allocation. Train senior ICs in each domain to do first-pass causal reviews, so the statistician is a second-pass escalation, not the only gate."
+      },
+      {
+        "q": "What metrics would you use to assess whether the org's statistical rigor has actually improved?",
+        "a": "Track the fraction of product decisions backed by a pre-registered experiment (versus a post-hoc analysis), the replication rate of significant A/B test results in follow-up confirmatory tests, the A/A false-positive rate to measure platform calibration, and the prevalence of explicitly stated causal assumptions in decision docs. A harder metric: regression frequency of guardrail metrics in the six months after ship, which should drop as teams run proper experiments instead of opportunistic launches."
+      },
+      {
+        "q": "How do you handle the political tension when a causal analysis contradicts a business leader's intuition?",
+        "a": "Present the analysis with the identification assumptions visible and with a sensitivity analysis showing how large an unmeasured confounder would need to be to overturn the conclusion (E-values). Offer to run a prospective experiment to resolve the disagreement rather than argue the observational case. Framing it as 'here is what the data says under these assumptions, and here is how we can get a definitive answer' depoliticizes the conversation, because it shifts from 'you are wrong' to 'here is a path to certainty.'"
+      }
+    ]
+  },
+  {
+    "q": "What does company-wide experimentation and decision-science strategy look like at the Principal level, and how do you set it?",
+    "a": "At the Principal level, experimentation strategy is a company capability investment, not a tooling project. The first question is strategic: what fraction of product decisions should be experiment-driven, on what time horizon, and what is the cost of getting that wrong? Setting this requires an honest audit of how decisions are currently made and which categories have historically produced the biggest regrets. From that, you design a tiered decision framework—experiment, quasi-experiment, or informed judgment—with explicit criteria for each tier, socialized with the CPO and CTO so it is a company norm, not a data-team request. Platform investment follows from the strategy: the right tooling is sized to serve the experiment volume the strategy requires, not the reverse. Externally, you position the company's decision science capability as a competitive moat in recruiting and partner conversations, and internally you run a quarterly calibration session where the C-suite reviews experiment portfolio health, false-positive trends, and the fraction of shipped features with a positive measured effect.",
+    "fs": "Set an org-wide tiered decision framework (experiment vs quasi vs judgment) endorsed at the CPO/CTO level; size the platform to serve it, and run C-suite calibration reviews on experiment portfolio health.",
+    "fj": "Build the best A/B platform and strategy will take care of itself.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you prevent the experimentation platform from becoming a local optimum trap where every decision gets routed through a test, even ones that shouldn't?",
+        "a": "Define explicit criteria for when an experiment is the wrong tool: decisions with unacceptably long time-to-data (annual planning, strategic pivots), decisions where the experiment would be unethical, decisions where the effect is so large it's obvious from even noisy data, and decisions that require coordinated organizational change where a partial rollout is incoherent. Publishing these 'anti-patterns' alongside the experimentation standards prevents dogmatic over-reliance and keeps the experiment platform's output credible by limiting it to questions it can honestly answer."
+      },
+      {
+        "q": "How do you sustain executive trust in experiment-driven decisions when results are ambiguous or unflattering?",
+        "a": "The only durable path is to be the team that tells leaders the truth before they've committed resources, not after. That means proactively sharing null and negative results in the same forum as successes, using statistical equivalence tests to make 'no meaningful difference' a positive finding rather than a failure, and connecting experiment results to business outcomes retrospectively so leaders can see the compounding value of the decisions the platform influenced. Trust erodes when data science cherry-picks what it surfaces; it compounds when the track record shows calibrated, honest reporting."
+      },
+      {
+        "q": "What is a long-run holdout and how does it answer questions that individual A/B tests cannot?",
+        "a": "A long-run holdout reserves a small, never-treated user cohort (typically 1–5%) over months or years and periodically measures the gap between them and the fully-treated population. Individual A/B tests measure the marginal effect of one change, but they can't measure the compounding interaction effect of all the changes shipped over time, because each test's control arm quickly receives subsequent experiments. The holdout captures the cumulative effect of the entire treatment portfolio. It answers 'how much better are users who have had access to all our product improvements' versus the counterfactual of shipping nothing, which individual tests cannot."
+      }
+    ]
+  },
+  {
+    "q": "How do you set statistical-rigor standards for an organization where 'move fast' is a cultural imperative?",
+    "a": "Rigor and speed are not opposites if the standards are designed carefully. The first principle is to make the high-rigor path the fastest path: pre-built experiment templates, automatic power calculations, CUPED by default, and one-click sequential testing remove the friction that makes teams want to skip the process. The second principle is to differentiate by decision weight: lightweight guardrails and a fast review for reversible changes; mandatory pre-registration, an independent statistical review, and a confirmatory replication requirement for decisions that are hard to reverse or affect core metrics. The third is explicit cost accounting: when a team wants to ship without a test, they sign off on a documented risk statement that goes to their VP. That administrative cost is calibrated to the cost of the type of error the decision could cause. Finally, publish a 'decisions we wish we had tested' retrospective every quarter to give the fast-move culture real, internal evidence of what rigor is worth.",
+    "fs": "Make rigor the default fast path via automation; differentiate standards by reversibility and decision weight; require documented risk sign-off when bypassing tests; publish retrospectives on decisions that should have been tested.",
+    "fj": "You have to choose between speed and rigor; a fast-moving org just has to accept more statistical errors.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What is a 'decision weight' framework and how do you quantify it without slowing down every discussion?",
+        "a": "A decision weight matrix maps two axes—reversibility (can we roll back within a day, a week, never?) and blast radius (affects 1% of users, all users, a partner contract)—into three tiers: ship-and-monitor, test-required, and board-level sign-off. The matrix is published as a one-page reference, and teams self-classify; the data platform validates the classification automatically based on the feature flag's traffic percentage and surface. High-weight decisions trigger an automated prompt to open an experiment; the tool does the routing, not a human reviewer on every launch."
+      },
+      {
+        "q": "How do you retrospectively calibrate whether the organization's statistical thresholds are set correctly?",
+        "a": "Run a calibration audit annually: take all experiments that rejected H0 at your threshold, follow up on the features shipped, and estimate the rate that subsequent data (longer holdout, follow-on experiment) overturned the initial positive conclusion. If the reversal rate is much higher than the nominal alpha (say 25% reversal at a 5% alpha threshold), thresholds are too loose or the testing process is leaking false positives through peeking or HARKing. If the reversal rate is near zero, you may be too conservative and leaving real improvements on the floor."
+      },
+      {
+        "q": "How do you make statistical rigor a hiring and performance criterion rather than a compliance box?",
+        "a": "Integrate it into the technical interview: give candidates an ambiguous analysis scenario with a subtle confounding structure and assess whether they surface the identification problem, propose a credible design, and communicate uncertainty honestly. In performance frameworks, include 'statistical quality' alongside 'impact': did the analyses this person produced hold up, were assumptions stated, were null results published, did they catch rigor problems in peer review? Signal from the top that a well-designed null result earns more respect than a sloppy positive, and the culture follows."
+      }
+    ]
+  },
+  {
+    "q": "What multi-year bets would you make to advance decision science as a structural competitive advantage?",
+    "a": "Three multi-year bets compound well. First, invest in causal foundation models: instead of one-off propensity models or CUPED covariates, build a shared user representation trained on the full behavioral history that any experiment or observational analysis can plug in as a variance-reduction covariate or confounder control. The compounding is that every new analysis gets better as the representation improves. Second, build a decision memory system: a queryable history of every experiment decision, its assumptions, the outcome, and whether a follow-up replicated it. After five years this is a unique organizational asset—a calibrated track record that informs priors for new decisions and makes institutional knowledge explicit. Third, invest in automated assumption auditing: tooling that, given a causal DAG and a dataset, checks whether assumptions like parallel trends, instrument relevance, or covariate balance are supported, and surfaces violations before an analysis is finalized. This democratizes causal rigor beyond the handful of senior statisticians who currently catch these issues.",
+    "fs": "Bet on a shared causal representation model for all experiments, a decision memory system with outcome tracking, and automated assumption auditing tools that democratize causal rigor at scale.",
+    "fj": "Just keep improving the A/B platform speed; that's the only decision-science moat that matters.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "Why is a shared user representation for causal inference a bigger bet than just improving CUPED?",
+        "a": "CUPED uses one covariate, usually the pre-period metric; a shared representation uses hundreds of behavioral features learned across the full product surface. It captures patterns that a single metric misses—usage frequency across features, network centrality, price sensitivity—and those patterns predict post-period outcomes far better, compounding variance reduction across every experiment run. More importantly, as the representation is trained on more data and updated more frequently, every downstream analysis improves without any per-experiment work, creating a flywheel that individual CUPED covariate choices can never replicate."
+      },
+      {
+        "q": "What does 'decision memory' specifically enable that an experiment log does not?",
+        "a": "A raw experiment log records what was tested and what the p-value was. A decision memory layer adds: what the team decided and why, what assumptions they accepted or rejected, and, critically, whether a follow-up experiment or a long-run holdout confirmed or overturned the initial conclusion. That calibration signal lets you update the organization's priors—this team's quick wins tend to replicate, this surface's experiments tend to reverse—and makes the cost of assumption-cutting visible in a way that changes incentives. An experiment log just records; a decision memory learns."
+      },
+      {
+        "q": "How do you avoid the risk that automated assumption auditing becomes a bureaucratic checkbox rather than a genuine quality gate?",
+        "a": "Design the output as a structured risk register, not a pass/fail badge. For each assumption, report the evidence, the magnitude of potential bias if violated (using sensitivity bounds or E-values), and a suggested resolution, so reviewers engage with the substance rather than the verdict. Calibrate the tool's flags against historical cases where assumption violations led to wrong decisions, so the false-alarm rate is low enough that analysts take each flag seriously. A tool that flags 30% of analyses as 'failed' is ignored; one that flags 5% for real, serious issues builds trust."
+      }
+    ]
   }
 ]

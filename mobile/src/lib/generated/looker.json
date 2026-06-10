@@ -942,5 +942,258 @@
         "a": "When multiple projects need the same canonical definitions (a shared date spine, common dimensions) and you want one source of truth with versioned upgrades. Copying duplicates logic and drifts over time; `remote_dependency` keeps one upstream repo, pinned by the lock file, that all consumers import, then locally refine. The cost is managing the dependency/version bumps."
       }
     ]
+  },
+  {
+    "q": "How do you enforce LookML modeling standards at scale across dozens of developers and projects?",
+    "a": "Treat LookML exactly like application code. Define and document conventions in a shared style guide: naming patterns (snake_case views, plural measures, view-prefixed fields), mandatory primary_key, required datagroup_trigger on all PDTs, no bare sql_trigger_value, field-level description and group_label on every user-facing field. Enforce mechanically: use the LookML Validator in CI (lkml open-source CLI or Looker's API /lookml_models endpoint) as a blocking pre-merge gate so broken references never reach main. Layer on custom lint rules (spectacles/lkmltools) that fail PRs for violations like missing primary_key, excessive fanout potential, or undocumented explores. Pair with shared base projects (remote_dependency) for canonical date spines, access grants, and datagroup definitions so teams pull rather than reinvent. Code review via required-reviewer PRs on the LookML repo is the human layer; the CI gate is the mechanical one.",
+    "fs": "Style guide + mandatory CI lint (lkml/spectacles) as a blocking gate, shared base project via remote_dependency for canonical objects, required-reviewer PR policy for human review.",
+    "fj": "Post guidelines in a doc and trust developers to follow them; Looker's own validator is enough.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "CI lint gate (spectacles)",
+        "lang": "sql",
+        "lines": [
+          "# .github/workflows/lookml.yml",
+          "- name: LookML lint",
+          "  run: |",
+          "    spectacles lookml \\",
+          "      --project my_project \\",
+          "      --branch ${{ github.head_ref }}",
+          "# fails PR if validator errors exist"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle teams that want to override a modeling standard for a legitimate reason?",
+        "a": "Codify an exception process: a documented comment in the file (`# lint-ignore: reason`) plus a PR that gets principal-level sign-off. The CI rule can be configured to skip flagged lines. This keeps the override visible in Git history rather than silently bypassing lint, and forces a justification. Unreviewed drift is the enemy; structured overrides are fine."
+      },
+      {
+        "q": "What makes spectacles/assert-based content tests a complement to, not a replacement for, LookML validation?",
+        "a": "LookML validation is static compile-time: it checks syntax and references but never runs a query. Spectacles content tests and LookML `test:` blocks actually execute queries against the database and assert expected values or non-zero results, catching logical bugs (wrong joins, broken business logic) that static analysis can't see. You need both layers: compile gate + data assertion gate."
+      },
+      {
+        "q": "How do you prevent legacy bad patterns from growing while incrementally improving existing files?",
+        "a": "Run lint in warn mode on existing files (not blocking) and blocking mode only on net-new files or modified sections. Track a remediation backlog as a project board with ownership. Set a quarterly target to reduce lint-warn count by a percentage. This decouples stopping the bleeding (new code is clean) from the long-tail cleanup without making every PR block on decades of legacy."
+      }
+    ]
+  },
+  {
+    "q": "What is your strategy for PDT and aggregate table architecture at scale to control cost and build time?",
+    "a": "Catalog all PDTs and aggregates by build time, frequency, and downstream query count using System Activity's PDT Builds explore and Looker's query history. Tier them: Tier-1 PDTs are business-critical and get their own datagroup pegged to the ETL SLA; Tier-2 share a slower datagroup; Tier-3 are candidates for elimination if query count is low. Convert large append-only Tier-1 PDTs to incremental (increment_key + increment_offset) to avoid full rebuilds. Design aggregate tables from query-history analysis—only materialize the Pareto grains that account for most query volume, and set allow_approximate_optimization for high-cardinality distinct counts. Govern via a PDT review gate: no new PDT merges without documented build time estimate, trigger justification, and scratch-schema cost sign-off.",
+    "fs": "Tier PDTs by criticality, convert heavy ones to incremental, build aggregates only for Pareto-high-volume grains from query-history analysis, gate new PDTs via PR review.",
+    "fj": "Just increase your warehouse size and set all PDTs to rebuild nightly; cost is the warehouse team's problem.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "incremental PDT",
+        "lang": "sql",
+        "lines": [
+          "view: revenue_pdt {",
+          "  derived_table: {",
+          "    datagroup_trigger: daily_etl",
+          "    increment_key: load_date",
+          "    increment_offset: 3",
+          "    sql: SELECT",
+          "      DATE(created_at) AS load_date,",
+          "      region,",
+          "      SUM(amount) AS revenue",
+          "      FROM orders",
+          "      WHERE {% incrementcondition %}",
+          "        created_at {% endincrementcondition %}",
+          "      GROUP BY 1, 2 ;;",
+          "  }",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle late-arriving data with incremental PDTs without full rebuilds?",
+        "a": "`increment_offset` tells Looker to re-process the last N periods (e.g. 3 days) in addition to the new period, capturing late arrivals within that window. For data that can arrive arbitrarily late you need a broader offset or a periodic full-rebuild schedule (e.g. weekly). The business SLA on lateness tolerance should drive the offset value, not a guess."
+      },
+      {
+        "q": "How do you track PDT build failures and alert before users notice stale data?",
+        "a": "Query System Activity's `pdt_builds` explore: filter on `status = 'error'` and wire it to a scheduled Look that pages on-call via Slack/PagerDuty. Add a freshness assertion Look that checks `MAX(loaded_at)` against expected ETL windows for Tier-1 PDTs. Looker's Monitoring API also exposes PDT status programmatically if you want to integrate into an existing observability platform."
+      },
+      {
+        "q": "What is the risk of too many aggregate tables on a single explore?",
+        "a": "Looker must evaluate every aggregate candidate at query time to find the best match, so dozens of aggregates add overhead to query planning. More critically, each aggregate is a PDT that must build and stay fresh, compounding scratch-schema cost and build-time load. Aim for 3–7 well-chosen aggregates per explore covering the top grains; prune aggregates with zero hits from query history aggressively."
+      }
+    ]
+  },
+  {
+    "q": "How do you design and enforce access governance across a large Looker deployment with many teams and data domains?",
+    "a": "Model access governance in three layers. Object layer: use access_grants with meaningful user_attribute values (team, role, clearance) to gate explores, views, and sensitive fields; never use group-based Looker permissions as a substitute for LookML-level grants, since groups change but model gates are version-controlled. Row layer: access_filter per explore keyed on a tenant/org user attribute to enforce data-domain isolation, designed alongside every aggregate table so tenant columns are never collapsed away. Permission layer: govern Looker roles at the connection level (which explores/models a user can even see) via group-to-role mapping, managed in Looker Admin and reflected in IaC (Terraform provider or Looker API scripts). Audit all three layers quarterly using a generated access matrix: for each user_attribute × explore × field, document who can see what. Alert on any new explore or field without required_access_grants, automated via a CI lint rule.",
+    "fs": "Three layers: LookML access_grants for object/field gates (version-controlled), access_filter for per-row isolation, Looker role/permission layer for model visibility—all audited quarterly with an access matrix.",
+    "fj": "Manage access by hiding dashboards in folders and using group permissions; that's sufficient for compliance.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A data-domain team wants to own their own LookML project but share canonical dimension definitions. How do you structure that?",
+        "a": "Publish shared definitions (date spines, user dimensions, access grants) in a central `shared_models` project under a platform-team repo. Domain teams declare it as `remote_dependency` in their own manifest, include the canonical views, and `refine` or `extend` them locally. Platform team governs `shared_models` with PR review; domain teams own their explores. The lock file pins versions so platform changes are opt-in upgrades."
+      },
+      {
+        "q": "How do you prevent access control drift when user attributes are managed in an external IdP?",
+        "a": "Provision user attributes to Looker via SAML/OIDC attribute mapping from the IdP (e.g. Okta group claims → Looker user attributes) rather than setting them manually in Looker Admin. That way, attribute values stay in sync with the IdP's source of truth and revocation is automatic on role change. Audit the mapping quarterly and alert on attribute values present in LookML grants but missing from the IdP schema."
+      },
+      {
+        "q": "What is the risk of embedding access_filter on some explores but forgetting it on related explores in the same project?",
+        "a": "A user discovers the unfiltered explore and queries cross-tenant data through it, a compliance incident despite protecting most surfaces. Governance must be comprehensive: lint rules that fail CI on any explore in a project touching tenant-scoped tables without an `access_filter` for the tenant attribute, so no explore can accidentally bypass isolation. Access control is only as strong as its least-protected surface."
+      }
+    ]
+  },
+  {
+    "q": "How do you build a CI/CD pipeline for LookML that gives teams fast, safe delivery without breaking production?",
+    "a": "A mature LookML CI/CD pipeline has five stages. Static validation: the lkml open-source CLI plus spectacles `lookml` command runs on every PR against the dev branch; any syntax/reference error blocks merge. Content validation: spectacles `assert` runs data tests (LookML test: blocks) against a non-prod environment seeded with production data; this catches broken explores and wrong metrics. PDT build validation: spin up a dev branch environment, trigger critical PDT builds, and assert they complete without error. Semantic diff: generate a human-readable diff of LookML changes (new/removed fields, renamed explores) and post it as a PR comment so reviewers understand the user-facing impact, not just the code change. Deploy: merge to main triggers Advanced Deploy Mode promotion to the pinned production SHA. Gate production promotion behind all five stages and at least one required LookML-expert reviewer.",
+    "fs": "Five-stage gate: static lint → LookML data tests → dev PDT build smoke → semantic diff PR comment → Advanced Deploy Mode SHA promotion, all required before production.",
+    "fj": "Push to main and let Looker's built-in validator handle it; CI is overkill for LookML.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "CI stages (pseudocode)",
+        "lang": "sql",
+        "lines": [
+          "# Stage 1 – static",
+          "spectacles lookml --branch $PR_BRANCH",
+          "",
+          "# Stage 2 – data tests",
+          "spectacles assert --branch $PR_BRANCH \\",
+          "  --project my_project",
+          "",
+          "# Stage 3 – PDT smoke",
+          "looker_api trigger_pdt --branch $PR_BRANCH",
+          "",
+          "# Stage 4 – semantic diff posted to PR",
+          "lookml-diff main..$PR_BRANCH",
+          "",
+          "# Stage 5 – promote SHA",
+          "looker_api deploy_ref --ref $SHA"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you run spectacles content tests without hitting production data or blowing CI budget?",
+        "a": "Spectacles supports a dev-branch mode that queries through the test/non-prod Looker connection rather than production. You configure a separate connection (or the same warehouse with a non-prod schema) for CI, scope tests to a `--explores` subset that's cheap to run, and set `--timeout` guardrails. Large-table tests use sampled or synthetic data to keep runtime predictable. Production data is only needed for correctness regressions, not every PR."
+      },
+      {
+        "q": "What does a 'semantic diff' look like in practice and why is it more useful than a code diff for reviewers?",
+        "a": "A LookML code diff shows raw parameter changes; a semantic diff translates them to user-visible impact: 'Explore `orders` loses dimension `legacy_status`; 3 saved Looks depend on it' or 'New measure `adjusted_revenue` added to `orders`'. Tools like spectacles or custom scripts querying the Looker API's `lookml_model_explore` endpoint can generate this. Business reviewers can assess impact without reading LookML, speeding up review."
+      },
+      {
+        "q": "How do you handle rollback when a bad LookML deploy breaks production dashboards?",
+        "a": "Advanced Deploy Mode makes rollback a two-step: identify the last-known-good commit SHA from Git history, then call the Looker API (or UI) to promote that SHA as the production deployment. No re-deploy pipeline needed; it's an API call. Pair this with post-deploy dashboard health checks (scheduled Looks that alert on null results or query errors) so you detect regressions within minutes of promotion and can roll back before most users notice."
+      }
+    ]
+  },
+  {
+    "q": "When should you build a Looker custom semantic extension (the Marketplace framework) versus extending LookML natively?",
+    "a": "LookML-native extension (refinements, extends, shared projects) is almost always correct when the problem is modeling reuse within or across LookML projects. Marketplace/Extension Framework (a React app hosted inside Looker) is for UI problems: custom visualizations not achievable with LookML viz, workflow overlays (approval flows, annotation layers), deep integrations with external APIs, or use cases where the semantic layer is correct but the user experience needs code. The bar for Extension Framework is high: it requires React/TypeScript engineering, Looker's SDK, and a deployment surface (external hosting or Marketplace), and it lives outside the LookML validator. If the need can be solved with a LookML parameter, Liquid, or a Dashboard filter, solve it there. Reserve the Extension Framework for first-class product features adjacent to data, not for working around modeling gaps.",
+    "fs": "LookML-native (refinements/extends/shared projects) for modeling reuse; Extension Framework (React app) only for genuine UI/workflow needs that LookML can't express—it's engineering overhead, not a shortcut.",
+    "fj": "Build a custom extension whenever you want a new feature; it's more flexible than LookML.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does the Extension Framework authenticate to the Looker API on behalf of the user?",
+        "a": "Extensions run inside the Looker iframe and receive an API auth context automatically via the Looker Extension SDK (`@looker/extension-sdk`), which vends OAuth tokens scoped to the logged-in user's permissions without exposing credentials to the extension code. The extension calls the Looker SDK methods directly; it doesn't need to manage its own OAuth flow. This means the extension inherits Looker's RBAC, including `access_grants` and `access_filter`, automatically."
+      },
+      {
+        "q": "What are the maintenance risks of a custom Looker extension compared to a LookML solution?",
+        "a": "Extensions are full applications: they depend on the Looker Extension SDK version, React, and any external APIs, all of which can break on Looker upgrades. LookML changes are validated by Looker itself and fail loudly at compile time; extension breakage is a runtime JavaScript failure that users discover in the UI. Extensions also require a separate build/deploy pipeline and engineering ownership, whereas LookML changes live in the same project repo with the same review process."
+      },
+      {
+        "q": "Can an extension bypass Looker's data access controls to show data a user isn't permitted to see?",
+        "a": "Not through the SDK's governed path: SDK calls go through Looker's API which enforces `access_grants`, `access_filter`, and role permissions on every query, same as the explore UI. An extension that makes direct warehouse calls (outside the SDK) could bypass controls, which is why that pattern is prohibited in compliant deployments. Govern extension architecture reviews the same way you govern new SQL access."
+      }
+    ]
+  },
+  {
+    "q": "How do you structure the build-versus-buy decision for LookML modeling capacity: centralized platform team versus federated domain teams?",
+    "a": "Both extremes fail. A pure centralized LookML team becomes a bottleneck: every domain change is queued, slowing business agility, and the team accumulates context debt across domains it doesn't own. A pure federated model produces divergent standards, duplicate logic, and security gaps (each team re-implements access_filter differently). The effective pattern is a hub-and-spoke model: a small platform team owns the shared base project (remote_dependency), modeling standards, CI lint rules, datagroup definitions, and the common access-grant taxonomy. Domain teams own their own LookML projects, pull from the shared base, and are empowered to build explores and PDTs in their domain. The platform team governs via PR review on shared-project changes and the CI gate on domain projects; they don't review every domain explore. Investment ratio: roughly 1 platform LookML engineer per 5–8 domain model contributors, scaling with domain complexity. Revisit when the PR queue to shared-project grows beyond a 2-day median, signaling either understaffing or over-centralization.",
+    "fs": "Hub-and-spoke: platform team owns shared base + CI gates + standards; domain teams own their own projects and pull from the shared base. ~1 platform eng per 5–8 domain contributors.",
+    "fj": "Either one central team builds all LookML, or each domain team figures it out independently—pick one.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you onboard a new domain team to write LookML without degrading quality?",
+        "a": "Pair an initial engagement: a platform engineer co-authors the first 2–3 key views and explores with the domain team, embedding the standards in working code rather than docs. Then set up CI lint and required-reviewer PR policy before the domain team goes independent. A 30/60/90 day cadence where the platform team reviews all PRs, then spot-checks, then only reviews shared-project PRs builds autonomy without a quality cliff."
+      },
+      {
+        "q": "What signals tell you a domain team's LookML project should be merged back into a central project versus staying separate?",
+        "a": "Merge signals: frequent cross-domain joins (two 'separate' domains are actually the same subject area), duplicated PDTs, or users confused by which explore to pick (too many explores across too many projects). Keep separate signals: genuinely different business domains with no cross-domain query need, different ETL schedules and datagroups, or different data sensitivity levels requiring separate access-grant taxonomies. Structure follows the data model, not the org chart."
+      },
+      {
+        "q": "How do you prevent the shared base project from becoming a mega-model that nobody wants to touch?",
+        "a": "Ruthlessly scope it: only canonical objects that 3+ domain projects consume belong there—date spines, user/account dimensions, global access grants, datagroup definitions. Everything else lives in domain projects. Set a quarterly audit: any shared view with fewer than 2 downstream importers is a candidate for migration to the domain that owns it. Size is the enemy of agility in the shared project; keep it small and high-leverage."
+      }
+    ]
+  },
+  {
+    "q": "How do you architect an org-wide semantic layer strategy when the business has multiple BI tools, Looker being one of them?",
+    "a": "Treat Looker's LookML as the canonical semantic layer and expose it to other tools rather than letting each tool re-define metrics independently. For SQL-native tools (Power BI, Tableau, ThoughtSpot), use Looker's Open SQL Interface (JDBC/ODBC) so they query against the modeled explores and inherit Looker's metric definitions and access controls without re-modeling. For spreadsheet consumers, Connected Sheets pulls from LookML explores directly. For programmatic consumers, the Looker API and the Looker-native SDK let data science, notebooks, and operational apps query the semantic layer. The central principle is 'one definition of revenue'—if a tool can't consume the semantic layer via a governed interface, require a formal exception and document the divergence risk. Govern new BI tool adoption with an evaluation criteria: does it support a governed query path through the semantic layer, or does it require re-modeling metrics in its own dialect?",
+    "fs": "Looker LookML is the canonical semantic layer; expose it to other tools via Open SQL Interface, Connected Sheets, and the API rather than letting each tool re-define metrics.",
+    "fj": "Each BI tool should model metrics natively for best performance; reconcile them in a downstream spreadsheet.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle metric drift when a legacy tool can't consume the semantic layer and has its own hardcoded definitions?",
+        "a": "Declare it formally in a metric registry: document the divergence, the owner, and the known delta (e.g. 'Legacy Tool revenue excludes refunds; Looker includes them'). Schedule a deprecation review quarterly and set a sunset date tied to the tool's migration roadmap. Until migration, surface the divergence in a visible place (data catalog, dashboard header note) so consumers aren't surprised. Invisible drift is a trust issue; documented drift is a managed risk."
+      },
+      {
+        "q": "What governance process prevents new BI tool sprawl from creating more metric drift?",
+        "a": "A BI tool adoption gate: any new tool must pass an architecture review that evaluates whether it can consume the governed semantic layer via Open SQL Interface or API, or whether it forces re-modeling. Tools that fail must go through a principal-level exception requiring documented isolation and a migration timeline. Pair this with a BI tool inventory and cost review quarterly; tools that are low-adoption and high-drift are deprecated, not tolerated indefinitely."
+      },
+      {
+        "q": "How does the Looker open semantic layer (LSML/metrics layer) interact with independent metrics layers like dbt Semantic Layer?",
+        "a": "In a mature stack these can coexist in layers: dbt's Semantic Layer (MetricFlow) defines warehouse-level metrics close to the transform step; Looker's LookML can import or sit atop those definitions, using dbt-defined aggregates as view sources. The tension is ownership: which layer is authoritative for a given metric? Best practice is to align on one system per metric and not let both define it independently. As of early 2026 both support JDBC-based consumption, so tool-agnostic clients can query either—the governance decision is organizational, not technical."
+      }
+    ]
+  },
+  {
+    "q": "How do you make multi-year Looker platform investment decisions versus evaluating alternatives like Tableau, Power BI, or a headless metrics layer?",
+    "a": "Frame the decision on four axes. Semantic layer ownership: does the org need one governed definition layer across all tools (Looker's strength), or is per-tool modeling acceptable (reduces switching cost but creates drift)? Embedded analytics: Looker's signed/cookieless embed and Extension Framework are best-in-class for product analytics; Tableau/Power BI require Power Embed or external SDKs with fewer LookML-style governance hooks. Self-service depth: Looker's explore requires training and tends to work better for power users; Tableau/Power BI have broader non-technical adoption. Modern cloud-native stacks (dbt + headless metrics layer + lightweight BI front-ends) offer flexibility but sacrifice Looker's single-query-interface governance. Decision criteria: number of customer-facing embedded analytics use cases (favors Looker), percentage of power-user vs. casual-consumer audience (split consideration), existing dbt investment (favors dbt Semantic Layer integration), and multi-cloud/multi-warehouse flexibility needs. Map these against a 3-year TCO including licensing, training, and modeling-team size.",
+    "fs": "Evaluate on semantic-layer ownership model, embedded analytics depth, self-service breadth, and dbt integration; build a 3-year TCO that includes training and modeling-team cost, not just license cost.",
+    "fj": "Choose whichever BI tool is cheapest per seat; all modern BI tools are equivalent in capability.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you manage the risk of vendor lock-in with deep LookML investment?",
+        "a": "LookML has no direct portability—the semantic layer is Looker-native. Mitigate by keeping your transform/modeling boundary clear: push as much business logic as possible into dbt models (SQL, portable) and use LookML primarily for the explore/presentation layer on top. That way, a BI-tool migration preserves the dbt foundation and only re-models the presentation layer. Document every LookML-specific feature (Liquid, access_filter) you rely on with a migration note if the tool changes."
+      },
+      {
+        "q": "A stakeholder argues for replacing Looker with a cheaper per-seat BI tool. What TCO elements do they typically undercount?",
+        "a": "Hidden costs: re-modeling every metric definition (analyst-months per domain), retraining end users, rebuilding embedded analytics (often the most expensive because it requires engineering work, not just SQL), data access governance re-implementation (access_filter and grants don't have direct equivalents in cheaper tools—someone handrolls it in SQL), and the opportunity cost of downtime and trust erosion during migration. Cheap-per-seat licenses frequently cost more in implementation than they save."
+      },
+      {
+        "q": "When is a headless metrics layer (dbt Semantic Layer, Cube, Metriql) the right answer instead of doubling down on Looker?",
+        "a": "When the org has many BI tool consumers (Tableau for business, Notebooks for data science, Slack bots for ops) and the overhead of running queries through Looker's API for each tool is high, or when engineering teams want metric definitions co-located with dbt transforms. A headless layer decouples metric definition from visualization and is accessed by any SQL-compatible client. The tradeoff: you lose Looker's UI (explores, dashboards), access governance requires a separate enforcement layer, and embedding requires building from scratch. Strong when BI is diverse; weaker when a unified governed explore/dashboard surface is the core product."
+      }
+    ]
+  },
+  {
+    "q": "How do you build and govern an org-wide metrics layer with Looker when different teams disagree on metric definitions?",
+    "a": "Define a Metrics Governance Board: cross-functional (Finance, Data Engineering, Analytics, Product) with a named DRI for each business domain's metrics. Establish a Metric Definition RFC process: any new or changed metric definition goes through a short written proposal (definition, SQL logic, intended use, known exclusions) reviewed by the board before LookML implementation, not after. Maintain a Metric Registry (a machine-readable YAML or a Looker-native catalog entry) that captures the canonical definition, owner, last-reviewed date, and known divergences with legacy systems. Implement data tests (LookML test: blocks) as executable documentation—a test that asserts 'total monthly revenue in this explore matches the Finance-approved figure' is the contract between teams. Escalation path: disagreements on definition go to the governance board, not to individual LookML developers, so the model doesn't become a political artifact.",
+    "fs": "Metrics Governance Board + RFC process for definition changes + machine-readable Metric Registry + executable LookML data tests as contracts; escalation to the board, not individual devs.",
+    "fj": "Let each team define their version of the metric in their own explore; reconcile in reporting.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you enforce that a metric in LookML matches the governance-board-approved definition and hasn't silently drifted?",
+        "a": "A LookML `test:` block that queries the metric against a seeded reference dataset and asserts the exact expected value. This test runs in CI on every PR; if the implementation drifts from the approved SQL logic the test breaks, and the developer must update the RFC or fix the implementation. Tests are the executable contract between the governance definition and the LookML code—not documentation that can drift."
+      },
+      {
+        "q": "What happens when a metric definition genuinely needs to change (business rule changes)?",
+        "a": "Submit a new RFC documenting the old and new definition, the retroactive impact on historical data, and the communication plan to downstream consumers (dashboards, embedded apps, data exports) that depend on the metric. The governance board approves before any LookML change merges. On deploy, version-tag the change in the model's changelog and post to all consuming teams. Backward-compatible changes (adding a new variant) are preferred over breaking changes (replacing the definition in place)."
+      },
+      {
+        "q": "How do you surface to end users that two metrics with similar names might have different scopes?",
+        "a": "Use LookML `description` fields with explicit scope notes ('Revenue (GAAP): excludes refunds and adjustments. Approved by Finance 2025-Q3. Use for external reporting only.') visible in the explore field picker and in Looker's data dictionary. Tag metrics with `group_label` groupings that signal scope ('Revenue – GAAP', 'Revenue – Internal'). Supplement with a data catalog link in the description pointing to the Metric Registry entry, so users can follow the chain of authority without hunting through Slack."
+      }
+    ]
   }
 ]

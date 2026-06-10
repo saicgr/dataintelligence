@@ -37,6 +37,25 @@ ALIAS_EXTRA = {
     "Spark": ["apache spark", "spark"],
     "Azure Data Factory": ["adf", "azure data factory"],
     "scikit-learn": ["sklearn", "scikit learn", "scikit-learn"],
+    # ── duplicate JD terms whose concept is already covered under another name ──
+    # (each canonical verified to have >=10 dedicated cards, or is a track name)
+    "Kinesis": ["aws kinesis", "kinesis data streams", "amazon kinesis"],
+    "Pub/Sub": ["google cloud pub/sub", "gcp pub/sub", "cloud pub/sub", "pubsub"],
+    "Vertex AI": ["google cloud ai", "google vertex ai", "vertex"],
+    "EHR": ["emr/ehr", "ehr/emr", "emr"],
+    "OneLake": ["azure onelake", "ms onelake"],
+    "SLO": ["slis/slos", "sli/slo", "slos", "slis", "service level objectives"],
+    "Cost Monitoring": ["warehouse cost optimization", "warehouse cost", "credit monitoring"],
+    "cluster policies": ["workspace guardrails", "databricks workspace guardrails"],
+    "Foundry": ["palantir foundry", "palantir fde", "foundry ontology"],
+    "Power BI": ["business intelligence"],
+    "Unity Catalog": ["databricks administration", "databricks admin"],
+    "Entra ID": ["azure administration", "azure ad administration"],
+    "Tableau": ["tableau ai", "tableau pulse"],
+    "GitHub Copilot": ["ai tools", "ai coding tools", "ai coding assistant"],
+    "Kubernetes": ["cka", "certified kubernetes administrator"],
+    "REST API": ["backend development", "backend dev"],
+    "message queue": ["ibm mq", "websphere mq", "ibm websphere mq"],
 }
 
 def load_md():
@@ -134,10 +153,10 @@ def mention_counts(term, tracks):
 def grade(term, tracks, tnames):
     counts = mention_counts(term, tracks)
     total_mentions = sum(counts.values())
-    if not counts:
+    is_track = term.lower() in tnames
+    if not counts and not is_track:
         return {"track": "", "qa": "", "status": "⬜ missing", "action": "author 5",
                 "notes": "no cards mention it yet"}
-    is_track = term.lower() in tnames
     if is_track:
         slug = tnames[term.lower()]
         tot = tracks.get(slug, {}).get("total", 0)
@@ -180,9 +199,18 @@ def main():
     for c in rows:
         if len(c) < 9:
             continue
-        term = c[0]
+        cterm = canonical(c[0], alias)          # collapse aliases -> canonical
+        key = cterm.lower()
         seen = [x.strip() for x in c[7].split(",") if x.strip()]
-        existing[term.lower()] = {"term": term, "date": c[6], "seen": seen, "notes": c[8]}
+        if key in existing:                     # two rows fold into one (dedupe)
+            e = existing[key]
+            e["seen"] = sorted(set(e["seen"]) | set(seen))
+            dates = [d for d in (e.get("date"), c[6]) if d]
+            e["date"] = min(dates) if dates else c[6]
+            if not e.get("notes"):
+                e["notes"] = c[8]
+        else:
+            existing[key] = {"term": cterm, "date": c[6], "seen": seen, "notes": c[8]}
 
     # batch term -> set(labels)
     batch_labels = {}

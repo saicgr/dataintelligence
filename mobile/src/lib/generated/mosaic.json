@@ -582,5 +582,459 @@
         "a": "Governance fragments: data copied to an external vector DB no longer carries UC masking/ACLs, direct provider keys skip gateway logging and rate limits, and lineage breaks at every boundary. You end up reimplementing permissions and audit in each external system and reconciling them by hand — exactly the sprawl UC exists to eliminate. The cost is real but invisible until an audit or breach exposes the gap."
       }
     ]
+  },
+  {
+    "q": "What are Genie trusted assets and how does each type shape the SQL Genie generates?",
+    "a": "Genie trusted assets are the curated inputs inside a Genie space that guide NL-to-SQL generation: (1) table and column descriptions from Unity Catalog metadata give vocabulary; (2) SQL expressions map business terms like 'active user' or 'MRR' to exact SQL fragments that get substituted verbatim; (3) example SQL queries show correct multi-table joins, date arithmetic, and filters for canonical questions; (4) free-text instructions encode editorial rules the other three can't express. The priority order matters: SQL expressions are the most reliable because they're executable and unambiguous; instructions are a last resort because LLM interpretation can be inconsistent. Adding a wrong example query is worse than no example, because Genie may over-fit to its pattern on related questions.",
+    "fj": "Genie trusted assets are just the table list you attach to the space.",
+    "fs": "Trusted assets = UC column comments + SQL expressions (verbatim substitution) + example queries + instructions. SQL expressions beat instructions for precision; examples set join/grain patterns.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why can a single badly authored example query cause broad regression in a Genie space?",
+        "a": "Genie uses example queries as anchors for similar NL patterns. An example that uses the wrong join key, the wrong date grain, or a non-canonical filter can be applied to structurally similar questions and produce wrong SQL across that whole class. You must validate examples against known-correct results before adding them, and benchmark the space before and after each addition."
+      },
+      {
+        "q": "When would you choose a free-text instruction over a SQL expression for the same business rule?",
+        "a": "Only when the rule genuinely can't be encoded in SQL — for example, 'when the user asks about revenue, always break it down by region unless they say otherwise' is a presentation and framing preference with no single SQL mapping. SQL expressions handle deterministic filter/metric definitions; instructions handle soft formatting and framing conventions. Using instructions where an expression would work means accepting inconsistent application."
+      },
+      {
+        "q": "How do you test that a new SQL expression doesn't break existing Genie answers?",
+        "a": "Maintain a Genie evaluation set — a fixed set of representative questions with verified SQL and expected results. Before and after adding the expression, run all questions and compare generated SQL and result tables. Any regression signals the expression is over-matching adjacent question patterns. Treat expressions like code: reviewed, tested, and rolled back if they break the eval set."
+      }
+    ]
+  },
+  {
+    "q": "Explain the Genie Conversations API: what it exposes and how you'd use it to embed conversational BI in a custom application.",
+    "a": "The Genie Conversations API is a REST API that lets you programmatically start and continue multi-turn conversations against a Genie space from outside the Databricks UI. You create a conversation (POST /genie/spaces/{space_id}/start-conversation), send follow-up messages (POST /genie/spaces/{space_id}/conversations/{conversation_id}/messages), and poll the message result for the generated SQL, query results, and any clarifying questions Genie raises. This lets you build a branded BI chat UI, a Slack bot, or any custom front end that surfaces governed analytics without exposing the Databricks workspace directly. Access still enforces Unity Catalog permissions — the API runs as the caller's identity, so row/column policies apply.",
+    "fj": "Genie only works inside the Databricks SQL UI; there's no programmatic access.",
+    "fs": "The Genie Conversations API exposes start-conversation + message endpoints so you can embed Genie multi-turn NL-to-SQL in any app while UC permissions still apply per the caller's identity.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Start a Genie conversation via REST",
+        "lang": "python",
+        "lines": [
+          "import requests, os",
+          "host = os.environ['DATABRICKS_HOST']",
+          "token = os.environ['DATABRICKS_TOKEN']",
+          "space_id = 'abc123'",
+          "r = requests.post(",
+          "  f'{host}/api/2.0/genie/spaces/{space_id}/start-conversation',",
+          "  headers={'Authorization': f'Bearer {token}'},",
+          "  json={'content': 'What was revenue last week?'})",
+          "conv = r.json()  # contains conversation_id + message_id"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "The Genie API is asynchronous — what does that mean for how you poll a message result?",
+        "a": "After sending a message you get a message_id; you then GET the message result endpoint and check the status field, which transitions through EXECUTING_QUERY to COMPLETED or FAILED. You must poll until a terminal state, then parse the result_data. This async pattern exists because SQL generation and execution can take several seconds; building a synchronous wrapper around it requires an exponential-backoff polling loop or a webhook, not a simple blocking call."
+      },
+      {
+        "q": "How does the Genie API handle follow-up questions that refer back to prior context in the conversation?",
+        "a": "Each message is posted to the same conversation_id, so Genie retains the prior turn's SQL and context — follow-ups like 'now break that down by region' resolve correctly because Genie knows what 'that' refers to. Conversational context is server-side; the client just passes the conversation_id and the new message text. If you start a new conversation for every question you lose multi-turn resolution."
+      },
+      {
+        "q": "A Slack bot calls the Genie API and surfaces answers in a channel. What governance concerns arise?",
+        "a": "The bot authenticates with a service principal token, so Genie runs every query as that principal's UC permissions rather than the individual Slack user's. That can expose data the Slack user shouldn't see if the service principal has broad grants. The correct design is a per-user OAuth token or a pattern where the Slack user's identity is passed as the calling principal, not a broad service account, to preserve per-user RLS and column masking."
+      }
+    ]
+  },
+  {
+    "q": "How does Genie handle NL-to-SQL governance in multi-tenant environments where different users should see different row subsets?",
+    "a": "Genie runs the generated SQL as the requesting user's identity via Unity Catalog, so row-level security policies defined on the underlying Delta tables apply automatically at query execution. If user A's UC identity has a row filter that restricts to their tenant's rows, Genie's SQL runs with that filter enforced by the storage layer — Genie doesn't see a cross-tenant result set and then try to mask it. This means you define multi-tenancy once as UC policies on the tables, and Genie inherits them without any extra logic in the space. The critical implication: a shared Genie space can safely serve users from different tenants as long as the underlying tables have correct row filters.",
+    "fj": "You must build a separate Genie space per tenant to avoid data leakage.",
+    "fs": "Genie runs SQL as the caller's UC identity, so row-level security on the underlying tables enforces tenant isolation automatically — one space, many tenants, no leakage if UC policies are correct.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What specific UC construct implements row-level filtering on a Delta table for Genie to inherit?",
+        "a": "Row filters are defined as Delta table properties via `ALTER TABLE ... SET ROW FILTER`, pointing to a SQL function that takes table column values and returns a boolean. Unity Catalog pushes the filter predicate at scan time, so any query — including Genie-generated SQL — runs with that predicate silently applied. You author the filter once on the table; all upstream consumers inherit it."
+      },
+      {
+        "q": "If a Genie space is used by a service account running a scheduled report, what multi-tenant risk does that create?",
+        "a": "A service account typically has broader grants than an individual user, potentially spanning multiple tenants. A Genie query run as that account bypasses per-user row filters and could return cross-tenant rows. For scheduled or automated Genie use, the service account should have the same tight RLS scope as the business user it's acting for — or you must verify the service account's grants are explicitly constrained to the correct tenant."
+      },
+      {
+        "q": "Can column masking policies — e.g. masking PII like email — also flow through Genie, and how?",
+        "a": "Yes. Column masking is defined via `ALTER TABLE ... ALTER COLUMN ... SET MASK` referencing a SQL masking function. When Genie generates a SELECT that includes the masked column and runs it as the user, UC applies the mask at scan time — the user sees the masked value, not the raw PII, exactly as if they ran the query in SQL editor directly. Genie doesn't special-case masking; it inherits it because it runs through the standard UC query path."
+      }
+    ]
+  },
+  {
+    "q": "How do you benchmark a Genie space's NL-to-SQL accuracy, and what metrics matter?",
+    "a": "Build an evaluation set of representative business questions paired with ground-truth SQL and verified result tables. Run every question through the Genie space and compare on three metrics: SQL correctness (does the generated SQL match the expected SQL's logic or at minimum produce the same result), result accuracy (do the numbers match the known-correct output), and coverage (what fraction of questions produce a valid SQL attempt vs. Genie declining). Beyond numbers, inspect where Genie fails: wrong aggregation grain, missing filter, wrong join — categorized failures guide what trusted assets to add next. Treat the eval set as a regression suite: every curation change should be gated by a run that either holds or improves all three metrics.",
+    "fj": "Ask a few users if the answers looked right — that's enough validation.",
+    "fs": "Genie benchmarking needs a labeled question set scored on SQL correctness, result accuracy, and coverage. Categorize failures to guide curation; run the set as a regression gate on every change.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why is SQL correctness harder to measure than result accuracy, and when does result accuracy mislead you?",
+        "a": "Two different SQL queries can produce the same result on current data but diverge on edge cases, historical periods, or after schema changes — so result accuracy passes even when the logic is wrong. SQL correctness checks the query structure, not just the output, catching wrong joins or filters that happen to produce the right number today. Use result accuracy for quick signal and SQL review for validation of critical business metrics."
+      },
+      {
+        "q": "How do you build the ground-truth labeled set without it becoming a manual bottleneck?",
+        "a": "Start with the top 20-30 questions users actually ask (pull from Genie's conversation history once live, or interview business users). Have an analyst author the canonical SQL for each and verify the result. That set covers the high-frequency, high-stakes questions where errors cost the most. Grow it incrementally by adding any new failure type from production rather than trying to enumerate exhaustively up front."
+      },
+      {
+        "q": "Genie's coverage metric is low — many questions get 'I can't answer that.' What do you investigate?",
+        "a": "Low coverage usually means vocabulary mismatch: Genie doesn't recognize the user's term for a column or metric because the UC descriptions use different language. Check whether the failing questions contain terms not in any column description, SQL expression label, or example query. Adding a SQL expression or description that uses the user's terminology typically unlocks that class of questions without any model changes."
+      }
+    ]
+  },
+  {
+    "q": "What is the Genie instructions layer and what are the failure modes of over-relying on it?",
+    "a": "Genie instructions are a free-text block inside a space where the curator writes natural-language directives that guide SQL generation — for example, 'always filter to completed orders unless the user explicitly asks for all statuses' or 'present revenue in thousands'. Genie includes these instructions in its LLM context alongside the question. The failure modes: (1) instructions are interpreted by the LLM and can be applied inconsistently across question phrasings; (2) as instructions grow long they compete for context and earlier rules can be crowded out; (3) a poorly worded instruction can interfere with unrelated questions; (4) there's no executable test for whether an instruction was applied. For anything with one correct definition, a SQL expression is strictly better. Instructions should be short, composable, and tested against an eval set just like code.",
+    "fj": "Free-text instructions are the most powerful lever in a Genie space and should be the first thing you write.",
+    "fs": "Instructions are the weakest trusted asset — LLM-interpreted, inconsistently applied, context-limited. Reserve them for soft editorial rules; encode every precise definition as a SQL expression.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you test whether a specific Genie instruction is actually being followed?",
+        "a": "Write eval questions specifically designed to trigger the instruction and check the generated SQL. For example, if the instruction says 'always filter to completed orders', include questions about orders and verify the WHERE clause contains the status filter. This is the only way to confirm the instruction is applied consistently — reading the instruction text doesn't tell you whether the LLM honors it across phrasings."
+      },
+      {
+        "q": "What's the maximum useful length for a Genie instructions block, and why?",
+        "a": "There's no hard limit, but beyond roughly 500-700 words you see diminishing returns and interference: long instruction sets fill context that could carry the question and schema, and later rules can override or dilute earlier ones depending on LLM attention. Keep each rule atomic and short. If you have 20 instructions, that's a signal the space is trying to do too much — split it into multiple focused Genie spaces instead."
+      },
+      {
+        "q": "Give a concrete example where migrating an instruction to a SQL expression solved a reliability problem.",
+        "a": "Suppose the instruction says 'active means the user placed an order in the last 90 days.' Genie applies this inconsistently — sometimes it uses 89 days, sometimes it doesn't apply the filter on an ambiguous question. Replacing it with a SQL expression `is_active AS (last_order_date >= current_date - 90)` that Genie substitutes verbatim eliminates the variance: every query that triggers the term uses the exact predicate, testably and reproducibly."
+      }
+    ]
+  },
+  {
+    "q": "Genie vs. a manually authored Databricks SQL dashboard: when does each win, and how do they complement each other?",
+    "a": "A manually authored SQL dashboard wins when the question set is fixed and well-understood, when users need pixel-perfect layout and interactive filters, and when performance matters (queries are pre-tuned). Genie wins when users need ad-hoc exploration, when the question space is too broad to enumerate in dashboards, and when business users who can't write SQL need answers without a data engineer in the loop. They complement each other: a Genie space can surface a candidate SQL that an analyst then turns into a dashboard tile, and a dashboard can embed a Genie conversational widget for the questions that fall outside its fixed panels. Neither eliminates the other; the right pattern is a dashboard for the 20% of repeated questions and a Genie space for the long tail.",
+    "fj": "Genie replaces the need for any SQL dashboards.",
+    "fs": "Dashboards win for fixed, repeated, performance-tuned views; Genie wins for ad-hoc exploration and questions outside the enumerated set. Use both: dashboards for the 20% long-tail, Genie for the rest.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What's the strongest case against replacing a CFO's weekly revenue dashboard with a Genie space?",
+        "a": "The CFO's dashboard is pixel-perfect, pre-agreed, and its SQL has been audited for edge cases. Genie generates SQL dynamically, so if the question phrasing varies slightly, the aggregation might shift. For a board-level metric, reproducibility and auditability of the exact query matter more than flexibility. Keep the dashboard for the canonical view; Genie handles the follow-up questions."
+      },
+      {
+        "q": "How can a Genie space accelerate building new dashboard tiles without replacing the dashboard?",
+        "a": "An analyst poses a question in Genie, inspects the generated SQL, refines it, and copies it into a SQL dashboard tile. Genie acts as a first-draft SQL generator that the analyst validates and owns — faster than authoring from scratch, but the dashboard tile is audited human-owned SQL, not a live Genie answer. This is the workflow Databricks recommends for analyst productivity."
+      },
+      {
+        "q": "What governance property makes Genie safe to give to a business user, whereas raw SQL editor access is not?",
+        "a": "With SQL editor access a business user could author queries that scan expensive tables, bypass intended filters, or accidentally expose cross-tenant data if permissions are broad. Genie scopes the question to the tables in the space, runs as the user's identity so UC policies apply, and the space curator can set boundaries on what's answerable. Business users get analytics self-service within a curated, governed perimeter, not open-ended warehouse access."
+      }
+    ]
+  },
+  {
+    "q": "How does the Genie space scoping model affect security, and what happens when a curator adds a table that contains more columns than the business question needs?",
+    "a": "Every table in a Genie space is fair game for the LLM's SQL generation and for Unity Catalog permission checks — Genie can and will SELECT from any column in any attached table if it determines that column answers the question. Adding a table with sensitive columns (even ones not needed for the business use case) means those columns are in scope. The correct practice is to attach views or materialized columns that expose only the grain and attributes needed, so Genie's SQL generation space is constrained and overly broad SELECTs can't leak sensitive fields to users who shouldn't see them. Principle of least privilege applies to Genie space curation just as to direct data access.",
+    "fj": "Attaching a full table to a Genie space is fine; Genie only uses the columns relevant to the question.",
+    "fs": "Every column in an attached table is in scope for Genie's SQL. Attach narrow views not raw wide tables to enforce least-privilege and prevent accidental sensitive-column leakage.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What UC object should you attach to a Genie space instead of the raw table when the table has 80 columns but only 10 are relevant?",
+        "a": "A Unity Catalog view that SELECTs only the 10 needed columns with clear aliases and a well-authored description. The view inherits the source table's row filters, is registered in UC with its own grants, and its column set constrains what Genie can SELECT. You can add computed columns like `is_active` into the view definition so Genie never needs to reconstruct that logic."
+      },
+      {
+        "q": "If you attach two tables to a Genie space and both have a column named `id`, what problem does that cause and how do you fix it?",
+        "a": "Ambiguous column names cause Genie to either pick the wrong table's `id` in join conditions or generate unqualified SQL that errors. Fix it by attaching views that alias ambiguous columns to fully-qualified names (e.g. `customer_id`, `order_id`), and add a join relationship hint in trusted assets that shows the correct join key so Genie doesn't have to infer it."
+      },
+      {
+        "q": "Can you restrict which rows of a table are visible in a Genie space without writing a separate view?",
+        "a": "Yes — UC row filters on the source table are enforced at scan time for any query Genie generates, including in the space. So if the table already has a row filter that limits rows by tenant or date range, Genie inherits it automatically. But if you need a Genie-specific subset (e.g. only finalized orders for a BI-facing space) and the table doesn't already have that filter, creating a view with a WHERE clause is the clean, explicit way to constrain the space."
+      }
+    ]
+  },
+  {
+    "q": "What are Genie spaces' current limitations compared to a full SQL analytics workbench, and how do they affect senior architecture decisions?",
+    "a": "As of early 2026 Genie spaces have several hard limits senior architects must plan around: (1) the underlying model has a context window that bounds how many tables, column descriptions, and examples fit — very wide schemas require narrowing via views; (2) Genie cannot run arbitrary Python or UDFs, only SQL over the attached tables; (3) multi-step reasoning (compute a temp result, then filter it) is expressed as subqueries in one shot, not as multi-hop tool calls like an agent; (4) it doesn't support write operations — no INSERT/UPDATE; (5) question history is conversational but not stateful across sessions by default. These limits mean Genie is the right answer for governed self-service analytics but not for operational workflows, ML feature pipelines, or complex multi-step data transformations — those still need notebooks or agents.",
+    "fj": "Genie can replace all analytics tooling including Python notebooks and ML pipelines.",
+    "fs": "Genie's limits: context window constrains schema breadth, SQL-only (no Python/UDFs), single-shot SQL (no multi-hop), read-only, no cross-session state. Design it for self-service BI, not operational or ML workloads.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "A finance team wants to use Genie to drive an automated month-end journal entry process. Why is that the wrong architecture?",
+        "a": "Genie is read-only NL-to-SQL — it can't execute INSERT, UPDATE, or procedural logic, and its SQL is generated non-deterministically from natural language, making it unsuitable as the engine for a controlled, auditable financial process. Month-end automation needs deterministic, tested SQL or dbt models, not LLM-generated SQL. Use Genie for ad-hoc exploration; use governed scheduled pipelines for operational writes."
+      },
+      {
+        "q": "How do you architect around Genie's context window limit when the business domain has 200 relevant columns?",
+        "a": "Decompose into multiple focused Genie spaces, each covering a business domain with 15-30 well-described columns rather than one monolithic space. Users route their question to the right space (or a router layer directs them). Each space's context is dense and relevant, improving accuracy. Avoid forcing one space to cover everything — a bloated context hurts both accuracy and latency."
+      },
+      {
+        "q": "When a user needs an answer that requires Python-level logic (e.g., a statistical model or a pandas transformation), what Databricks-native alternative covers the gap?",
+        "a": "A Mosaic AI Agent that has access to code execution (via a tool that calls a Databricks job or a notebook task) can handle Python-level logic while still routing simpler SQL questions through Genie via the Conversations API. The agent uses Genie for the SQL retrieval layer and falls back to Python execution for complex transformations. This is the correct architecture for a hybrid analytics assistant that needs both NL-to-SQL and computation."
+      }
+    ]
+  },
+  {
+    "q": "How does Genie's SQL generation compare to Cortex Analyst's when the semantic model is mature, and what should drive the choice between them in a new Databricks-first org?",
+    "a": "Both are mature NL-to-SQL systems backed by large models, so raw generation quality on well-curated models is comparable. The architectural difference is the semantic model artifact: Cortex Analyst's YAML is an explicit, versionable, CI-testable document that data engineers can diff and review in pull requests, while Genie's semantic layer is distributed across Unity Catalog comments, SQL expressions, and example queries — easier to author incrementally but harder to version atomically. In a Databricks-first org the decisive factors are (1) data is already in Delta under Unity Catalog — Genie inherits all UC governance automatically, no re-expression in YAML; (2) the audience is business users in the Databricks SQL UI — Genie is native and seamless; (3) if you want to embed conversational BI in a custom app, the Genie Conversations API gives programmatic access. Only choose Cortex Analyst if your data is primarily in Snowflake or if you need the YAML model to double as a dbt-style semantic contract.",
+    "fj": "Cortex Analyst is always more accurate because it uses a structured YAML model.",
+    "fs": "On mature models accuracy is comparable; choose Genie for Databricks-native UC governance flow-through and casual analyst UX, Cortex Analyst for Snowflake-first orgs or teams who need a CI-auditable YAML semantic contract.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "A team argues Cortex Analyst's YAML is better for governance because it's explicit and versionable. What's the Genie counter-argument?",
+        "a": "Genie's semantic layer is also version-controlled implicitly through Unity Catalog: column descriptions are table-level attributes that change with ALTER TABLE DDL (tracked via lineage), and SQL expressions are catalog objects. The difference is you can't PR-review a Genie space as a single diff the way you can a YAML file. The practical counter is that UC governance (row filters, masking, grants) flows into Genie for free; replicating that in a YAML semantic model requires hand-encoding what UC already enforces."
+      },
+      {
+        "q": "If an org runs data on both Databricks and Snowflake, what's the recommended approach for conversational BI?",
+        "a": "Use each platform's native system on its own data: Genie spaces for Unity Catalog tables in Databricks, Cortex Analyst for Snowflake data. A routing layer in the front end or a unified agent dispatches questions to the appropriate system based on which platform owns the authoritative data for that domain. Avoid trying to federate one semantic model across both platforms — the governance models diverge and the maintenance burden exceeds the convenience."
+      },
+      {
+        "q": "What does Genie's integration with Databricks AI/BI Dashboards give you that the Conversations API alone doesn't?",
+        "a": "The Databricks AI/BI Dashboard embeds a Genie conversational widget directly alongside static dashboard panels, so a user can ask a follow-up question about a dashboard chart and get a Genie-generated answer scoped to the same data without leaving the page. The Conversations API requires a custom app to wire this together. The native dashboard integration gives a no-code path to the hybrid fixed-plus-conversational BI pattern Databricks recommends, with no application development required."
+      }
+    ]
+  },
+  {
+    "q": "You own the Mosaic AI platform for a 200-person data org. How do you architect the Model Serving layer to handle both online inference (sub-100 ms) and batch scoring (millions of rows/night) without doubling infrastructure?",
+    "a": "Separate the serving topology by workload class rather than duplicating clusters. For online inference, provision dedicated endpoints sized to peak QPS with provisioned-throughput foundation models or custom model weights — autoscaling handles burst. For batch, route ai_query calls inside Databricks SQL or a Spark job against pay-per-token endpoints (or a provisioned endpoint that shares the same weight, but throttled during off-hours via gateway rate limits). The AI Gateway is the unification layer: one set of credentials and guardrails, logged to Unity Catalog so cost attribution is per-endpoint per-team. Avoid a 'one cluster for everything' approach — batch locks up online capacity during scoring windows. The staff-level insight is that the model weights can be the same (same Unity Catalog version), but the serving topology and rate contracts differ: dedicated+reserved for online, shared+throttled for batch.",
+    "fj": "Run all inference on one large provisioned endpoint so it's simpler to manage.",
+    "fs": "Separate topology: provisioned endpoints for latency-sensitive online traffic, pay-per-token or shared throttled endpoints for batch — same UC model version, different rate contracts. AI Gateway unifies governance.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you prevent a runaway nightly batch job from consuming all provisioned throughput and spiking latency for online users?",
+        "a": "Apply endpoint-level rate limits in the AI Gateway for the batch caller's service principal, capping tokens-per-minute to a headroom-safe band below the endpoint's total capacity. The online callers hit the endpoint with no artificial ceiling; the batch job is throttled and retries with backoff. If the endpoint is shared, this isolation is the only thing protecting online SLOs — don't rely on scheduling alone, because overlap happens."
+      },
+      {
+        "q": "How do you right-size a provisioned throughput endpoint, and what's the operational review cadence?",
+        "a": "Size from p95 online QPS multiplied by average tokens per call, with 20-30% headroom. Pull these numbers from AI Gateway usage logs in Unity Catalog — token-per-minute histograms per endpoint. Review monthly: downsize when p95 drops more than 25% below reserved capacity for two consecutive weeks, upsize when throttle errors appear. The review cadence matters because both over- and under-provisioning cost real money and SLOs."
+      },
+      {
+        "q": "When does a model cascade (small model first, escalate to large) genuinely reduce cost at this scale, and when does it backfire?",
+        "a": "It pays when traffic is skewed — e.g. 70% of tickets are simple tier-1 queries the small model handles at 5x lower cost, and only 30% need the flagship model. At 200-person org scale with millions of nightly rows, even a 60% deflection to a cheaper model is meaningful. It backfires when the routing classifier itself is expensive, when the task distribution is uniformly hard (cascade doesn't deflect much), or when misroutes to the weak model produce costly remediation downstream. Always measure empirical deflection rate and error rate before committing the routing logic."
+      }
+    ]
+  },
+  {
+    "q": "Your agent platform runs 15 distinct agents deployed via agents.deploy(). Explain how you govern prompt versions, model versions, and tool schemas across all of them as a Staff platform engineer.",
+    "a": "Treat the agent definition as code: use MLflow Models-from-Code so each version is a source file committed to git with a deterministic hash, and register every agent as a versioned Unity Catalog model. Model versions track the LLM endpoint + Vector Search index at the time of logging as declared resources, so a deployed version is reproducible from its UC model version metadata. Gate promotions: agents move from dev alias to staging only after Agent Evaluation scores meet a defined quality bar on the eval set, then to prod via alias promotion rather than overwriting. For prompt governance, store prompt templates as MLflow Prompt Engineering artifacts or as parameterized strings in the agent source, versioned alongside the model — never inline ad-hoc strings in the serving environment. Tool schemas are versioned with the agent code; a breaking change to a tool contract increments the agent version. The cross-cutting risk is drift: an agent at Unity Catalog version 3 declares it needs serving endpoint X at a specific model, so a model upgrade on that endpoint must be coordinated with an agent re-evaluation cycle, not deployed silently.",
+    "fj": "Deploy the latest prompt and model change directly to the production endpoint — agents are stateless, so rollback isn't needed.",
+    "fs": "All three dimensions (prompt, model, tool schema) version together in the MLflow model source; UC alias promotion gates prod changes; Agent Evaluation is the quality gate. Drift between declared resource versions and live endpoint models is the main operational risk.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Promote agent alias to prod after eval",
+        "lang": "python",
+        "lines": [
+          "from databricks import agents",
+          "from databricks.sdk import WorkspaceClient",
+          "w = WorkspaceClient()",
+          "# Gate: eval score must be >= threshold",
+          "assert eval_score >= 0.85, 'eval gate failed'",
+          "w.registered_models.set_alias(",
+          "  full_name='cat.sch.my_agent',",
+          "  alias='prod',",
+          "  version_num=new_version)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a breaking tool schema change — e.g. a tool now requires an extra mandatory field — without taking down all 15 agents?",
+        "a": "Version the tool interface: introduce the new schema as a v2 tool and run both v1 and v2 side-by-side until all agents have been updated and re-evaluated. Agents that call the tool by name will keep working on v1; you migrate each agent in a controlled eval cycle and promote to prod only after passing quality gates. Avoid force-deprecating v1 until every agent's prod alias points to a version that uses v2."
+      },
+      {
+        "q": "An agent in production is misbehaving after an unrelated model endpoint upgrade. How do your versioning practices let you diagnose and roll back quickly?",
+        "a": "Because the UC model version declares its required serving endpoint and the endpoint's model version at logging time, you can diff the current agent's declared resources against what's live. MLflow traces on the production endpoint show the exact model that generated each span. Roll back by moving the prod alias to the previous UC model version — agents.deploy() re-provisions the endpoint from that version's declared resources. Root cause is usually an undeclared dependency: the endpoint model was upgraded without re-evaluating and re-logging the agent."
+      },
+      {
+        "q": "What's your strategy for keeping 15 agents' eval sets from becoming a maintenance burden?",
+        "a": "Factored eval sets: share a common base eval set for cross-cutting quality dimensions (groundedness, safety, format) across all agents, and maintain a small agent-specific addendum for domain-specific correctness. Run the base suite in CI for every agent build; run the agent-specific suite only for that agent's pipeline. Grow each addendum by routing production traces that receive low judge scores or user thumbs-down into a curation queue — evaluation stays tethered to real failure modes, not synthetic edge cases."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a cost and quality attribution system for Mosaic AI workloads across 10+ teams in a large org, and what does the monthly review cycle look like?",
+    "a": "Unity Catalog is the data backbone: the AI Gateway logs every LLM request — endpoint, principal, tokens consumed, latency — into UC tables you own. Tag every serving endpoint with team metadata at creation time (endpoint name convention or custom tags), so log joins produce per-team, per-agent breakdowns in SQL. Build a daily Lakeflow pipeline that reads the gateway log, enriches with team ownership from an HR/catalog table, and writes to a governed cost_attribution Delta table. Layer on a Databricks SQL dashboard for the monthly review: total DBU + token cost per team, cost per 1K requests by agent, quality trend (average groundedness and correctness score from Agent Evaluation logs). Monthly review covers: (1) over-budget teams get provisioned throughput right-sized or model right-sized; (2) agents with degrading quality get an eval re-run and possible rollback; (3) batch workloads that ran on provisioned endpoints during online hours get flagged. The goal is making cost and quality first-class operational metrics, not after-the-fact billing surprises.",
+    "fj": "Cost is the cloud provider's problem; teams self-manage their agents.",
+    "fs": "AI Gateway logs → Lakeflow enrichment → governed cost_attribution table → SQL dashboard. Monthly review ties cost per team to quality trend and drives provisioning decisions. Make it a first-class operational metric.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Aggregate gateway usage by team",
+        "lang": "sql",
+        "lines": [
+          "SELECT t.team_name,",
+          "  SUM(g.total_tokens) AS tokens,",
+          "  SUM(g.cost_usd)     AS cost_usd,",
+          "  AVG(g.latency_ms)   AS p50_latency",
+          "FROM ai_gateway_usage g",
+          "JOIN team_catalog t",
+          "  ON g.principal = t.service_account",
+          "WHERE g.date >= current_date - 30",
+          "GROUP BY t.team_name",
+          "ORDER BY cost_usd DESC"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "A team's cost doubled month-over-month but their request count barely changed. What's your diagnostic path?",
+        "a": "Token count per request increased — look at the gateway log's per-request token breakdown. Common causes: a prompt change bloated context (retrieval returning more chunks, system prompt grew), a model upgrade that returns longer responses, or a new tool that injects large schemas into the prompt. Join the token spike to the deployment timeline — find when a new agent version went live. Then audit the prompt assembly for that agent: retrieve chunk count, context window fill rate."
+      },
+      {
+        "q": "How do you prevent one team's batch job from appearing on another team's cost line if they share a serving endpoint?",
+        "a": "The AI Gateway logs the calling principal (service account or user identity), not the endpoint owner. As long as each team uses its own service principal for its workloads, the gateway log attribution is by caller, not by endpoint owner. Teams that share an endpoint still appear on separate lines because the caller identity differs. This is why each team needs its own service principal tied to its team in the catalog — shared service accounts break cost attribution."
+      },
+      {
+        "q": "What's the right escalation path when a team's quality score (groundedness) is trending down over 4 weeks?",
+        "a": "First check whether a model endpoint upgrade or a data pipeline change correlates with the trend start. Pull the low-groundedness traces and have the team's SME review 20 examples to classify failure mode (retrieval returned wrong docs, model ignored context, chunking broke a key passage). If retrieval is the issue, reindex with better chunking and re-evaluate. If model behavior changed, re-evaluate the previous agent version against current traffic. The four-week trend is enough to distinguish noise from signal; don't roll back on one week of data."
+      }
+    ]
+  },
+  {
+    "q": "An engineering team proposes deploying an open-source model (Llama 3.3 70B) on Databricks provisioned throughput instead of using Foundation Model APIs. Walk through the build-vs-buy tradeoff at Staff level.",
+    "a": "Foundation Model APIs are the managed path: Databricks runs and patches the infrastructure, handles scale-out, and the cost is token-metered. They're the right default for most orgs. Hosting your own weights on provisioned throughput makes sense when: (1) you've fine-tuned the model on proprietary data and need to serve that custom checkpoint — FM APIs can't serve your weights; (2) your volume is high enough that the per-token rate of a managed endpoint is more expensive than the compute cost of running the model yourself at sustained QPS; (3) you need model configurability (quantization, context length, batch size) the managed offering doesn't expose; (4) data residency requirements mean model weights can't live on shared infrastructure. The hidden costs of self-hosting: you own GPU infra sizing, model patching cadence, serving software updates, and on-call for serving failures. At a 200-person org the default should be FM APIs unless one of the four triggers above is clearly met — the engineering leverage is usually better spent on agent quality than on model serving operations.",
+    "fj": "Self-hosting is always cheaper because you avoid the per-token markup.",
+    "fs": "FM APIs win for most orgs (managed infra, no ops). Self-host on provisioned throughput only for fine-tuned custom checkpoints, volume-driven economics, model config needs, or data residency — and price in the ops cost.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you calculate the break-even point between FM API per-token pricing and provisioned throughput compute cost?",
+        "a": "Measure your sustained token throughput (tokens/hour averaged over a week). Multiply by FM API per-token rate to get the hourly API cost. Compare to the hourly DBU cost of the provisioned throughput cluster sized for that throughput. Break-even is where those two cross. Add 20% to the provisioned estimate for ops overhead (patching, alerting, on-call). In practice, break-even for a 70B model is typically well above 10M tokens/day of sustained load — most teams don't hit it."
+      },
+      {
+        "q": "What model patching obligation do you take on when self-hosting a Llama checkpoint, and why does it matter for a production agent?",
+        "a": "Llama releases security patches and capability updates; Meta doesn't push them to you — you have to monitor, evaluate, and apply. A production agent that depends on the model's behavior needs re-evaluation every time the weights change, so a model patch triggers a full eval cycle before promotion. FM APIs handle this transparently (Databricks patches managed models); self-hosting means you own the upgrade runway, which can mean weeks of delay if your eval suite is slow."
+      },
+      {
+        "q": "Your CISO says proprietary training data can't leave the Databricks workspace during inference. Does that change the analysis?",
+        "a": "It removes the external-provider option entirely — an FM API that proxies to a third-party model (Anthropic, OpenAI) sends request payloads off-workspace. Databricks-hosted FM API models (like Meta Llama on Foundation Model APIs) run inside the Databricks workspace, so inference stays in-boundary. Self-hosted provisioned throughput endpoints are also in-workspace. The data-residency requirement is not automatically an argument for self-hosting over FM APIs — check whether the specific Databricks-hosted FM API model is classified as workspace-resident in your data classification agreement."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern and operationalize an Agent Evaluation program across multiple squads shipping agents on Databricks, so quality regressions never reach production?",
+    "a": "Three layers: eval-set ownership, automated CI gates, and production feedback loops. Each squad owns a versioned eval set registered as an MLflow dataset in Unity Catalog — questions, ground-truth answers, and metadata about when questions were added and by whom. CI (Databricks Asset Bundles or GitHub Actions calling the Databricks Jobs API) runs Agent Evaluation on every agent version candidate, comparing groundedness, correctness, and safety scores against the prior promoted version. A version can only be promoted to the staging alias if scores hold or improve; a regression on any judge blocks the promotion and requires a human review comment in the model version's UC annotation before override. Production feedback comes from two sources: the Review App (SME ratings) and gateway traces scored by the label-free groundedness judge in Lakehouse Monitoring. Low-score production traces automatically flow into a curation queue where the squad adds them to the eval set, closing the loop. The Staff-level pattern is treating eval sets as living governed datasets, not static test files — they grow from production failures and are reviewed in squad sprint ceremonies.",
+    "fj": "Run the eval notebook manually before each release — that's sufficient quality control.",
+    "fs": "Squad-owned UC eval datasets + CI gates on every version + production trace feedback loop → eval sets grow from real failures. Promotion requires passing all judges; regression blocks and requires human override annotation.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A squad argues their agent is hard to evaluate because ground truth is subjective. How do you help them?",
+        "a": "Decompose quality into dimensions that can be evaluated without ground truth: groundedness (is the answer supported by context?), relevance (does the retrieval match the question?), and format compliance (does output conform to schema?) are all label-free. For correctness on subjective tasks, have two SMEs independently label a sample and measure inter-rater agreement — if they disagree on ground truth, that's a product scoping issue, not an eval problem. Resolve the definition of 'correct' with product leadership first; then the eval is straightforward."
+      },
+      {
+        "q": "What's the risk of eval set contamination, and how do you prevent it?",
+        "a": "Contamination happens when questions from the eval set leak into the fine-tuning or retrieval corpus, causing artificially high scores. Prevent it by hashing eval question texts and running a similarity check against training data before each fine-tune job. Keep the eval set in a Unity Catalog table with write access restricted to the squad lead — not editable by the same engineer who tunes the model. Treat it like held-out test data in classical ML: the model is never trained on it."
+      },
+      {
+        "q": "The label-free groundedness judge is flagging 15% of production traces as low-groundedness — what's your triage workflow?",
+        "a": "Sample 50 flagged traces and classify failure modes manually: (a) retrieval returned the wrong documents — fix is index or query improvement; (b) model was grounded but judge scored wrong — the judge needs calibration against human labels for this domain; (c) true hallucinations. For type (a) add the question to the eval set with the correct retrieval as the target. For type (b) tune the judge prompt and re-validate against labeled samples. For type (c) prioritize prompt hardening and consider adding an output guardrail in the AI Gateway. Don't treat '15% flagged' as one problem — it's at least three distinct root causes."
+      }
+    ]
+  },
+  {
+    "q": "You are making the architectural decision on whether to add a dedicated vector database (Pinecone, Weaviate) alongside Mosaic AI Vector Search in the platform. What is the Staff-level decision framework?",
+    "a": "Start from the governance and operational cost of running a second store. Mosaic AI Vector Search integrates into Unity Catalog — one permission model, one lineage graph, one sync mechanism (Delta Sync). Adding a second store immediately creates dual-write complexity, drift risk between the Delta source and the external index, and a parallel ACL system that must shadow Unity Catalog's row filters and masking. The legitimate triggers for a second store are: (1) a genuine capability gap — e.g. you need graph-based ANN, a specific HNSW variant, or multi-modal vectors Mosaic AI doesn't support as of early 2026; (2) cross-cloud portability where Vector Search isn't available; (3) existing high-value Pinecone investment that would cost more to migrate than to maintain. If none of those apply, the 'it's faster to demo' argument doesn't hold at platform scale — the ops cost of a second store is borne by every team that uses the platform, not just the team that added it. The decision is: capability gap first, then migration cost, then governance overhead. Default to staying native unless the gap is real.",
+    "fj": "Add Pinecone alongside Vector Search — more options for teams is always better.",
+    "fs": "Second vector stores multiply governance complexity and drift risk. Add one only for a genuine capability gap, cross-cloud need, or unmigratable investment. Capability gap first — not 'more options is better'.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you assess whether Mosaic AI Vector Search's ANN performance is the actual bottleneck before concluding there's a capability gap?",
+        "a": "Benchmark it properly: measure recall@k vs. latency on your actual data distribution at your target QPS, with your chunk count, not on a toy dataset. Vector Search uses DiskANN-style approximate nearest neighbor; for most enterprise RAG corpora at <50M vectors and reasonable QPS, it's sufficient. Profile whether latency is dominated by embedding, retrieval, or generation — retrieval is rarely the bottleneck in RAG. Only if measured retrieval latency is the bottleneck AND optimizing index params (num_results, query parameters) doesn't help does a capability gap argument hold."
+      },
+      {
+        "q": "A team wants to use a third-party vector DB for a PoC and promises to 'migrate later.' What's the governance conversation you need to have?",
+        "a": "The migration promise almost never materializes — PoCs become production. The governance conversation is: during the PoC, what access controls are on the external store? Does it honor UC row filters? What happens to PII that gets embedded there? How are credentials managed? If the answers are 'we'll figure it out later,' the PoC is building ungoverned infrastructure. The staff-level intervention is either requiring a governance plan before the PoC starts, or insisting the PoC use Vector Search from day one so the 'migration' is already done."
+      },
+      {
+        "q": "How does multi-modal retrieval (images + text in the same index) change the analysis in early 2026?",
+        "a": "As of early 2026, Mosaic AI Vector Search supports text and dense numeric vectors but does not offer native multi-modal index support for arbitrary image embeddings alongside text in the same index. If an application genuinely needs image+text co-retrieval (e.g. a product catalog search over images and descriptions simultaneously), that is a real capability gap. The correct architecture is to either pre-compute multi-modal embeddings externally and store them in Vector Search as dense numeric vectors if the format is compatible, or to maintain a separate specialized store only for the multi-modal use case while keeping all text RAG in Vector Search — not replacing Vector Search entirely."
+      }
+    ]
+  },
+  {
+    "q": "How would you architect Mosaic AI's rollout across a newly acquired company whose ML stack is entirely SageMaker + Bedrock, including the migration sequencing and what you leave in place?",
+    "a": "Start with inventory and don't migrate everything. Categorize the SageMaker estate by workload type: (a) online inference endpoints; (b) batch transform jobs; (c) training pipelines; (d) feature pipelines. Most orgs discover that 60-70% of SageMaker endpoints serve models that are rarely updated and low-traffic — those are migration candidates. Begin with governance: register existing SageMaker model artifacts as external model versions in Unity Catalog so you have lineage without yet moving serving. Next, migrate serving by standing up equivalent Mosaic AI endpoints (provisioned throughput for custom weights, FM APIs for commodity models) and running shadow traffic before cutover. Third, migrate features: re-express SageMaker Feature Store features as Databricks Feature Engineering feature specs, using Lakebase as the online store. Bedrock-backed agents are the trickiest: register the Bedrock models as external models in the AI Gateway so traffic flows through Databricks governance while you build equivalent Mosaic AI agents, then cut over. Leave in place any SageMaker capability with no equivalent — ground-truth labeling (Label Studio/SageMaker Ground Truth) or specialized SageMaker Studio notebooks the team depends on — and integrate via Delta Sharing or API rather than forklift. Sequence: governance registration first, serving migration second, feature migration third, training pipelines last (highest risk, lowest governance payoff).",
+    "fj": "Migrate everything to Mosaic AI at once — unified platform is the goal.",
+    "fs": "Inventory → govern in place (UC registration) → migrate serving → features → training pipelines. Leave true capability gaps (labeling tools) integrated, not forklift-migrated. Governance first, compute last.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle models that the acquired team fine-tuned on SageMaker and actively retrain weekly?",
+        "a": "Active weekly retraining pipelines are high-risk to migrate cold. First, port the training data pipeline to Delta (establish the data layer), register the existing SageMaker model artifacts in Unity Catalog as versions with provenance metadata so lineage is tracked. Then run a parallel Mosaic AI Model Training run on the same data and compare eval metrics before switching. Only cut over the retraining pipeline once both runs produce equivalent quality for three consecutive weeks. Never cut over training and serving simultaneously — decouple them."
+      },
+      {
+        "q": "The acquired team uses Bedrock for a customer-facing chatbot with 5M monthly users. What's the cutover risk, and how do you mitigate it?",
+        "a": "Customer-facing means zero-tolerance for latency regression or capability degradation. Cutover risk is: new endpoint doesn't handle the QPS, latency profile changes, or the replacement model behaves differently enough to degrade user experience. Mitigate with shadow traffic for four weeks (route 5% to Mosaic AI, 95% stays on Bedrock), measuring latency p99, error rate, and conversation quality scores side by side. Agree a rollback trigger with product leadership — if p99 latency on Mosaic AI exceeds Bedrock by >30ms, pause. Promote only after shadow traffic shows equivalent quality at full QPS."
+      },
+      {
+        "q": "What's the argument for leaving the acquired team's Bedrock models as external models in the AI Gateway rather than migrating them to Databricks-hosted models?",
+        "a": "External model registration is the lowest-risk, lowest-cost integration: the Bedrock model stays on Bedrock, but all traffic flows through the AI Gateway for unified rate limits, logging, and guardrails. The acquired team gets governance continuity without a model migration. The migration to Databricks-hosted or fine-tuned models is a separate, later decision driven by cost optimization or capability needs — not a prerequisite for governance. Forcing a model migration to justify Databricks adoption is the common mistake; governance can precede compute consolidation."
+      }
+    ]
+  },
+  {
+    "q": "As a Principal, define the multi-year strategic bet: should a large enterprise standardize on Mosaic AI as its unified GenAI-plus-ML stack, or maintain a best-of-breed stack (separate vector DB, MLflow self-hosted, external LLM provider APIs)?",
+    "a": "The standardization bet is fundamentally a governance bet, not a capability bet. As of early 2026 Mosaic AI's individual components — Vector Search, Model Serving, Agent Evaluation, Feature Engineering — are production-grade but not universally best-in-class on every dimension. The strategic case for standardization: (1) governance compound returns — Unity Catalog governance accretes value as more assets register, because lineage, masking, and ACLs span the whole estate automatically, reducing audit burden and data-governance headcount; (2) platform leverage — teams build on shared primitives (shared serving endpoints, shared eval infrastructure, shared gateway guardrails) instead of each team owning a bespoke stack; (3) data gravity — LLM workloads that operate on data already in Delta under Unity Catalog pay zero egress tax and inherit access controls, while best-of-breed stacks pay continuous sync and governance reconciliation cost. The counter-case: vendor lock-in concentrates platform risk, best-of-breed components may have 2-3x better performance or cost in specific dimensions (e.g. Pinecone's ANN performance, Anthropic's frontier model quality), and Databricks' roadmap is a bet on their execution. The principal-level synthesis: standardize the governance layer (Unity Catalog, AI Gateway) unconditionally — it's the moat, and the lock-in risk is low because UC assets are Delta/MLflow, which are open. Standardize the serving and evaluation layer for all net-new workloads. Leave escape hatches via external models and external Vector Search only where capability gaps are documented and reviewed annually. Sunset escape hatches when Mosaic AI closes the gap.",
+    "fj": "Best-of-breed is always safer because you're not locked into one vendor.",
+    "fs": "Standardize governance unconditionally (UC, AI Gateway — low lock-in risk, compounding value). Standardize serving/eval for net-new. External escape hatches only for documented capability gaps, reviewed annually. The moat is governance, not compute.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you define and track the 'documented capability gap' escape hatch annually so it doesn't become a permanent exemption?",
+        "a": "Each escape hatch is registered: the capability claimed to be missing, the external tool filling it, the team, and an annual review date. At review, the platform team benchmarks whether Mosaic AI has closed the gap in the past year (Databricks ships fast; Vector Search gained hybrid and multi-modal improvements each half). If the gap is closed, the team gets a migration timeline — 6 months to move to native. If not closed, the exemption renews. Tracking in a Unity Catalog table with the review date as a partition makes the audit trivial and visible to leadership."
+      },
+      {
+        "q": "A top ML team says they want to use a separate MLflow self-hosted instance to avoid 'Databricks dependency' on experiment tracking. How do you respond at the principal level?",
+        "a": "MLflow is open-source and the protocol is standard — there is no meaningful lock-in at the experiment-tracking layer. The question is operational: a self-hosted MLflow means the team runs infra (S3 artifact store, database, auth). The stronger argument is lineage: Databricks-managed MLflow participates in Unity Catalog lineage, so a model registered there carries its training-data provenance into governance workflows. Self-hosted breaks that link. The principal-level conversation is: the 'dependency' concern is about the serving and serving-to-data integration, not experiment tracking. Accept self-hosted MLflow only if the team is also willing to maintain the lineage bridge to UC, and make that a condition of the exemption."
+      },
+      {
+        "q": "How do you model the governance compounding return to justify the standardization investment to a CFO skeptical of platform lock-in?",
+        "a": "Governance cost is roughly linear in the number of data+AI asset types you govern, multiplied by the number of governance frameworks in play. Best-of-breed with five tools means up to five ACL systems, five audit logs, and five lineage graphs to reconcile — staff time to maintain that scales with org size. Unity Catalog collapses it to one. Model it as: each additional governed asset type on UC costs near-zero incremental governance overhead, while each additional external tool adds N engineer-days/year of reconciliation and audit prep. Quantify the current reconciliation cost (how long does a compliance audit take?), project it forward with the headcount plan, and compare to the platform investment. The CFO case is not 'best platform' but 'lowest total governance cost as the estate grows.' Lock-in risk is mitigated by UC being built on open formats (Delta, Parquet, MLflow) — data can be extracted without reformatting."
+      }
+    ]
+  },
+  {
+    "q": "As a Principal, how do you set the org-wide GenAI governance standards for Mosaic AI deployments — covering model risk tiering, evaluation thresholds, and production monitoring requirements — and how do you enforce them without becoming a bottleneck?",
+    "a": "Start with a risk tiering framework, not a one-size policy. Tier 1: GenAI features that affect regulated decisions (credit, employment, health) — highest bar, mandatory human-in-the-loop, external audit, monthly model review. Tier 2: customer-facing features affecting brand or customer trust (chatbots, personalized recommendations) — Agent Evaluation correctness and groundedness thresholds published centrally, mandatory Review App sign-off by a product owner before prod alias promotion, weekly Lakehouse Monitoring review. Tier 3: internal productivity tools (code assistants, internal Q&A agents) — evaluation thresholds lower, self-certified by the team, monthly sampling review. The standards define minimum thresholds (e.g. groundedness ≥ 0.85 for Tier 2) and required monitoring (groundedness and latency alert on every Tier 1/2 endpoint). Enforcement without bottleneck: encode the standards in the CI/CD pipeline using Asset Bundles — a bundle validator checks that every endpoint config has monitoring enabled, that the eval score artifact meets the tier threshold, and that the model version has a UC annotation for the tier classification. The pipeline fails if standards aren't met, not a committee. The governance office (you) owns the standards file and the CI validator, not every deployment decision. Annually review tier definitions as product and regulatory landscape shifts.",
+    "fj": "All GenAI deployments should go through a central governance review board before shipping.",
+    "fs": "Risk-tiered standards (3 tiers by regulatory and customer impact) + eval thresholds encoded in CI validators, not review boards. The Principal owns the standard; the pipeline enforces it. Governance scales with the org, not with your calendar.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "A team deploys a Tier 2 customer-facing agent and argues their use case is 'just a search feature' to avoid the Review App sign-off requirement. How do you handle it?",
+        "a": "The tier classification is determined by the impact surface, not the feature label. A 'search feature' that returns AI-generated summaries to customers, could surface harmful or incorrect information, or influences a customer decision is Tier 2 by definition. The CI validator checks the tier annotation on the UC model version — if the team classified it as Tier 3 to skip the requirement, that's a miscategorization, not a policy exception. Walk them through the classification criteria; if there's genuine ambiguity on the boundary, the principal call is to err Tier 2 and use the Review App as a lightweight two-hour exercise, not a multi-week gate."
+      },
+      {
+        "q": "How do evaluation thresholds interact with model upgrades — if Databricks upgrades a Foundation Model API model, do all Tier 2 agents automatically re-enter the eval gate?",
+        "a": "Yes, and this should be an automated trigger, not a manual process. The CI/CD system monitors for model version changes on declared endpoint resources. When a FM API model version changes, a Databricks workflow automatically re-runs Agent Evaluation for all agents that declare that endpoint as a resource, and posts the result to the UC model version annotation. If scores drop below threshold, the prod alias is frozen and the owning team is paged. This is why declaring resources at log time matters — it creates the dependency graph that the monitoring can traverse. Without declared resources, you can't know which agents are affected by a model change."
+      },
+      {
+        "q": "Regulatory requirements in your industry require explainability for any AI decision. How does Mosaic AI's architecture support or limit that requirement for Tier 1 agents?",
+        "a": "MLflow Tracing captures the full reasoning trace — retrieved documents, tool calls, model inputs/outputs — per request, which is the closest approximation to explainability for LLM agents: you can reconstruct what information the model had and what it generated. Store traces for Tier 1 agents with a longer retention policy in a governed Unity Catalog table. For regulated decisions that require deeper explainability, pair the agent trace with SHAP or attention-based analysis on a classification model that makes the final decision, keeping the LLM as a reasoning aid rather than the decision-maker. The architecture limitation is that transformer attention is not yet auditor-accepted as causal explainability — the trace is evidence of process, not a feature-importance explanation. Document this distinction in your governance standards and design Tier 1 flows so the human-in-the-loop step is the explainable decision point."
+      }
+    ]
+  },
+  {
+    "q": "You are advising a 500-person enterprise deciding between building their ML/AI platform on Mosaic AI vs. maintaining a separate ML stack (Kubeflow + self-hosted MLflow + Pinecone + direct OpenAI). Make the multi-year total-cost-of-ownership argument.",
+    "a": "Total cost of ownership has four components: direct infrastructure cost, governance and compliance cost, platform engineering headcount, and opportunity cost of velocity. On direct infra: Mosaic AI is bundled into Databricks DBU pricing, so the marginal cost of Model Serving, Vector Search, and Feature Engineering is incremental on an existing Databricks contract — compare to the Kubernetes cluster for Kubeflow (always-on GPU nodes), Pinecone's per-pod or storage-unit pricing, and OpenAI's per-token rate (which the AI Gateway can surface on any provider). On governance: a self-managed stack requires a dedicated platform engineering team to maintain UC equivalents — an internal model registry, a vector DB ACL system, a usage logging pipeline, and a compliance dashboard. At 500 people that's typically 3-5 FTEs. Unity Catalog as a managed service replaces most of that with configuration. On platform engineering: Kubeflow's operational surface (upgrades, pod scheduling, node pools, GPU drivers) requires deep K8s expertise; Mosaic AI's serverless and provisioned endpoints are managed. At 500 people, the Kubeflow team is typically 4-6 engineers; Mosaic AI reduces that to 2-3 who focus on configuration and eval frameworks. Opportunity cost: teams that don't own platform infra ship features faster. The three-year TCO model usually shows the self-managed stack is cheaper on compute alone but 40-60% more expensive in total when governance and platform headcount are included. The principal-level recommendation: if the org is already on Databricks, the incremental cost of Mosaic AI is small and the governance dividend is immediate. If the org is Databricks-first for data but considering a separate ML stack to 'avoid lock-in,' the lock-in risk on open-format Delta + MLflow is low, and the governance consolidation savings outweigh it within 18 months.",
+    "fj": "Self-managed Kubeflow + Pinecone is cheaper because you avoid vendor per-token markups.",
+    "fs": "Direct compute cost favors self-managed; total cost including governance headcount (3-5 FTE) and platform ops (4-6 FTE) favors Mosaic AI by 40-60% over 3 years for an org already on Databricks. Lock-in risk is low on open formats.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "The self-managed team argues they can use open-source tooling and avoid all vendor costs. What's the hidden cost they're not modeling?",
+        "a": "Open-source is not free to operate. Hidden costs: (1) upgrade treadmill — Kubeflow, Pinecone OSS, and self-hosted MLflow each have their own release cycle; at 500 people a major version upgrade is a multi-sprint project; (2) security patching — CVEs in ML serving libraries need immediate response, which is a dedicated job; (3) GPU driver compatibility — keeping ML libraries, CUDA versions, and K8s driver plugins aligned is a full-time job at scale; (4) on-call — every component the team operates is a page at 2am. These costs are real and recurring; model them explicitly in the TCO rather than assuming 'open-source = $0 ops'."
+      },
+      {
+        "q": "How does the TCO argument change if the enterprise is not already on Databricks and would be greenfielding?",
+        "a": "Greenfield changes the calculus: the org pays full Databricks platform cost (not incremental), so the direct cost comparison tightens. The governance argument still holds but the full platform cost must be weighed against the combined cost of Snowflake/BigQuery for data + SageMaker/Kubeflow for ML. At greenfield, the principal recommendation shifts to a build-vs-buy evaluation across the full data+AI stack rather than a narrow Mosaic AI vs. self-managed ML comparison. If the org needs a modern lakehouse anyway, Databricks' bundled pricing often still wins on three-year TCO; if the org is already on a cloud-native data warehouse, the incremental cost of adding Mosaic AI to Databricks may not justify a platform migration."
+      },
+      {
+        "q": "What's the migration exit cost if the enterprise adopts Mosaic AI and then needs to move off in year 4?",
+        "a": "This is the lock-in risk to quantify explicitly. Models in Unity Catalog are stored as MLflow model artifacts on cloud object storage in open format — they're portable. Delta tables are Parquet under the hood — portable. Vector Search indexes are not directly portable (proprietary ANN index format), but the source Delta table is, and you re-embed on a new platform. The gateway config and eval datasets are the least portable, but they're configuration and labeled data — re-implementable. The exit cost is dominated by: (1) re-building the governance layer equivalent (the biggest sunk cost); (2) re-indexing vectors; (3) re-wiring CI/CD. Estimate 6-12 months of platform engineering effort at a 500-person org. That's real but not catastrophic, and much lower than a database migration. Communicate this as a manageable exit cost, not a trap."
+      }
+    ]
   }
 ]

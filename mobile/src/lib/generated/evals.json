@@ -987,5 +987,814 @@
         "a": "Often yes, which is why most quality judging runs async out of the band, scoring responses after they're served for monitoring and feedback, not gating. You reserve inline (synchronous) judging for hard safety blocks where you must not serve the output, and keep those checks cheap/fast. Putting a slow CoT judge in the hot path trades one production problem for another."
       }
     ]
+  },
+  {
+    "q": "What is Word Error Rate in ASR evaluation and why isn't it the only metric you need?",
+    "a": "Word Error Rate (WER) is the standard ASR accuracy metric computed as (substitutions + deletions + insertions) / total reference words after aligning hypothesis and reference with dynamic programming. It's indispensable as a headline number, but WER treats every word error identically regardless of semantic importance, so a single-word substitution on a named entity like a drug name or financial ticker can catastrophically change meaning while only nudging WER by fractions of a percent on a long transcript. You therefore complement WER with Character Error Rate (CER) for morphologically rich languages and character-level sensitivity, entity-level accuracy for high-stakes terms, and downstream task metrics when ASR feeds a pipeline such as an NLU intent classifier.",
+    "fs": "Defines WER precisely, names its semantic blindspot, and names CER and entity/task metrics as complements.",
+    "fj": "Treats WER as the single sufficient ASR quality signal and reports only the aggregate number.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "WER computation",
+        "lang": "python",
+        "lines": [
+          "from jiwer import wer, cer",
+          "score_wer = wer(reference, hypothesis)",
+          "score_cer = cer(reference, hypothesis)",
+          "# WER = (S+D+I) / N_ref"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does CER complement WER for some languages in ASR evaluation?",
+        "a": "In morphologically rich or agglutinative languages a single word can carry the semantics of a multi-word English phrase, so one word error in WER hides many character-level mistakes, and CER gives finer-grained signal. For logographic scripts like Chinese where word segmentation is ambiguous, CER sidesteps segmentation inconsistencies entirely. WER and CER together let you localize whether errors are whole-word deletions or partial character confusions, which points at different failure modes in the acoustic versus language model."
+      },
+      {
+        "q": "Two ASR systems have identical WER on your test set but one is preferred by downstream NLU. How do you reconcile that?",
+        "a": "WER is a surface-form metric; it's agnostic to which errors matter most to the task. The NLU system cares about correct intent slots and entity values, so an ASR error on a content word like a city name hurts far more than an error on a function word. You add slot-error-rate and named-entity accuracy as task-coupled metrics, and prefer the system whose errors fall on low-value tokens. This is the core argument for task-coupled ASR evaluation rather than treating WER as the final arbiter."
+      },
+      {
+        "q": "Your ASR test set WER improved after a model upgrade but production complaints increased. Why?",
+        "a": "Your test set likely doesn't match the production acoustic distribution: different microphone types, room acoustics, accents, or speaking rates than real users. A WER gain on a clean studio-recorded test set can coincide with a regression on noisy, spontaneous, or accented speech. The fix is to audit test-set representativeness against real traffic slices, add domain-matched test partitions, and set up online WER estimation via sampled human-verified transcripts to catch distribution mismatch."
+      }
+    ]
+  },
+  {
+    "q": "How do you normalize text before computing WER, and what normalizations can silently inflate or deflate the score?",
+    "a": "Standard ASR WER normalization strips punctuation, lowercases, expands contractions, and converts numbers to spoken-word form before alignment, because the ASR hypothesis may omit punctuation while the reference has it and vice versa. Each normalization choice is a policy decision that can swing WER significantly: aggressively removing punctuation inflates apparent accuracy on systems that insert lots of commas; inconsistent number expansion (is '5' 'five' or '5'?) can create spurious substitutions; not expanding abbreviations like 'dr' to 'doctor' penalizes systems that spell correctly. You must document and version your normalization script, apply it identically to hypothesis and reference, and evaluate on both normalized and denormalized text to expose artifacts, because leaderboard comparisons are only valid when normalization is identical.",
+    "fs": "Describes normalization policy as a documented, symmetric operation that must be versioned and validated on both sides.",
+    "fj": "Applies ad-hoc normalization inconsistently and reports WER without noting what was normalized.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "symmetric normalization",
+        "lang": "python",
+        "lines": [
+          "def normalize(text: str) -> str:",
+          "    text = text.lower()",
+          "    text = re.sub(r'[^\\w\\s]', '', text)",
+          "    text = num2words_expand(text)",
+          "    return text",
+          "wer_score = wer(",
+          "    normalize(ref), normalize(hyp))"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "English ASR models are often evaluated on datasets that normalize numbers differently. Why does that make cross-paper WER comparisons unreliable?",
+        "a": "Papers frequently use different normalization pipelines, so a lower WER in paper B versus paper A may simply reflect more aggressive normalization that removes hard tokens, not a genuinely better model. This is a known reproducibility problem in ASR benchmarking. You replicate using the same normalization script on both systems, or use benchmark platforms like ESPnet-eval or Hugging Face evaluate that enforce a shared normalization. Comparing raw WER numbers across papers without verifying normalization parity is unreliable."
+      },
+      {
+        "q": "Why should you report WER on denormalized text in addition to the normalized version?",
+        "a": "Denormalized WER exposes punctuation and capitalization accuracy, which matters for ASR outputs feeding downstream NLP tasks like named-entity recognition or downstream text used directly (subtitles, legal transcripts). A system that perfectly transcribes phonemes but never predicts sentence boundaries or proper-noun capitalization looks identical to a fully correct system under normalized WER but degrades any downstream system that relies on those signals. Reporting both versions gives a fuller picture."
+      },
+      {
+        "q": "How do you handle domain-specific proper nouns and acronyms that a generic normalization pipeline would corrupt?",
+        "a": "You inject a domain vocabulary into the normalization rules so that 'AWS' stays 'AWS' rather than being lowercased to 'aws' and then misaligned against a reference that uses 'Amazon Web Services'. More importantly, you add these domain terms to the reference lexicon and to entity-level evaluation so their error rate is tracked separately. For ASR systems, you also check whether the language model has coverage of the domain vocabulary, since out-of-vocabulary terms are a disproportionate source of errors even when aggregate WER looks fine."
+      }
+    ]
+  },
+  {
+    "q": "Explain Diarization Error Rate for multi-speaker ASR and why minimizing WER alone doesn't guarantee a good meeting transcription.",
+    "a": "Diarization Error Rate (DER) measures how accurately an ASR or speaker-diarization system assigns speech segments to the correct speaker, computed as (missed speech + false alarm speech + speaker confusion) / total reference speech duration. In meeting transcription, low WER on individual utterances is necessary but insufficient: if the system misattributes sentences to the wrong speaker, the transcript is useless for action-item extraction, compliance logging, or meeting review even if every word is correct. A pipeline with 4% WER and 20% DER produces a word-accurate but speaker-scrambled transcript that downstream tools cannot rely on. Evaluating a full ASR pipeline for meetings requires both WER and DER, plus concatenated minimum-permutation word error rate (cpWER) which jointly penalizes word errors and speaker assignment errors in a single score.",
+    "fs": "Defines DER as a speaker-assignment metric, explains WER's insufficiency for multi-speaker use, and names cpWER as the joint metric.",
+    "fj": "Reports only WER for meeting transcription and assumes speaker attribution is correct.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is cpWER and why does it matter more than WER + DER reported separately?",
+        "a": "Concatenated minimum-permutation WER (cpWER) finds the speaker-label permutation that minimizes WER across all speaker pairs, effectively asking how accurate the words are after optimally re-labeling speakers. Reporting WER and DER separately allows a system to game the combination, scoring low WER on clean single-speaker segments while DER is high on overlapping speech. cpWER forces both to matter simultaneously and is now the standard joint metric for multi-speaker ASR benchmarks like CHiME-6 and NOTSOFAR."
+      },
+      {
+        "q": "Overlapping speech is a well-known hard case for ASR. How do you evaluate a system's handling of it?",
+        "a": "You partition your evaluation set by overlap ratio (fraction of time two or more speakers are simultaneously active) and report WER and DER stratified by overlap tier: clean non-overlapping, moderate overlap, and heavy overlap. This reveals whether degradation is uniform or collapses only under simultaneous speech, which points at a specific failure in the acoustic model or beamforming front-end. The CHiME and LibriCSS benchmarks include overlap-stratified evaluation protocols for exactly this reason."
+      },
+      {
+        "q": "How do you build a diarization ground truth that's reliable enough to validate DER?",
+        "a": "You need double-annotated timestamps with an adjudication pass, because single-annotator diarization boundaries can vary by hundreds of milliseconds, and DER is sensitive to collar width. Standard practice uses a 250 ms forgiveness collar around segment boundaries to absorb annotator uncertainty, but you document and fix the collar so comparisons are valid. For meeting data you also handle overlapping speech annotation explicitly, distinguishing silence, single-speaker, and multi-speaker regions, since collapsing overlaps into one label inflates DER on systems that handle them correctly."
+      }
+    ]
+  },
+  {
+    "q": "ASR models like Whisper are known to hallucinate on silence or low-energy audio. How do you detect and measure hallucination in ASR?",
+    "a": "ASR hallucination occurs when the model generates plausible-sounding tokens against a background of silence, music, noise, or cross-talk where no intelligible speech exists. Detecting it requires including silence and noise-only segments in your evaluation set with empty reference transcripts, then measuring the Hallucination Rate (fraction of such segments that produce non-empty hypothesis) and Hallucination Word Count per second of silence. The standard jiwer WER computation doesn't surface this because WER on empty references is undefined or degenerately high. You implement a dedicated hallucination probe: hold out audio-only segments known to be speechless, run the ASR model, and flag any non-empty output. For Whisper specifically, the no_speech_prob logit threshold is a key operating parameter you tune and report alongside WER.",
+    "fs": "Defines hallucination rate as a separate probe on silent/noise segments and names the Whisper no_speech_prob parameter.",
+    "fj": "Only checks WER and misses that the model fabricates text on silence entirely.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "hallucination probe",
+        "lang": "python",
+        "lines": [
+          "silence_segs = load_silent_audio()",
+          "hallucinated = 0",
+          "for seg in silence_segs:",
+          "    result = model.transcribe(seg)",
+          "    if result['text'].strip():",
+          "        hallucinated += 1",
+          "hall_rate = hallucinated / len(silence_segs)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does Whisper's no_speech_prob threshold introduce a WER-vs-hallucination trade-off?",
+        "a": "Raising the no_speech_prob threshold (treating more segments as silence and suppressing output) reduces hallucinations on quiet audio but increases missed speech on soft or distant speakers, lifting WER on genuine low-energy utterances. Lowering it reduces missed speech WER but allows more hallucinations. You tune this threshold against a validation set that includes both real low-energy speech and genuine silence, and report the Pareto curve across thresholds rather than a single operating point, because the optimal value depends on whether the downstream use-case tolerates more false negatives (missed words) or false positives (hallucinated words)."
+      },
+      {
+        "q": "How do you distinguish ASR hallucination from legitimate non-speech transcription like music lyrics or background TV?",
+        "a": "You segment your evaluation set by audio category: pure silence, background noise, music without speech, overlapping distant speech, and genuine foreground speech. For the first three categories any transcription output is hallucination by definition. For overlapping distant speech, you use a secondary reference from the background source if available, or accept that output as undefined. This categorical segmentation turns a fuzzy 'was that real?' question into a per-category precision gate, and it exposes whether the model hallucinates on all non-foreground audio or only specific acoustic conditions like reverberant music."
+      },
+      {
+        "q": "A Whisper upgrade reduced hallucination rate but WER on real speech rose. How do you decide which version to deploy?",
+        "a": "Model a downstream risk score weighting the severity of each failure type for your application: in a compliance recording use-case a hallucinated sentence has higher liability than a missed word, so lower hallucination rate wins even at a small WER cost. In a live captioning product, missed words are more disruptive to users than rare silence-induced artifacts, flipping the preference. You don't resolve this with a single aggregate metric; you define explicit per-category tolerances before testing, set the operating version against those, and test with a held-out sample of both categories to confirm each threshold holds."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate streaming ASR latency, and why do offline WER benchmarks miss the quality-latency trade-off?",
+    "a": "Streaming ASR emits partial hypotheses incrementally, so you need two latency metrics beyond WER: First Token Latency (time from audio start to first emitted word token) and Token Emission Latency (average delay from a word's acoustic occurrence to its appearance in the stream). Offline WER benchmarks score a final transcript against a reference after the full audio is available, which is useless for streaming evaluation because a model can buffer the entire utterance, achieve low WER, and yet have unacceptable latency for a live captioning or voice-assistant use-case. You evaluate streaming ASR on a latency-normalized WER curve: record WER at different emission-delay thresholds to show the quality degradation from forcing earlier commitments. Systems with low emission latency typically show higher WER on non-final tokens because they haven't seen enough future context to commit correctly.",
+    "fs": "Defines first-token and emission latency metrics and argues for latency-normalized WER curves, not just offline WER.",
+    "fj": "Benchmarks streaming ASR with offline WER only and assumes latency is a deployment-side concern unrelated to model quality.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is retraction rate in streaming ASR and why does it matter beyond WER?",
+        "a": "Retraction rate measures how often the model emits a word token and then changes or deletes it in a subsequent partial hypothesis update, i.e. how much the transcript flickers before stabilizing. High retraction rate is perceptually disruptive in live captioning even when final WER is low, because users track the changing text and get confused. You measure it as retractions-per-minute and enforce a retraction budget as a quality constraint separate from WER. Architectures that use a larger look-ahead window reduce retractions but increase emission latency, exposing the core streaming trade-off."
+      },
+      {
+        "q": "Two streaming ASR systems have identical offline WER and first-token latency. How do you break the tie?",
+        "a": "Measure them on the full latency-normalized WER curve across a range of look-ahead windows, retraction rate, and tail latency at p95 and p99 rather than mean. Also test on acoustically hard segments (overlapping speech, fast talkers, accented speakers) because systems with equivalent average latency can diverge significantly in tail behavior under stress. For voice assistant applications you additionally evaluate end-of-utterance detection accuracy, since a false early endpointing triggers premature intent classification on incomplete speech."
+      },
+      {
+        "q": "How do you construct a streaming ASR test set when most public datasets only have final transcripts?",
+        "a": "You record or annotate word-level timestamps either via force-alignment (running an aligner like MFA or CTC-forced-alignment on the reference transcript against the audio) or via human annotation with a timestamp tool. Word timestamps let you compute emission latency and retraction rate. For latency evaluation specifically you also need a diversity of speaking rates and utterance lengths because short utterances have trivially low latency; your test set must include long spontaneous-speech segments where look-ahead buffering creates real latency pressure."
+      }
+    ]
+  },
+  {
+    "q": "Walk me through a complete ASR benchmark evaluation: what benchmark sets do you use and what do they each stress-test?",
+    "a": "A comprehensive ASR evaluation covers multiple axes with different benchmark sets: LibriSpeech (clean and other splits) tests read speech in quiet conditions and is the standard WER baseline; CHiME-6 and NOTSOFAR stress-test far-field multi-speaker dinner-party speech with high overlap and room noise; Common Voice and FLEURS cover accent and multilingual diversity; TED-LIUM and AMI target spontaneous and meeting speech with diverse speaking styles. VoxPopuli adds political and EU parliamentary domain. For medical and call-center domains you need proprietary in-domain sets because none of the above represents the acoustic and lexical distribution of those verticals. A robust benchmark suite reports WER stratified by noise level, speaking rate, overlap ratio, and accent group rather than a single aggregate number, because a model can top LibriSpeech-clean while failing on real production audio.",
+    "fs": "Names multiple benchmark sets and maps each to a specific stress condition, and insists on per-slice reporting.",
+    "fj": "Reports only LibriSpeech WER and assumes it represents production quality.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why doesn't a great LibriSpeech score predict real-world ASR performance?",
+        "a": "LibriSpeech consists of read audiobook speech by self-selected speakers with good pronunciation and high-quality recording conditions, a distribution that differs dramatically from spontaneous speech, telephone audio, accented speakers, or noisy environments. Modern large ASR models can achieve sub-2% WER on LibriSpeech clean while showing 30%+ WER on real call-center recordings or accented speakers in Common Voice, because the acoustic and lexical distributions don't overlap. LibriSpeech is useful as a clean-condition baseline and for tracking optimization regressions, but it must be paired with domain-matched in-distribution sets for any production-relevant claim."
+      },
+      {
+        "q": "How do you construct an in-domain evaluation set when your production domain has no public benchmark?",
+        "a": "You sample real production audio, stratify by acoustic condition (SNR bucket, speaker demographics, recording device type), and double-annotate a representative slice of around 5-10 hours with professional transcribers, adjudicating disagreements. You version-control the set, hold it out from any model training or adaptation, and run it on a fixed normalization pipeline. This set becomes your primary production quality gate, with public benchmarks serving only as a check for catastrophic regression on well-understood conditions, not as a proxy for your actual use-case."
+      },
+      {
+        "q": "CHiME-6 uses cpWER as its primary metric. What does that tell you about what the organizers consider the key evaluation challenge?",
+        "a": "cpWER jointly penalizes word errors and speaker assignment errors, signaling that the organizers view speaker-attributed accurate transcription as the core challenge, not just raw lexical accuracy. A meeting transcription that misattributes speakers is nearly as useless as one with high WER for the downstream tasks the benchmark targets: action-item extraction, speaker-specific summaries, and compliance. The metric choice encodes the product requirement: you can't evaluate a multi-speaker pipeline with a single-speaker WER metric and claim to have measured the right thing."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate an ASR model's fairness across demographic groups, and what does a WER disparity between groups mean in practice?",
+    "a": "ASR fairness evaluation stratifies WER (and CER) by speaker demographics: accent/dialect, native language, age, gender, and recording condition. A model that achieves 3% aggregate WER while showing 15% WER for speakers with non-native accents or 12% WER for elderly speakers has a high fairness disparity, which means the system is systematically less accurate for groups already underserved by technology, amplifying inequity in any downstream application. The key metric is the worst-group WER and the gap between best and worst demographic slice, not the aggregate; you set a fairness budget that caps the maximum gap. Public datasets like Common Voice include demographic labels that enable this stratification, and Mozilla's Common Voice dashboard reports per-language and per-accent WER gaps as part of ASR evaluation best practice.",
+    "fs": "Stratifies WER by demographic group, names worst-group WER as the fairness metric, and sets a disparity budget.",
+    "fj": "Reports only aggregate WER and assumes uniform quality across speaker demographics.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Your model shows a 10-point WER gap between native and non-native English speakers. What are the root causes and interventions?",
+        "a": "Root causes include under-representation of non-native speaker data in training, acoustic model sensitivity to phoneme distributions that differ from training, and language model n-gram priors that penalize non-standard syntax. Interventions in roughly increasing complexity: augment training data with accented speech from Common Voice, VoxPopuli, and accent-specific corpora; apply accent-adaptive fine-tuning on held-out accent classes; use a language model with broader syntactic coverage; and apply speaker-adaptive decoding at inference time. You validate each intervention by re-measuring per-accent WER slices, not just the aggregate."
+      },
+      {
+        "q": "Why can't you just report average WER across demographic groups as a fairness proxy?",
+        "a": "Averaging across groups masks the worst-case outcome: a system that achieves 3% WER for the majority group and 20% for a minority group averages to something like 5% if the minority is small, which sounds acceptable while concealing a severe and systematically inequitable failure. Fairness is a worst-case concept, not an average one; the adversarially underserved group determines whether the system is equitable. You report the full distribution of per-group WER and explicitly gate on the worst-performing slice meeting a maximum threshold."
+      },
+      {
+        "q": "You want to add demographic stratification to your evaluation but don't have demographic labels in your production logs. How do you proceed?",
+        "a": "You use a two-pronged approach: for new recordings, collect self-reported demographic attributes at consent time or sample from controlled demographic cohorts in your user research. For existing unlabeled audio, you apply automatic demographic classifiers (accent identification, age estimation, gender identification) with known error rates, use them as noisy proxies with appropriate uncertainty, and validate the stratified WER findings on a human-labeled slice to confirm the proxy classifications are accurate enough to drive decisions. You also work with community partners to collect labeled data from underrepresented groups directly, since proxy classifiers themselves can be biased."
+      }
+    ]
+  },
+  {
+    "q": "How would you design an end-to-end eval harness for a voice-assistant pipeline that includes ASR, NLU, and response generation?",
+    "a": "You evaluate each component in isolation and the full pipeline end-to-end, because component metrics don't compose additively and errors propagate and interact. ASR is measured with WER and CER on a domain-matched transcript set; NLU (intent classification + slot filling) is measured with intent accuracy, slot error rate, and F1 on a labeled NLU test set that covers both clean reference transcripts and ASR-hypothesis inputs to capture error propagation; the response generator is measured with faithfulness, task-success rate, and an LLM judge against gold responses. End-to-end you measure task completion rate on multi-turn dialogues. The diagnostic value is in comparing component metrics to end-to-end: a 15% ASR WER on proper nouns combined with good NLU slot-fill accuracy flags that the NLU has learned to handle ASR errors, while a low WER but poor task-completion points at NLU or generation. Each stage has a separate golden test set, all held out from any adaptation.",
+    "fs": "Evaluates each component independently plus end-to-end, uses error-propagation tests, and localizes bugs by comparing component vs pipeline metrics.",
+    "fj": "Only measures end-to-end task success and can't localize which stage is the bottleneck.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "pipeline eval",
+        "lang": "python",
+        "lines": [
+          "wer_score   = wer(ref_tx, asr_hyp)",
+          "slot_err    = slot_error_rate(",
+          "    gold_slots, nlu_output)",
+          "task_ok     = task_completion(",
+          "    dialogue_gold, pipeline_out)",
+          "# localize: wer ok, slot_err high",
+          "# => ASR noise hurts NLU slotting"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you isolate whether NLU degradation is caused by ASR errors versus an NLU model weakness?",
+        "a": "You run the NLU evaluation twice: once on gold clean reference transcripts and once on ASR hypotheses. The gap between those two NLU accuracy numbers is the error-propagation penalty attributable to ASR quality. If NLU accuracy is low even on clean transcripts, the NLU model itself is the bottleneck. If it's high on clean text but drops on ASR output, ASR WER on intent-critical tokens is the proximate cause and you focus on domain adaptation of the ASR language model."
+      },
+      {
+        "q": "What should a multi-turn dialogue task-completion eval look like to be meaningful?",
+        "a": "Multi-turn task-completion should use human-playback evaluation or a user simulator, not just greedy scripted tests, because a single turn error can cascade differently across scenarios. You define completion criteria as observable state changes in a backend (booking confirmed, item added to cart) rather than surface text matches, and you include recovery scenarios where the user corrects the assistant mid-task. You stratify completion rate by dialogue length and by ASR WER tier to see whether high WER sessions disproportionately fail, which separates ASR-driven completion failures from planning failures."
+      },
+      {
+        "q": "How does latency compound across ASR, NLU, and generation in a voice assistant?",
+        "a": "End-to-end voice assistant latency is roughly the sum of ASR first-hypothesis latency, NLU inference time, and generation first-token latency, but acoustic end-of-utterance detection (endpointing) adds another variable that can dominate: a 300 ms early endpoint causes a wrong intent and a retry that adds seconds. You measure each stage's p95 latency independently and the full end-to-end p95 from speech end to first audio out, and you track endpointing false-positive and false-negative rates as their own quality gate. Streaming ASR with low first-token latency only helps if endpointing and NLU keep pace."
+      }
+    ]
+  },
+  {
+    "q": "What is slot error rate in an ASR-NLU pipeline and how does it differ from WER in diagnosing production failures?",
+    "a": "Slot error rate (SER) measures the fraction of intent slots (named entities extracted by NLU from the ASR hypothesis) that are incorrect, defined as (incorrect + missing slots) / total reference slots. Unlike WER, which counts every word equally, SER counts only the semantically load-bearing tokens that the downstream application uses to take action: a city name, date, amount, or product ID. A voice assistant can have 4% WER and 25% SER if the errors cluster on the proper nouns and quantities the NLU depends on, which means the application makes the wrong action a quarter of the time despite nearly perfect surface transcription. SER is a task-coupled diagnostic that exposes where in the vocabulary the ASR system's errors concentrate, whereas WER averages that information away.",
+    "fs": "Defines SER as a task-coupled metric targeting semantically critical tokens and contrasts its diagnostic value with WER.",
+    "fj": "Uses only WER to evaluate a voice-assistant NLU pipeline and misses slot-level accuracy.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you weight slot types by severity when reporting SER?",
+        "a": "You assign error weights per slot type based on downstream consequence: a wrong amount on a payment intent is a hard block, so it gets weight 1.0; a wrong optional modifier like 'extra sauce' gets weight 0.2. Weighted SER = sum(weight_i × error_i) / sum(weight_i), giving you a risk-adjusted accuracy signal. This turns SER into an actionable business metric: you can show that 80% of high-severity slot errors are on amount and date slots, which focuses ASR adaptation effort on the number-word vocabulary specifically."
+      },
+      {
+        "q": "Your SER is high only for long multi-word slot values like full addresses. What does that diagnose?",
+        "a": "Long multi-word slot values accumulate WER probability across more tokens, so even a 5% per-token error rate compounds to meaningful SER on a 5-word address. Additionally, ASR language models are weakest on rare proper noun sequences like street names, and the NLU span extractor may not recover partial slots correctly when one word is wrong. Diagnosis: audit ASR WER specifically on address tokens, check whether the LM has coverage of local place names, and evaluate the NLU slot extractor's robustness to partial-word errors using noisy reference inputs."
+      },
+      {
+        "q": "How do you build a SER test set when you don't have ground-truth slot annotations on your ASR evaluation audio?",
+        "a": "You bootstrap from existing NLU-annotated text corpora: take annotated sentences, synthesize them with a TTS system or find matching real recordings, and use the text annotations as slot ground truth. For real ASR audio without slot labels, you use a high-confidence NLU model on the clean reference transcript to generate pseudo-labels, then have human reviewers verify a sample. The key discipline is that slot labels come from the reference transcript (clean text), not the ASR hypothesis, so your ground truth is uncontaminated by the system under evaluation."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate an ASR model's robustness to acoustic noise, and what augmentation strategies does a robust evaluation expose as insufficient?",
+    "a": "Robust ASR evaluation requires stratifying WER by signal-to-noise ratio (SNR) tiers: clean (>20 dB SNR), moderate noise (10-20 dB), noisy (0-10 dB), and extreme (<0 dB). You also stratify by noise type: additive white noise, babble (competing speech), music, and reverberation each stress different components of the acoustic model. A model trained only on additive-noise augmentation often generalizes poorly to babble or reverberant conditions, which a multi-condition evaluation reveals. The standard evaluation sets for this are CHIME-2 through CHIME-6 for progressively harder conditions, MUCHed and VOiCES for near-field and far-field device variability. You report WER degradation per noise type as a robustness profile and gate on no single condition dropping more than an absolute threshold relative to clean.",
+    "fs": "Stratifies evaluation by SNR tier and noise type to produce a robustness profile, and names standard noisy-condition benchmark sets.",
+    "fj": "Tests only on clean audio or with a single noise type and assumes noise augmentation solves all conditions.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "SNR stratified eval",
+        "lang": "python",
+        "lines": [
+          "for snr_tier, segs in snr_buckets.items():",
+          "    refs  = [s.ref for s in segs]",
+          "    hyps  = [asr(s.audio) for s in segs]",
+          "    score = wer(refs, hyps)",
+          "    print(f'{snr_tier}: WER={score:.3f}')"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does babble noise stress ASR differently from white noise even at the same SNR?",
+        "a": "White additive noise is spectrally flat and the acoustic model learns to exploit frequency bands where speech energy dominates; standard spectral subtraction and Wiener filtering handle it well. Babble consists of competing speech that shares the same frequency and temporal structure as the target signal, so the model cannot separate target from background using spectral features alone and must rely on spatial or speaker-identity cues. This is why ASR accuracy degrades more steeply under babble at equivalent SNR, and why multi-microphone beamforming and speaker-separation front-ends are evaluated specifically on babble conditions rather than on white-noise benchmarks."
+      },
+      {
+        "q": "What does evaluating WER on artificially augmented noise versus real-world noise reveal?",
+        "a": "Artificially augmented noise (mixing clean recordings with noise samples at a target SNR) produces cleaner acoustic conditions than real-world recordings because room impulse responses, microphone characteristics, and talker movement introduce convolutive distortion not captured by simple addition. A model fine-tuned on artificial augmentation often shows a significant WER gap on real noisy recordings versus a matched artificial-noise test set, because the real data's convolutive and non-stationary noise structure is harder. Evaluation on both exposes this gap, signaling that you need convolutive room-simulation and multi-condition real-data collection beyond simple noise mixing."
+      },
+      {
+        "q": "How do you set the WER degradation threshold for your robustness gate?",
+        "a": "You define an acceptable degradation budget as a multiple of clean-condition WER or an absolute WER ceiling per noise tier, based on application requirements. For a transcription product the tolerance for extreme noise may be high; for a safety-critical voice command in a factory environment it's low. You derive the budget from user research on intelligibility tolerance and from the distribution of real acoustic conditions your application will encounter, not from a round number. The gate catches regressions where a model update improved clean performance but degraded a specific noise tier, which a single-number evaluation would miss entirely."
+      }
+    ]
+  },
+  {
+    "q": "What is the Hugging Face Evaluate library and how does it differ from rolling your own metric functions?",
+    "a": "Hugging Face Evaluate is a lightweight Python library that provides a unified, community-maintained registry of evaluation metrics (accuracy, F1, BLEU, ROUGE, BERTScore, WER, exact-match, and many more) each shipped as a versioned module with a standardized compute() interface. The key difference versus rolling your own is reproducibility and comparability: every metric has a fixed implementation with pinned dependencies and a citation, so your BLEU score is computed identically to the number in a paper that also used Hugging Face Evaluate, eliminating the silent normalization differences that make cross-paper comparisons unreliable. It also handles multi-process distributed evaluation natively and integrates directly with the Hugging Face datasets library so you can chain dataset loading → model inference → metric computation in one pipeline without format-conversion boilerplate.",
+    "fs": "Explains the reproducibility and comparability guarantee from a versioned shared implementation, plus native HF-ecosystem integration.",
+    "fj": "Writes a custom metric function per project and never considers whether the implementation matches the paper they're comparing to.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "HF Evaluate compute",
+        "lang": "python",
+        "lines": [
+          "import evaluate",
+          "rouge = evaluate.load('rouge')",
+          "results = rouge.compute(",
+          "    predictions=hyps,",
+          "    references=refs,",
+          "    use_aggregator=True)",
+          "# reproducible, citable score"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Hugging Face Evaluate metrics run on CPU by default. What bottleneck does that create for large eval runs and how do you fix it?",
+        "a": "Metric computation on CPU becomes the wall-clock bottleneck when you're scoring tens of thousands of predictions, especially for embedding-based metrics like BERTScore that run a full forward pass. Fix: pass device='cuda' when loading BERTScore, batch predictions rather than scoring one-at-a-time, and for large offline evals split the prediction set across processes using evaluate.combine() with multiple workers so metric computation scales with your GPU or CPU count."
+      },
+      {
+        "q": "Why is pinning the metric module version in your requirements file critical when using Hugging Face Evaluate?",
+        "a": "Metric implementations can change between library versions, subtly shifting normalization or tokenization and making historical score comparisons invalid. Pin evaluate==<version> and the underlying tokenizer versions (e.g. for ROUGE, nltk version) so a pip upgrade doesn't silently invalidate a months-long trend. The point of a shared library is reproducibility, which breaks the moment the implementation drifts under you."
+      },
+      {
+        "q": "How do you add a custom metric to the Hugging Face Evaluate ecosystem for your team's proprietary rubric?",
+        "a": "Implement a class inheriting from evaluate.Metric, define _info() with metadata, _compute() with your scoring logic, and optionally _feature_names() for input validation. Host it as a module in a private Hugging Face Hub repo or a local path and load it with evaluate.load('path/to/module'). This gives you the same versioned, reproducible interface for a custom metric as for any public one, and teams can share it across projects via the Hub without duplicating code."
+      }
+    ]
+  },
+  {
+    "q": "How does the Hugging Face Open LLM Leaderboard evaluate models, and what are its known methodological limitations?",
+    "a": "The Hugging Face Open LLM Leaderboard (v1 and v2) evaluates publicly submitted models on a fixed suite of benchmarks—originally ARC, HellaSwag, MMLU, TruthfulQA, Winogrande, and GSM8K on v1, then expanded to MMLU-Pro, IFEval, BBH, MATH, GPQA, and MuSR on v2—using lm-evaluation-harness as the execution engine with standardized few-shot prompts and exact-match or normalized-log-prob scoring. It runs inference on Hugging Face's own infrastructure so all models see identical hardware. Known limitations: the fixed benchmark suite is a public signal that labs can and have optimized for, known as benchmark contamination or benchmark saturation. The leaderboard also only evaluates open-weight or openly submitted models, misses instruction-following and dialog quality (captured only by IFEval in v2), and rewards models on multiple-choice pattern-matching rather than generation quality.",
+    "fs": "Names the benchmark suite, the execution engine, and both contamination and MCQ-only-quality limitations.",
+    "fj": "Treats a high leaderboard score as proof the model is the best general-purpose LLM.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is benchmark contamination on the Hugging Face Open LLM Leaderboard and how do leaderboard maintainers attempt to detect it?",
+        "a": "Contamination occurs when a model's pre-training or fine-tuning data includes the evaluation benchmarks' test questions verbatim or near-verbatim, giving it an unfair advantage through memorization. The Hugging Face team uses n-gram overlap detection between reported training datasets and leaderboard test splits, and v2 introduced harder, less-leaked benchmarks (GPQA, MATH) specifically to raise the contamination bar. Detection is still imperfect because models with opaque or undisclosed training data can't be audited, which is why leaderboard rank should be cross-validated with private held-out sets or independent third-party evals."
+      },
+      {
+        "q": "Why did the Hugging Face team launch Leaderboard v2 and what evaluation philosophy drove the benchmark changes?",
+        "a": "v1 benchmarks became saturated—many models clustered near ceiling on ARC, HellaSwag, and Winogrande, reducing their discriminative power—and they were heavily contaminated in newer training sets. v2 shifted philosophy toward difficulty and diversity: MMLU-Pro adds harder reasoning over MMLU, GPQA requires graduate-level domain knowledge, MATH tests multi-step mathematical reasoning, MuSR tests multi-step soft reasoning, and IFEval tests instruction following. The goal is discriminating frontier models rather than crowning already-solved benchmarks."
+      },
+      {
+        "q": "If a model ranks highly on the Hugging Face Open LLM Leaderboard but poorly on your internal eval, what do you investigate?",
+        "a": "Domain distribution mismatch: leaderboard benchmarks are general-purpose and heavily English-language, so a model excelling there can underperform on your vertical-specific vocabulary, reasoning patterns, or language. You also check whether your eval covers generation quality (instruction following, multi-turn coherence) that the leaderboard's multiple-choice format doesn't measure. Run leaderboard benchmarks internally using lm-eval-harness to confirm the reported scores are reproducible, then add domain-specific few-shot tasks calibrated to your production queries."
+      }
+    ]
+  },
+  {
+    "q": "Describe the architecture of lm-evaluation-harness and how Hugging Face's Open LLM Leaderboard uses it.",
+    "a": "lm-evaluation-harness (EleutherAI, also the execution engine used by the Hugging Face Open LLM Leaderboard) is a framework that defines evaluation tasks as YAML configs specifying dataset, prompt template, output type (multiple-choice log-prob, generative, exact-match), few-shot count, and metric. At runtime it loads models via a unified LM interface supporting HuggingFace transformers, vLLM, OpenAI-compatible APIs, and custom backends, feeds batched prompts, and scores outputs through the task-defined metric. The Hugging Face Leaderboard submits open-weight models via the Hub, runs them on lm-eval-harness on standardized A100/H100 hardware with fixed seed and batch sizes, and aggregates normalized scores. Key design decisions: all tasks are reproducible from a pinned config and dataset version, and the log-prob scoring for multiple-choice removes the need for free-text parsing on structured tasks.",
+    "fs": "Explains task-as-YAML configs, the unified LM backend interface, and how the Leaderboard wraps it for reproducible submission.",
+    "fj": "Thinks evaluation harnesses are just for-loop scripts that call model.generate() and check exact strings.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "lm-eval CLI usage",
+        "lang": "python",
+        "lines": [
+          "# run MMLU + GSM8K on a HF model",
+          "lm_eval --model hf \\",
+          "  --model_args pretrained=mistralai/Mistral-7B-v0.3 \\",
+          "  --tasks mmlu,gsm8k \\",
+          "  --num_fewshot 5 \\",
+          "  --output_path results/"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does lm-evaluation-harness use log-probability scoring for multiple-choice tasks rather than generating the answer token?",
+        "a": "Log-prob scoring measures which answer choice the model assigns higher probability to under a fixed prompt, avoiding sensitivity to whether the model formats its answer as 'A', '(A)', 'The answer is A', or similar surface variations that confuse exact-match parsers. It's also more stable across models with different chat templates. The trade-off is it doesn't test the model's ability to generate a free-form answer in a realistic output format, which is why IFEval and generation tasks were added alongside log-prob benchmarks."
+      },
+      {
+        "q": "You want to add a proprietary internal benchmark to lm-evaluation-harness. What does that take?",
+        "a": "Write a YAML task config referencing your dataset on Hugging Face Hub (or a local path), specifying the doc_to_text template for prompt formatting, doc_to_target for the reference answer, process_results for scoring, and the metric name. For multiple-choice tasks you define answer_choices and use loglikelihood output type; for generation you use generate_until with stop sequences. Register the task with lm_eval.api.registry.register_task and point the CLI at your config file. No Python code needed for straightforward tasks."
+      },
+      {
+        "q": "lighteval is Hugging Face's newer evaluation library. How does it differ from lm-evaluation-harness and when would you choose one over the other?",
+        "a": "lighteval is developed by Hugging Face as a leaner, more natively integrated alternative: it's designed for tight integration with the Hugging Face ecosystem (Hub, transformers, PEFT), supports nanotron and lightseq training frameworks for evaluating checkpoints mid-training, and has a cleaner Python API for programmatic task definition. lm-eval-harness has a larger community task library and is the established standard for leaderboard comparisons. Choose lighteval when you need tight training-loop integration (checkpoint evals during training), and lm-eval-harness when you want the broadest task coverage and reproducibility parity with published leaderboard numbers."
+      }
+    ]
+  },
+  {
+    "q": "How does the Hugging Face datasets library facilitate eval dataset management, and what eval-specific features does it provide beyond data loading?",
+    "a": "Hugging Face datasets is not just a loader; it provides eval-relevant features including: streaming mode so you never need to download a 100 GB benchmark fully, trust_remote_code=False safety controls for third-party datasets, dataset cards with provenance and known biases, versioned splits with canonical train/validation/test boundaries enforced by the Hub, and the datasets.load_metric() integration (now superseded by evaluate.load()) so the same dataset and metric are fetched in one coherent pipeline. For eval specifically, the Hub hosts community-submitted eval datasets with dataset cards documenting annotation protocol, inter-annotator agreement, and known limitations, so you can audit quality before trusting a benchmark as a ground-truth source.",
+    "fs": "Covers streaming, versioned splits, dataset cards with bias documentation, and the Hub-hosted community eval sets.",
+    "fj": "Uses the datasets library only as a file downloader and never reads the dataset card before treating a dataset as ground truth.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why do versioned dataset splits on Hugging Face Hub matter specifically for eval reproducibility?",
+        "a": "A dataset's test split can be corrected, re-annotated, or rebalanced between versions, silently changing what your model is evaluated against. Pinning the dataset revision in your eval code (datasets.load_dataset('glue', 'sst2', revision='sha')) ensures every run scores the same examples, so a score change is attributable to the model not a shifted benchmark. Without revision pinning, a leaderboard run today may not be comparable to one from six months ago."
+      },
+      {
+        "q": "When should you not use a Hugging Face Hub dataset for evaluation?",
+        "a": "When your production domain differs substantially from the dataset's collection conditions: a Hugging Face-hosted general NLI dataset is the wrong eval set for a medical-domain entailment task. Also avoid using it as-is if the dataset card documents high annotation disagreement or known demographic biases that affect your use-case. And if the dataset is widely used as a training source across the community, your own model likely saw it during pre-training, making it a contaminated leaderboard rather than a clean holdout."
+      },
+      {
+        "q": "How do you use the Hugging Face datasets library to build a domain-specific eval set from scratch while maintaining the Hub's reproducibility guarantees?",
+        "a": "Collect and annotate your examples, convert them to Hugging Face datasets format using datasets.Dataset.from_pandas() or datasets.DatasetDict(), write a dataset card in the datasets_info field documenting annotation protocol, inter-annotator agreement, known biases, and intended use, then push to a private Hub repo with repo.push_to_hub(private=True). Version-pin in your eval code via the commit SHA. Other engineers in your org load it with load_dataset('your-org/your-dataset', revision='sha') and get the same splits every run. The Hub becomes your team's versioned eval database."
+      }
+    ]
+  },
+  {
+    "q": "What is a Hugging Face model card and what should it include to make a model's evaluation results trustworthy?",
+    "a": "A Hugging Face model card is a README-like structured document that lives alongside the model weights on the Hub and documents everything a practitioner needs to evaluate and deploy the model responsibly: base model lineage, training data sources and known contamination risks, evaluation benchmarks with exact scores and the versions of datasets and metrics used, hardware and framework used for evaluation, known limitations and bias evaluations, intended use cases, and out-of-scope uses. For evaluation results to be trustworthy the card must specify the exact benchmark name and split, the evaluation library version (e.g. lm-eval-harness commit or Hugging Face Evaluate version), few-shot count, and prompt format, because the same benchmark name under different harnesses or prompt templates can produce very different numbers, making cross-card comparisons misleading without that metadata.",
+    "fs": "Names the required eval provenance fields (benchmark, split, harness version, prompt format) as necessary for cross-model comparisons.",
+    "fj": "Reports benchmark scores on the model card without specifying which harness, prompt template, or metric version was used.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Model cards on Hugging Face Hub often report conflicting MMLU scores across papers and cards for the same model. What causes that?",
+        "a": "Different evaluation setups: 0-shot vs 5-shot prompting, different prompt templates (some models were fine-tuned on specific instruction formats that boost or hurt MCQ), different normalization (normalized logprob vs unnormalized), different subsets of MMLU tasks averaged, and different harness implementations. Without a standardized eval configuration, MMLU is not a single number—it's a family of numbers. The fix is to always report the full eval spec and to rerun all models under comparison with the identical lm-eval-harness config."
+      },
+      {
+        "q": "Hugging Face has proposed structured metadata tags in model cards for eval results. Why does structured metadata matter more than free-text descriptions?",
+        "a": "Free-text descriptions require human parsing to extract benchmark names, scores, and conditions, which prevents automated aggregation, search, and cross-model comparison on the Hub. Structured YAML metadata in the model card allows the Hub to index and surface 'all models with MMLU > 70 evaluated with 5-shot', powers the leaderboard's ingestion pipeline, and lets downstream tools programmatically select a model based on eval criteria. Structured eval metadata treats the model card as machine-readable provenance, not just human-readable documentation."
+      },
+      {
+        "q": "A model card reports 72% on MMLU but doesn't specify the evaluation setup. How do you reproduce and trust that number?",
+        "a": "You can't without the setup. Attempt to reproduce by running the model under multiple standard configurations (5-shot normalized log-prob via lm-eval-harness, which is the Hugging Face Leaderboard standard) and check if any matches. If none does, flag the card's results as unverified and don't compare them against other models in your selection process. File a card-quality issue on the Hub. For your own evals, always report the exact harness version, prompt format, and few-shot count so downstream users can audit rather than trust."
+      }
+    ]
+  },
+  {
+    "q": "How do you use Hugging Face Evaluate's EvaluationSuite to run multi-metric, multi-dataset evaluations in a single reproducible pipeline?",
+    "a": "Hugging Face Evaluate's EvaluationSuite (in evaluate.evaluator combined with evaluate.combine()) lets you define a list of metrics and datasets, run them in one call against a model's predictions, and get back a combined result dict. The workflow is: load each metric with evaluate.load(), build predictions from your model on the dataset, call suite.compute(predictions, references) and get all metric scores at once. The reproducibility value is that the full suite—dataset version, metric module versions, and compute kwargs—is captured in one place rather than scattered across ad-hoc scripts. For text-classification you can use the evaluate.evaluator('text-classification') API which wraps a Hugging Face pipeline and handles batched inference and metric computation end-to-end.",
+    "fs": "Explains the EvaluationSuite/evaluator pattern as a single reproducible entry-point for multi-metric eval runs.",
+    "fj": "Runs each metric in a separate script, manually aggregating results and losing the combined versioning guarantee.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "evaluator pipeline",
+        "lang": "python",
+        "lines": [
+          "from evaluate import evaluator",
+          "task_eval = evaluator('text-classification')",
+          "results = task_eval.compute(",
+          "    model_or_pipeline='bert-base-uncased',",
+          "    data=dataset['test'],",
+          "    metric=evaluate.combine(",
+          "        ['accuracy', 'f1']))"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "evaluate.combine() aggregates multiple metrics. What hidden assumption should you verify before trusting the combined output?",
+        "a": "That all metrics share the same input format and tokenization assumptions. Combining ROUGE (string-based) with BERTScore (requires tokenization) means the combined.compute() call must provide inputs compatible with both. If one metric expects a list of strings and another expects token IDs, the combine silently adapts or fails depending on the version. Verify each metric's required input format individually before combining, and run a small sanity-check on known examples to confirm scores are as expected."
+      },
+      {
+        "q": "Why does the evaluate.evaluator() API handle more edge cases than manually calling model.predict() then metric.compute()?",
+        "a": "The evaluator handles batching automatically to avoid OOM, manages tokenization alignment between model output and reference, normalizes label mappings (model may output 'LABEL_0' while the metric expects 'positive'), and wraps prediction and scoring in a single provenance-tracked object. Rolling your own loop risks tokenization mismatches, label-space mismatch, and batching bugs that are hard to catch in aggregate. The evaluator's single entry point also makes it easier to swap the metric or model for A/B comparisons without rewriting scoring logic."
+      },
+      {
+        "q": "Your EvaluationSuite run takes 6 hours on a large dataset. What's the fastest safe acceleration strategy within the Hugging Face Evaluate ecosystem?",
+        "a": "Enable multi-process scoring for the metric: metrics with _compute_distributed support (like accuracy) can be accumulated across multiple processes. For model inference, switch to a vLLM backend or use Hugging Face's Text Generation Inference server with continuous batching so GPU utilization is high. For very large datasets, run with evaluate.enable_progress_bar() and add_batch() in a streaming loop rather than loading the full dataset, and use a subset of the test split for rapid dev-loop checks. If time-to-result is critical, subset + significance test rather than running the full set every iteration."
+      }
+    ]
+  },
+  {
+    "q": "Walk through how you would set up a reproducible LLM benchmark comparison for two open-weight models using Hugging Face tools end-to-end.",
+    "a": "Start by defining the evaluation protocol: choose benchmarks from lm-evaluation-harness's task registry (e.g. MMLU 5-shot, GSM8K 8-shot, TruthfulQA), pin the lm-eval-harness commit and the Hugging Face datasets revision for each benchmark. Load both models from Hugging Face Hub at specific commit SHAs to freeze weights. Run both models through lm-eval with identical batch size, seed, device, and quantization settings on the same hardware, outputting results to JSON. Compute metric deltas and confidence intervals using Hugging Face Evaluate or scipy (paired tests where applicable). Document everything—model card for each model specifying the eval config—and push results to a comparison table. Any future re-run of the pinned config against the pinned model commits should produce identical scores; that is the definition of a reproducible eval.",
+    "fs": "Pins model commits, harness commit, dataset revision, hardware, and seed as the reproducibility checklist, not just 'ran the model on MMLU'.",
+    "fj": "Runs lm-eval at HEAD on the latest model checkpoints with no pinning and wonders why scores differ from the paper.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Two models score within 1% on MMLU. How do you determine if the difference is meaningful?",
+        "a": "Compute a confidence interval from the per-example pass/fail outcomes using a binomial proportion CI or bootstrap, and check if the intervals overlap. For lm-eval-harness, the output JSON includes per-task standard error; compare models on the full per-task score vector with a paired test (Wilcoxon signed-rank across tasks). 1% on a large benchmark can be statistically significant while 1% on 200 examples is pure noise. Size the conclusion to the example count."
+      },
+      {
+        "q": "Model A is a chat-tuned instruction model, model B is a base model. Why is a direct MMLU comparison potentially misleading?",
+        "a": "Chat-tuned models often respond in a format that lm-eval-harness's log-prob scorer doesn't expect (adding explanations before the answer letter), which can hurt their log-prob scores relative to a base model that's purely completing the prompt. The instruction model may actually be more capable but scores lower because it produces a different output format. You address this by using a chat-format prompt template in lm-eval (most models now have registered chat templates) and evaluating generation accuracy in addition to log-prob, so the scoring matches the model's actual output distribution."
+      },
+      {
+        "q": "After running your comparison, a stakeholder asks you to add a new benchmark. How do you avoid invalidating the existing comparison?",
+        "a": "Add the new task to the eval config without re-running old tasks; you have the pinned results from the original run in JSON. Run only the new task on the same pinned model commits and hardware, and append to the comparison table. Never re-run old tasks after pin-point changes—results should be additive, not retroactively re-computed. If the stakeholder also wants new tasks on a newer model checkpoint, that is a separate comparison run, not a mutation of the existing one."
+      }
+    ]
+  },
+  {
+    "q": "What are the standard Hugging Face Evaluate metrics for summarization, and how do you choose between them in practice?",
+    "a": "Hugging Face Evaluate ships ROUGE (ROUGE-1, ROUGE-2, ROUGE-L for n-gram recall), BERTScore (contextual embedding F1 between hypothesis and reference), BLEURT (a learned metric fine-tuned on human judgments), and METEOR (unigram recall with synonym and stemming matching). In practice: ROUGE-L is the baseline for extractive or near-extractive summarization where surface overlap is meaningful. BERTScore handles paraphrase-heavy abstractive summaries better because it matches semantic embeddings. BLEURT correlates best with human judgments on abstractive tasks but requires downloading a fine-tuned checkpoint. None replaces a task-specific LLM judge for production quality gates; use them as cheap sanity checks and trend signals, and validate whichever you choose against human preferences on a representative sample.",
+    "fs": "Names all four metrics with their characteristics and positions them as trend signals validated against human judgment.",
+    "fj": "Reports only ROUGE-L for all summarization tasks and doesn't validate whether it correlates with human preference on their specific data.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "You load BERTScore via Hugging Face Evaluate and notice scores vary across runs. What's causing that?",
+        "a": "BERTScore loads a pre-trained model (default: microsoft/deberta-xlarge-mnli) and runs inference, which can be affected by GPU non-determinism (different CUDA matmul implementations across hardware) and by which model revision the Hub fetches. Fix: pin the BERTScore model revision explicitly with evaluate.load('bertscore', model_type='microsoft/deberta-xlarge-mnli'), run on CPU for bit-exact reproducibility if speed allows, and set a fixed random seed if any sampling is involved. For a deterministic baseline, prefer ROUGE or METEOR which have no model-inference variability."
+      },
+      {
+        "q": "ROUGE scores are high on your summarization system but human reviewers rate the summaries poorly. What's the diagnostic and fix?",
+        "a": "High ROUGE with poor human ratings typically means the model is copying source sentences verbatim (maximizing n-gram overlap) while humans want a concise, rewritten summary. You're measuring extractive recall when users want abstractive quality. Switch to BERTScore or BLEURT as a better proxy, then validate with a human preference eval on a sample. Also check for length bias: longer outputs mechanically boost ROUGE recall, so normalize by length or add a summary-length constraint."
+      },
+      {
+        "q": "When is BLEURT the right choice over BERTScore from Hugging Face Evaluate, and when is it overkill?",
+        "a": "BLEURT is right when you need the highest correlation with human judgments on abstractive text and can afford the checkpoint download and inference cost. It's overkill for trend monitoring where you only need a directional signal (a lighter metric gets the same trend at less cost), for fast CI checks where evaluation speed matters, or for tasks with tight references where ROUGE already correlates well with humans. Choose based on the empirical correlation with your own human labels on your task—don't default to BLEURT as 'best' without validating it outperforms BERTScore on your domain."
+      }
+    ]
+  },
+  {
+    "q": "How would you use the Hugging Face datasets library to build a contamination-aware eval split for benchmarking a model you trained?",
+    "a": "Contamination-aware eval requires proving your test set doesn't overlap with training data. After loading both your training corpus and a candidate eval dataset via Hugging Face datasets, run n-gram deduplication (e.g. with the datasets.fingerprint dedup utilities or datasketch MinHash LSH) between training documents and eval examples, flagging any example whose 13-gram overlap with any training document exceeds a threshold. The Hugging Face datasets map() function runs this efficiently in parallel. Remove flagged examples and version the remaining clean split. Document the dedup threshold, overlap metric, and the fraction removed in the dataset card. If contamination is high (>10% of eval examples have training overlap), the benchmark is compromised and you either need a new eval set or must treat the reported score as an upper bound.",
+    "fs": "Describes the MinHash/n-gram dedup workflow using Hugging Face datasets map(), including dataset card documentation of contamination rate.",
+    "fj": "Evaluates on a public benchmark without checking whether the training corpus included it, then reports the score as a clean holdout result.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "MinHash dedup sketch",
+        "lang": "python",
+        "lines": [
+          "from datasketch import MinHash, MinHashLSH",
+          "# build train set LSH index",
+          "lsh = MinHashLSH(threshold=0.8, num_perm=128)",
+          "for i, doc in enumerate(train_ds):",
+          "    m = shingle_minhash(doc['text'])",
+          "    lsh.insert(f'train_{i}', m)",
+          "# filter eval examples",
+          "clean_eval = eval_ds.filter(",
+          "    lambda ex: not lsh.query(",
+          "        shingle_minhash(ex['text'])))"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is exact-string deduplication insufficient for contamination detection?",
+        "a": "Training data is often lightly paraphrased, chunked differently, or reformatted during pre-processing, so exact matches miss near-duplicate contamination. An eval question rephrased from its exact training form still gives the model unfair familiarity with the answer. MinHash LSH catches fuzzy near-duplicates at Jaccard similarity ≥ threshold, and n-gram overlap (13-grams is a common choice from the pre-training dedup literature) catches partially reworded instances. Exact dedup gives a false sense of clean separation."
+      },
+      {
+        "q": "Your contamination filter removed 30% of the eval set. What does that tell you about the benchmark?",
+        "a": "The benchmark was substantially present in your training data, meaning up to 30% of its test questions were seen during training. The remaining 70% is a valid holdout but the benchmark is no longer comparable with other models that were evaluated on the full benchmark. You should report the contaminated fraction, use only the clean split, and be explicit that scores are on a filtered subset. This also signals you should source a new eval benchmark less present in common pre-training corpora."
+      },
+      {
+        "q": "How does the Hugging Face datasets library's dataset fingerprinting help with eval contamination tracking across team members?",
+        "a": "Hugging Face datasets automatically computes a deterministic fingerprint (hash) of any dataset object based on its content and all applied transforms. If two team members apply the same filter independently, their filtered datasets have the same fingerprint, confirming they produced identical splits. You store the fingerprint in the eval report alongside the model commit and harness config. If a downstream run's fingerprint differs from the original, you know the split changed and the comparison is invalid without investigation."
+      }
+    ]
+  },
+  {
+    "q": "What is the Hugging Face Evaluate's ELO / comparative evaluation approach and when is it appropriate over absolute metric scores?",
+    "a": "Hugging Face Evaluate supports pairwise comparison workflows where two model outputs are compared on the same input and a judge (human or LLM) decides a winner, with results aggregated into an Elo-style rating using Bradley-Terry. This is appropriate when absolute metrics are poorly calibrated (e.g. creative writing where no reference exists), when you want to rank a fleet of models without a single ground-truth reference, or when fine-grained pairwise preferences correlate better with human satisfaction than pointwise scores. The Chatbot Arena paradigm (used on Hugging Face Spaces) popularized this for LLM ranking. The limitation is O(n²) comparison cost and the fact that Elo is a relative rank, not an absolute quality certificate—a model can be best-of-fleet while still failing your absolute quality threshold.",
+    "fs": "Positions pairwise Elo as appropriate for reference-free ranking and names the Chatbot Arena lineage, with the relative-not-absolute limitation.",
+    "fj": "Uses absolute metric scores for ranking models on open-ended generation tasks where no reference exists and scores are poorly calibrated.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How does the Bradley-Terry model convert pairwise win rates into a global Elo ranking?",
+        "a": "Bradley-Terry models a pairwise win probability as a logistic function of the difference in latent strength parameters: P(A beats B) = exp(s_A) / (exp(s_A) + exp(s_B)). You fit the strength parameters s by maximum likelihood over the observed win/loss matrix. The resulting values are comparable across all models in the comparison set. Elo is a simpler online approximation of the same idea, updating ratings after each match by a factor proportional to the surprise of the outcome. Both require enough pairwise comparisons for the estimates to be reliable; sparse comparison matrices produce high-variance rankings."
+      },
+      {
+        "q": "Chatbot Arena on Hugging Face Spaces uses human judges. What biases does crowd-sourced pairwise judgment introduce and how are they mitigated?",
+        "a": "Crowd judges show verbosity bias (preferring longer responses), self-selection bias (technically sophisticated users may systematically prefer certain model styles), and recency/position effects (judging whichever response they read last more favorably). Arena mitigates these by randomizing response order, anonymizing models, requiring judges to see both responses before voting, and collecting large N to let random biases average out. Statistical controls like mixed-effects models can further separate judge population effects from true model quality differences, though in practice the volume-based approach is what makes Arena competitive."
+      },
+      {
+        "q": "Your team wants to adopt a pairwise Elo eval but has only 5 models and limited annotation budget. Is it feasible?",
+        "a": "With only 5 models you have C(5,2)=10 pairs, which is manageable. Budget annotations across all 10 pairs with at least 50-100 judgments per pair for stable Elo estimates (total: 500-1000 labels). Use an LLM judge to scale cheaply on clear-cut pairs and reserve human judges for close or high-stakes ones. Validate the LLM judge's agreement with humans on a held-out slice first. 5 models is actually the ideal starting scale for pairwise evaluation—the O(n²) burden is only painful above ~20 models."
+      }
+    ]
+  },
+  {
+    "q": "How do you use Hugging Face Evaluate to implement a custom LLM-as-judge metric that integrates with the standard evaluate.load() interface?",
+    "a": "You implement a custom Hugging Face Evaluate metric by subclassing evaluate.Metric and implementing: _info() returning EvaluationModuleInfo with description, citation, features schema, and a reference URL; _download_and_prepare() optionally for any model or tokenizer needed; and _compute(predictions, references, **kwargs) which calls your LLM judge and returns a dict of score keys. The judge call lives inside _compute, typically via the Hugging Face transformers pipeline API or an OpenAI-compatible endpoint. You host the module on Hub or a local directory and load it with evaluate.load('path/to/judge_metric'). This gives your LLM judge the same versioned, reproducible interface as any built-in metric: other team members evaluate.load() it by path or Hub ID and get the same judge behavior pinned to that commit.",
+    "fs": "Walks through the _info/_compute implementation contract and stresses that hosting on Hub gives versioning and shareability.",
+    "fj": "Runs LLM judge scoring in an ad-hoc script outside any metric framework, making it impossible for teammates to reproduce or swap judges.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "custom judge metric",
+        "lang": "python",
+        "lines": [
+          "import evaluate",
+          "from evaluate import EvaluationModuleInfo",
+          "class LLMJudge(evaluate.Metric):",
+          "    def _info(self):",
+          "        return EvaluationModuleInfo(",
+          "            description='LLM rubric judge',",
+          "            citation='', features={})",
+          "    def _compute(self, predictions,",
+          "                 references, **kw):",
+          "        scores = [judge(p, r)",
+          "            for p, r in zip(",
+          "                predictions, references)]",
+          "        return {'llm_judge': sum(scores)/len(scores)}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the risk of caching judge scores inside a Hugging Face Evaluate metric?",
+        "a": "evaluate.Metric has a built-in caching layer that reuses compute() results for the same input hash. If your judge is non-deterministic (temperature > 0), caching returns a stale score that doesn't reflect the current judge model or prompt, silently giving misleading results after you update the judge. Disable caching by overriding compute_result = 'last' or by setting experiment_id per run, and make the judge deterministic (temperature=0) when reproducibility matters. Document in _info() what temperature and model version the judge uses."
+      },
+      {
+        "q": "A colleague uses your custom LLM judge metric but gets different scores. You used GPT-4o; they used GPT-4o-mini. How should the metric handle this?",
+        "a": "The judge model should be a required kwarg to _compute(), not hardcoded, so callers declare it explicitly and the difference is visible in the call: metric.compute(predictions, references, judge_model='gpt-4o'). Document in _info() that scores are not comparable across judge models. Consider versioning the metric by judge model family so users load evaluate.load('your-judge-v2-gpt4o') versus 'your-judge-v1-mini', making the model choice part of the metric identity rather than an invisible parameter."
+      },
+      {
+        "q": "How do you validate that your custom Hugging Face Evaluate judge metric is trustworthy before deploying it org-wide?",
+        "a": "Build a human-labeled validation set of 150-200 prediction/reference pairs covering your label distribution, run both your judge metric and human raters on the same set, and compute weighted Cohen's kappa between judge scores and human scores. Aim for kappa ≥ 0.7 as a minimum bar. Run bias probes (swap prediction/reference order, pad length) and confirm verdicts are stable. Package the validation set and kappa result as tests in the metric's test/ directory so any future change to the judge prompt or model triggers a re-validation via CI."
+      }
+    ]
+  },
+  {
+    "q": "You own the eval platform for a 40-engineer LLM product org. Walk through the infrastructure layers you build and the tradeoffs at each.",
+    "a": "The stack has four layers. The dataset layer is a versioned golden-set store: eval inputs, references, and metadata live in a dataset registry with commit-pinned versions so any run cites an immutable snapshot. The execution layer runs evals in CI (pre-merge gate) and on a nightly schedule; it abstracts model backends (local HF, vLLM, OpenAI-compatible) behind a uniform interface so swapping the backend doesn't change task definitions. The metric layer is a shared library of metric modules—reference-based, LLM-judge, safety classifiers—each versioned and tested so no team writes ad-hoc scoring. The reporting layer publishes per-run results to a dashboard with slice breakdowns, trend lines, and regression alerts. Tradeoffs: a monorepo metric library creates a shared dependency that slows iteration if not well-governed; decentralized dataset ownership risks drift in quality; and a synchronous CI gate adds merge latency, so you offer a fast subset gate plus a full nightly to balance speed with coverage.",
+    "fs": "Names all four layers, their governance ownership, and the concrete tradeoffs at each without hand-waving.",
+    "fj": "Describes 'running evals in CI' as the full platform without addressing dataset versioning, metric reuse, or reporting.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "Two product teams want different judge rubrics for the same shared metric module. How do you handle divergence without forking the codebase?",
+        "a": "Parameterize the rubric: the shared module accepts a rubric config (prompt template, criteria weights, judge model) as a versioned artifact stored alongside the dataset in the registry. Teams own their rubric config, not the scoring code. The platform provides rubric validation (schema check, required fields) and tracks which rubric version was used in each run for attribution. Forking the scoring code is the failure mode: it causes silent drift in how numbers are computed and makes cross-team comparisons invalid."
+      },
+      {
+        "q": "The nightly eval job takes 6 hours and engineers are ignoring the results. How do you fix adoption?",
+        "a": "The adoption problem is a feedback-loop problem, not a compute problem. Segment the gate: a fast sub-5-minute CI gate on a high-signal subset of 50-100 cases gives immediate merge-time feedback; the nightly runs the full suite for richer diagnostics. Surface failures as PR comments with per-case drill-down, not just a dashboard link. Make the metric names match the team's vocabulary—a 'faithfulness score' means nothing if the team talks about 'grounding failures.' Adoption follows when the signal is fast, visible, and clearly mapped to something engineers care about."
+      },
+      {
+        "q": "How do you version a golden dataset such that historical run comparisons remain valid after the set is updated?",
+        "a": "Treat the dataset like a database migration: each update appends a new versioned split rather than mutating the existing one. A run report cites dataset@sha so you can always replay it. Score comparisons are only valid within the same dataset version. When you onboard a new version, run both old and new side-by-side for one cycle to quantify the baseline shift and set the new threshold from the new version's distribution, not by inheriting the old one blindly."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a CI eval gate that is both trustworthy and doesn't block engineering velocity?",
+    "a": "The gate must answer three questions quickly: did quality regress, is the regression statistically real, and which slice broke. To be fast you curate a high-signal subset—typically 50–150 stratified cases—run at temperature 0 for determinism, and use cheap metrics (pass-rate thresholds, classifier-based safety checks) for the synchronous gate, reserving expensive LLM-judge calls for the async nightly. To be trustworthy you set thresholds from the measured baseline variance (not round numbers) so you know the false-positive rate, run paired tests so a single flaky case can't fail the build, and version both the golden set and the metric module in the gate config. Velocity is preserved by making the fast gate a soft warning on non-critical metrics and a hard block only on safety and severe quality regressions; soft signals go to a dashboard without blocking merge.",
+    "fs": "Balances fast/cheap synchronous gate with async depth, sets thresholds from measured variance, and distinguishes hard from soft blocks.",
+    "fj": "Either blocks all merges on a slow comprehensive eval (killing velocity) or runs only a trivial smoke test with no statistical rigor.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "gate config schema",
+        "lang": "python",
+        "lines": [
+          "gate = {",
+          "  'dataset': 'golden@sha3f2a',",
+          "  'metric_module': 'faithfulness@v2',",
+          "  'hard_floor': 0.82,   # block below",
+          "  'soft_floor': 0.87,   # warn below",
+          "  'paired_alpha': 0.05",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "The CI gate has a 12% false-positive rate — valid changes are getting blocked. What's the fix?",
+        "a": "A 12% false-positive rate means either the threshold was set too tight relative to the metric's natural variance, or determinism assumptions broke (provider non-determinism at temperature 0). Diagnose first: compute the metric's run-to-run variance on identical inputs. If the threshold is too tight, widen it to match the 95th-percentile noise band. If non-determinism is the cause, pin the model version more aggressively or switch to a deterministic local model for the gate. Also switch from a per-case pass/fail to a distribution-level paired test so one volatile case can't flip the build."
+      },
+      {
+        "q": "A team argues that their feature is so new there's no golden set to gate against. How do you handle it?",
+        "a": "Negotiate a bootstrap gate: they commit to authoring a minimum seed set (20–30 cases) from the feature spec before merge, which becomes v1 of their golden set. The gate starts as a soft warning with a lenient threshold, tightens as they add cases from real traffic post-launch, and transitions to a hard block once the set is representative and the baseline variance is known. The alternative—shipping with no gate—is worse because you have no regression detection at all. The seed set is the minimum viable contract."
+      },
+      {
+        "q": "What does a 'paired test' in a CI gate actually look like when there's no explicit control variant to pair against?",
+        "a": "In CI the pairing is across the golden set items: the same N input cases are scored under the current PR's model/prompt and the main-branch baseline. The paired statistic (Wilcoxon signed-rank on the per-case score deltas) removes per-item difficulty from the variance estimate, which is the key win. You don't need a simultaneous A/B; you have stored baseline scores for each golden-set item from the last main-branch run, and you compare deltas, not absolute scores. That's the paired structure, and it buys 2–3× statistical power for the same N."
+      }
+    ]
+  },
+  {
+    "q": "Describe a complete golden-set governance model for an org with multiple product teams sharing one eval platform.",
+    "a": "Governance has four pillars. Ownership: each golden set has a named team owner responsible for curation, labeling quality, and freshness reviews on a quarterly cadence. Access control: golden sets are immutable once tagged; only the owning team plus a platform review can merge additions, preventing silent drift. Quality standards: every example must carry annotator ID, inter-annotator agreement score, and a difficulty tag; examples below a minimum kappa are quarantined rather than deleted. Contamination control: any example drawn from a public benchmark is flagged; any example accidentally present in a model's training data is removed before tagging. Cross-team sharing: a shared catalog lists available golden sets with data cards documenting collection protocol, domain, known gaps, and last-freshness date so teams can discover and reuse rather than re-build. The platform enforces that no CI gate can point to an unreviewed or expired golden set.",
+    "fs": "Defines ownership, immutability, quality standards with kappa gates, contamination control, and a searchable cross-team catalog.",
+    "fj": "Treats golden sets as shared folders anyone can edit, with no versioning, ownership, or quality bar.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A product team wants to fast-path a hot-fix and proposes skipping the golden-set review gate. How do you handle that without becoming a bottleneck?",
+        "a": "Pre-approve an emergency bypass procedure: the team can merge with a soft gate and a required post-merge review within 24 hours, and the platform auto-reverts if the post-merge full eval shows a hard regression. The bypass is logged, visible to the eval platform team, and the team owns the remediation if something breaks. This separates the velocity need from the governance need: velocity wins in the short term, but accountability and automated rollback keep the system safe. Never make the bypass silent or permanent."
+      },
+      {
+        "q": "Quarterly freshness reviews are too infrequent — the golden set drifts from real traffic in weeks. What's the right cadence and trigger?",
+        "a": "Cadence should be event-triggered, not purely calendar-driven. Triggers: a new product intent exceeds 5% of production traffic (mine it into the set), online faithfulness or task-completion drops outside the control band for 3 consecutive days (mine the failing cohort), or a major model or prompt change ships (re-validate distribution coverage). Calendar quarterly reviews catch slow drift between triggers. The combination is continuous monitoring for sharp shifts and quarterly audits for gradual representativeness decay."
+      },
+      {
+        "q": "How do you handle a golden set that was high-quality when built but the task definition evolved, making the old labels wrong?",
+        "a": "Version the task definition alongside the dataset. When the task definition changes, freeze the old version for regression back-compat and create a new labeled version under the new definition, re-labeling a sample of old examples to quantify the label-shift. Run both versions in parallel for one release cycle so you can see whether the score change is real or an artifact of the label redefinition. Retire the old version with a deprecation notice, not a silent delete, so teams who were gating on it know to migrate."
+      }
+    ]
+  },
+  {
+    "q": "How do you operationalize human evaluation at scale — designing the workflow, maintaining quality, and containing cost?",
+    "a": "Human eval at scale requires four engineering decisions. Task decomposition: break complex quality judgments into atomic, independently answerable sub-questions with a constrained output format (binary or 1–3 scale) so annotators are faster and more consistent, replacing one vague 'rate quality' task. Queue and routing: distribute tasks through a managed annotation platform (Scale AI, Surge, or an internal tool) with routing rules that send sensitive or ambiguous cases to senior reviewers and routine cases to a broader pool. Quality control: embed golden calibration tasks (known-answer items) throughout each annotator's queue; flag annotators whose accuracy on calibration items falls below threshold and quarantine their recent work for re-review. Cost containment: use LLM pre-screening to filter clearly passing or clearly failing cases so humans only adjudicate the ambiguous middle, typically 30–40% of traffic. Track annotator agreement (kappa) per task type and tighten rubrics where agreement is low before scaling the annotation volume.",
+    "fs": "Covers task decomposition, queue routing, calibration-based quality control, and LLM-prescreening for cost efficiency.",
+    "fj": "Sends a spreadsheet to a freelancer pool with no calibration, no routing, and no quality tracking.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "You discover that one annotation vendor is gaming calibration tasks by memorizing the answer key. How do you detect and respond?",
+        "a": "Rotate the calibration item pool continuously so no item is shown more than twice per month to the same annotator, and include near-duplicate paraphrases of key items that test understanding rather than memorization. Detect gaming by checking whether an annotator's kappa on novel calibration items differs from their kappa on previously-seen items; a large gap is a gaming signal. Respond by quarantining and re-annotating that annotator's queue, contracting for explicit anti-gaming terms, and switching to a different vendor cohort for sensitive tasks."
+      },
+      {
+        "q": "LLM pre-screening rejects 60% of cases as clearly passing. What's the risk of that, and how do you validate the prescreener?",
+        "a": "The risk is systematic blind spots: if the prescreener has a bias (e.g. it misses a specific failure mode it was never shown), you never expose that cohort to human review and the golden set develops a gap. Validate the prescreener by sending a random 5% sample of its 'clearly passing' calls directly to humans and checking whether the human pass rate matches the prescreener's confidence. If humans and the prescreener disagree on more than 3–5% of that sample, the prescreener is biased and you expand the ambiguous zone it sends to humans."
+      },
+      {
+        "q": "Annotation throughput can't keep up with the volume of model changes. How do you prioritize which outputs get human review?",
+        "a": "Prioritize by a combination of novelty (inputs in a distribution tail the prescreener is weakest on), impact (high-traffic or high-stakes intents), and signal value (cases where the automated metric and user feedback diverge, which have the highest diagnostic value). Use a stratified budget: reserve 20% of human-review capacity for random samples (for unbiased coverage), 60% for high-priority triggered cases, and 20% for spot-checks on known-risky categories. Never drop coverage to zero on any category, even if you throttle the rate."
+      }
+    ]
+  },
+  {
+    "q": "Your team is deciding whether to build an in-house eval platform or buy a vendor solution (Braintrust, Langsmith, Cleanlab, etc.). How do you structure that decision?",
+    "a": "Frame it as a build-vs-buy tradeoff along five axes. Integration: vendors offer out-of-the-box UI, trace logging, and dataset management but require data egress, which fails compliance requirements for PII-heavy products; a build gives full control. Velocity: a vendor is live in days; building a robust platform takes 6–12 months of platform-team time that isn't shipping product features. Differentiation: if your eval methodology is a competitive moat (e.g. a proprietary rubric tuned to your domain), building and owning it preserves the IP; commodity needs (run ROUGE, log traces) are not worth building. Lock-in: vendor eval schemas and APIs vary; switching later is painful if your golden sets and metric modules are stored in their format. Cost: vendor per-run pricing scales non-linearly at volume; a self-hosted solution has fixed infra cost that amortizes. The typical resolution for an org ≥30 engineers: adopt a vendor for the first 6 months (speed to learn what you actually need), then invest in a thin internal platform that owns dataset governance and metric modules while optionally keeping the vendor for UI and trace logging.",
+    "fs": "Evaluates across integration, velocity, differentiation, lock-in, and cost, and gives a phased hybrid resolution.",
+    "fj": "Either always builds (ignores speed cost) or always buys (ignores lock-in and compliance) without a structured analysis.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "The vendor solution stores golden-set labels in their proprietary format. What's the migration risk if you decide to switch?",
+        "a": "The format risk is the label metadata, not the text: examples migrate easily, but annotation provenance (annotator ID, kappa, golden-set version, rubric version) is often in a vendor-specific schema with no standard export. You lose the audit trail needed to validate historical comparisons. Mitigate at contract time: require a full schema export in open format, run periodic exports to your own storage, and maintain a vendor-agnostic internal schema as the source of truth that the vendor tool mirrors. Never let the vendor be the only copy of your labeled data."
+      },
+      {
+        "q": "A vendor offers an LLM-judge metric as a managed service with no access to the judge prompt or model version. What are the risks?",
+        "a": "You can't validate the judge against your human labels (the core trustworthiness check), you can't detect when the judge drifts after a provider model update, and you can't customize the rubric for your domain. The score becomes a black box you can't audit. Treat it as an unvalidated signal: run it alongside your own validated judge and compare; if they diverge, investigate rather than trusting the vendor number. Never use an unaudited third-party judge as a CI gate for ship decisions without at minimum a human-agreement validation on a held-out set."
+      },
+      {
+        "q": "After 6 months on a vendor platform you decide to build in-house. How do you migrate without breaking eval continuity?",
+        "a": "Run both systems in parallel for two release cycles. Export all golden sets to your internal schema, re-run the last three months of gates on the internal platform, and calibrate the threshold by verifying that the internal platform's scores match (within noise) what the vendor reported on the same runs. Only cut the CI gate over to the internal platform once agreement is confirmed. Maintain the vendor's historical run data as read-only archival for back-compat comparisons, and document the cutover date in the eval lineage so teams know which system produced which number."
+      }
+    ]
+  },
+  {
+    "q": "How do you build and maintain an eval leaderboard for an internal fleet of fine-tuned models so the ranking stays trustworthy as the fleet grows?",
+    "a": "A trustworthy internal leaderboard has five properties. Reproducibility: every entry cites model checkpoint SHA, dataset version, metric module version, hardware spec, and random seed so any score can be replayed identically. Temporal anchoring: scores are not comparable across dataset versions; the leaderboard segments by dataset version and flags cross-version comparisons as directional only. Bias detection: periodically run all models on a held-out contamination probe set to catch any that have memorized eval examples; contaminated entries are demoted with a flag. Statistical significance: adjacent ranks within the confidence interval margin are displayed as ties rather than a precise ordering, avoiding false precision. Freshness: a model that hasn't been re-evaluated in more than 60 days is marked stale since provider drift can silently shift its behavior. Governance: a platform team owns the leaderboard schema; teams submit entries via a reviewed PR, not a self-serve write, so scores can't be manipulated.",
+    "fs": "Lists reproducibility metadata, version anchoring, contamination probing, confidence-interval ties, staleness decay, and submit governance.",
+    "fj": "Maintains a spreadsheet of scores with no provenance, allows teams to self-report numbers, and never re-evaluates old models.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "Two fine-tuned models are within each other's confidence intervals on the leaderboard. A stakeholder demands a definitive winner. How do you respond?",
+        "a": "Explain that the data doesn't support a definitive ordering: both models are statistically equivalent on the current benchmark. Offer three paths: run additional cases to tighten the CI (power analysis to find the N needed to separate them at the observed delta), switch to a pairwise evaluation on the specific slice where the decision actually matters (the aggregate may be tied while one wins on the critical sub-domain), or run an online A/B on the real KPI where the business decision will be made. Presenting a false winner from a tied benchmark is worse than admitting uncertainty."
+      },
+      {
+        "q": "A new team submits a model to the leaderboard with a suspiciously high score. What's your review process?",
+        "a": "Run a contamination probe first: check whether the model's training data includes the evaluation set via n-gram overlap detection. Then run a difficulty-stratified eval: a genuinely strong model should score higher on hard cases, not uniformly high; a model that memorized the eval often has an inverted difficulty profile. Re-run a random subset of the reported score yourself using the submitted checkpoint to confirm reproducibility. If any check fails, the entry is rejected with a written explanation, not silently removed, so the team understands what to fix."
+      },
+      {
+        "q": "The leaderboard now has 80 models and governance is a bottleneck. How do you scale the review process without lowering standards?",
+        "a": "Automate the mechanical checks: the submission pipeline runs the contamination probe, reproducibility re-run on a 20-case subset, and metadata completeness validation automatically and blocks submission if any fail. Human review only triggers for failures, new metric modules being introduced, or entries claiming SOTA on a key benchmark. Introduce a tiered trust model: teams with a clean submission history get a fast-path review; new teams or new model families go through full review. This is the same trust-but-verify pattern as code review: senior review for novel patterns, automation for the routine."
+      }
+    ]
+  },
+  {
+    "q": "How do you design an org-wide eval quality strategy that spans model selection, prompt engineering, fine-tuning, and safety — without letting each team build a silo?",
+    "a": "The strategy has three components. A shared measurement contract: publish org-wide definitions for the five quality dimensions every team must report — task accuracy, faithfulness/grounding, safety (ASR per category), cost-per-query, and latency p95 — with canonical metric modules teams load from a central library rather than implement themselves. This makes numbers comparable across teams. A federated governance model: each team owns their domain-specific golden sets and rubrics, but all sets must satisfy platform quality standards (minimum kappa, contamination check, data card). The platform team audits quarterly and maintains the shared metric library. A shared infrastructure layer: a common eval runner, dataset registry, and reporting dashboard; teams bring their data and rubrics and get the rest. This prevents duplicated infra while preserving team autonomy on what they measure. The payoff is that leadership can compare quality across the org on a common basis, cross-team regressions surface in one dashboard, and no team reinvents the statistical testing wheel.",
+    "fs": "Defines a shared measurement contract, federated governance, and shared infra as the three levers, naming each team's autonomy boundary.",
+    "fj": "Either dictates a single rigid rubric to all teams (losing domain nuance) or lets every team do whatever they want (losing comparability).",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "A high-growth product team argues the shared metric contract is slowing them down. How do you balance standardization with their velocity needs?",
+        "a": "Separate the mandatory floor (the five shared dimensions, reported every release) from the optional extensions (team-specific metrics they add freely without platform review). The shared floor is non-negotiable because it's what enables cross-org comparison and leadership visibility; extensions are the team's lab to innovate. Invest in making the shared floor low-friction: an SDK that wraps the metric calls in three lines, a CI template that auto-publishes the five numbers, so compliance is a matter of minutes not days. Velocity complaints usually mean the shared tooling is too hard to use, not that the standard itself is wrong."
+      },
+      {
+        "q": "Two teams report the same metric name ('faithfulness') with different implementations. How do you discover and resolve that at the org level?",
+        "a": "The metric library is the source of truth: faithfulness@v1 has one implementation, one rubric, one judge model, pinned. If a team needs a variant, they submit a new named module (faithfulness-long-doc@v1) through a review process, not a local copy. Discover existing drift by comparing a shared calibration set across all teams' self-reported implementations; divergence above noise indicates a fork. Resolve by bringing both teams together, picking the better implementation or merging them, and deprecating the diverged version with a migration path. Silent divergence is the worst outcome: it poisons cross-team comparisons without anyone knowing."
+      },
+      {
+        "q": "How do you measure whether the org-wide eval strategy is actually improving product quality, not just compliance?",
+        "a": "Track the proxy-to-outcome correlation over time: for each team, measure whether their gate metric improvements predict their online KPI improvements in A/B tests. If the correlation is strong, the strategy is generating real signal; if gates pass but KPIs don't move, teams are optimizing the metric not the outcome. Also measure eval coverage maturity per team (golden set size, inter-annotator kappa, slice coverage) and correlate with their production incident rate — teams with mature evals should have fewer surprise regressions. The meta-metric for a strategy is whether it reduces production surprises."
+      }
+    ]
+  },
+  {
+    "q": "As a Principal, you are asked to set the company's multi-year bet on how to evaluate increasingly capable agentic AI systems. What framework do you propose and why?",
+    "a": "The core insight is that as agents become capable of longer-horizon tasks, evaluation must shift from measuring outputs to measuring plans, trajectories, and side-effects. The multi-year framework has four phases. Phase 1 (current): component eval (retrieval metrics, tool-call accuracy, output quality) plus task-success on benchmark environments (WebArena, SWE-bench style). Phase 2 (next 12 months): trajectory-grounded evaluation that explicitly measures efficiency, reversibility of actions, and policy compliance at each step, not just final success. Phase 3 (18-24 months): adversarial robustness evals for multi-agent systems — prompt injection across agent boundaries, confused-deputy attacks, cascade failures — since component evals miss emergent multi-agent failure modes. Phase 4 (2-3 years): real-world outcome measurement on production deployments with clear causal attribution between agent actions and business outcomes, closing the proxy-to-outcome loop that purely offline evals can never close. The through-line is that every phase must maintain human interpretability of failure modes: as agents get more capable, the eval must get more diagnostic, not just more comprehensive.",
+    "fs": "Proposes a phased multi-year trajectory that names the evaluation bottleneck at each horizon and the through-line of human-interpretable failure diagnosis.",
+    "fj": "Proposes adding more benchmarks and scaling the existing eval suite without addressing the structural shift from output to trajectory/side-effect measurement.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "Adversarial multi-agent evals in Phase 3 are expensive to build. How do you justify the investment before you need them?",
+        "a": "Frame it as risk mitigation with a known cost-benefit structure: the cost of building the adversarial eval suite is bounded and predictable; the cost of a multi-agent cascade failure in production is unbounded and reputational. Present historical analogues — security red-teaming is never justified by ROI until the breach happens, so the industry front-loads it. Start with a threat model that lists the top 5 multi-agent attack surfaces your system will be exposed to in 18 months, and build evals for those specifically rather than a general suite. Narrow scope to the known risks makes the investment defensible without waiting for a production incident."
+      },
+      {
+        "q": "Real-world outcome measurement in Phase 4 requires causal attribution from agent actions to business outcomes. Why is that technically hard and what's the practical approach?",
+        "a": "Causal attribution is hard because agents operate in a world with many confounders: other agents, human decisions, and environmental changes happen concurrently with agent actions, making it difficult to isolate the agent's causal contribution. The practical approach is counterfactual experiment design — run controlled rollouts where the agent is active versus a baseline policy, measure the outcome difference, and analyze which trajectory features correlate with better outcomes using causal inference tools (difference-in-differences, instrumental variables). Start with the highest-leverage, clearest-signal outcomes (a booking completed vs not, a refund issued vs not) where the causal chain from agent action to outcome is short and observable."
+      },
+      {
+        "q": "The research team proposes using a powerful LLM to auto-generate evaluation trajectories for Phase 2. What's the principal-level concern with that approach?",
+        "a": "The concern is circularity and coverage gaps. A strong LLM generating trajectories will produce trajectories that look like what a strong LLM would produce, systematically under-representing failure modes that emerge from real user inputs, edge-case tool outputs, or novel task structures it wasn't prompted to imagine. The eval set reflects the generator's knowledge, not the world's complexity. At the principal level, the deeper concern is governance: if the eval methodology is generated by the same class of system being evaluated, it becomes self-referential and can mask capability limitations. Synthetic trajectory generation is useful for scaling volume in known-distribution regimes; human-authored trajectories from real task walkthroughs and domain experts must anchor the suite for trustworthiness."
+      }
+    ]
+  },
+  {
+    "q": "A board-level stakeholder asks you to define what 'AI quality' means for the company and how the company will know when it achieves it. How do you answer?",
+    "a": "Start by rejecting a single universal definition: quality is relative to the task, user, and risk tier. Instead propose a tiered quality framework. For each product, quality is defined as meeting a floor on three categories — correctness/task success (does it do the right thing), safety (does it avoid harm categories the company has enumerated), and reliability (does it perform consistently under the operating conditions it's deployed in). At the company level, 'achieving quality' means every deployed product has documented, validated eval coverage for all three categories with thresholds derived from user research and risk analysis, not from engineering intuition. Progress is tracked on two lagging indicators: the fraction of shipped changes that produced an undetected production regression (wants to trend toward zero), and the mean time from production incident to root-cause diagnosis (wants to shrink as eval coverage improves). This reframes quality from a point-in-time certification to a continuous operational posture, which is the honest answer for systems that change every month.",
+    "fs": "Defines quality as a three-category tiered floor, proposes lagging outcome indicators for measuring progress, and reframes it as operational posture not certification.",
+    "fj": "Proposes a single benchmark score or a one-time audit as proof of quality, without connecting it to ongoing operational measurement.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "The board pushes back and wants a single quality score to track over time. How do you respond?",
+        "a": "Acknowledge the legitimate need for a simple signal while explaining the risk of a single number: it creates an optimization target that teams will game (Goodhart's Law), and it hides the structure of quality that leaders need to make resource decisions (is the safety floor sliding or the correctness floor?). Offer a compromise: a three-number scorecard (correctness, safety, reliability), each normalized to a 0-100 index against their respective floor thresholds, with a dashboard drill-down. This is still simple enough for a board deck — three numbers instead of forty — but it preserves the diagnostic structure. The score alone is a headline; the structure is the decision tool."
+      },
+      {
+        "q": "How do you prevent the eval thresholds from becoming a compliance checkbox rather than a genuine quality signal?",
+        "a": "Make threshold derivation transparent and evidence-based: each threshold is published with a rationale document showing the user-research data or risk analysis that set it, and thresholds are reviewed annually against new data. Tie at least one threshold to an observable user or business outcome rather than a model metric — if faithfulness≥0.85 was set because users trust answers at that level, validate the correlation annually. Rotate the golden set to prevent overfitting. And measure the leading indicator: are teams using eval results to make decisions, or are they running evals purely to produce a compliance artifact? The difference shows up in whether failed eval gates ever block a ship decision."
+      },
+      {
+        "q": "Two business units have fundamentally different risk tolerances — one is consumer-facing and one is internal tooling. How do you maintain a unified quality framework without forcing the same thresholds on both?",
+        "a": "The framework is unified in structure (same three categories, same metric modules, same reporting format) but parameterized in thresholds and coverage requirements. Consumer-facing gets a higher safety floor and a mandatory human-eval review cycle; internal tooling gets a lower safety floor but the same correctness and reliability gates. The platform enforces that every product has a documented threshold for each category with a sign-off from a risk owner, but the actual values are set by the product team with platform audit. This creates comparability (apples-to-apples structure) while respecting context (different thresholds). The governance question is: who approves a threshold that seems too low? That requires a cross-functional review, not a unilateral platform decision."
+      }
+    ]
   }
 ]

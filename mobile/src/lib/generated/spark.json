@@ -1219,5 +1219,531 @@
         "a": "When one side is much smaller than the other yet still too big to broadcast (e.g. a few GB), and partitions are evenly distributed. It skips the sort that SMJ pays and avoids the broadcast that won't fit — a niche middle ground. In practice AQE and broadcast/SMJ cover most cases, so it's a deliberate tuning lever, not a default."
       }
     ]
+  },
+  {
+    "q": "What is the difference between repartition by column and repartition by count in Spark, and which should you choose before writing partitioned Parquet?",
+    "a": "repartition(N) reshuffles into N equal-sized partitions using round-robin Partitioning, while repartition('col') reshuffles by hash Partitioning on the column so every distinct value lands in at most one shuffle partition. Before writing Hive-style partitioned Parquet with .partitionBy('dt'), you should repartition by the partition column first so each shuffle partition maps to one distinct value and produces one file per partition-value — otherwise multiple shuffle partitions can write the same Hive directory and create file proliferation. The ordering matters: repartition('dt') collapses same-dt rows together, then .partitionBy('dt') at write time routes each partition's rows to the right directory with one file per directory.",
+    "fj": "I just call .write.partitionBy('dt') and Spark handles the file layout.",
+    "fs": "Without pre-repartitioning by the column, each executor writes to each dt directory and produces N × distinct_dt files. I repartition('dt') first so each shuffle partition covers one dt value and writes exactly one output file per directory.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Before — N files per dt directory",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "# Bug: 200 shuffle parts → 200 files",
+          "# per Hive partition directory",
+          "df.write.partitionBy('dt').parquet('o/')"
+        ]
+      },
+      {
+        "label": "After — one file per dt value",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "# Partitioning by column first collapses",
+          "# same-dt rows into one shuffle partition",
+          "(\n  df.repartition('dt')",
+          "  .write.partitionBy('dt').parquet('o/'))",
+          "# one file per distinct dt directory"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens to data Partitioning when you call repartition(N, 'col')?",
+        "a": "Spark applies hash Partitioning on 'col' and distributes the N partitions so rows with the same col value land in the same partition. If N > distinct_col_values, multiple partitions may be empty; if N < distinct values, multiple distinct values share a partition. For write optimization, set N roughly equal to the number of distinct partition values."
+      },
+      {
+        "q": "Why does Partitioning by a date column before write matter for downstream query performance?",
+        "a": "Hive-style partition directories are pruned by the query engine at the directory level. If you write many files per dt directory, every query touching that date still opens all files — no pruning benefit within the directory. One clean file per directory maximizes both write efficiency and downstream partition pruning."
+      }
+    ]
+  },
+  {
+    "q": "What is hash Partitioning vs range Partitioning in Spark shuffles, and when does each appear?",
+    "a": "Hash Partitioning assigns a row to a partition by hashing the key modulo N, producing even partition counts for uniform keys but concentrating skewed keys in one bucket. Range Partitioning samples the data to build key boundaries and assigns rows so each partition holds a contiguous key range, producing sorted output but requiring an extra sampling pass. Spark uses Hash Partitioning for groupBy and join shuffles by default, and Range Partitioning for orderBy/sortBy (repartitionByRange). The practical implication is that a hot key under Hash Partitioning always routes to the same partition; Range Partitioning spreads it across the range bucket, which is why repartitionByRange is occasionally used to pre-sort dimension tables before a range-based lookup.",
+    "fj": "All shuffles use the same Partitioning strategy.",
+    "fs": "GroupBy and join shuffles use Hash Partitioning; orderBy uses Range Partitioning (sampled boundaries). Hash can concentrate skewed keys; Range distributes a sorted key spread but pays a sampling pre-pass.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Explicit range Partitioning vs hash",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "from pyspark.sql import functions as F",
+          "# Hash Partitioning (default for groupBy)",
+          "df.repartition(200, 'key')",
+          "# Range Partitioning (orderBy uses this)",
+          "df.repartitionByRange(200, 'key')",
+          "# Exchange node shows strategy in plan"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does Hash Partitioning produce skew when a key has high frequency?",
+        "a": "Hash Partitioning maps every row with the same key to the same partition (hash(key) % N is deterministic). A mega-key that appears millions of times all routes to a single partition, creating one huge task. Range Partitioning would spread those rows across a range bucket based on sort order, but for hash-based joins it changes the co-location semantics and requires both sides to be range-partitioned alike."
+      },
+      {
+        "q": "How does repartitionByRange choose its boundaries?",
+        "a": "Spark samples the dataset (controlled by spark.sql.execution.rangeExchange.sampleSizePerPartition), sorts the sample, and picks N-1 quantile boundaries. Then a full shuffle routes each row to the partition whose range it falls in. The sample cost means Range Partitioning has a higher setup overhead than Hash Partitioning — it runs an extra map-side partial sort before the main exchange."
+      }
+    ]
+  },
+  {
+    "q": "How does Partitioning interact with AQE's coalesce-partitions feature, and when can it hurt?",
+    "a": "AQE post-shuffle partition coalescing merges adjacent, small shuffle partitions into combined partitions to reduce task overhead after a shuffle, controlled by spark.sql.adaptive.coalescePartitions.enabled and targetPostShuffleInputSize. It inspects actual shuffle-map statistics and collapses contiguous partition groups into one task. The problem arises when your downstream operation depends on specific Partitioning cardinality — for example, a bucketed write expecting N partitions equal to the bucket count, or a join relying on co-Partitioning of two datasets. AQE coalescing can silently reduce partition count below what bucketing or co-Partitioning requires, forcing an extra shuffle on the consumer. Disable coalescePartitions or pin minPartitionNum in those cases.",
+    "fj": "AQE coalescing always helps by reducing task overhead.",
+    "fs": "AQE coalescing is great for general queries but can break co-Partitioning assumptions: if a bucketed join or co-located read depends on an exact partition count, AQE silently merging partitions can add a re-shuffle. I pin minPartitionNum or disable coalescePartitions for those flows.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Pin minimum to protect co-Partitioning",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "a = 'spark.sql.adaptive.'",
+          "spark.conf.set(",
+          "  a+'coalescePartitions.enabled', 'true')",
+          "# Prevent merging below bucket count",
+          "spark.conf.set(",
+          "  a+'coalescePartitions.minPartitionNum','256')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is targetPostShuffleInputSize and how does it drive AQE coalescing?",
+        "a": "targetPostShuffleInputSize (default 64 MB) is the target partition size AQE coalesces toward. After the shuffle-map phase, AQE groups consecutive small partitions until their combined size reaches this target, then assigns them to one coalesced task. Setting it too high collapses many partitions into few tasks, reducing parallelism; too low leaves many small tasks and negates the coalescing benefit."
+      },
+      {
+        "q": "How do you detect in the SQL UI that AQE coalescing changed the Partitioning count?",
+        "a": "In the SQL tab, the AdaptiveSparkPlan node shows isFinalPlan=true. The Exchange node downstream of the shuffle lists the original numPartitions, and the CoalescedPartitions wrapper (if AQE fired) shows the actual tasks run. The Stage Detail in the Jobs tab will show fewer tasks than spark.sql.shuffle.partitions because adjacent partitions were merged."
+      }
+    ]
+  },
+  {
+    "q": "Explain partition pruning versus predicate pushdown in Spark — how do they differ, how do they stack, and what breaks each?",
+    "a": "Partition pruning operates at the file-system directory level: when data is stored with Hive-style layout, Spark uses the metastore to skip entire directories that cannot match a filter predicate, which is directory-level Partitioning metadata. Predicate pushdown operates inside a file: for Parquet, it uses row-group-level min/max footer statistics to skip row groups within the files that remain after pruning. They stack — first pruning eliminates directories, then pushdown skips row groups inside what's left. Partition pruning breaks when the filter is on a computed column not the raw partition column, when the metastore doesn't know the layout, or when reading without the Hive metastore. Predicate pushdown breaks when the filter references a computed expression, a Python UDF result, or a data source with no column statistics.",
+    "fj": "Predicate pushdown and partition pruning are the same optimization.",
+    "fs": "Partition pruning skips whole Hive directories using Partitioning metadata; predicate pushdown skips Parquet row groups using column stats inside a file. They stack, but each has different failure modes — partitioning metadata for one, column statistics for the other.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Both stack on a partitioned Parquet table",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "# Partitioning layout: s3://events/dt=2026-06-01/",
+          "df = spark.read.parquet('s3://events/')",
+          "(\n  df.filter('dt = \"2026-06-01\"')  # pruning",
+          "    .filter('amt > 500'))    # pushdown",
+          "# explain() shows PartitionFilters + PushedFilters"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does filtering on year(dt) break partition pruning when dt is the Partitioning column?",
+        "a": "Partition pruning works on the raw stored partition column value. year(ts) is a derived expression — Catalyst can't match it against the directory names (which store the raw ts value). You'd need to add a separate year partition column, or filter on the raw dt column instead. A filter on a function of the partition key is pushed as a post-scan filter, not a directory prune."
+      },
+      {
+        "q": "What is z-ordering and how does it enhance Partitioning and predicate pushdown in Delta Lake?",
+        "a": "Z-ordering co-locates related rows within Parquet files by interleaving the sort-bits of multiple columns, improving the min/max statistics for those columns. Within a Hive partition, predicate pushdown skips more row groups because similar values cluster together. Z-ordering is a within-partition optimization layered on top of Partitioning — it improves pushdown effectiveness but doesn't add or replace partition directories."
+      }
+    ]
+  },
+  {
+    "q": "What is partitionBy on write in PySpark, and what are the performance trade-offs of over-partitioning versus under-partitioning the output?",
+    "a": "partitionBy('col') on a DataFrameWriter creates Hive-style partition directories on storage, enabling partition pruning for downstream reads. Over-Partitioning — too many distinct partition values — creates thousands of tiny directories and files, harming downstream reads with excessive file-open overhead, bloating the metastore with millions of partition entries, and creating many small tasks on re-read. Under-Partitioning — too few coarse partition columns — limits pruning granularity so queries touch more data than necessary. A good Partitioning key has moderate cardinality (daily date columns, country codes), aligns with common query filter patterns, and is pre-repartitioned in Spark before write so each shuffle partition maps to one directory. Never partition on high-cardinality columns like user_id, which creates millions of directories.",
+    "fj": "I partition on every column I frequently filter by.",
+    "fs": "Over-Partitioning on high-cardinality columns creates millions of tiny directories that OOM the metastore and make reads slower, not faster. I partition on moderate-cardinality columns aligned to query patterns and pre-repartition by the same column before writing.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Safe Partitioning key choice",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "# Bad: user_id has millions of values",
+          "# df.write.partitionBy('user_id')...",
+          "",
+          "# Good: date has ~365 values/year",
+          "(df",
+          "  .repartition('dt')   # collapse same-dt rows",
+          "  .write.partitionBy('dt').parquet('o/'))"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens to the Hive metastore when you partition on a high-cardinality column?",
+        "a": "Each distinct partition value creates a separate metastore entry. A table partitioned on user_id with 50 million users creates 50 million metastore partition rows. MSCK REPAIR TABLE, partition listing calls, and query planning all slow to a crawl because the metastore must scan millions of entries. This is a common production anti-pattern that requires a full table rewrite to fix."
+      },
+      {
+        "q": "How does Partitioning column choice affect file sizes in the output?",
+        "a": "A high-cardinality partition column splits data into many tiny files — one per distinct value per write operation. A low-cardinality column creates large files that contain many distinct secondary column values per partition, making secondary-column predicate pushdown the only further optimization. Ideal Partitioning balances directory granularity for pruning with enough data per directory for row-group statistics to be meaningful."
+      }
+    ]
+  },
+  {
+    "q": "How does AQE's skew-join handling relate to data Partitioning, and what are its thresholds and limits?",
+    "a": "AQE's skew-join feature detects imbalanced shuffle Partitioning after the map phase by inspecting actual partition sizes. A partition is skewed if it exceeds both skewedPartitionFactor times the median partition size (default 5×) and skewedPartitionThresholdInBytes (default 256 MB). When both conditions hold, AQE splits the skewed partition into sub-partitions and replicates the corresponding opposite-side partition to serve each sub-partition — effectively doing on-the-fly manual salting without code changes. The feature only works for sort-merge joins because it needs shuffle write statistics; broadcast joins have no shuffle to inspect. Limits: AQE cannot split a skewed partition if the skewed side was already broadcast, and the split factor is bounded by spark.sql.adaptive.skewJoin.skewedPartitionMaxSplits.",
+    "fj": "AQE automatically fixes all Partitioning skew in any join type.",
+    "fs": "AQE fixes skew only in sort-merge joins by splitting oversized shuffle Partitioning and replicating the opposite side. Broadcast joins have no shuffle statistics, so AQE skew-join can't apply. And the split is bounded — extreme skew may need manual salting.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Enable AQE skew-join and tune thresholds",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "a = 'spark.sql.adaptive.'",
+          "spark.conf.set(a+'skewJoin.enabled','true')",
+          "# skew if > 5x median AND > 256MB",
+          "spark.conf.set(",
+          "  a+'skewJoin.skewedPartitionFactor','5')",
+          "spark.conf.set(",
+          "  a+'skewJoin.skewedPartitionThresholdInBytes','268435456')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why must both threshold conditions hold for AQE to treat a partition as skewed?",
+        "a": "The factor alone (5× median) would flag many partitions in a large query as skewed even when they're only slightly larger than tiny median partitions. The absolute size threshold (256 MB) ensures AQE only splits partitions that are actually large enough to cause a straggler task. Both guards prevent unnecessary splits on small datasets where Partitioning variance is noise."
+      },
+      {
+        "q": "What is skewedPartitionMaxSplits and when does it matter?",
+        "a": "skewedPartitionMaxSplits (default 5) caps how many sub-partitions AQE can split a skewed partition into. For extreme Partitioning skew — a mega-key that is 100× the median — five splits may not be enough to bring the sub-partitions down to a manageable size. In those cases manual salting with a higher N gives more control than relying on AQE's bounded auto-split."
+      }
+    ]
+  },
+  {
+    "q": "What is the relationship between Spark shuffle Partitioning and the number of output files when writing to object storage?",
+    "a": "The number of output files written by a Spark job equals the number of active partitions at write time when no partitionBy is used, or the number of active partitions per distinct partition value when partitionBy is used. Setting spark.sql.shuffle.partitions=200 means 200 map outputs, each becoming a file — on a small dataset this creates 200 tiny files with heavy object-storage overhead on re-read. AQE post-shuffle Partitioning coalescing reduces active partition count before the write stage, producing fewer, larger files automatically. For partitionBy writes, pre-repartitioning by the partition column collapses same-value rows into one shuffle partition, producing one file per partition value. The practical discipline: always check estimated data size and target 128-512 MB output files.",
+    "fj": "spark.sql.shuffle.partitions only affects query performance, not output file count.",
+    "fs": "Shuffle Partitioning directly controls output file count — 200 shuffle partitions = 200 output files. I match shuffle Partitioning to target file size or use AQE coalescing to avoid the small-files problem at write time.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Tune Partitioning for right-sized files",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "# 20 GB data, target 256 MB files -> ~80 files",
+          "spark.conf.set(",
+          "  'spark.sql.shuffle.partitions','80')",
+          "df.write.parquet('s3://bucket/out/')",
+          "# or use AQE to auto-coalesce to right size"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does spark.sql.files.maxPartitionBytes affect Partitioning on read vs write?",
+        "a": "maxPartitionBytes (default 128 MB) controls how Spark splits input files into read partitions — each task reads up to 128 MB of a file. It governs input Partitioning. Output Partitioning at write time is controlled by spark.sql.shuffle.partitions (for shuffled operations) or the partition count at time of write. The two settings affect opposite ends of the DAG."
+      },
+      {
+        "q": "What is the small-files problem in object storage and why is it worse than HDFS?",
+        "a": "On HDFS, a small file still reads from a nearby datanode with TCP overhead. On S3/GCS/ADLS, each file requires an HTTP request with authentication, list overhead, and higher per-request latency. A job reading 10,000 small files makes 10,000 HTTP requests, each with latency far exceeding the data transfer time. The Partitioning fix — fewer, larger files — is more impactful on object storage than on HDFS."
+      }
+    ]
+  },
+  {
+    "q": "How does bucketing relate to Partitioning, and what makes a bucketed read skip the sort step in a sort-merge join?",
+    "a": "Bucketing is a write-time Partitioning strategy that hashes rows into a fixed number of buckets by a key column and optionally sorts within each bucket, persisting both the Partitioning layout and the sort order in the metastore. A sort-merge join normally requires a shuffle (to align Partitioning) and a sort (to order each partition for the merge). When both tables are bucketed on the join key with identical bucket counts, the shuffle is skipped because Partitioning already aligns. When both tables are also sorted (bucketBy + sortBy) on the same key, the sort step is also skipped because the data is already ordered within each bucket. The join reads co-located, pre-sorted buckets and merges directly — zero shuffle, zero sort.",
+    "fj": "Bucketing is just another name for partitionBy on write.",
+    "fs": "partitionBy creates Hive directories for partition pruning; bucketing creates fixed-count hash-Partitioning in the metastore so a matching join skips both the shuffle (aligned Partitioning) and the sort (pre-sorted buckets with sortBy). They serve different optimizations.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Bucketing: shuffle-free + sort-free join",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "(orders.write",
+          "  .bucketBy(256, 'cust_id')  # Partitioning",
+          "  .sortBy('cust_id')         # sort",
+          "  .saveAsTable('orders_b'))",
+          "# dim table: same bucket count + key",
+          "# join: no Exchange, no Sort in plan"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does the bucket count have to match exactly for the Partitioning to align?",
+        "a": "The shuffle-skip works because Spark knows row X with key K was written to bucket hash(K) % N. For two tables to be co-partitioned, both must use the same N. If one has 256 buckets and the other 512, a row with key K is in different bucket numbers — the Partitioning doesn't align and Spark must re-shuffle. Spark 3 supports coalesceBucketsInJoin when one count is a multiple of the other."
+      },
+      {
+        "q": "What is coalesceBucketsInJoin and when is it useful?",
+        "a": "coalesceBucketsInJoin (spark.sql.bucketing.coalesceBucketsInJoin.enabled) lets Spark join two tables whose bucket counts are multiples of each other by reading the larger-bucket table in N/M groups. This avoids a full re-shuffle when the counts are compatible multiples, while still taking advantage of bucket-aligned Partitioning — a partial but meaningful optimization for tables where exact count matching isn't possible."
+      }
+    ]
+  },
+  {
+    "q": "What is partition skew, how do you measure it quantitatively, and which three techniques fix it?",
+    "a": "Partition skew is uneven data distribution across Spark partitions — some partitions hold far more rows or bytes than others, causing a few long-running tasks that stall the whole stage. Measure it in the Spark UI Stage Detail by comparing the max task input size to the median; skew is severe when max exceeds 5-10× median, and you can confirm the hot key by running a groupBy-count on the join or groupBy column ordered descending. Fix 1: broadcast the smaller join side to eliminate the shuffle entirely and avoid the skewed Partitioning. Fix 2: salt the hot key by appending a random bucket number on the large side and exploding the small side N times so the skewed Partitioning spreads across N partitions. Fix 3: enable AQE skew-join (spark.sql.adaptive.skewJoin.enabled) which automatically detects oversized shuffle Partitioning and splits them post-map without code changes.",
+    "fj": "Adding more executors or more memory fixes a slow task from skew.",
+    "fs": "Skew is one huge Partitioning on one executor — more resources don't help because the bottleneck is a single partition. I confirm the hot key, then choose broadcast/salting/AQE based on size and runtime constraints.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Measure skew in the hot key",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "from pyspark.sql import functions as F",
+          "# identify hot-key Partitioning imbalance",
+          "(df.groupBy('join_key').count()",
+          "  .orderBy(F.desc('count'))",
+          "  .show(10))",
+          "# null or a mega-tenant dominates?"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What specifically makes null join keys worse for Partitioning skew than other hot keys?",
+        "a": "hash(null) % N is typically 0 or a deterministic fixed bucket — every null key across the entire dataset lands in the same partition. In a large fact table with many nulls, one Partitioning absorbs all of them. The fix is to filter nulls before the join, or map nulls to random unique values (since null != null, they won't match anyway) to spread the Partitioning load."
+      },
+      {
+        "q": "When should you prefer manual salting over AQE skew-join for Partitioning skew?",
+        "a": "AQE skew-join has a bounded split cap (maxSplits=5 by default) and only applies to sort-merge joins. For extreme Partitioning imbalance (one key 100× the median), AQE's five splits may not be enough. For groupBy skew (not a join), AQE skew-join doesn't apply at all — you need two-phase aggregation with manual salting. Manual salting also gives explicit control over the spread factor N."
+      }
+    ]
+  },
+  {
+    "q": "How does Dynamic Partition Pruning use broadcast-join Partitioning to cut fact-table I/O at runtime?",
+    "a": "Dynamic Partition Pruning (DPP) addresses the case where a query filter targets a dimension table but the actual partition keys to prune on the fact table are unknown until the dimension is scanned. Spark evaluates the dimension filter at runtime, collects the matching join-key set, and injects it as a dynamic filter on the fact table's Partitioning directories — effectively the same shuffle as a broadcast join but applied as a partition prune. DPP fires only when the fact table is physically partitioned on the join key (so there are directories to prune), the dimension side is broadcastable (below autoBroadcastJoinThreshold), and spark.sql.optimizer.dynamicPartitionPruning is on. The result is that a query like 'sales WHERE region.country = US' can skip 95% of the sales Partitioning directories without touching those files.",
+    "fj": "DPP is just another name for partition pruning — they both filter directories.",
+    "fs": "Static partition pruning uses query-text literals to prune Partitioning directories before execution. DPP derives the filter values at runtime from the joined dimension table's broadcast, pushing a dynamic predicate onto the fact Partitioning layout — no literal needed, but requires a broadcastable dimension and fact Partitioning on the join key.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "DPP in a star-schema query",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "# fact is PARTITIONED by region_id",
+          "# dim.country = 'US' filters dim at runtime",
+          "# DPP injects region_ids matching US",
+          "# into the fact Partitioning scan",
+          "(fact.join(dim, 'region_id')",
+          "  .filter(dim.country == 'US')",
+          "  .groupBy('product').sum('revenue'))"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you verify in df.explain that DPP actually pruned Partitioning directories?",
+        "a": "In explain('formatted'), the fact-table Scan node's PartitionFilters line will contain a dynamicpruning# reference or SubqueryBroadcast annotation rather than a literal value. This confirms DPP is active. If PartitionFilters shows only static literals (or is absent), DPP didn't fire — check that the fact is partitioned on the join key and the dimension is below the broadcast threshold."
+      },
+      {
+        "q": "Why must the fact table be physically partitioned on the join key for DPP to prune Partitioning?",
+        "a": "DPP prunes at the directory level using Hive-style Partitioning layout. If the fact table is not partitioned on the join key, there are no directories to skip — every file must be opened regardless. DPP can't use Parquet row-group statistics for the pruning; it specifically needs the physical directory-level Partitioning that partitionBy creates at write time."
+      }
+    ]
+  },
+  {
+    "q": "Your team runs 50 Spark pipelines on a shared EMR cluster. Three high-SLA jobs keep getting starved. How do you architect multi-tenant cluster resource isolation?",
+    "a": "Start by replacing the default FIFO scheduler with the YARN Fair Scheduler or Capacity Scheduler. Create dedicated queues per SLA tier — a high-priority queue with a guaranteed capacity floor (e.g., 40% of cluster) and preemption enabled, a standard queue at 50%, and a burst queue that borrows idle capacity. Assign each pipeline to the right queue via spark.yarn.queue. Inside the application, enable dynamic allocation with per-queue maxExecutors to cap tenant blast radius. For truly latency-sensitive jobs, consider dedicated small clusters for the SLA-critical workloads and a shared cluster for batch, rather than fighting queue preemption. On Databricks, this maps to dedicated High-Concurrency clusters or Cluster Policies that set executor caps and autopilot bounds per team. Track queue utilization in the YARN timeline or Ganglia and rebalance capacity weights quarterly.",
+    "fj": "I'd just give the SLA jobs more executors.",
+    "fs": "More executors on a shared cluster starve other tenants even more. I'd use Fair/Capacity Scheduler queues with guaranteed floors and preemption so SLA jobs are first-class without monopolizing resources.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is YARN preemption and what are the risks of enabling it?",
+        "a": "Preemption lets the scheduler kill tasks from lower-priority queues and return their containers to a higher-priority queue that is below its guaranteed capacity. Risk: preempted tasks lose progress and must be recomputed — for shuffle-heavy jobs this can be expensive. Mitigate by setting a preemption grace period and enabling the external shuffle service so preempted containers don't lose shuffle data."
+      },
+      {
+        "q": "When would you recommend dedicated clusters over queue-based multi-tenancy?",
+        "a": "When the SLA job has strict latency guarantees that can't tolerate preemption delays, or when it requires specialized instance types (GPU, high-memory) that don't make sense cluster-wide. Dedicated clusters eliminate noisy-neighbor effects entirely at the cost of higher idle resource waste. The breakeven depends on job frequency — a 24/7 SLA job almost always warrants its own cluster."
+      },
+      {
+        "q": "How do you prevent a single runaway Spark application from consuming the whole queue?",
+        "a": "Set spark.dynamicAllocation.maxExecutors at the application level and enforce per-application limits in the queue policy. On EMR, use Instance Fleet max limits or Managed Scaling bounds. On Databricks, Cluster Policies can cap max_workers and pin autoscaling ranges per team. Combine with a hard wallclock timeout (spark.network.timeout or cluster auto-termination) so hung applications release resources automatically."
+      }
+    ]
+  },
+  {
+    "q": "A 10 TB daily Spark shuffle job costs $800/day on EMR. Walk me through a cost-reduction engagement without sacrificing SLA.",
+    "a": "Start with a profiling pass: pull the Spark History Server for each job and record shuffle write size, spill volume, stage durations, and executor utilization. Common wins in order of impact: (1) Enable AQE — coalesce over-partitioned shuffles and auto-broadcast small sides; often cuts shuffle size 30-50% with one config change. (2) Right-size executors — over-provisioned memory wastes Spot instance cost; target 75-85% executor memory utilization. (3) Switch on-demand drivers to Spot with a fallback strategy; driver failure rate is very low and a Spot interruption just replays from the checkpoint. (4) Use Spot Instances for executors with Instance Fleet diversification across 3+ instance types to reduce interruption risk. (5) Rewrite Python UDFs to native SQL functions to reduce CPU time. (6) Schedule non-SLA jobs in off-peak windows where Spot prices are 40-70% cheaper. After each change, measure wall-clock time × instance-cost to confirm the dollar delta, not just runtime.",
+    "fj": "I'd just switch everything to Spot Instances.",
+    "fs": "Spot alone cuts unit cost but doesn't fix over-shuffling or over-provisioning. I'd profile first — AQE and executor right-sizing often cut cost 30-50% before touching instance pricing.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "AQE + right-size: one-pass config",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "a = 'spark.sql.adaptive.'",
+          "conf = {",
+          "  a+'enabled': 'true',",
+          "  a+'coalescePartitions.enabled': 'true',",
+          "  # target 256 MB post-shuffle partitions",
+          "  a+'advisoryPartitionSizeInBytes': '268435456',",
+          "  'spark.executor.memory': '6g',",
+          "  'spark.executor.cores': '4'",
+          "}"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you quantify the cost of a Spark shuffle vs compute?",
+        "a": "Shuffle cost has two components: network I/O (billed in data transfer within a VPC it's often free, between AZs it's not) and the extra CPU/memory time to write, transfer, and read shuffle data. The practical metric is shuffle write bytes in the Spark UI × hours of stalled tasks. Reducing shuffle size with AQE or salting cuts both the I/O and the executor-hours needed."
+      },
+      {
+        "q": "What is EMR Managed Scaling and how does it reduce cost vs fixed cluster sizing?",
+        "a": "Managed Scaling lets EMR automatically add and remove instances between MinCapacity and MaxCapacity based on YARN pending-container demand. It's more cost-efficient than a fixed cluster because off-peak hours scale down to MinCapacity. The key parameter is MaximumOnDemandCapacityUnits — keep core nodes On-Demand for shuffle data stability and let task nodes be Spot. Managed Scaling reacts faster than manual dynamic allocation because it operates at the YARN layer."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a healthy SLA and alerting framework for production Spark pipelines at a company running 200+ daily jobs?",
+    "a": "Define SLAs at three levels: data-availability SLA (table X ready by 08:00 UTC), job-duration SLA (P95 runtime ≤ 90 min), and data-quality SLA (row count within 5% of yesterday). Instrument each level separately. For duration: emit job start/end events to a monitoring system (Datadog, CloudWatch) and alert when the P95 exponentially weighted moving average exceeds the threshold. For data availability: use the orchestrator's (Airflow, dbt) success callback to write a sentinel value to a status table; downstream consumers check that sentinel before processing. For data quality: run a lightweight Great Expectations or dbt test suite in the DAG after each write. Tie escalation to oncall using PagerDuty with severity tiers: data-quality warning = Slack only, job >2× P95 = oncall, data unavailable by hard deadline = immediate page. Review SLA hit rate monthly and tighten thresholds as the pipeline matures.",
+    "fj": "I'd set up an alert when the job fails.",
+    "fs": "A failure alert is table stakes. I'd add three SLA tiers — duration P95, data availability by deadline, and quality row-count bounds — with distinct escalation paths so the oncall gets actionable context, not just 'job failed'.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle SLA misses that are caused by upstream data lateness rather than your pipeline?",
+        "a": "Instrument upstream table availability with the same sentinel pattern. When your pipeline detects missing upstream data by its expected arrival time, it should page the upstream team and surface a 'waiting for upstream' status rather than a generic failure. Separate the oncall alert into 'pipeline failure' vs 'upstream late' categories so the right team is paged. Include the upstream SLA in the dependency graph so the orchestrator shows the causal chain."
+      },
+      {
+        "q": "What metrics beyond job duration and failure rate signal a degrading Spark pipeline?",
+        "a": "Track shuffle write bytes per job over time (increasing shuffle size without more data suggests skew or plan regressions), GC time percentage (rising GC means memory pressure creep), spill volume (should be near zero for a tuned job), and input-to-output row ratio (large deviations flag upstream schema changes). A P95 duration trend chart often reveals slow degradation weeks before an SLA miss."
+      }
+    ]
+  },
+  {
+    "q": "Build vs buy: when do you choose EMR, Databricks, or Glue for a new Spark workload, and what are the decision criteria?",
+    "a": "Glue is the right choice when the team has no Spark expertise and the workload is simple ETL with moderate data volumes; it eliminates cluster management entirely but caps at a fixed DPU abstraction, costs more per compute unit than EMR, and limits fine-grained Spark tuning. EMR is the right choice when you need full control over Spark configuration, custom libraries, specific instance types, or cost optimization below Databricks pricing; it requires cluster management expertise and more operational overhead. Databricks is the right choice when developer productivity, collaborative notebooks, Delta Lake deep integration, Unity Catalog governance, and managed MLflow are worth the premium; it abstracts cluster ops and provides the best Spark ecosystem tooling as of early 2026 but costs 2-4× EMR at similar compute. The decision matrix: budget-constrained + ops team = EMR; productivity-first + unified analytics = Databricks; no-ops + simple ETL = Glue. A hybrid is common: Databricks for data science and complex pipelines, EMR or Glue for simple scheduled ingestion.",
+    "fj": "Databricks is always the best Spark platform.",
+    "fs": "Databricks is the best developer experience but at a significant cost premium. The right answer depends on team expertise, workload complexity, budget, and whether Delta Lake / Unity Catalog features justify the multiplier over EMR.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What are the hidden operational costs of self-managed EMR that Databricks pricing absorbs?",
+        "a": "EMR requires engineers to manage: cluster bootstrap scripts, AMI patching, Spark version upgrades, autoscaling configuration, Spot interruption handling, cluster security (IAM roles, VPC, KMS), and the shuffle service. Databricks absorbs all of these in the platform. A rough rule of thumb: one dedicated platform engineer per 20 EMR clusters, whose fully-loaded cost can exceed the Databricks price premium at medium scale."
+      },
+      {
+        "q": "When is AWS Glue a better choice than EMR for an ETL job?",
+        "a": "Glue wins when: (1) the team has no Spark ops experience and can't afford to learn EMR cluster management; (2) the workload is low-frequency scheduled ETL with modest data volumes where per-DPU Glue pricing is acceptable; (3) you need tight AWS Glue Data Catalog integration without extra setup. Glue loses when you need fine Spark tuning, custom JARs, GPU instances, or cost efficiency at scale — at high DPU-hours, EMR is materially cheaper."
+      }
+    ]
+  },
+  {
+    "q": "Your org's Spark jobs are collectively failing to meet reliability targets: 3% weekly job failure rate, 8% late-data rate. How do you run a reliability improvement program?",
+    "a": "First instrument before acting: build a job-level failure taxonomy (OOM, shuffle fetch failure, straggler timeout, upstream data missing, code bug). Pull 30 days of Spark History Server + orchestrator logs and classify failures. In my experience, 60-70% of Spark failures fall into three buckets: executor OOM (fix: partition tuning, memory right-sizing), shuffle fetch failures (fix: retry configs, external shuffle service), and straggler timeouts (fix: AQE skew join, speculative execution). Prioritize the top failure mode and run a dedicated sprint. For late-data: identify the 5 longest pipelines and check if they're I/O-bound (fix: columnar format, partition pruning), shuffle-bound (fix: AQE, salting), or blocked on upstream (fix: upstream SLA or async dependency). Set a measurable target for each quarter (3% → 1.5% failure rate, 8% → 3% late rate) and track weekly. Build a runbook for each failure class so on-call engineers have a playbook instead of escalating to senior engineers each time.",
+    "fj": "I'd ask each team to fix their own failing jobs.",
+    "fs": "Ad-hoc per-team fixes don't move the org-wide metric. I'd classify failures by root cause across all jobs, find the 2-3 dominant failure patterns, and run a targeted org-wide fix program with measurable quarterly targets.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you get engineers to prioritize reliability work over feature development?",
+        "a": "Make reliability costs visible and painful: publish a weekly dashboard showing per-team failure rates and SLA miss costs in dollars (compute wasted on retries, data analyst hours lost waiting on late data). Tie reliability targets to team OKRs and include them in quarterly reviews. When engineers see that 3% failure rate = $50K/quarter in wasted compute, the prioritization conversation changes. Bottom-up culture fixes: dedicated reliability office hours, shared runbooks, blameless postmortems."
+      },
+      {
+        "q": "What is a shuffle fetch failure and how do you fix it at scale?",
+        "a": "A shuffle fetch failure occurs when a reduce task can't retrieve its shuffle partition from the map executor — either the map executor died, its local disk filled, or the network timed out. At scale these are common on spot-heavy clusters. Fixes: enable the external shuffle service (map output survives executor loss), tune spark.network.timeout and spark.reducer.maxReqsInFlight for congested clusters, and enable dynamic allocation with shuffle tracking so map executors holding live shuffle data aren't prematurely released."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a shuffle-minimization strategy for a Spark pipeline that joins five large tables daily at petabyte scale?",
+    "a": "Shuffle is the dominant cost in multi-join pipelines at petabyte scale; the strategy is to push every possible shuffle elimination to write time rather than read time. Step 1: bucket all frequently joined large tables on their join keys with identical bucket counts (e.g., 512 buckets on cust_id) and persist with sortBy — this makes the join shuffle-free and sort-free. Step 2: partition tables by the date column so each daily run reads only the current partition — DPP and partition pruning eliminate irrelevant data before it enters the Spark plan. Step 3: sequence joins to reduce intermediate size: start with the smallest-to-largest join ordering and apply selective filters before each join so the shuffled side is as small as possible. Step 4: enable AQE for the joins that remain, especially skewJoin for any mega-tenant key. Step 5: materialize expensive intermediate joins as Delta or Parquet tables with checkpointing so downstream pipelines can reuse them without recomputing. Measure success as total shuffle write bytes per run, not job duration alone, since shuffle bytes directly determines cost and reliability on large clusters.",
+    "fj": "I'd run all five joins in one Spark SQL query and let Catalyst optimize it.",
+    "fs": "Catalyst can't eliminate shuffles it doesn't know about at write time. I'd bucket the large tables on their join keys at write time so daily joins skip the shuffle entirely — Catalyst optimization is then on top of an already-efficient physical layout.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Bucket at write to eliminate daily join shuffle",
+        "lang": "pyspark",
+        "accent": "fix",
+        "lines": [
+          "# Write once, join shuffle-free every day",
+          "(orders.write",
+          "  .bucketBy(512, 'cust_id')",
+          "  .sortBy('cust_id')",
+          "  .partitionBy('dt')",
+          "  .saveAsTable('orders_bucketed'))",
+          "# Same for customers table:",
+          "# bucketBy(512,'cust_id').sortBy('cust_id')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens to the bucketed join optimization when the upstream table is rewritten with a different bucket count?",
+        "a": "The bucket co-partitioning breaks silently — Spark will fall back to a sort-merge join with a full shuffle rather than erroring. You'd only notice via a plan regression: the Exchange node reappears in explain(). To prevent this, treat bucket counts as a schema contract: document them in your data catalog, enforce them via CI tests that assert bucket count in the metastore metadata, and version bucket counts as part of any breaking schema change process."
+      },
+      {
+        "q": "How do you handle the case where two of the five tables can't be bucketed because they're owned by another team?",
+        "a": "For tables you don't control, fall back to the next-best strategies: if the table is small enough after filtering, use a broadcast join. If it's large, push for bucketing via a platform working group. As a stopgap, materialize a filtered and repartitioned version of the external table into your team's storage with your preferred bucket layout — a derived table that you control. This is extra storage cost but buys the shuffle elimination until the upstream team can adopt the standard."
+      }
+    ]
+  },
+  {
+    "q": "Your company's data compute bill is $4M/year, 60% on Spark. The CFO wants a 30% reduction in 18 months. What is your FinOps strategy for Spark at scale?",
+    "a": "A 30% reduction on a $2.4M Spark bill means saving $720K. I'd structure this as four levers: (1) Compute efficiency: AQE enablement org-wide, executor right-sizing using a 2-week profiling sprint with Ganglia/Datadog — over-provisioning typically accounts for 20-30% of compute cost. (2) Spot strategy: enforce Spot for all non-SLA task nodes with Instance Fleet diversification; typically saves 60-70% on those nodes. On a cluster that's 70% task nodes, this alone is 40-50% of compute cost × 60% savings = 25-30% total reduction. (3) Scheduling optimization: shift batch pipelines to off-peak windows (02:00-06:00 UTC) where Spot prices are 20-40% lower. (4) Workload right-sizing: decommission redundant pipelines (a 90-day no-read audit of output tables typically finds 15-20% zombie pipelines). Track unit cost as $/TB processed (not $/job) so teams see efficiency, not just absolute spend. Review monthly with a per-team cost dashboard.",
+    "fj": "I'd migrate everything to Spot Instances.",
+    "fs": "Spot alone gets 10-15% of the way there. The real levers are compute efficiency (AQE + right-sizing), Spot strategy, off-peak scheduling, and decommissioning zombie pipelines — structured as a program with measurable unit costs, not a one-time switch.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What is a unit cost metric for Spark and why is it better than absolute cost?",
+        "a": "A unit cost like $/TB processed or $/1000 rows normalizes for business growth — if data volume doubles, absolute cost will too even if efficiency improves. Unit cost reveals whether engineering improvements are actually making the system more efficient. A team that reduced $/TB by 40% even as total volume grew 2× has done well; absolute cost trending up alone would mask that improvement."
+      },
+      {
+        "q": "How do you run a zombie pipeline audit?",
+        "a": "Query your data catalog or Glue Data Catalog for tables with last_modified older than 90 days. Cross-reference with read access logs (S3 access logs, Lake Formation audit logs) to find tables no one has queried in 90 days. For each zombie table, notify the owning team and set a 30-day decommission window. Automate the detection with a monthly dbt test or Lambda that flags and tags zombie tables. This typically recovers 15-20% of compute cost at mature data platforms."
+      },
+      {
+        "q": "What governance mechanisms prevent the compute bill from growing back after a FinOps program?",
+        "a": "Cost budgets per team with automated Slack alerts at 80% and 100% of monthly budget. Required cost estimates in the RFC template for any new pipeline. Mandatory AQE + right-sizing config in the org's standard Spark job template so new jobs are efficient by default. Quarterly FinOps reviews that publish per-team unit costs. Without structural guardrails, Spark spending grows back within a year as new pipelines are added without efficiency discipline."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate whether to bet the org's big-data compute strategy on Spark vs Trino/DuckDB/Flink over a 3-year horizon?",
+    "a": "Frame it as a workload-fit matrix, not a winner-takes-all decision. As of early 2026: Spark is the right long-term bet for large-scale batch ETL, ML feature engineering, and unified batch+streaming — its ecosystem depth (Delta Lake, MLlib, Structured Streaming, broad cloud managed options) is unmatched. Trino is the right bet for interactive ad-hoc SQL at low latency — it's a query engine, not a processing engine, and has no streaming story. DuckDB is the right bet for single-node analytical workloads, embedded analytics, and developer-local data exploration — it's not a distributed system and won't replace Spark at multi-TB scale. Flink is the right bet for true low-latency streaming (sub-second event processing, CEP, stateful stream-to-stream joins) where Spark Structured Streaming's micro-batch latency (seconds) is unacceptable. The pragmatic 3-year architecture: Spark for ETL + ML, Trino for BI/ad-hoc on the same data lake, DuckDB for local dev and small-team analytics, Flink for real-time event pipelines. Avoid rebuilding all pipelines on a new engine based on benchmark hype — migration cost is almost always underestimated 3-5×.",
+    "fj": "I'd consolidate everything on Spark because it's the most popular.",
+    "fs": "Spark is the best ETL/ML engine but it's a poor fit for sub-second streaming (Flink wins) and interactive BI queries (Trino wins). I'd use a fit-for-purpose portfolio rather than forcing one engine on all workloads.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What are the leading indicators that a company's Spark bet is technically sound for the next 3 years?",
+        "a": "Apache Spark's velocity remains high: Spark 4.0 (expected 2025-2026) brings a revamped Python-first API (PySpark on Spark Connect), improved structured streaming exactly-once guarantees, and deeper Arrow integration. Databricks continues heavy investment. Delta Lake is the de-facto open table format for Spark. Cloud providers (AWS EMR, Azure Synapse, GCP Dataproc) are all deepening Spark managed offerings. The risk factors are cost (Databricks premium) and the rise of DuckDB-style single-node engines eating into small-scale use cases."
+      },
+      {
+        "q": "How do you make the Flink vs Spark Structured Streaming decision for a new real-time pipeline?",
+        "a": "The primary decision axis is latency: if end-to-end latency under 1 second is a hard requirement, Spark Structured Streaming's micro-batch model (minimum ~100ms trigger, practical seconds of latency) can't meet it — use Flink. If latency of 5-30 seconds is acceptable, Spark is the safer operational bet because your team likely already knows it. Secondary factors: Flink has richer CEP (complex event processing) and finer-grained state management; Spark has better SQL compatibility and a larger talent pool. Operational maturity of Flink at your org is a real factor — running Flink in production requires different expertise than Spark."
+      }
+    ]
+  },
+  {
+    "q": "You are the Principal engineer responsible for Spark platform strategy at a company that processes 5 PB/month. How do you govern the platform to prevent entropy over 3 years?",
+    "a": "Platform entropy in Spark manifests as: incompatible Spark versions across teams, proliferation of custom clusters with idiosyncratic configs, no shared libraries (every team re-implements the same ETL patterns), and compute cost creep. Counter it with four governance pillars. (1) Standardized platform tier: maintain 2 blessed Spark versions (current + previous LTS), enforce upgrades on a 12-month cycle, retire older versions with a hard cutoff. (2) Golden job template: a versioned org-standard Spark config that encodes AQE, right-sizing, external shuffle service, and observability defaults — new jobs start from this template, not from scratch. (3) Shared library monorepo: common reader/writer abstractions, SLA helper utilities, and Great Expectations wrappers — distributed as an internal PyPI package. (4) Platform review board: any team adding a new Spark cluster or major pipeline must pass a lightweight RFC review (cost estimate, SLA definition, failure taxonomy). Track platform health via a quarterly scorecard: version adoption rate, golden-template adoption %, average $/TB, and SLA hit rate. The goal is that a new engineer onboarding can ship a production pipeline in 1 day using the template without needing a senior review.",
+    "fj": "I'd write a detailed style guide for Spark usage.",
+    "fs": "A style guide no one reads doesn't prevent entropy. I'd enforce it structurally: a golden job template that's the default, a shared library that makes the right thing easy, and a platform review that catches anti-patterns before they hit production — with quarterly scorecards to measure adoption.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you manage Spark version upgrades at an org running 200 pipelines without a big-bang cutover?",
+        "a": "Run the new Spark version in shadow mode on a separate cluster pool for 4 weeks, replaying production workloads and comparing results. Migrate pipelines in three cohorts: a volunteer early adopter group (weeks 1-4), a bulk migration of standard pipelines (weeks 5-12), and a long-tail cleanup of edge cases (weeks 13-20). Provide a migration validation script that runs the pipeline on both versions and diffs output row counts and schemas. Set a hard cutoff date for the old version so the tail doesn't drag forever — experience shows 20% of pipelines account for 80% of migration friction."
+      },
+      {
+        "q": "What does a golden Spark job template concretely include?",
+        "a": "AQE enabled with sensible defaults (advisoryPartitionSizeInBytes=256 MB, skewJoin enabled), Kryo serialization, external shuffle service configured, dynamic allocation with shuffleTracking, executor memory set to the org's right-sized default (e.g. 8g + 1g overhead, 4 cores), structured logging with job name + run ID in every log line, automatic job tagging for cost attribution, and a mandatory SLA label. The template is a Python class or a Terraform module for cluster provisioning — not a document, but executable code."
+      }
+    ]
   }
 ]

@@ -1260,5 +1260,325 @@
         "a": "Often yes — a B-tree can be scanned backward, so a single-column DESC sort is usually free even on an ASC index. It breaks down with mixed directions, like `ORDER BY c ASC, d DESC`: no single forward/backward scan satisfies both, so you need the index to declare matching `(c ASC, d DESC)` order or the engine adds an explicit sort."
       }
     ]
+  },
+  {
+    "q": "Walk me through how ROWS vs RANGE vs GROUPS frame modes differ, including the new GROUPS clause, and when each changes query results.",
+    "a": "All three control which rows feed the window aggregate relative to the current row. ROWS counts physical rows regardless of value — ROWS BETWEEN 2 PRECEDING AND CURRENT ROW always includes exactly three rows. RANGE treats all peers that share the same ORDER BY value as a single unit, so on a column with duplicates the frame expands unpredictably; it's the default when you write ORDER BY with no frame clause, which is the root of the classic running-total tie bug. GROUPS, added in SQL:2011 and implemented in Postgres 11+ and DuckDB, counts distinct ORDER BY values rather than rows or value ranges — GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW includes the current peer group plus the immediately preceding distinct value group, regardless of how many physical rows are in each. GROUPS is the right tool when you want 'current week plus last week' semantics without a date spine: it collapses ties cleanly while still counting by logical periods. The operational rule: ROWS for precise N-row arithmetic, RANGE for value-based calendar windows, GROUPS when you want N prior distinct-value buckets.",
+    "fj": "ROWS and RANGE are basically the same; I've never heard of GROUPS.",
+    "fs": "ROWS counts physical rows, RANGE expands on value ties (default, often surprising), GROUPS counts distinct ORDER BY value buckets — each gives different answers when ties exist.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "sql",
+        "label": "GROUPS: current + prior peer group",
+        "accent": "fix",
+        "lines": [
+          "SELECT week, revenue,",
+          "  SUM(revenue) OVER (",
+          "    ORDER BY week",
+          "    GROUPS BETWEEN 1 PRECEDING",
+          "           AND CURRENT ROW",
+          "  ) AS two_week_roll",
+          "FROM weekly_revenue;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does the default frame (RANGE UNBOUNDED PRECEDING) give wrong cumulative totals when ORDER BY has ties?",
+        "a": "All peers sharing the same ORDER BY value are in the 'current' range boundary, so every row in a tied group receives the same cumulative total — the sum through the entire group — instead of stepping row by row. That inflates the running total for every row except the last in the group, silently corrupting cumulative metrics."
+      },
+      {
+        "q": "When does RANGE BETWEEN INTERVAL '7 days' PRECEDING AND CURRENT ROW outperform a date-spine join?",
+        "a": "When the source has gaps: rather than pre-generating every calendar date and LEFT JOINing, you let RANGE's value-based frame naturally include only the rows that fall within the 7-day value window. It's one scan, no generated rows, and handles irregular event data directly. The trade-off is it only works when the ORDER BY column is a numeric or date type that supports interval arithmetic — most warehouse dialects support this since SQL Server 2012+ and Postgres 8.4+."
+      }
+    ]
+  },
+  {
+    "q": "Your EXPLAIN shows the planner choosing a nested loop on a million-row join even though a hash join would be cheaper. Why, and how do you fix it?",
+    "a": "The planner chose the nested loop because its row-count estimate for the outer side was far too low — perhaps 50 rows — and at that size nested loop wins. The actual outer cardinality is huge, so the inner side executes a million times instead of once, making the plan catastrophically wrong. The root cause is almost always stale or absent statistics: the table has grown significantly since the last ANALYZE, or there's a complex predicate with many correlated columns that the planner can't model accurately. The diagnostic path is EXPLAIN ANALYZE to see actual vs estimated rows per node, then run ANALYZE on the relevant tables. If stats are fresh and the estimate is still wrong — multi-column correlation, high-skew distributions, or complex expressions — use CREATE STATISTICS to let Postgres model dependencies, extend default_statistics_target for the column, or apply a join hint via pg_hint_plan or, in Snowflake/BigQuery, query hints. As a last resort, materialized CTEs or temp tables force a known row count mid-plan.",
+    "fj": "I'd just bump work_mem and hope for a hash join.",
+    "fs": "The nested loop is a symptom of a wrong row estimate; I diagnose with EXPLAIN ANALYZE, run ANALYZE, and if correlation is the issue, add extended statistics or materialize the mis-estimated intermediate.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "sql",
+        "label": "diagnose and fix stale stats",
+        "accent": "fix",
+        "lines": [
+          "EXPLAIN ANALYZE SELECT ...;",
+          "-- node shows rows=50 actual=1M",
+          "ANALYZE large_table;",
+          "-- still wrong? model correlation:",
+          "CREATE STATISTICS s1",
+          "  ON col_a, col_b",
+          "  FROM large_table;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is pg_hint_plan and what risk does using it introduce?",
+        "a": "pg_hint_plan is a Postgres extension that accepts hints in comment syntax — `/*+ HashJoin(a b) */` — to force join strategies, scan types, or join order. It's a last resort because it bypasses the optimizer entirely: if the data distribution changes or the schema evolves, the hardcoded hint may become actively harmful. Always document why the hint exists and set a review date; use it only after you've confirmed the planner is wrong, not just slower than expected."
+      },
+      {
+        "q": "When would you use a materialized CTE as a plan-fixing technique?",
+        "a": "When the mis-estimated intermediate is referenced once and materializing it gives the optimizer a real row count for subsequent operators. In Postgres 12+ CTEs are inlined by default; adding the MATERIALIZED keyword forces evaluation at that point, emits actual rows to the next operator's plan, and can flip a nested loop to a hash join. It's more surgical than a temp table — stays in one query — but still a workaround for a stats failure."
+      },
+      {
+        "q": "CREATE STATISTICS covers what cases that regular column stats don't?",
+        "a": "Regular per-column histograms assume column independence. CREATE STATISTICS captures three kinds: MCV (most-common-value combinations for highly correlated columns), histograms over expression values, and ndistinct overrides for combination cardinality. Useful when a WHERE clause on (user_type, subscription_status) is vastly over- or under-estimated because the columns are correlated but the planner multiplies their individual selectivities."
+      }
+    ]
+  },
+  {
+    "q": "A recursive CTE over a 10-million-node graph is running out of memory. How do you scale it?",
+    "a": "The first question is whether full traversal is necessary: if you only need depth-limited BFS, cap with a depth counter in the recursive term and add AND depth < N to the recursive join. If cycle detection via a path array is the memory villain — carrying an ever-growing array per row — switch to the SQL:2011 CYCLE clause (Postgres 14+) which uses a compact bit field internally. For very deep or wide graphs, recursive CTEs fundamentally buffer the working set in memory at each iteration. The production solutions are: iterative BFS using a temp table swapped each iteration (insert next frontier, truncate prior), which keeps memory to one frontier at a time; moving the traversal out of SQL into a graph-native store (Apache AGE, Neo4j, or the graph layer of your warehouse); or pre-computing adjacency levels as a materialized hierarchy table maintained incrementally on write. In Snowflake, the recursive CTE implementation caps at 500 iterations and 10 GB by default — awareness of warehouse-specific limits is part of the Sr answer.",
+    "fj": "I'd raise max_recursion_depth and let it run.",
+    "fs": "Recursive CTEs buffer every iteration in memory; for large graphs I switch to iterative BFS with a temp table, add CYCLE detection, or pre-materialize the hierarchy.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "sql",
+        "label": "iterative BFS: bounded memory",
+        "accent": "fix",
+        "lines": [
+          "CREATE TEMP TABLE frontier AS",
+          "  SELECT id, 0 AS depth FROM roots;",
+          "-- loop in app layer:",
+          "INSERT INTO frontier",
+          "  SELECT e.id, f.depth+1",
+          "  FROM edges e",
+          "  JOIN frontier f ON f.id=e.src",
+          "  WHERE e.id NOT IN (",
+          "    SELECT id FROM frontier);"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When is a recursive CTE actually fine for large graphs?",
+        "a": "When the graph is a strict tree (no cycles, bounded depth), the working set per iteration is small (narrow frontier), and the result set fits in memory. Org charts up to ~100k nodes, file-system hierarchies, and bill-of-materials trees at 10-15 levels are usually fine. The pattern breaks on wide social graphs, dense dependency nets, or unbounded depth."
+      },
+      {
+        "q": "How does materialized hierarchy (closure table) change the query?",
+        "a": "A closure table pre-computes all ancestor-descendant pairs with their path lengths, so querying 'all descendants of node X at any depth' becomes a simple equi-join — O(result size) not O(graph traversal). Write cost: every insert/move triggers a batch insert of new ancestor pairs. It's the right trade when reads are frequent and hierarchy mutations are infrequent."
+      }
+    ]
+  },
+  {
+    "q": "How do you approach index design differently for OLTP vs OLAP workloads, and what changes when you're on a columnar warehouse?",
+    "a": "For OLTP, the access pattern is random single-row or narrow-range reads and frequent writes, so I invest in B-tree indexes on join keys and high-selectivity filter columns, use covering indexes for the hottest read paths, keep index count low on write-heavy tables to minimize write amplification, and enforce uniqueness constraints as indexes. For OLAP the access pattern is large scans over a subset of columns across billions of rows, so B-trees are nearly useless — the cost of per-row index lookups exceeds a full sequential scan at OLAP scale. Columnar warehouses like Snowflake, BigQuery, and Redshift don't have B-trees at all. Instead I choose clustering/sort keys aligned to the most common filter dimensions so the engine's micro-partition or zone-map pruning skips large swaths of data. Partition elimination is the OLAP equivalent of an index seek. I also watch out for low-cardinality clustering keys (like a boolean) that don't prune well, and avoid over-clustering on too many columns which kills write throughput without proportional read benefit.",
+    "fj": "Add indexes on the filter columns and it'll be fine for any workload.",
+    "fs": "OLTP: B-tree indexes, covering indexes, low count on write-hot tables. OLAP: B-trees don't scale; use clustering keys and partition pruning — that's the columnar equivalent of an index seek.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Snowflake says a query is scanning 100% of micro-partitions. What does that tell you and what do you investigate?",
+        "a": "The filter columns aren't in the clustering key (or the table is unclustered), so Snowflake can't use zone-map pruning and must read every micro-partition. Investigate: check SYSTEM$CLUSTERING_INFORMATION to see if the table has a useful clustering key and whether the data is clustered. If not, ALTER TABLE ... CLUSTER BY the most-filtered dimension and let Snowflake's automatic clustering service re-cluster. Also check if the filter value is highly selective — low-cardinality filters will always scan broadly regardless."
+      },
+      {
+        "q": "How does a Redshift sort key differ from a Snowflake clustering key?",
+        "a": "Redshift sorts data on load by the sort key, so zone map pruning kicks in for range filters on that key; it doesn't re-sort automatically and a 'vacuumed' SORT is needed periodically after DML. Snowflake's clustering key is maintained continuously by a background service without manual vacuuming, but each cluster operation costs credits. Conceptually both achieve similar zone-map pruning; the operational model differs significantly."
+      }
+    ]
+  },
+  {
+    "q": "You catch a query returning wrong totals due to a window frame default. How do you audit an entire codebase for this class of bug?",
+    "a": "The bug is window aggregates with an ORDER BY clause and no explicit frame specification — the SQL standard defaults to RANGE UNBOUNDED PRECEDING AND CURRENT ROW, which ties duplicate sort-key values into the same boundary and inflates running totals. The audit approach: grep or AST-parse all SQL files and dbt model files for OVER (ORDER BY without a ROWS or RANGE or GROUPS frame keyword following. In dbt projects I write a custom linting macro that queries information_schema.views and scans compiled SQL for the pattern. For each hit I check whether the ORDER BY column can have duplicates in practice — unique keys are safe, timestamps or dates typically aren't. I then add ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW explicitly, add a unique tiebreaker to the ORDER BY, or document that RANGE is intentional. I add the pattern to a CI lint rule so it can't silently re-enter the codebase.",
+    "fj": "I'd just review queries manually if someone reports wrong numbers.",
+    "fs": "I grep for OVER (ORDER BY without an explicit frame, triage each hit for potential duplicate sort keys, fix with ROWS + tiebreaker, and gate the pattern in CI linting.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "sql",
+        "label": "pattern to grep and fix",
+        "accent": "fix",
+        "lines": [
+          "-- risky (default RANGE frame):",
+          "SUM(x) OVER (ORDER BY day)",
+          "-- safe (explicit ROWS + tiebreaker):",
+          "SUM(x) OVER (",
+          "  ORDER BY day, id",
+          "  ROWS BETWEEN UNBOUNDED",
+          "  PRECEDING AND CURRENT ROW)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you prevent this class of bug from re-entering the codebase?",
+        "a": "Add a custom dbt test or SQLFluff rule that parses compiled SQL ASTs and flags OVER clauses with ORDER BY but no frame. Wire it into the CI pipeline so PRs fail on the pattern. Supplement with a linting pre-commit hook for raw SQL files. Document the rule and rationale in the team's SQL style guide so engineers understand why."
+      },
+      {
+        "q": "QUALIFY in Snowflake and BigQuery eliminates an outer CTE — does it change the window frame behavior?",
+        "a": "No — QUALIFY is purely syntactic sugar for filtering on a window function result without a wrapping CTE. The window frame default is exactly the same: RANGE UNBOUNDED PRECEDING when you omit the frame with ORDER BY. You still need an explicit ROWS frame or QUALIFY ROW_NUMBER for rank-based dedup to be safe against tie bugs."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern SQL query quality across a data platform team of 15+ engineers — style, patterns, review process, and performance standards?",
+    "a": "Governance at team scale needs automation over manual review, because humans miss consistent patterns under PR pressure. My three pillars are: automated linting in CI (SQLFluff with a shared config covering naming, join style, explicit frame clauses, and no SELECT *), query cost gates in Snowflake/BigQuery that fail a PR or alert if an estimated bytes-billed exceeds a threshold, and peer review standards that treat SQL as production code — every model gets a second set of eyes with a focus on grain, join key uniqueness, and NULL handling. Beyond tooling I run a monthly SQL clinic where the team audits one slow or wrong query together, building shared pattern recognition. New patterns go into a team SQL playbook. I also track a small set of leading indicators: P90 query duration by model, bytes-billed per model, and failed dbt test rate, on a dashboard that surfaces regressions before they hit stakeholders.",
+    "fj": "I'd write coding standards in a doc and ask people to follow them.",
+    "fs": "Docs alone don't scale; I combine automated CI linting, cost gates, review standards treating SQL as production code, a monthly clinic, and leading-indicator dashboards to catch regressions early.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle disagreement on a SQL pattern — e.g., whether to use CTEs or temp tables for a specific hot path?",
+        "a": "I run a benchmark with EXPLAIN ANALYZE on representative data, share the numbers in the PR, and let data drive the decision. If there's still disagreement about the general rule, I write an ADR (architecture decision record) documenting the options, tradeoffs, and the decision, so the team has a reference instead of relitigating the same argument quarterly."
+      },
+      {
+        "q": "A new engineer joins and writes non-SARGable predicates in every PR. How do you fix it systemically instead of playing whack-a-mole?",
+        "a": "Add a SQLFluff custom rule that flags function-wrapped column predicates (WHERE YEAR(col) = ..., WHERE UPPER(col) = ...) in CI. Run a one-on-one pairing session using one of their PRs as the teaching example. Add a page to the playbook with the non-SARGable patterns, why they're slow, and the rewritten form. The CI rule catches regressions; the playbook builds understanding."
+      },
+      {
+        "q": "What metrics tell you your SQL governance program is actually working vs just adding friction?",
+        "a": "Leading: reduction in P90 query runtime regressions month-over-month, falling bytes-billed per key dashboard query, lower ratio of dbt test failures in prod vs dev. Lagging: incidents traced to slow or wrong SQL. I also track developer sentiment — if the linter is blocking work more than helping, the rules need calibration. The goal is fewer production surprises, not more process."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate and manage the cost of SQL compute on a cloud warehouse (Snowflake, BigQuery, Redshift) across an analytics organization?",
+    "a": "Cloud warehouse cost is a product of bytes scanned, compute seconds, and storage — each with different levers. My approach starts with visibility: tagging every query by team, model, and job in the query metadata and building a weekly cost-per-team dashboard from the warehouse's query history views (QUERY_HISTORY in Snowflake, INFORMATION_SCHEMA.JOBS in BigQuery). The next layer is prevention: enforcing result caching (immutable queries hit the cache, avoiding recompute), pushing row filters upstream so scans are minimal, and choosing clustering keys aligned to the hottest filter dimensions. For multi-tenant or high-volume platforms I set warehouse auto-suspend to 1 minute on dev warehouses, size them by actual concurrency benchmarks not guesses, and separate workloads by warehouse so a heavy batch job doesn't steal slots from interactive BI users. Chargebacks per team create the right incentives without me playing cost police. In BigQuery specifically I evaluate flat-rate reservations vs on-demand for predictable workloads and slot commitments vs per-query billing.",
+    "fj": "I'd just look at the bill at the end of the month and ask teams to be careful.",
+    "fs": "Visibility (tagged query history dashboard), prevention (caching, pruning, clustering), workload isolation (separate warehouses), and chargebacks per team — month-end bill reviews are too late to steer behavior.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A team's BigQuery bill spikes 10x month-over-month. What's your diagnostic path?",
+        "a": "Query INFORMATION_SCHEMA.JOBS filtered to that team's service account and the spike date range, sorted by total_bytes_billed DESC. Identify the top 5 queries by bytes, check whether they were cached (cache_hit = false is the expensive case), and look at table names to see if a new large table was added. Likely culprits: a new BI dashboard with no date filter querying a multi-year table, a scheduled job that stopped hitting cache because the query text changed, or a new developer running exploratory queries on a full raw table."
+      },
+      {
+        "q": "How do you set warehouse sizing on Snowflake without over-provisioning?",
+        "a": "Baseline with a Small warehouse on a representative query mix, track queuing time and spillage (both visible in QUERY_HISTORY), and upsize only when there's persistent queuing (> 10-20 seconds average wait) or frequent disk spillage. Auto-scaling covers burst; a fixed larger size pays for capacity you use only occasionally. I run a 2-week A/B between sizes on a staging warehouse before committing."
+      },
+      {
+        "q": "When does a flat-rate commitment on BigQuery make sense vs on-demand pricing?",
+        "a": "Flat-rate wins when your bytes-billed is predictable (consistent pipelines, stable BI loads) and you can fully utilize the reserved slots — typically > 60-70% slot utilization on-demand. For bursty or unpredictable workloads, on-demand avoids paying for idle slots. A hybrid model (baseline flat-rate commitment + on-demand overflow) is common for platforms with both steady ETL and ad-hoc analyst queries."
+      }
+    ]
+  },
+  {
+    "q": "Your organization has three teams each defining 'monthly active users' differently in their SQL. How do you resolve and prevent metric inconsistency at platform scale?",
+    "a": "This is a semantic consistency problem, not a SQL problem — and solving it requires both social and technical intervention. On the social side: convene the stakeholders, surface the three definitions, and facilitate agreement on a canonical definition (events that count as 'active', whether trial users are included, how bots are excluded, time-zone handling for the calendar month). Critically, do not let the most senior person's definition win by default — run a count under each definition on the same date range and show the number difference, which forces the conversation to be concrete. On the technical side: encode the canonical definition once in a dbt or LookML semantic layer as a certified metric, mark unofficial usages in BI tools as 'draft', and add a dbt test that the certified MAU model's output is within a tolerance of each team's old definition so regressions surface before publish. Going forward, new metrics go through a definition review before any SQL is written.",
+    "fj": "I'd write the 'correct' definition in the data warehouse and tell teams to use it.",
+    "fs": "Decree doesn't stick without understanding — I surface the number difference under each definition, facilitate stakeholder alignment, encode the agreed definition once in the semantic layer, and test that downstream models don't drift.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does a semantic layer (dbt metrics, Looker LookML) prevent metric drift technically?",
+        "a": "The semantic layer defines a metric once — its aggregation, dimension grain, filter logic, and label — and every consuming query references the definition by name rather than re-implementing it in SQL. When the definition changes (e.g. adding a bot-exclusion filter), it propagates automatically to all consumers. This is structurally different from copying SQL into many models: copies drift independently, definitions in a semantic layer are forced-synchronized."
+      },
+      {
+        "q": "A senior engineer says the semantic layer adds too much abstraction and they prefer direct SQL. How do you handle the pushback?",
+        "a": "Acknowledge the valid tradeoff — semantic layers add a learning curve and can limit query flexibility. Counter with evidence: show two existing models that returned different MAU numbers for the same period, and the stakeholder confusion that followed. Propose a hybrid: semantic layer for certified, cross-team metrics (MAU, revenue, churn); direct SQL remains fine for exploratory or team-local metrics. The goal isn't abstracting all SQL — it's a single source of truth for the numbers that appear in executive decks."
+      }
+    ]
+  },
+  {
+    "q": "How do you approach query performance reviews for a dbt project with 200+ models and a mix of Snowflake and BigQuery targets?",
+    "a": "At 200+ models, manual review is a sampling strategy at best. My systematic approach layers several automated signals before I look at any query manually. First I pull model-level runtime and bytes-billed trend from the warehouse query history, surface the top 10 by absolute cost and the top 10 by week-over-week regression — those are the models worth a human in the loop. Second I run EXPLAIN on the expensive models in dry-run mode (BigQuery supports this via the jobs API) and check for full-table scans on large tables and skipped partition pruning. Third I enforce compile-time rules via SQLFluff in CI: no SELECT *, explicit window frames, no correlated aggregates in the SELECT list, no function-wrapped filter columns. For cross-target (Snowflake + BigQuery) consistency I keep a dialect abstraction in dbt macros — QUALIFY, DATEADD syntax differences — so engineers don't write two model variants. Finally I build a model performance scorecard refreshed nightly: cost, runtime P90, bytes, test pass rate, and a 'no-partition-filter' flag for BigQuery partitioned tables.",
+    "fj": "I'd review the slowest model whenever someone complains.",
+    "fs": "Complaint-driven review is too reactive; I automate cost/runtime trending, run EXPLAIN on top spenders, CI-lint anti-patterns, maintain a cross-dialect macro layer, and publish a nightly scorecard.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle the Snowflake vs BigQuery SQL dialect differences without duplicating model logic?",
+        "a": "dbt's dispatch and adapter macros: define a safe_divide, date_spine, or current_timestamp macro with adapter-specific implementations, and model SQL calls the macro rather than the raw dialect function. For structural differences (QUALIFY vs CTE-filter, GENERATE_SERIES vs UNNEST(SEQUENCE)) I write a macro layer that resolves to the right syntax per target. The test suite runs against both adapters in CI to catch silent divergence."
+      },
+      {
+        "q": "A dbt model's runtime doubled overnight. What's your first diagnostic step?",
+        "a": "Query the warehouse's query history for that model's job yesterday and today — compare bytes_billed, rows_produced, and partitions_scanned. If bytes spiked, a new date of data landed with no partition filter (full scan). If rows spiked but bytes didn't, the upstream table grew proportionally. If neither changed but runtime doubled, look for plan changes: a clustering key maintenance window, new warehouse contention, or stats staleness. All of this takes under 5 minutes with a prepared dashboard query on QUERY_HISTORY."
+      }
+    ]
+  },
+  {
+    "q": "How does two-phase locking work, and what is the difference between optimistic and pessimistic concurrency control in the context of analytics pipelines?",
+    "a": "Two-phase locking (2PL) acquires all locks during a growing phase and releases none until a shrinking phase, guaranteeing serializability by preventing any interleaved conflict. In practice, strict 2PL holds write locks until commit to prevent dirty reads and lost updates. OLTP databases (Postgres, SQL Server) use 2PL variants by default. Pessimistic concurrency assumes conflict is likely and holds locks preemptively — SELECT FOR UPDATE is the explicit form — preventing concurrent modification at the cost of reduced throughput and deadlock risk. Optimistic concurrency assumes conflict is rare: it reads data freely, does work, then validates at commit that nothing changed (compare-and-swap on a version number), retrying on conflict. MVCC (used by Postgres, Oracle, Snowflake) is the standard implementation: each transaction sees a snapshot of committed data at its start time, writers create new row versions instead of overwriting, and conflicts are resolved at commit. For analytics pipelines specifically, the choice matters for incremental loads: a MERGE with optimistic locking is cheap when most source rows are new, but under high concurrent writers you see serialization failures and need a retry loop. Pessimistic locking (advisory locks or explicit table locks) avoids retries at the cost of pipeline serialization.",
+    "fj": "Locking is handled by the database, I just write my queries.",
+    "fs": "2PL holds locks for isolation; MVCC lets readers never block writers via row versioning; for analytics pipelines I choose optimistic (MERGE + retry) vs pessimistic (advisory locks) based on expected conflict rate and retry cost.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is a deadlock, how does it happen, and how do you prevent it in SQL pipelines?",
+        "a": "A deadlock occurs when transaction A holds lock X and waits for Y, while transaction B holds Y and waits for X — a cycle with no exit. Prevention strategies: always acquire locks in a consistent global order (e.g. always lock table A before table B), keep transactions short to reduce lock hold time, and avoid explicit locks when MVCC snapshot isolation suffices. Postgres detects deadlocks automatically and aborts one participant; applications must handle the serialization error and retry."
+      },
+      {
+        "q": "What is a phantom read, which isolation level prevents it, and why does Postgres's REPEATABLE READ actually prevent phantoms too?",
+        "a": "A phantom read is when a transaction re-runs the same range query and gets different rows because another transaction committed inserts in the range between the two reads. Standard REPEATABLE READ (per SQL spec) doesn't prevent phantoms — only SERIALIZABLE does. Postgres implements REPEATABLE READ as snapshot isolation, where each transaction sees a consistent snapshot from its start, so rows inserted after the snapshot are invisible — effectively preventing phantoms even at REPEATABLE READ. This diverges from the SQL standard and is an important nuance when porting queries between engines."
+      }
+    ]
+  },
+  {
+    "q": "Design a SQL-based strategy to ensure analytics correctness across a multi-team data platform — from metric definitions to query validation and incident response.",
+    "a": "Analytics correctness is an organizational property, not a query property, so the strategy has three layers. The first layer is definitional: every certified metric lives in a single semantic layer (dbt metrics / LookML measures), has an owner, a written business definition, and a signed-off SQL implementation. No metric appears in a stakeholder report unless it's been through definition review. The second layer is continuous validation: dbt tests gate every model — not just presence but semantic correctness. Volume tests catch sudden drops (> 20% row change triggers an alert). Cross-model consistency tests assert that MAU from the product events model equals MAU from the billing model within a 0.1% tolerance. Primary key tests prevent fan-out bugs from silent join explosions. These run in CI and in production nightly; failures page the model owner, not a central team, because ownership is the accountability mechanism. The third layer is incident response: maintain a SQL correctness runbook with the ten most common failure modes (fan-out joins, NULL in aggregates, wrong window frame, timezone off-by-one, late-arriving data gap), each with its diagnostic query and known fix. When a stakeholder reports a wrong number, the on-call analyst runs the runbook queries before doing any freeform investigation — it cuts mean time to diagnosis from hours to minutes. Post-incident, every root cause feeds back into a new dbt test or lint rule so it can't recur silently.",
+    "fj": "I'd test queries manually before shipping and fix issues when reported.",
+    "fs": "Manual testing doesn't scale; I layer definitional controls (semantic layer with owners), automated validation (dbt tests with cross-model consistency checks), and structured incident response (runbook + root-cause→test feedback loop).",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you write a cross-model consistency dbt test without coupling the models?",
+        "a": "Use a dbt singular test (a SQL file in tests/) that joins or compares the two model outputs on a shared key and asserts the tolerance: `SELECT * FROM (SELECT abs(a.mau - b.mau) / nullif(a.mau, 0) AS pct_diff FROM model_a a JOIN model_b b ...) WHERE pct_diff > 0.001`. This test lives in the tests/ layer, not in the models themselves, so neither model has a hard dependency on the other. Failing rows represent real inconsistency."
+      },
+      {
+        "q": "A critical metric has been wrong for three weeks before anyone noticed. How do you prevent the same failure mode?",
+        "a": "Three weeks of silence means no automated alert fired and no one looked at a trend. Immediate actions: add a volume and value-range dbt test with a threshold tight enough to catch the observed drift on day one. Add a weekly stakeholder review of leading metrics against a baseline — not the full dashboard, just three or four key numbers against a prior period. Root-cause whether the test was missing or silently failing (test framework misconfiguration), fix that too, and document the gap in the incident retrospective."
+      }
+    ]
+  },
+  {
+    "q": "How should an organization decide between investing in a semantic layer (dbt metrics / Looker LookML / Cube) vs. building bespoke aggregate SQL models for metric delivery?",
+    "a": "The decision is primarily about scale of consumers and rate of metric change, not technical preference. A semantic layer earns its cost when: multiple BI tools or teams query the same metric, the metric definition changes frequently and you need consistent propagation, or you need row-level security and dimension filtering to be applied uniformly regardless of who queries. The cost is real: semantic layers add a learning curve, limit query flexibility, and introduce a new dependency layer to debug and upgrade. Bespoke SQL aggregate models are faster to build for a small number of stable, well-understood metrics, and they're easier for SQL-fluent engineers to debug. My decision framework: if the metric is used in more than two tools or two teams, and it's changed more than once in six months, the fan-out and drift risk makes the semantic layer worth the investment. For exploratory or team-local metrics, bespoke SQL is the right default. The hybrid — a semantic layer for certified cross-team metrics, direct SQL for everything else — is the most practical production answer. When evaluating specific tools: dbt metrics + Metricflow is the right choice if you're already dbt-centric and want SQL-native governance; Looker LookML if BI is Looker-dominated; Cube if you need a server-side API layer for embedding or multi-tool consumption.",
+    "fj": "We should just pick the semantic layer tool everyone is talking about.",
+    "fs": "Semantic layers earn their complexity when a metric is consumed by multiple tools or teams and its definition changes; for stable, team-local metrics, bespoke SQL aggregate models are simpler and faster to build and debug.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What does Metricflow bring that earlier dbt metrics didn't?",
+        "a": "Metricflow introduces a query semantics layer that compiles metric requests into SQL dynamically, supporting dimension-slicing, time granularity changes, and multi-hop joins without re-authoring models. Earlier dbt metrics was a YAML configuration over pre-built dbt models without dynamic query compilation. Metricflow lets you define entities and measures once and the compiler handles the join graph, which is the key step toward genuine semantic completeness rather than a documentation overlay."
+      },
+      {
+        "q": "A stakeholder says 'our metric layer is a black box, I can't trust it.' How do you respond?",
+        "a": "Make the layer transparent: publish the generated SQL for each metric query in a developer-accessible log, add a 'show SQL' feature in the BI tool if possible, and document the metric definition including its canonical SQL in a data catalog. Run a validation by comparing the semantic layer output to a hand-written SQL query for the same metric on the same date range — if they agree, share that comparison. Trust is built by showing the mechanism, not asserting correctness."
+      }
+    ]
+  },
+  {
+    "q": "You're setting the five-year SQL and analytics-compute platform strategy for a 500-person data organization. What bets do you make and why?",
+    "a": "The bets I'd make in early 2026 given current trajectory: First, converge on a single ANSI-compatible warehouse dialect supplemented by dbt as the transformation layer — the multi-warehouse world (Snowflake + BigQuery + Redshift running in parallel) is expensive to govern and creates SQL-dialect fragmentation that no semantic layer fully solves. Pick the primary warehouse based on data residency, pricing model, and ecosystem fit, and migrate secondaries over 18-24 months. Second, invest in a semantic layer with Metricflow-style dynamic compilation rather than static aggregate tables — the static model requires manual updates every time a business dimension changes, which at 500 people becomes a bottleneck. Third, treat SQL correctness as a software engineering discipline: CI-gated testing (dbt tests), semantic contracts for certified metrics, and incident runbooks. This is cultural and tooling together — you can't buy it, only build it. Fourth, plan for AI-assisted SQL to go from novelty to standard developer flow: invest now in a test suite and lint rules robust enough to evaluate AI-generated SQL, because the productivity gain is real but the correctness risk is also real without guardrails. Fifth, do not bet on SQL disappearing — semantic query languages and natural-language interfaces all compile to SQL; the abstraction changes, the compute target does not. Invest in SQL literacy across the engineering and analyst population as a multi-year skill investment.",
+    "fj": "I'd adopt whatever new tools are trending and consolidate later.",
+    "fs": "Converge on one warehouse dialect, invest in a dynamic semantic layer, elevate SQL correctness to an engineering discipline, build guardrails for AI-generated SQL, and invest in SQL literacy — don't bet on SQL disappearing, only on the abstraction layer above it changing.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle the political reality that two teams are deeply invested in different warehouses (Snowflake vs BigQuery)?",
+        "a": "Data sovereignty is real: migration is expensive in time, retraining, and risk. I'd run a structured evaluation with both teams — total cost of ownership, ecosystem fit (existing tooling integrations), SLA requirements, data residency constraints — rather than picking a winner by executive decree. If the evaluation is genuinely close, negotiate a sunset timeline for the secondary platform tied to a business milestone (e.g. when contract renewal comes up) rather than an arbitrary date. The goal is a fact-based decision both teams can accept, not political capitulation."
+      },
+      {
+        "q": "What is your view on whether SQL will remain the dominant query language for analytics over a five-year horizon?",
+        "a": "SQL will remain dominant as the compile target; the question is how many layers of abstraction sit above it. Natural-language query and AI-generated SQL are accelerating, but they all eventually emit SQL to the warehouse. Semantic layers like Metricflow compile to SQL. Even dataframe libraries (Ibis, Polars) translate to SQL when they target a warehouse backend. The five-year bet is that SQL literacy remains critical — perhaps more so, because evaluating AI-generated SQL requires deeper understanding of correctness than writing it from scratch."
+      },
+      {
+        "q": "How do you evaluate and adopt a new warehouse feature (e.g. Snowflake's dynamic tables, BigQuery's materialized views with incremental refresh) without creating technical debt?",
+        "a": "A three-gate process: first, fit assessment — does this feature solve a problem we actually have at scale (e.g. incremental materialized view for reducing scan cost on a hot aggregate), or is it a solution looking for a problem? Second, a bounded pilot: one non-critical model uses the feature for 60 days; measure cost, freshness accuracy, and operational complexity against the status quo. Third, decision review: if the pilot wins on all three, write adoption criteria (which model types are candidates), add it to the engineering guide, and plan migration. Features that save cost but add debugging complexity need clear documentation before adoption — the team inherits the operational burden."
+      }
+    ]
+  },
+  {
+    "q": "How do you define and enforce a firm-wide standard for metric governance — from definition ownership to change management — in a 200+ analyst organization?",
+    "a": "Metric governance at this scale is a product management problem as much as a data problem. The foundation is a metric registry: every certified metric has a canonical name, business definition, SQL implementation, owner (a named human, not a team), update history, and downstream consumers. This lives in a data catalog (Atlan, Datahub, or dbt's docs) not a Confluence page, because a catalog is queryable and linked to the actual code. The change management process: any change to a certified metric definition requires a change request with a 72-hour comment window open to all consumers, a side-by-side comparison of old vs new values on a representative date range showing the magnitude of the change, and explicit sign-off from the top three consuming teams. Changes are deployed to a staging metric environment first, consumers validate, then production. Governance failures I've seen: metric definitions that live only in a BI tool with no code representation (you can't diff or test them), owners listed as a team instead of a person (no accountability), and 'emergency' changes that bypass review and create silent breaks in downstream models. The Principal-level insight is that governance is about the change process, not the initial definition — most metrics are defined correctly once and broken by an unreviewed change six months later.",
+    "fj": "I'd write a data dictionary and ask teams to keep it updated.",
+    "fs": "A queryable metric registry with named human owners, a 72-hour change review with side-by-side impact comparison and consumer sign-off, staging deployment before production, and a catalog linked to actual code — not a Confluence page that drifts.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "A critical business metric definition needs to change urgently (e.g. a legal requirement). How do you apply governance without blocking the change?",
+        "a": "Governance should have a fast-track path for legal/compliance changes: compressed 24-hour comment window, mandatory notification to all consumers with the reason and deadline, and an auto-generated impact list of downstream models and dashboards affected. The fast-track is documented in the governance policy so it's not ad-hoc. Post-change, run the full post-mortem to confirm the change propagated correctly and no consumers were missed."
+      },
+      {
+        "q": "How do you measure whether your metric governance program is working?",
+        "a": "Two categories: correctness signals (rate of stakeholder-reported metric discrepancies per quarter, number of undocumented metric definitions discovered via audits, days between a metric change and downstream consumer update) and adoption signals (percentage of BI report metrics linked to certified registry definitions, percentage of metric changes that went through formal review vs bypassed). A governance program that looks good on paper but has 30% bypass rate isn't working — the bypass rate is the honest signal."
+      }
+    ]
   }
 ]

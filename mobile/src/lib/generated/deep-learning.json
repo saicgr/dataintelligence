@@ -990,5 +990,227 @@
         "a": "BYOL and SimSiam use only positive pairs with an asymmetric architecture, an online network predicts a target network's representation of another view, plus a stop-gradient. This prevents the trivial collapse (all embeddings identical) that you'd expect without negatives, showing the repulsion negatives provide can be replaced by architectural asymmetry rather than explicit contrast."
       }
     ]
+  },
+  {
+    "q": "How do you architect a distributed training platform to sustain 80–90% GPU utilization across a 512-GPU LLM training job?",
+    "a": "The bottleneck at scale is nearly always data I/O, communication, and imbalance, not raw compute. A high-utilization platform combines: (1) a streaming data loader that pre-fetches and tokenizes asynchronously so GPUs never wait on CPU; (2) 3D parallelism (tensor-parallel intra-node over NVLink, pipeline-parallel across nodes with micro-batch pipelining to shrink the bubble, data-parallel across replicas with ZeRO-3/FSDP to shard optimizer state); (3) NCCL tuned to the cluster's topology (NVLink rings, InfiniBand trees) so all-reduces and peer-to-peer transfers overlap computation via async ops; (4) BF16 everywhere to eliminate loss-scaler overhead and saturate tensor cores; (5) activation checkpointing on the most memory-hungry layers only to trade minimal compute for the headroom to keep micro-batches large enough to fill pipelines. A utilization dashboard per GPU distinguishes compute-bound, memory-bandwidth-bound, and communication-bound phases so each bottleneck is attacked specifically.",
+    "fs": "3D parallelism + async data I/O + NCCL topology tuning + BF16 + selective checkpointing; instrument per-GPU to know whether you're compute-, bandwidth-, or comm-bound.",
+    "fj": "High GPU utilization just means launching as many processes as GPUs; the framework handles the rest automatically.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "FSDP + micro-batch pipeline sketch",
+        "lang": "python",
+        "lines": [
+          "model = FSDP(model, sharding_strategy=FULL_SHARD)",
+          "# pipeline: split layers across PP ranks",
+          "# each rank holds stage; stream micro-batches",
+          "for micro in micro_batches:",
+          "    with torch.cuda.stream(compute_stream):",
+          "        loss = stage_forward(micro)",
+          "    # overlap all-reduce on comm_stream"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you diagnose whether a training job is communication-bound vs. compute-bound?",
+        "a": "Use DCGM or `nvidia-smi dmon` to sample SM utilization and memory bandwidth simultaneously. If SM util is low while PCIe/NVLink bandwidth is saturated, you're communication-bound. Nsight Systems' timeline view shows the gap between NCCL all-reduce ops and the next compute kernel. If the all-reduce consistently sits on the critical path, either fuse smaller all-reduces, increase micro-batch size (less frequent syncs), or improve topology (InfiniBand vs. Ethernet)."
+      },
+      {
+        "q": "What is the tradeoff when choosing micro-batch count for pipeline parallelism?",
+        "a": "More micro-batches reduce the pipeline bubble (idle time at edges) proportionally, so ideal fill ratio approaches 1 as M/P → ∞ where M is micro-batches and P is pipeline stages. But each micro-batch adds a forward/backward activation footprint and more scheduler overhead. A practical rule: M ≥ 4P keeps the bubble below 20% while staying memory-feasible; tune from there."
+      },
+      {
+        "q": "Why should activation checkpointing be selective rather than applied uniformly?",
+        "a": "Checkpointing every layer adds a full extra forward pass per checkpointed segment, increasing step time roughly proportionally. But activation memory is dominated by the widest, longest-sequence layers (attention, wide FFN). Checkpointing only those recovers 60-80% of the memory benefit at a fraction of the compute cost. Profile activation sizes per layer type before blanket application."
+      }
+    ]
+  },
+  {
+    "q": "How do you run multi-team experiment governance at scale — tracking, reproducibility, and preventing duplicate work across dozens of ML engineers?",
+    "a": "At Staff scale, experiment governance is an organizational system, not just tooling. The three pillars are: (1) Provenance — every run logs code SHA, dataset version, hyperparams, and environment via MLflow/W&B so any result can be recreated; data and model artifacts are versioned in object storage with immutable paths. (2) Discoverability — a shared experiment registry with mandatory tagging (team, hypothesis, baseline reference, outcome) so engineers search before launching; a weekly 'what's running' digest prevents 40 people pursuing the same ablation. (3) Policy — a lightweight pre-run checklist (does this beat an existing logged baseline? is the dataset changelog attached?) enforced via CI before cluster resources are allocated. Without the human policy layer, tooling alone doesn't prevent duplication: engineers skip search because searching feels slower than launching.",
+    "fs": "Provenance (SHA + data version per run) + discoverability (searchable registry with mandatory tags) + human policy (pre-run checklist before cluster access) — tooling alone isn't enough.",
+    "fj": "Experiment tracking just means saving TensorBoard logs; reproducibility is just using the same random seed.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle experiment reproducibility across CUDA versions and library upgrades?",
+        "a": "Containerize the training environment (Docker image pinned to CUDA, cuDNN, and library versions) and log the image SHA alongside each run. If a result needs reproducing, pull that exact image. Additionally, seed all sources of randomness (Python, NumPy, PyTorch, CUDA, DataLoader workers) and use deterministic CUDA ops (`torch.use_deterministic_algorithms(True)`) where performance allows. Accept that some determinism is only approximate under multi-GPU all-reduce."
+      },
+      {
+        "q": "What's a practical way to flag when two running experiments are likely duplicates?",
+        "a": "Hash the experiment's hyperparameter dict and dataset version fingerprint at submission time and compare against the registry. If a near-identical hash exists and that run hasn't concluded, block the new submission with a warning and a link to the in-flight run. This requires agreeing on a canonical hyperparameter schema — which is itself the valuable artifact that forces teams to standardize."
+      },
+      {
+        "q": "How do you make model versioning work across an org that releases models to multiple downstream teams?",
+        "a": "Adopt a semantic versioning scheme for models (major = architecture change, minor = data or recipe change, patch = fine-tune) and publish a model card with each version: training data lineage, eval results, known failure modes, and deprecation timeline. Store artifacts in a model registry (MLflow Model Registry, W&B Artifacts, or SageMaker) with access-controlled promotion stages (dev → staging → production) so downstream consumers can pin to a version and get explicit notification before breakage."
+      }
+    ]
+  },
+  {
+    "q": "Your H100 cluster costs $3M/month. How do you govern GPU spend and improve training cost-efficiency without slowing research velocity?",
+    "a": "Cost governance at Staff level is a feedback loop between spend visibility and engineering incentives. (1) Attribution first: tag every job with team, project, and run-id so you can produce a daily cost-per-team-per-project breakdown; the moment engineers see their spend they self-regulate. (2) Spot/preemptible for exploratory runs — most hyperparameter sweeps and ablations can tolerate checkpointing and restart; reserve on-demand only for production training runs with SLA. (3) Kill-switch policy: any run that doesn't improve a tracked metric within N GPU-hours is auto-paused pending a human review, not killed (to preserve exploratory work) but flagged. (4) Cluster packing: profile typical job memory and duration at submission, reject or re-queue jobs that would leave >30% GPU-hours idle due to poor sizing. (5) Unit economics: define a cost-per-eval-gain metric; when an architecture iteration costs more per MMLU point than the current leader, it needs justification. Hardware frugality (BF16, gradient checkpointing, efficient attention) is table stakes, the real lever is organizational discipline.",
+    "fs": "Attribution tagging + spot for ablations + metric-gated kill policy + cluster packing + cost-per-eval-gain as a unit metric; visibility drives self-regulation.",
+    "fj": "GPU cost optimization just means using smaller batch sizes so each run is cheaper.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you balance cost pressure with research teams that need to run long exploratory jobs?",
+        "a": "Separate budgets by job class: exploratory (lower priority queue, preemptible, flexible cost limit), targeted (scheduled, higher priority, cost budget attached to a milestone), and production (reserved, SLA-bound, full cost accountability). Researchers self-classify; auditing a sample weekly builds trust and catches misuse without micromanaging. The goal is that exploratory work doesn't crowd out production and vice versa."
+      },
+      {
+        "q": "What utilization floor would you set before concluding a job is poorly sized?",
+        "a": "A healthy distributed training job should sustain >75% GPU SM utilization averaged over a full training step (ignoring the first few warmup steps). Below 50% is a strong signal of data-loading bottleneck, communication overhead, or poor batch sizing. The practical fix path: profile with Nsight, check DataLoader prefetch queue depth, tune micro-batch count, then consider if the job should be running on fewer GPUs."
+      },
+      {
+        "q": "How does spot/preemptible instance usage change your checkpointing strategy?",
+        "a": "Preemptible jobs can be evicted with ~30 seconds notice, so checkpoints must be frequent and fast. Async checkpointing (writing to persistent storage in a background thread while training continues) keeps checkpoint overhead under 2-3% of step time even at large model sizes. Use a rolling N-checkpoint scheme and verify checkpoint integrity on load to avoid silent corruption from a partial write at eviction."
+      }
+    ]
+  },
+  {
+    "q": "How do you design and operate a production deep learning model serving platform for latency-sensitive inference at millions of RPM?",
+    "a": "Serving reliability at Staff scale has five axes: (1) Model optimization — quantize to INT8/FP8 (TensorRT, GGUF, bitsandbytes) cutting latency and memory; apply continuous batching (TGI, vLLM) so requests share GPU time; use speculative decoding for autoregressive models to amortize long sequences. (2) Deployment shape — route via a load balancer to a pool of replicas sized for p99 latency SLO, with autoscaling on GPU queue depth (not CPU metrics). (3) KV cache management — for LLM endpoints, PagedAttention (vLLM) prevents fragmentation; precompute prefix caches for shared system prompts. (4) Reliability — circuit breaker per model version, canary traffic (1% → 10% → 100%) with automated rollback on p99 regression, shadow mode testing of new model versions against production traffic. (5) Observability — per-request latency broken into tokenization, prefill (prompt), decode (generation), and postprocessing; GPU utilization, queue depth, and KV cache occupancy as operational dashboards.",
+    "fs": "INT8 quant + continuous batching + PagedAttention + canary rollout with p99 SLO gate + per-phase latency dashboards (prefill vs. decode) = production LLM serving.",
+    "fj": "Production serving just means deploying the model with more replicas behind a load balancer; no other changes are needed.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "vLLM async engine config",
+        "lang": "python",
+        "lines": [
+          "from vllm import AsyncLLMEngine, AsyncEngineArgs",
+          "args = AsyncEngineArgs(",
+          "    model='meta-llama/Llama-3.1-8B-Instruct',",
+          "    quantization='fp8',",
+          "    max_num_seqs=256,      # continuous batching",
+          "    enable_prefix_caching=True,",
+          ")",
+          "engine = AsyncLLMEngine.from_engine_args(args)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does continuous batching improve GPU utilization over static batching?",
+        "a": "Static batching waits for a full batch to accumulate, stalling shorter requests behind longer ones. Continuous (iteration-level) batching inserts new requests into the running batch at each decode step as finished sequences free their slots. This keeps the GPU batch nearly full, cutting average latency for short requests and throughput gaps. The tradeoff is more complex scheduling logic."
+      },
+      {
+        "q": "What is speculative decoding and when is it worth the complexity?",
+        "a": "A small draft model generates K tokens quickly; the large target model verifies them in a single parallel forward pass, accepting correct tokens and regenerating from the first rejection. When most draft tokens are accepted (high acceptance rate), you get nearly the same quality as the large model at the draft model's speed. It's valuable when the large model's decode phase dominates latency, draft quality is high (e.g. same model family at smaller size), and added orchestration overhead fits the latency budget."
+      },
+      {
+        "q": "How would you design a canary rollout for an LLM serving update with a p99 latency SLO?",
+        "a": "Route 1% of traffic to the new version. Compute rolling p99 latency and error rate over a window (e.g. 10 minutes, 1000 requests minimum). Define pass gates: new p99 ≤ old p99 × 1.1, error rate ≤ old + 0.1pp. Automated gating promotes to 10% → 50% → 100% on pass, rolls back on failure. For LLMs also track quality metrics (output length distribution, refusal rate) as proxies since ground-truth quality can't be measured in real time."
+      }
+    ]
+  },
+  {
+    "q": "How do you build a build-vs-buy decision framework for deep learning infrastructure components (training platform, serving, vector DB, feature store)?",
+    "a": "At Staff level the build-vs-buy question is really a portfolio decision across the ML stack. The framework has four inputs: (1) Differentiation — does this component directly determine model quality or product differentiation? If yes, build or deeply customize; if no, buy or use OSS. Training and data pipelines often differentiate; generic vector DBs rarely do. (2) TCO over 3 years — internal builds carry full-time engineering maintenance cost; compare that against vendor pricing at projected scale. Hidden vendor costs include egress, seat licenses, and lock-in risk. (3) Integration fit — custom tooling that perfectly fits your data model and secrets management beats a general SaaS that requires 10 adapters. (4) Time-to-value — a vendor solution that ships in 2 weeks beats a 6-month build even if it costs 2× more over 3 years if the business urgency is high. Map every major component on a 2×2 of differentiation vs. build-cost and revisit annually as open-source alternatives mature.",
+    "fs": "Build where the component differentiates or deeply determines model quality; buy elsewhere; decide via 3-year TCO × differentiation × time-to-value, revisit annually as OSS matures.",
+    "fj": "Always build internal infrastructure because vendor tools are too expensive at scale.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you avoid lock-in when a vendor is the right short-term choice?",
+        "a": "Design an abstraction layer (thin adapter/interface) over vendor APIs so swapping providers requires changing the adapter, not application code. Negotiate data portability and export rights in the contract. Limit proprietary features to isolated surface areas: use a vendor's managed training cluster but keep your data, code, and model artifacts portable in standard formats (ONNX, safetensors, Parquet). Continuously track OSS alternatives that could replace the vendor within a migration sprint."
+      },
+      {
+        "q": "How does a feature store's build-vs-buy decision differ from a serving platform's?",
+        "a": "A feature store's value is in your specific feature transformation logic, join patterns, and freshness guarantees, which are tied to your data model, so it often tilts toward build or deep customization. A serving platform's heavy lifting (GPU scheduling, autoscaling, batching) is more generic and vendor-solvable. The inflection point is when you have >50 features being served with <100ms freshness SLAs across multiple models; at that point OSS like Feast or a managed solution (Tecton, Vertex Feature Store) pays off versus hand-rolled."
+      },
+      {
+        "q": "What signals indicate it's time to internalize a vendor component?",
+        "a": "Vendor bill exceeds what an internal team of 2-3 engineers would cost including overhead; vendor SLAs don't meet your reliability requirements and you've exhausted escalation; vendor roadmap diverges from your needs and workarounds accumulate; or the component has become a competitive differentiator. All four typically converge together — if only cost is the issue, negotiate rather than build."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a deep learning model governance process that handles model cards, bias audits, and regulatory compliance across 30+ production models?",
+    "a": "Governance at Staff scale requires a lifecycle system, not per-model heroics. (1) Model registry with mandatory metadata: training data lineage, eval results across demographic and domain slices, out-of-distribution behavior, known failure modes, and a responsible-use statement. (2) Bias audit checkpoints before promotion: automated fairness metrics (equalized odds, demographic parity) across protected attributes using an evaluation dataset separate from training, plus a human review for high-stakes models. (3) Tiered risk classification: low-risk (no sensitive decisions, automated approval), medium-risk (advisory only, lightweight audit), high-risk (healthcare, credit, hiring: external audit, legal review, doc lock). (4) Refresh triggers: automated drift detection on input distribution and output quality; any model exceeding thresholds is flagged for re-evaluation before it can continue in production. (5) Incident response: a documented runbook for 'model behaving unexpectedly' with clear rollback, shadow mode, and remediation steps. EU AI Act and emerging US frameworks require the high-risk tier to be defensibly documented, so the same system that serves engineering also serves legal.",
+    "fs": "Registry with lineage + automated fairness audits + tiered risk classification + drift-triggered re-eval + incident runbook; builds defensible documentation for regulation.",
+    "fj": "Model governance just means adding a README to the model repository before deploying.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you operationalize fairness audits without slowing down shipping?",
+        "a": "Automate the metric computation as a CI gate: before any model promotion, a fairness evaluation pipeline runs against a pre-agreed evaluation set and checks that no protected group's error rate exceeds the population rate by more than a defined threshold. This adds minutes, not days. Human review is gated only on medium- and high-risk models or when automated metrics are close to threshold, so the fast path stays fast."
+      },
+      {
+        "q": "What does 'training data lineage' mean in practice and why does it matter for compliance?",
+        "a": "Lineage means being able to answer: what datasets were used, at what versions, with what preprocessing transforms, and were there any consent or licensing constraints? A model trained on data that violated consent or scraping terms can create legal liability that persists through model versions. Concretely: store dataset version hashes, link to data consent documentation, and log any filtering decisions (e.g. removal of PII) with the code that performed them, not just a prose description."
+      },
+      {
+        "q": "Under the EU AI Act, what models fall into the high-risk tier and what does that require from an ML platform?",
+        "a": "The Act lists specific domains: employment (CV screening, performance evaluation), education (scoring), credit, healthcare, critical infrastructure, law enforcement, and migration. High-risk requires: a risk management system, data governance documentation, technical documentation (model card equivalent), human oversight mechanisms, accuracy and robustness testing, logging of autonomous decisions, and registration in an EU database before deployment. A mature ML platform should have the first five covered by the governance system; registration and human oversight require product-level integration beyond pure ML infra."
+      }
+    ]
+  },
+  {
+    "q": "How do you set the multi-year compute and framework strategy for an org moving from PyTorch research at 100-GPU scale to 10,000-GPU production training?",
+    "a": "A 100× compute scale change requires betting on three interconnected axes: (1) Hardware trajectory — H100/H200 today with a gating decision at 18 months on whether to integrate GB200 NVL72 rack-scale systems or maintain current node topology; the key input is NVLink versus InfiniBand bandwidth at your model parallelism degree. Evaluate TPUs as a diversity hedge if your workload is mostly Transformer training with static shapes. (2) Framework stack — PyTorch 2.x with torch.compile and FSDP2 is mature enough for LLM-scale production; JAX/XLA is a viable alternative for TPU-heavy shops with stronger static-shape discipline. Avoid framework bets that require rewriting the research codebase; instead add a compilation and serving layer. (3) Orchestration — Kubernetes with volcano or Slurm for job scheduling; at >1,000 GPUs the scheduler's gang-scheduling fidelity (whether all GPUs for a job start simultaneously) matters more than feature richness; test it before committing. Revisit these annually: hardware generations compress to 2-year cycles, and OSS frameworks iterate fast enough to change the calculus.",
+    "fs": "Hardware trajectory bet (H100→GB200 gate at 18mo) + torch.compile/FSDP2 as framework standard + gang-scheduling-capable orchestrator; revisit annually, avoid rewriting research code.",
+    "fj": "Just buy more of whatever GPUs you already have and keep using the same framework; scale is a pure resource problem.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you evaluate whether a new GPU generation is worth a migration during active model development?",
+        "a": "Run a micro-benchmark suite on your actual workload (not vendor benchmarks): measure step time, memory efficiency, and inter-GPU bandwidth for your specific model parallelism configuration on the new hardware. Also account for software maturity — new GPU generations often ship 6-12 months before CUDA libraries, NCCL, and framework kernels are fully optimized. Migration ROI is the compute gain minus the migration cost (driver validation, recompilation, performance regression hunting) amortized over expected hardware lifetime."
+      },
+      {
+        "q": "What are the organizational risks of a framework monoculture vs. supporting multiple frameworks?",
+        "a": "A monoculture (one framework for all teams) reduces tooling surface, simplifies hiring, and concentrates optimization expertise, but creates fragility: a framework EOL or a critical bug becomes org-wide risk. Supporting multiple frameworks preserves flexibility and lets research use emerging tools, but fragments the infrastructure investment and creates impedance mismatches at model handoff (research to production). The pragmatic middle is a single primary framework with an export standard (ONNX, TorchScript, safetensors) so serving is framework-agnostic."
+      },
+      {
+        "q": "How does the decision between custom silicon (TPUs, Trainium) and general-purpose GPUs affect research velocity?",
+        "a": "Custom silicon forces static shapes, limited dynamic control flow, and proprietary compilation toolchains, which research workflows — with frequent architecture experiments and dynamic batching — don't fit well. The tradeoff is better cost-per-FLOP on production training of fixed architectures at high volume. A pragmatic strategy: run research on GPUs for flexibility, graduate stable architectures to custom silicon for cost-efficient production training, and invest in shape-static preprocessing + XLA compilation work only when the production economics justify it."
+      }
+    ]
+  },
+  {
+    "q": "How do you design the research-to-production operating model for a DL org — from research prototype to reliable production model in under 8 weeks?",
+    "a": "The 8-week gate requires eliminating the classic 'throw it over the wall' handoff pattern. The operating model has five elements: (1) A minimum viable experiment standard: before a research result enters the production queue, it must have a reproducible training script with pinned deps, a baseline eval on the production evaluation suite, and a documented failure mode analysis. This prevents vague prototypes from entering expensive productionization. (2) An embedded ML engineer in each research pod — not a separate 'MLOps team' — who starts productionization prep in parallel with research iteration weeks 3-6, not after. (3) A shared production evaluation suite that research also runs: offline metrics that are known to predict production outcomes, refreshed as production distribution shifts. (4) A model promotion ladder: research → internal beta → canary (1%) → production, with automated metric gates at each step. (5) A 'production readiness' checklist that doubles as a knowledge transfer doc: data pipeline ownership, rollback procedure, evaluation cadence, on-call escalation. Organizations that achieve sub-8-week cycles have collapsed the research/engineering boundary, not optimized handoff speed.",
+    "fs": "Minimum viable experiment standard + embedded ML engineer starting parallel productionization at week 3 + shared eval suite + automated promotion ladder + production readiness checklist = collapsed research/engineering boundary.",
+    "fj": "Research-to-production is a sequential process: finish research, then handoff to engineering to productionize.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you define 'production-predictive offline metrics' and why does that matter for the research-to-production pipeline?",
+        "a": "A production-predictive metric is one where a known delta offline reliably predicts a known delta in production KPI (e.g. BLEU+0.5 predicts DAU retention +0.3pp). It's derived by retrospectively correlating historical offline eval results with production outcomes after model updates. Without it, research optimizes metrics that don't move the product needle, creating a selection illusion: models that look better in research consistently underperform in production, the leading cause of failed productionization."
+      },
+      {
+        "q": "What org design change most reliably reduces research-to-production time?",
+        "a": "Embedding production ML engineers in research teams, rather than centralizing them in a platform team, removes the largest delay: the queue wait and context reconstruction cost of a separate handoff. The embedded engineer brings production constraints (data freshness, latency SLO, monitoring) into early research decisions, so the prototype is already shaped for production. The cost is that platform work gets fragmented; a thin central platform team owning shared infra while engineers embed resolves this."
+      },
+      {
+        "q": "How do you prevent the minimum viable experiment standard from becoming a bureaucratic bottleneck that slows research?",
+        "a": "Make the standard a template, not a gate: a 30-minute checklist auto-populated from the experiment registry (code SHA is already logged, baseline evals run automatically, failure mode analysis is one structured text field). Reserve human gate review only for models entering the canary queue. Research teams report the checklist feels like documentation of what they already know, not extra work, if it's designed that way. Friction should live at the canary gate, not at the exploration phase."
+      }
+    ]
+  },
+  {
+    "q": "How do you set an org-wide strategy for responsible scaling and model capability evaluation as your org trains progressively larger foundation models?",
+    "a": "Responsible scaling at Principal scope is a policy-and-process question as much as a technical one. The components a mature org needs in 2025-2026: (1) A capability evaluation suite that runs before any model promotion: CBRN uplift, deception and instruction-following evasion, cyberoffense assist, and autonomous replication benchmarks adapted from frontier lab RSPs (Anthropic RSP, Google DeepMind Frontier Safety Framework). These run automatically against every model that exceeds a compute threshold. (2) An internal 'deployment allowed' threshold: if any eval exceeds a defined score, the model enters enhanced review before external deployment, regardless of business pressure. This must have executive sponsorship to be credible. (3) Red-teaming cadence: every major model version gets a structured red-team (internal + optional external) covering policy violations, jailbreaks, and capability probing, with findings documented and tracked as known issues in the model card. (4) A model weight access tiering policy: research weights stay internal, production weights are served behind an API with rate limits and use-case screening, off-the-shelf weights are released only after a documented risk assessment. (5) A safety-capability parity commitment: safety evals must be updated to keep pace with capability growth, not lag by 6 months.",
+    "fs": "Automated capability evals (CBRN/cyberoffense/autonomy) at compute threshold + deployment-allowed gate with exec sponsorship + red-teaming cadence + weight access tiering + safety-eval parity with capability growth.",
+    "fj": "Responsible scaling just means adding content filters to the API; the model itself doesn't need evaluation.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What makes a capability evaluation suite credible when you're evaluating your own models?",
+        "a": "Credibility requires independence and adversarial construction. The eval suite should be maintained by a team with no product incentive to pass (a safety research team or external org), updated by people who know the model's failure modes (i.e., by adversarial probing, not benchmark design from first principles), and subject to external audit for high-stakes decisions. Internally-designed evals assessed by the same team that trains the model have known blind spots."
+      },
+      {
+        "q": "How do you prevent capability evaluation from becoming a checkbox exercise over time?",
+        "a": "Three mechanisms: (1) Rotate red teamers and use external groups periodically so institutional familiarity doesn't reduce adversarial effectiveness. (2) Track model performance on each eval longitudinally — a flat score over multiple generations is a signal the eval isn't keeping up with capability, not that capability has plateaued. (3) Publish internal eval results to a safety committee with authority to block a release, giving the results real stakes rather than being a report nobody acts on."
+      },
+      {
+        "q": "How does compute-threshold gating work in practice for a responsible scaling policy?",
+        "a": "Define a threshold in FLOPs (e.g. 10^24 training FLOPs as of 2025 is roughly the threshold where frontier labs trigger enhanced review) that triggers the full capability eval suite. Below the threshold, a lighter eval suite runs. The threshold should be set conservatively and revised downward as capability per FLOP increases with algorithmic improvements. Internally, the MLOps platform should make the estimated training FLOP visible at job submission so gating is automatic, not manual."
+      }
+    ]
   }
 ]

@@ -1217,5 +1217,349 @@
         "a": "Event sourcing needs all events for an aggregate in strict order on one partition, but those events are different types (Created, Updated, Deleted). TopicNameStrategy would force them into one merged schema; RecordName/TopicRecordName strategy lets each type keep its own schema and compatibility while sharing the topic and key, preserving per-aggregate ordering across mixed event types."
       }
     ]
+  },
+  {
+    "q": "What is Azure Event Hubs and how does it expose a Kafka-compatible Event Streams surface? When does the Kafka protocol shim cover you and when does it fall short?",
+    "a": "Azure Event Hubs is Microsoft's fully managed, cloud-native Event Streams service that can speak the native AMQP/HTTP protocol or, via its Kafka surface, accept standard Kafka producer and consumer API calls without code changes — you point your Kafka client at the Event Hubs FQDN with SASL/OAUTHBEARER and it works. Event Hub namespaces map to Kafka clusters, Event Hubs to topics, and consumer groups to consumer groups. The shim covers most common produce/consume flows, Schema Registry integration, and Kafka Connect connectors. It falls short on admin APIs (CreateTopics, AlterConfigs beyond retention/partitions), Kafka Streams stateful topology (no internal topics management), the transactional producer API, and log compaction — so Kafka Streams topologies and EOS pipelines that rely on those primitives need real Kafka or Confluent Cloud, not Event Hubs.",
+    "fj": "Azure Event Hubs is just managed Kafka on Azure.",
+    "fs": "Event Hubs offers a Kafka-protocol Event Streams surface that handles produce/consume transparently, but the shim lacks transactions, log compaction, and full admin API — which matters for Kafka Streams topologies or EOS pipelines.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How does authentication differ between native Event Hubs and its Kafka surface?",
+        "a": "Native Event Hubs uses AMQP with SAS tokens or Azure AD Managed Identity. The Kafka surface requires SASL/OAUTHBEARER (Azure AD token) or SASL/PLAIN with a connection string as the password — standard Kafka SSL+SASL config, just pointed at the Event Hubs FQDN. The token audience is `https://eventhubs.azure.net/.default` for Managed Identity flows."
+      },
+      {
+        "q": "What happens to a Kafka Streams app that tries to create internal topics against Event Hubs?",
+        "a": "Kafka Streams auto-creates internal repartition and changelog topics via the AdminClient API. Event Hubs' Kafka surface either rejects or silently fails the CreateTopics calls for those internal topics, causing the Streams app to fail at startup. You must pre-create the expected internal topic names manually in the portal, or run against real Kafka/Confluent where auto-create works."
+      }
+    ]
+  },
+  {
+    "q": "IBM Event Streams is the enterprise Kafka distribution from IBM. What does it add over open-source Kafka, and what does its Kafka compatibility mean for migration?",
+    "a": "IBM Event Streams is a fully Kafka-protocol-compatible Event Streams platform built on top of the Strimzi Kafka operator for Kubernetes, and it adds enterprise-grade features over vanilla Kafka: integrated Schema Registry (backed by Confluent's schema registry API), a UI-rich Admin console, built-in monitoring with OpenMetrics/Prometheus integration, geo-replication via MirrorMaker 2, fine-grained RBAC through Kubernetes RBAC and OAuth, and support for IBM Cloud Pak for Integration. Because it is protocol-compatible with the standard Kafka client API, existing producers and consumers connect to IBM Event Streams unchanged — migration is a broker-endpoint and authentication swap, not a code change. The trade-off versus Confluent Cloud is less ecosystem richness (fewer managed connectors) but tighter IBM enterprise security and support contracts.",
+    "fj": "IBM Event Streams requires special IBM client libraries.",
+    "fs": "IBM Event Streams is wire-protocol compatible with standard Kafka — you swap the bootstrap server and credentials, not the client code. It adds enterprise RBAC, Schema Registry, and Strimzi-based k8s deployment on top of open-source Kafka.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is Strimzi and why does IBM Event Streams build on it?",
+        "a": "Strimzi is a CNCF project that provides Kubernetes operators for running Kafka: KafkaCluster, KafkaTopic, KafkaUser, KafkaMirrorMaker2 CRDs. IBM Event Streams layers its enterprise features (UI, RBAC, schema registry, IBM support) on top of Strimzi so it inherits cloud-native Kafka deployment, rolling upgrades, and cert management from the operator, reducing IBM's maintenance surface while giving users a supported enterprise product."
+      },
+      {
+        "q": "How does geo-replication work in IBM Event Streams?",
+        "a": "IBM Event Streams uses Kafka MirrorMaker 2 (MM2), configured as a KafkaMirrorMaker2 custom resource in Strimzi. MM2 reads from the source cluster and produces to the target, translating consumer group offsets so a failover consumer can resume near where it left off. IBM packages the MM2 config in the Event Streams console and adds monitoring dashboards on top of the raw MM2 replication lag metrics."
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between event streaming and message queuing, and when does choosing an Event Streams platform like Kafka over a traditional queue (RabbitMQ, SQS) matter architecturally?",
+    "a": "A traditional message queue is a temporary buffer: the broker deletes a message once a consumer acknowledges it, so consumers get each message exactly once in a consumer-race model and the queue shrinks over time. An Event Streams platform like Kafka treats the log as a durable, replayable record of what happened: retention is decoupled from consumption, multiple consumer groups read independently at their own pace, and a new consumer can replay the full history within the retention window. This matters architecturally when you need multiple downstream systems to consume the same events independently (fan-out without republishing), when replay is necessary for new analytics pipelines or bug recovery, when ordering within a key must be guaranteed end-to-end, or when you want consumers to lag safely without losing messages. Queues win when you need work-queue semantics, strict priority, per-message TTLs, or bidirectional request-reply patterns.",
+    "fj": "Kafka is just a faster message queue.",
+    "fs": "Kafka is an Event Streams platform, not a queue. The core difference is that the log is retained and replayable independently of consumption — multiple groups read at different speeds, replay is possible within retention, and the broker never deletes messages because one consumer acked them.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "When would you choose SQS over Kafka even on an AWS stack that already has MSK?",
+        "a": "SQS for work-queue fan-out where exactly-one-worker-handles-it semantics matter (order processing, job dispatch), per-message visibility timeouts and dead-letter queues are needed, or the consumer count is dynamic and scales to zero. MSK/Kafka for fan-out to multiple independent readers, replay, or ordered per-key processing. They're not mutually exclusive: Kafka as the Event Streams backbone, with SQS at the edge for worker dispatch."
+      },
+      {
+        "q": "How does Kafka's log-retention model enable the 'lambda architecture' or 'kappa architecture' pattern?",
+        "a": "Because the Event Streams log is retained, a batch job (Spark, Databricks) and a stream processor (Flink, Kafka Streams) can both read the same topic — the batch job reads a historical window, the stream job reads the live head. Kappa architecture collapses batch and stream into one stream processor replaying the retained log for historical passes, avoiding a separate batch layer entirely. Both patterns depend critically on the log being replayable, not consumed-and-deleted."
+      }
+    ]
+  },
+  {
+    "q": "How do you guarantee strict per-entity ordering in an Event Streams pipeline when the entity's events arrive from multiple upstream producers writing to the same topic?",
+    "a": "Strict per-entity ordering in an Event Streams pipeline requires that all events for a given entity land on the same partition, which means all producers must use the same deterministic key (entity_id) and the same partition count — if any producer uses a different key or the topic is repartitioned, ordering breaks. In practice, use a canonical entity key and enforce it via a gateway or producer library wrapper that sets the key before every write. If events arrive from different microservices with different event types, put all entity events on one topic keyed by entity_id (using a multi-type schema subject strategy) rather than using per-event-type topics, so per-entity order is maintained across event types. The consumer must process each partition serially and not parallelize within the partition — parallel consumption threads within a partition destroy the ordering guarantee that the partition topology enforces.",
+    "fj": "I'd sort the events after consuming them.",
+    "fs": "Ordering in an Event Streams platform is preserved by routing all events for an entity to one partition via a canonical key, using one topic for all entity event types, and consuming each partition serially. Post-consumer sorting is a last resort that adds latency and requires sequence numbers.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Canonical key enforced in a producer wrapper",
+        "lang": "python",
+        "lines": [
+          "def produce_entity_event(entity_id,",
+          "                         event_type, payload):",
+          "    # canonical key -> same partition always",
+          "    producer.produce(",
+          "        topic='entity-events',",
+          "        key=entity_id,   # NOT event_type",
+          "        value=json.dumps({",
+          "            'type': event_type,",
+          "            'payload': payload",
+          "        }).encode()",
+          "    )"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "A consumer parallelizes processing within a partition using a thread pool. How does this break per-entity ordering?",
+        "a": "All messages for entity A are on partition 3 in arrival order. If the consumer dispatches each message to a thread pool, two messages for entity A can execute concurrently on different threads — the second message may finish and write its side effect before the first, reversing the intended order. To keep ordering within a partition while using threads, group by key within a batch and process each key's sub-list sequentially, or use a per-key queue dispatched to a dedicated thread."
+      }
+    ]
+  },
+  {
+    "q": "What is event replay in an Event Streams platform and how do you design for it from day one? What breaks if you ignore it?",
+    "a": "Event replay is the ability to re-read past events from the log — either to backfill a new downstream system, recover from a consumer bug, train an ML model on historical data, or bootstrap a new consumer group from scratch. Designing for replay means setting retention long enough to cover your worst-case recovery window (use tiered storage to S3 for months-long retention cheaply), ensuring consumer logic is idempotent so reprocessing the same event produces the same outcome, documenting the offset-at-point-in-time from which each important pipeline was first consumed, and versioning schemas for backward-compatible evolution so a consumer replaying from partition offset 0 can deserialize records written under any historical schema. If you ignore replay: short retention forces expensive re-ingestion from source systems, non-idempotent consumers double-write on replay, schema evolution breaks deserialization of old records, and bootstrapping a new analytics system from history becomes an out-of-band ETL job rather than a standard consumer group seek.",
+    "fj": "If we need to reprocess we'll just re-extract from the source database.",
+    "fs": "The Event Streams log is the replayable source of truth if you design for it: set adequate retention, keep consumers idempotent, evolve schemas backward-compatibly, and use tiered storage for long windows. Re-extracting from the source database is an ops incident, not a design pattern.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you find the Kafka offset that corresponds to a specific wall-clock time for a replay starting point?",
+        "a": "Use the AdminClient's `offsetsForTimes` API, which takes a map of TopicPartition to epoch-millisecond timestamps and returns the earliest offset whose timestamp is >= the given time per partition. You then seek each partition's consumer to that offset. This works because Kafka brokers index message timestamps via the time-index file alongside the offset index. The granularity is segment-level for the binary search, so you get the first offset in the segment that contains the target time."
+      },
+      {
+        "q": "Why does schema backward compatibility matter specifically for replay and not just for live consumption?",
+        "a": "In live consumption, new consumers typically read only recent records written under recent schemas. Replay starts from an old offset and reads every record written since the topic was created, including records serialized under schema versions that may be many generations old. If the current deserializer can't read an old schema version — because backward compatibility was broken in an intermediate evolution — the replay consumer crashes on old records, making full replay impossible without schema archaeology."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a fan-out pattern in an Event Streams pipeline where one upstream topic must feed five downstream consumers with different processing requirements and SLAs?",
+    "a": "In an Event Streams platform, fan-out is a first-class capability: each downstream system runs as an independent consumer group with its own committed offsets, and they all read the same topic at their own pace without any coupling — this is fundamentally different from a queue where only one consumer gets each message. Each group advances independently: a fast analytics consumer can be at the head while a slow ML training consumer is days behind, and neither affects the other. For isolation of SLAs, give each consumer group its own consumer instances scaled to its partition count, monitor lag per group separately, and set different retention per topic if one group needs longer replay windows. If one consumer is slow enough to fall behind retention, use tiered storage or write a dedicated archival group that copies events to S3 so the slow consumer can catch up from object storage rather than requiring extended broker retention.",
+    "fj": "I'd need to copy the events into five separate queues, one per downstream system.",
+    "fs": "Event Streams fan-out is native — five consumer groups read the same topic at their own pace with independent offsets. No copying needed. Monitor per-group lag separately; if one group risks falling behind retention, archive to S3 via a dedicated sink consumer.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "One of the five downstream consumers is much slower than the others and is approaching the retention boundary. How do you handle it without extending broker retention for everyone?",
+        "a": "Add a dedicated archival consumer group that sinks events to S3 (via an S3 Sink connector or a Flink/Spark job) in Parquet or Avro with the original Kafka metadata (topic, partition, offset, timestamp). The slow downstream consumer can then read from S3 when it falls behind broker retention, resuming from Kafka once it catches up. Alternatively, enable tiered storage on the topic so the slow consumer reads cold segments from remote storage transparently without S3-side re-ingestion logic."
+      }
+    ]
+  },
+  {
+    "q": "What is consumer group offset retention in Kafka, and what happens when a consumer group that hasn't committed offsets in a long time reconnects to an Event Streams cluster?",
+    "a": "Kafka retains committed consumer group offsets in the internal __consumer_offsets topic for `offsets.retention.minutes` (default 10,080 minutes = 7 days in Kafka 2.x, extended to longer in 3.x). If a consumer group is inactive — no commits, no metadata heartbeats — longer than this window, the broker purges its committed offsets entirely. When that group reconnects to the Event Streams cluster, it has no stored offset and falls back to `auto.offset.reset`: `earliest` restarts from the beginning of the retained log, `latest` skips to the current head. This is a common silent data-gap incident: a group is paused for maintenance for 10+ days, comes back expecting to resume, and either reprocesses everything from the start (earliest) or silently skips the gap (latest). The fix is to either extend offsets.retention.minutes, keep a sentinel consumer alive with occasional commits, or snapshot the group's offsets externally before the pause.",
+    "fj": "Committed offsets are stored forever in Kafka.",
+    "fs": "Consumer group offsets expire after `offsets.retention.minutes` of inactivity — by default 7 days. A group reconnecting after a longer pause finds no stored offsets and falls back to auto.offset.reset, causing either a full replay or a silent gap. Keep a sentinel committer alive or extend retention for long maintenance windows.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you preserve a consumer group's exact offset position through a planned long pause of more than 7 days?",
+        "a": "Three approaches: (1) Run a no-op sentinel consumer that polls and commits the current offset periodically without processing, keeping the group active. (2) Snapshot the offsets externally using AdminClient's `listConsumerGroupOffsets`, then restore with `alterConsumerGroupOffsets` when the group restarts. (3) Extend `offsets.retention.minutes` to cover the pause window. Option 2 is the cleanest for a hard pause; option 3 is a cluster-wide change that increases __consumer_offsets storage."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement event-time windowed aggregations in an Event Streams pipeline, and how does watermarking handle late-arriving events?",
+    "a": "In an Event Streams pipeline, event time is the timestamp embedded in the message payload or header, versus processing time which is wall-clock time at the consumer. Windowed aggregations (sum clicks per user per 5-minute window) must use event time to be deterministic on replay. In Kafka Streams you set the timestamp extractor to read the event-time field, define a TimeWindows.of(Duration.ofMinutes(5)).grace(Duration.ofMinutes(1)) window, and Streams advances event time per partition as records arrive. A watermark is the estimate of the current event time, typically defined as the maximum observed event-time minus a grace period — events arriving within the grace window are included in the window; events arriving after the grace expires are late records and are dropped or routed to a side output. In Flink, watermarks are emitted by a WatermarkStrategy on the source, and each parallel task advances its watermark independently, with the global watermark being the minimum across all tasks. Setting the grace period too tight drops legitimate out-of-order events; too loose delays window emission and grows state.",
+    "fj": "I'd just use the time when the consumer reads the message.",
+    "fs": "Processing time is non-deterministic and breaks replay. Event Streams windowed aggregations must key on the event-time field embedded in the record, with a watermark (max-seen-time minus grace period) that defines how long to wait for late events before closing a window.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Kafka Streams event-time window with grace",
+        "lang": "java",
+        "lines": [
+          "stream",
+          "  .groupByKey()",
+          "  .windowedBy(",
+          "    TimeWindows.of(Duration.ofMinutes(5))",
+          "               .grace(Duration.ofMinutes(1))",
+          "  )",
+          "  .count()",
+          "  .toStream();",
+          "// events > 1min late are dropped"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is the global watermark in Flink the minimum across all parallel task watermarks, not the maximum?",
+        "a": "The global watermark represents the point in event time before which no further events are expected across the entire pipeline. If it used the maximum, a slow partition with old events could be silently excluded — those events would arrive after the window was already closed because the fast partitions pulled the watermark ahead. Using the minimum ensures no partition is outpaced, at the cost of the global watermark advancing only as fast as the slowest partition."
+      },
+      {
+        "q": "How does replaying an Event Streams topic for backfill interact with event-time windowing?",
+        "a": "Replay compresses historical event time rapidly — hours of events pass through in seconds of processing time. Event-time windowing handles this correctly because windows are keyed on the event timestamp in the record, not wall-clock time, so replaying 6 months of history produces the same window results as if it had been processed live. Processing-time windows would be useless for replay since they'd bucket all replayed records into the current wall-clock time window."
+      }
+    ]
+  },
+  {
+    "q": "How does Kafka's message retention policy interact with Event Streams replay guarantees, and what architectural patterns ensure you never lose events needed for recovery?",
+    "a": "Kafka's retention (time- or size-based) is the primary constraint on Event Streams replay: once a segment is purged, those events are gone from Kafka, and a consumer that was down longer than the retention window silently misses the gap. To guarantee recovery-grade replay, you combine several layers: set retention long enough to cover the P99 recovery time for your slowest consumer; enable tiered storage to offload old segments to S3/GCS cheaply so very long windows don't require expensive broker disk; maintain an archival consumer group that writes events to durable long-term storage (S3, BigQuery, Snowflake) in append-only partitioned Parquet so events are always replayable beyond any broker retention horizon; and version schemas backward-compatibly so the archival format can be deserialized by future consumers. The critical mistake is treating Kafka retention as the only replay store — it is a hot replay tier, not a permanent archive.",
+    "fj": "If we need events older than the retention window we're just out of luck.",
+    "fs": "Kafka retention is the hot replay tier, not a permanent archive. Pair it with tiered storage for the warm tier and an archival sink (S3 Parquet) for permanent replay — then no recovery scenario requires events beyond the archival store, regardless of broker retention.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How would you structure the S3 archival partition layout for maximum query efficiency when replaying by time range?",
+        "a": "Partition the S3 prefix by topic / year= / month= / day= / hour= with Parquet files containing the Kafka metadata columns (partition, offset, event_timestamp) alongside the event payload. This lets a replay consumer query the Hive-style partition filter by date range without scanning all files, and Athena or Spark can push the filter down to skip irrelevant S3 objects. Store files in hourly Parquet batches and compact small files daily to avoid S3 list overhead during seeks."
+      },
+      {
+        "q": "If your Event Streams archival sink lags behind the live topic by 30 minutes, what is the window of risk?",
+        "a": "Events in the last 30 minutes of broker retention that haven't been flushed to S3 yet are the risk window. If the broker purges a segment before the archival consumer catches up — possible if retention is set very short or the broker fills up — those events exist only in the archival consumer's in-flight buffer. Mitigate by setting local broker retention conservatively longer than the archival consumer's worst-case lag, and alert when archival consumer lag exceeds a threshold (e.g. > 1 hour behind head)."
+      }
+    ]
+  },
+  {
+    "q": "You are designing a multi-cluster Kafka topology to serve 12 regional teams. How do you decide the cluster topology — one global cluster, per-region clusters, or a hub-and-spoke — and what determines replication strategy between them?",
+    "a": "The decision turns on three axes: latency (local producers need local brokers to avoid cross-region round-trips that inflate linger and ack latency), data sovereignty (EU events may not leave EU borders, mandating per-region clusters), and operational complexity (one global KRaft cluster on fast inter-connect simplifies topic governance but requires stretched reliability). Hub-and-spoke puts an authoritative hub cluster per tier (global events aggregated up, reference data mirrored down) and suits data-platform fan-outs. MirrorMaker 2 handles async replication between regions with automatic offset translation for consumer group failover; Confluent Cluster Linking is a faster, lower-latency alternative. Define clear topic namespaces per cluster (region.team.domain.entity) so topics don't collide during replication. Active-active multi-region requires conflict-resolution logic at the application layer because Kafka has no built-in CRDT semantics.",
+    "fj": "I'd put everything in one big cluster and let consumers sort out region latency.",
+    "fs": "One cluster trades away data sovereignty, cross-region write latency, and blast-radius isolation. I'd pick the topology from sovereignty requirements first, then data-gravity and latency, using MM2 or Cluster Linking for async replication with offset translation for consumer group failover.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does MirrorMaker 2 translate consumer group offsets across clusters, and why does it matter for failover?",
+        "a": "MM2 runs a consumer on the source cluster and an offset-translation process that maps source offsets to equivalent target offsets using a checkpointing topic on the target. On failover, a consumer group that switches to the target cluster can call RemoteClusterUtils.translateOffsets to get the nearest equivalent committed offset and resume close to where it left off, avoiding full replay or head-of-log skip. Without offset translation, failover resets to auto.offset.reset."
+      },
+      {
+        "q": "What is Confluent Cluster Linking and how does it differ from MirrorMaker 2?",
+        "a": "Cluster Linking is a broker-to-broker native link that replicates partition data with near-zero lag (sub-second) without an intermediary consumer process. Consumers can read from mirror topics on the destination cluster as if they were local partitions. Unlike MM2 which is a Kafka Connect application with finite throughput and separate lag, Cluster Linking is embedded in the broker and scales with the cluster itself — but it is Confluent-proprietary and requires Confluent Platform or Cloud."
+      }
+    ]
+  },
+  {
+    "q": "Walk me through Kafka tiered storage operational cost modeling. When does tiered storage actually save money versus buying more broker disk, and what are the hidden costs?",
+    "a": "Tiered storage moves old closed segments to object storage (S3/GCS) while keeping recent data on local broker disks. The savings model is: broker SSD disk cost per GB-month is typically 5-20x object storage cost, so for long retention (14+ days) tiered storage almost always wins on raw storage spend. The hidden costs are: S3 PUT and GET request fees accumulate at high produce rates (each segment flush is a PUT, each remote consumer fetch is a GET) and can dominate at very high throughput with short segment roll intervals; egress fees apply when remote-tier reads cross AZ or region boundaries; the metadata store for segment manifests adds broker memory and I/O; and operational complexity of a new failure mode (S3 outage causes consumer lag for cold reads). The break-even point is roughly when average retention exceeds 3-5x the local.retention.ms configured for the hot tier, because below that threshold you are paying S3 request overhead without recovering meaningful disk savings.",
+    "fj": "Tiered storage is always cheaper — just enable it.",
+    "fs": "Raw disk savings are real for long retention, but S3 PUT/GET costs at high produce rates, egress fees for cold reads, and segment manifest overhead are hidden costs. Model the break-even around whether average retention is >3-5x the local hot-tier window before enabling.",
+    "level": "Staff",
+    "code": [
+      {
+        "lang": "python",
+        "label": "Break-even estimation",
+        "lines": [
+          "# SSD broker disk: ~$0.10/GB-month",
+          "# S3: ~$0.023/GB-month + requests",
+          "# If avg retention = 90 days, RF=3:",
+          "broker_cost = 100 * 90/30 * 0.10 * 3  # $900",
+          "# local: 1 day hot tier",
+          "s3_cost = 100 * 90/30 * 0.023  # $69",
+          "# s3 wins by ~13x on raw storage",
+          "# add GET cost at scale: check breakeven"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you choose the right local.retention.ms value for tiered storage, and what is the risk of setting it too low?",
+        "a": "Set local.retention.ms to cover your P99 consumer lag for hot consumers — if your fastest consumer group typically lags 30 minutes at peak, set local retention to at least 2-4 hours. Too low means live consumers that fall slightly behind during a GC pause or rebalance suddenly hit the remote tier, paying S3 GET latency and request costs for every read. The local tier is the performance tier; the remote tier is the archive tier."
+      }
+    ]
+  },
+  {
+    "q": "Your organization wants to enforce a unified Schema Registry governance policy across 20 Kafka topics owned by different teams. How do you design the subject naming, compatibility rules, and enforcement gates in CI/CD?",
+    "a": "Define a per-team or per-domain Schema Registry subject namespace using TopicRecordNameStrategy so each event type evolves independently across topics, and each team owns their subject's compatibility rule. Enforce FULL_TRANSITIVE compatibility as the org default — any new schema version must be readable by consumers on any historical version, which blocks silent breaking changes. Build a CI gate (pre-merge check) that runs schema-registry-maven-plugin or a custom script calling the compatibility check REST endpoint before merging any Avro/Protobuf schema change; the pipeline rejects the PR if compatibility is violated. For topics where a team needs a breaking change (e.g. dropping a field), require a two-step migration: introduce the new schema under a new subject version with a default, let all consumers upgrade to handle both, then remove the old field in a subsequent PR. Centralize the Schema Registry in a shared service with RBAC so each team can read any schema but can only write to their own subjects. Provide a schema change runbook and a versioned schema catalog in the internal developer portal.",
+    "fj": "Teams can use whatever schema they want per topic — Schema Registry is just a convenience.",
+    "fs": "Schema governance requires FULL_TRANSITIVE compatibility enforced in CI (pre-merge REST compatibility check), RBAC-scoped write access per team/domain, and a two-step migration protocol for any breaking changes — otherwise one team silently breaks downstream consumers across the org.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A team needs to rename a field in their Avro schema. Walk me through a backward-compatible two-step migration.",
+        "a": "Step 1: Add the new field name with a default value alongside the old field in the same schema version. Deploy all producers to write both fields, and all consumers to read the new field (falling back to old if absent). This version is backward compatible. Step 2: Remove the old field in the next schema version. At this point all consumers are already reading the new field, so the old field's removal is safe. Verify with --schema-check against FULL_TRANSITIVE before merging each step."
+      },
+      {
+        "q": "How do you handle a team that wants to break compatibility because the schema evolution would take too long?",
+        "a": "Two safe options: (1) Create a new topic (v2 naming convention) and migrate producers to it while running MM2 or a Kafka Streams job to bridge old-to-new for consumers that can't update yet; retire the v1 topic after all consumers migrate. (2) Change the subject's compatibility to NONE temporarily under a change-freeze, but require all consuming teams to sign off and deploy simultaneously — this is a coordinated cut-over, not a unilateral change."
+      }
+    ]
+  },
+  {
+    "q": "Compare self-hosted Kafka (Strimzi on Kubernetes), MSK, and Confluent Cloud for a new production Event Streams platform. What drives the decision at Staff level?",
+    "a": "Self-hosted Kafka on Strimzi gives maximum control (custom broker configs, direct JVM tuning, arbitrary Kafka versions, no vendor lock-in, lowest raw cost at scale) at the cost of significant platform engineering investment — Kubernetes operators, upgrade automation, monitoring, DR, and on-call. MSK removes broker and ZooKeeper/KRaft cluster management and integrates natively with IAM, VPC, CloudWatch, and AWS PrivateLink, but config flexibility is limited (no custom KRaft controller tuning, restricted plugin install), provisioned MSK is over-provisioned by design and MSK Serverless has throughput caps and no tiered storage. Confluent Cloud adds the full Confluent ecosystem (Schema Registry as a service, ksqlDB, Cluster Linking, Tableflow, Connect as a service, Flink as a service) at a significant per-unit cost premium, with no infrastructure ops but vendor dependency on pricing and feature roadmap. Decision drivers: organizational Kubernetes maturity and on-call capacity (Strimzi), deep AWS integration requirements and avoiding infra ops (MSK), or needing the Confluent ecosystem without deploying it yourself (Confluent Cloud).",
+    "fj": "Use Confluent Cloud — it's the best Kafka.",
+    "fs": "Confluent Cloud is operationally easiest and ecosystem-richest but costs most and adds vendor lock-in. MSK is the AWS-native managed middle ground but restricts advanced configs. Strimzi on k8s gives full control and lowest long-term cost but demands platform engineering investment. The decision is organizational maturity and total cost of ownership, not product quality alone.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "At what scale does self-hosted Kafka typically become cheaper than Confluent Cloud, and what overhead must you account for?",
+        "a": "Confluent Cloud charges per CKU (Confluent Kafka Unit) or per GB ingress/egress depending on the tier. At sustained throughput above roughly 500 MB/s ingress or very large retention needs, self-hosted broker compute on spot/reserved EC2 plus EBS or tiered storage to S3 typically undercuts Confluent Cloud pricing by 3-5x on raw infrastructure. But the hidden overhead includes: dedicated platform-engineering team time (0.5-2 FTE for a medium cluster), on-call rotation, upgrade planning, security patching, DR testing, and the opportunity cost of that engineering time. The break-even in total cost of ownership usually arrives at the Staff+ team size with a 10+ broker cluster and 24/7 production SLAs."
+      }
+    ]
+  },
+  {
+    "q": "Your Kafka cluster is experiencing chronic ISR shrink on high-throughput partitions during peak hours. Walk me through diagnosing and resolving it without adding brokers.",
+    "a": "ISR shrink during peak hours means followers cannot keep up with the leader's replication rate, which can be caused by follower disk I/O saturation, network throughput ceiling between brokers, garbage collection pauses on follower JVMs, or the leader's produce rate temporarily exceeding what followers can fetch-replicate in time. Diagnose by correlating ISRShrinkRateAndTimeMs JMX metric timestamps against disk I/O (iostat), network saturation (netstat/iftop), GC pause logs, and producer BytesInPerSec peaks. Common resolutions without adding brokers: tune replica.fetch.max.bytes and replica.fetch.wait.max.ms to allow larger fetch batches per cycle so followers catch up faster; reduce the JVM heap to leave more RAM for the page cache so followers serve replicated data without disk seeks; enable compression on the producer to reduce the network volume the follower must pull; add log.flush.interval.messages (relying on OS fsync less frequently) only as a last resort since it increases data-loss risk; and consider temporarily lowering the partition count on the hottest topics to reduce per-partition replication load per broker.",
+    "fj": "ISR shrink means the cluster needs more brokers — I'd just add capacity.",
+    "fs": "Adding brokers is valid long-term but not always possible now. ISR shrink is typically follower I/O or network saturation — diagnose with JMX ISRShrinkRate + disk/network metrics, then tune replica.fetch.max.bytes, reduce JVM heap to free page cache, and enable producer-side compression to cut replication network load.",
+    "level": "Staff",
+    "code": [
+      {
+        "lang": "python",
+        "label": "Replica fetch tuning",
+        "lines": [
+          "# broker configs to improve follower",
+          "# catch-up throughput:",
+          "# replica.fetch.max.bytes=10485760  # 10MB",
+          "# replica.fetch.wait.max.ms=500",
+          "# num.replica.fetchers=4  # parallel fetchers",
+          "# smaller heap -> more page cache for replicas"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does producer-side compression reduce ISR shrink, and what is the trade-off?",
+        "a": "Compression shrinks the bytes the leader writes to disk and the bytes followers must fetch over the network to replicate. A 3-5x compression ratio on JSON payloads means the replication bandwidth requirement drops by the same factor, reducing the probability of followers falling behind on a saturated inter-broker network. The trade-off is producer CPU for compression and, if the consumer decompresses per record instead of per batch, slightly higher consumer CPU."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a Kafka-based reliability pattern to survive a complete broker cluster outage lasting up to 4 hours, maintaining producer availability and eventual consumer delivery?",
+    "a": "The pattern is a producer-side outbox with local durable buffering plus async reconciliation. Producers write to a local transactional store (SQLite, embedded RocksDB, or a local Postgres table) using a transactional outbox alongside the business operation, so the business state commits atomically even if Kafka is unreachable. A separate relay thread reads the outbox and forwards to Kafka with retries and exponential back-off, draining the backlog once Kafka recovers within the producer's buffer.memory and retry window. On the consumer side, set max.poll.interval.ms above the 4-hour window and rely on the Kafka log durability — messages are already committed to the ISR before the outage, so consumers resume from their last committed offset when brokers come back. For regional outages, pre-configure MirrorMaker 2 or Cluster Linking to a secondary cluster and have producers fail over via a DNS switch or Kafka client configuration toggle, routing to the standby while the primary recovers. Test this playbook quarterly with chaos injection.",
+    "fj": "If Kafka is down, producers just fail and operators restart everything manually.",
+    "fs": "A transactional outbox decouples producer availability from Kafka availability — business transactions commit locally, the relay re-produces when Kafka recovers. For consumers, the durable log preserves in-flight messages through broker outages. A standby cluster with MM2 or Cluster Linking handles regional failures.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you prevent the outbox relay from producing duplicates if it crashes mid-replay after Kafka recovers?",
+        "a": "Use idempotent producer with a transactional.id tied to the outbox relay instance. The relay stores the Kafka topic/partition/offset (or a business idempotency key) for each successfully produced outbox row, and marks rows as `published` in the local store. On relay restart, it skips rows already marked published. With the idempotent producer, retried batches from the same session are deduplicated by the broker on producer-id + sequence number, so even if the relay crashes before marking a row done, the retry is safely accepted once."
+      }
+    ]
+  },
+  {
+    "q": "As a Principal engineer, how do you establish an organization-wide event-driven architecture (EDA) standard for 50+ engineering teams, and what governance mechanisms prevent the platform from becoming a spaghetti of undocumented topics?",
+    "a": "The foundation is a topic registry — a curated catalog (backed by a tool like Datahub, Amundsen, or a bespoke internal portal) where every topic in every environment has mandatory metadata: owner team, schema link, SLA (retention, throughput, latency), consumers, and a one-line business purpose. Topic creation is gated: teams submit a topic provisioning PR (Terraform or Pulumi) that triggers CI checks validating naming conventions (domain.team.entity.event-version), schema registration under the correct subject naming strategy, and a reviewer from the streaming platform team who validates the ownership model. Event versioning policy is standardized org-wide — all topics use Avro or Protobuf with FULL_TRANSITIVE compatibility, and breaking changes require an RFC that goes through architecture review. Producer/consumer contracts are documented in a producer/consumer matrix in the portal. Platform teams publish a golden-path SDK (a thin wrapper around the Kafka client) that enforces the naming, serialization, and observability standards so teams don't hand-roll producers.",
+    "fj": "Teams should be free to create topics and schemas however they want — governance is premature optimization.",
+    "fs": "Without governance, EDA at 50+ teams creates topic sprawl, undocumented consumers, and breaking schema changes that cascade across teams. The Principal-level answer is a mandatory topic registry, CI-gated topic provisioning, org-wide FULL_TRANSITIVE schema policy, and a golden-path producer SDK that embeds standards so teams get compliance by default.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you enforce topic ownership when a team is dissolved or changes ownership?",
+        "a": "The topic registry is the source of truth. When a team dissolves, the platform team triggers an ownership transfer RFC: all topics owned by the dissolved team are assigned to a receiving team or transferred to a platform-managed orphan pool with read-only producers and a sunset date. Monitoring alerts on topics with no committed consumer group activity for 30+ days (zombie topics) surface candidates for cleanup. The Terraform IaC for topic provisioning includes an `owner` tag that drives ACL assignment, so ownership transfer is a single Terraform PR that re-ACLs the topic."
+      },
+      {
+        "q": "What metrics do you track at the platform level to know if the EDA is healthy at scale?",
+        "a": "Platform-level health metrics: mean and P99 producer end-to-end latency per domain (from produce timestamp to consumer commit); number of topics with ISR < RF (reliability health); schema incompatibility events per week (breaking change attempts caught by CI vs slipping through); consumer lag P99 per tier (real-time < 30s, near-real-time < 5min, batch < 1h); DLQ message rate (quality proxy); and topic creation rate vs deprecation rate (platform sprawl index). These feed a streaming platform health dashboard reviewed weekly in the platform review meeting."
+      }
+    ]
+  },
+  {
+    "q": "What is your framework for evaluating a multi-year streaming platform bet — choosing between continuing to invest in Kafka, migrating to Confluent Cloud, or evaluating Apache Pulsar — as a Principal engineer with 200+ internal topics in production?",
+    "a": "Frame the decision as a total-cost-of-ownership over 3-5 years with four lenses. First, operational cost: TCO = (infra cost) + (platform-team engineering cost) + (incident cost). Self-hosted Kafka with a mature team has the lowest infra cost but highest engineering and incident overhead. Confluent Cloud shifts that curve but at 2-4x raw infra spend. Second, ecosystem lock-in risk: Confluent-specific features (Cluster Linking, Tableflow, Flink as a service) create migration switching costs; Strimzi on k8s preserves optionality. Third, capability ceiling: if the next 3-year roadmap includes Flink-native stream processing, true elastic auto-scaling, or multi-tenant SaaS, evaluate whether Confluent Cloud or Pulsar's storage-compute separation closes a gap your self-hosted Kafka cannot easily close. Fourth, migration risk: 200+ topics means schema migration, consumer group offset reconciliation, and parallel-run testing at scale — factor in the 6-18 month migration window with dual-write cost. Recommend Pulsar only if the storage-compute separation is a first-class requirement and the engineering org has Pulsar expertise; otherwise the Kafka ecosystem's maturity advantage is decisive for most data engineering contexts in 2026.",
+    "fj": "Pick whichever platform the biggest vendor advocate presents at the next conference.",
+    "fs": "A 3-5 year platform bet requires TCO modeling across infra, engineering time, and incident cost; lock-in risk assessment; a capability ceiling audit against the 3-year product roadmap; and a 200-topic migration risk estimate. Pulsar's storage-compute separation is a real architectural advantage but ecosystem immaturity makes Kafka or Confluent the safer bet for most data engineering contexts in 2026.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you migrate 200+ production topics from self-hosted Kafka to Confluent Cloud with zero downtime?",
+        "a": "Phase 1 (dual-write): configure MirrorMaker 2 or Cluster Linking to replicate all 200+ topics to Confluent Cloud, lagging 0-10 seconds. Phase 2 (consumer migration): shift consumer groups topic-by-topic to Confluent Cloud, using MM2 offset translation so they resume at the correct position. Phase 3 (producer cut-over): flip producers to Confluent Cloud endpoints topic-by-topic during low-traffic windows, with a feature flag rollback path. Phase 4 (decommission): once all producers are on CC, drain the last self-hosted consumers, verify zero consumer lag, and shut down MM2 replication. Total migration window: 3-12 months depending on team count and topic interdependencies."
+      }
+    ]
+  },
+  {
+    "q": "How do you design the Principal-level observability and SLO framework for a streaming platform serving 50 teams — what are the right SLIs, what does an SLO breach look like, and how do you build alerting that doesn't page-fatigue oncall?",
+    "a": "Define SLIs at three layers. Producer layer: end-to-end produce latency P99 (from message creation to ISR-committed ack) and producer error rate. Broker layer: ISR shrink rate, under-replicated partition count, and leader imbalance. Consumer layer: consumer lag P99 per group and DLQ message rate. For each mission-critical topic, negotiate an SLO with the owning team: e.g. produce P99 < 50ms, consumer lag < 60 seconds for real-time, < 5 minutes for near-real-time. Express SLOs as error budgets over a 28-day rolling window so teams can make risk-aware decisions about schema changes and consumer upgrades. Build alerting with symptom-based routing: page only on consumer lag > SLO threshold and ISR = 0 (partition unavailable); raise a ticket on ISR shrink trending and DLQ growth; never alert directly on broker-internal metrics like JVM heap that don't map to user-visible impact. Use a single streaming health dashboard (Grafana + Kafka exporter + JMX exporter) surfaced in every team's engineering portal, with SLO burn-rate alerts rather than threshold alerts to avoid constant low-severity noise.",
+    "fj": "Alert on every Kafka metric that goes out of range — better too many alerts than missing something.",
+    "fs": "Symptom-based SLOs with error budgets prevent alert fatigue. Page on consumer lag breach (user-visible) and zero ISR (data unavailable); ticket on ISR trending and DLQ growth; ignore raw JVM/GC metrics in the oncall path. SLO burn-rate alerts over a 28-day window are more actionable than point-in-time thresholds.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you attribute consumer lag SLO responsibility when the breach is caused by a producer throughput spike, not a consumer bug?",
+        "a": "Lag is a symptom shared between producer and consumer. At the SLO level, the consumer team owns their lag SLO but the root cause can be a producer throughput spike that saturates the partition. In practice: separate the lag SLO from the produce-rate SLO. If the producer produces within its own throughput SLO but the consumer can't keep up, the consumer team owns the remediation (scale out, optimize processing). If the producer spikes above its published throughput SLO and drowns the consumer, the producer team owns a throughput SLO breach and the consumer team gets an SLO exemption window for the duration of the spike."
+      },
+      {
+        "q": "What is SLO burn-rate alerting and why is it better than threshold alerting for Kafka consumer lag?",
+        "a": "A burn-rate alert fires when the error budget is being consumed faster than it can sustain over the SLO window. For a 60-second lag SLO with a 28-day window, a 10x burn rate means the error budget will be exhausted in 2.8 days — alert immediately. A 2x burn rate exhausts it in 14 days — raise a ticket. Threshold alerts fire on any momentary breach (a 10-second lag spike fires a page regardless of context), causing alert fatigue. Burn-rate alerts require sustained or large breaches to page, while still detecting slow-building degradation before it exhausts the budget."
+      }
+    ]
   }
 ]

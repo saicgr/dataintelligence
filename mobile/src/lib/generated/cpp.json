@@ -1159,5 +1159,177 @@
         ]
       }
     ]
+  },
+  {
+    "q": "How do you architect a high-throughput C++ service to minimize heap allocations on the hot path?",
+    "a": "The strategy has three tiers. First, pre-allocate fixed-size pools at startup (tcmalloc or jemalloc as the global allocator, plus custom arena/slab allocators for hot objects), so hot-path work never calls the OS allocator. Second, reuse objects via object pools: `std::deque`-backed free lists gated by a `std::mutex` or lock-free ring buffer. Third, prefer stack allocation and `std::inplace_vector`/`std::small_vector` for bounded-size collections. Profile with `perf` and heap profilers (gperftools, Heaptrack) to confirm allocation rate. Critical rule: measure first — premature pool design often introduces complexity without measurable gain below 100k ops/sec.",
+    "fj": "I'd just use a better allocator — jemalloc fixes most performance allocation problems.",
+    "fs": "Swapping the allocator helps, but I eliminate allocations on the hot path by designing with arena lifetimes and object pools — so the allocator change becomes an insurance policy, not the first-line fix.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "simple arena: bump allocator, reset per-request",
+        "lang": "cpp",
+        "accent": "fix",
+        "lines": [
+          "struct Arena {",
+          "  alignas(64) char buf[64*1024];",
+          "  std::size_t offset = 0;",
+          "  void* alloc(std::size_t n, std::size_t align=8) {",
+          "    offset = (offset+align-1)&~(align-1);",
+          "    void* p = buf + offset;",
+          "    offset += n;",
+          "    return p;",
+          "  }",
+          "  void reset() { offset = 0; }",
+          "};"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is false sharing and how do pool designs expose it?",
+        "a": "False sharing occurs when two threads write to different variables that land on the same 64-byte cache line, causing each write to invalidate the other CPU's cache. In a pool, thread-local free lists or per-thread arenas avoid it; a global shared free list under a mutex serializes and creates false sharing on the list head. Pad hot per-thread structures to `alignas(64)`."
+      },
+      {
+        "q": "How does `std::pmr` (polymorphic memory resources, C++17) fit into this picture?",
+        "a": "`std::pmr` provides a standardised arena/pool interface (`monotonic_buffer_resource`, `pool_resource`) that can be wired into any `std::pmr::vector/string` without changing their API. It lets you switch allocators per-scope without template proliferation, making it the right foundation for new code."
+      }
+    ]
+  },
+  {
+    "q": "Walk through the major ABI stability concerns when shipping a C++ shared library and how you manage them.",
+    "a": "ABI breakage causes silent crashes or corruption rather than linker errors. The most common culprits: adding, reordering, or resizing data members in an exported class (changes sizeof/offset), changing a function signature or adding default template arguments to an exported template, changing the vtable layout (adding or removing virtual functions, or reordering them), and changing enum sizes. Management strategies: (1) PImpl (pointer-to-implementation) hides all data members behind an opaque pointer, so adding fields never changes the ABI. (2) Versioned symbol maps (`--version-script`) let you introduce new symbols at a new version while old callers link to old symbols. (3) Semantic versioning: major bumps are ABI breaks, minor bumps must be ABI compatible. (4) Regular ABI checkers (libabigail `abidiff`, ABI Compliance Checker) in CI to gate releases.",
+    "fj": "I just bump the library version whenever I change things — callers can recompile.",
+    "fs": "ABI stability is a contract, not an afterthought: I design exported classes with PImpl from day one, enforce versioned symbol maps, and run `abidiff` on every release candidate to catch unintentional breaks before downstream teams feel them.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "PImpl: stable ABI regardless of impl size",
+        "lang": "cpp",
+        "accent": "fix",
+        "lines": [
+          "// widget.h — public, stable ABI",
+          "class Widget {",
+          "  struct Impl;",
+          "  std::unique_ptr<Impl> impl_;",
+          "public:",
+          "  explicit Widget(int cfg);",
+          "  void process();",
+          "  ~Widget();",
+          "};",
+          "// widget.cpp — impl can grow freely"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When is it acceptable to break ABI?",
+        "a": "When you can guarantee an atomic recompile of all consumers (monorepo with hermetic build graph), or when incrementing a major SO version so the old and new .so coexist on disk and linker SONAME ensures each consumer links the right one. OS-level distributions often require a full reverse-dependency rebuild."
+      }
+    ]
+  },
+  {
+    "q": "What is your strategy for adopting C++20/23 features in a large existing codebase, and what are the riskiest migrations?",
+    "a": "Adoption is a phased risk-management exercise. Phase 1: enable the standard flag (`-std=c++20`) in CI without changing code — fix the resulting deprecation and narrowing warnings. Phase 2: adopt low-risk features first: `std::span`, structured bindings, `std::optional/variant`, `std::format` (C++20). These are additive and don't change existing semantics. Phase 3: introduce concepts to constrain new template code only; retrofitting old templates is high-risk because SFINAE→concept substitution changes overload resolution. Phase 4: coroutines — high reward but require selecting a coroutine library and significant test coverage. Riskiest migrations: (1) replacing SFINAE with concepts in hot, heavily-overloaded template code (overload resolution changes); (2) adopting `std::jthread` and structured concurrency where thread lifetimes were manual; (3) modules — still incomplete in major build systems (CMake/Bazel support as of early 2026 is maturing but fragile).",
+    "fj": "Just pass `-std=c++23` and use whatever compiles.",
+    "fs": "I gate standard upgrades behind feature flags in our CMake toolchain, run the full test matrix with `-Werror` on the new standard before touching any call sites, and migrate in semantics-preserving increments with rollback points.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is the status of C++ modules in early 2026 and are they production-ready?",
+        "a": "As of early 2026, all three major compilers (GCC 14, Clang 18, MSVC 19.39) support C++20 named modules, but CMake and Bazel support is still maturing. Large codebases report incremental build wins (modules avoid repeated header parsing) but integration with third-party headers (that haven't adopted modules) requires header-unit wrapping. Most production shops are doing limited pilot adoption, not full migrations."
+      }
+    ]
+  },
+  {
+    "q": "Describe the role of sanitizers (ASan, TSan, UBSan, MSan) in a large C++ CI pipeline — how do you manage the runtime cost?",
+    "a": "Each sanitizer catches a distinct bug class: AddressSanitizer (ASan) catches heap/stack/global buffer overflows, use-after-free, and leaks (~2x slowdown, 3x memory). ThreadSanitizer (TSan) catches data races (~5-15x slowdown). UndefinedBehaviorSanitizer (UBSan) catches signed overflow, null dereference, misaligned access (~5-20% slowdown). MemorySanitizer (MSan) catches uninitialized reads (~3x slowdown, requires all libraries rebuilt). Running all four on every CI build is impractical. Strategy: (1) ASan+UBSan always on in the debug/test build — fast enough for unit tests. (2) TSan in a dedicated concurrency test suite run nightly or on PRs touching threading code. (3) MSan in a separate monthly sweep. (4) Fuzzing corpora (libFuzzer, AFL++) with ASan enabled. Gate merges on ASan/UBSan clean; treat TSan findings as P1 bugs.",
+    "fj": "I run the tests normally and add sanitizers only when there's a known bug.",
+    "fs": "I treat ASan+UBSan as a required CI gate on the test build — the slowdown is 2-3x which is acceptable for unit tests. TSan runs nightly because its 10x slowdown makes it impractical in the merge gate, but findings from it are P1.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "Can you run ASan and TSan together?",
+        "a": "No — ASan and TSan are mutually exclusive because they both intercept memory allocation and access in incompatible ways. You run them in separate build configurations."
+      },
+      {
+        "q": "What is HWASAN and when would you prefer it over ASan?",
+        "a": "Hardware-Assisted AddressSanitizer (HWASAN) uses ARM MTE (Memory Tagging Extension) to detect similar bugs at ~10-15% overhead versus ASan's ~2x. On supported ARMv8.5+ hardware (Android 11+ devices, newer server chips) HWASAN is the right default because the overhead is low enough to run in staging or even production canary environments."
+      }
+    ]
+  },
+  {
+    "q": "How do you make a build-vs-buy decision when a third-party C++ library could replace internal code?",
+    "a": "The decision tree: (1) Capability gap — does the library cover our exact feature set or will we fork/patch it? Forks create a maintenance burden that often exceeds writing the feature internally. (2) ABI and linking compatibility — static vs dynamic, LGPL vs MIT/Apache, does it export a stable C ABI or a C++ ABI that may clash across compiler versions? (3) Build system integration — Conan, vcpkg, or manual vendoring; friction cost in monorepo. (4) Maintenance health — commit frequency, CVE response time, roadmap alignment. (5) Performance contract — does the library allow zero-copy / custom allocators, or does it force copies? Buy decision: the library is mature, ABI-stable, covers 90%+ of your need, has active CVE response, and integration cost is bounded. Build decision: you need tight control over allocator, threading model, or hot-path layout that the library won't expose, or the feature is 200 LOC and a dependency adds operational risk exceeding the cost.",
+    "fj": "I always use a popular open-source library if one exists — reinventing the wheel wastes time.",
+    "fs": "I frame it as total cost of ownership: the library's integration cost today versus the divergence cost if we need it to do something it doesn't support — which usually surfaces in the first year and tips the scales toward internal for anything in the hot path or with complex allocator requirements.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is vendoring and when is it preferred over a package manager?",
+        "a": "Vendoring is copying the third-party source into your own repository (often under a `third_party/` directory). It is preferred for hermetic builds where you need reproducibility regardless of upstream changes, for applying patches without forking, and in highly regulated environments where all source must be auditable. The cost is manual update work when pulling in upstream fixes."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a reliable, observable C++ service — what are the key reliability patterns?",
+    "a": "Reliability in a C++ service comes from five layers. (1) Memory safety: sanitizer-clean builds, RAII everywhere, no raw owning pointers in service code. (2) Fault isolation: partition the process into `std::jthread` workers with bounded queues; a crash in one subsystem triggers structured shutdown, not silent data corruption. (3) Graceful degradation: every blocking I/O call has a deadline (`SO_TIMEOUT`, asio timeouts); backpressure via bounded queues rather than unbounded growth. (4) Observability: structured logging (spdlog + JSON sink), Prometheus metrics, distributed trace spans via OpenTelemetry C++ SDK (GA as of early 2024). (5) Crash safety: use `sigaction` to install a signal handler that writes a mini-dump before calling the default handler; never heap-allocate in a signal handler. Canary-deploy with health checks; version all serialized formats.",
+    "fj": "I add try/catch blocks around everything and log errors — that handles reliability.",
+    "fs": "Reliability is a design property, not something you retrofit: bounded queues enforce backpressure before the process OOMs, every I/O has a timeout, and OTel traces let me diagnose tail latency without adding debug builds to production.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does structured concurrency improve reliability over raw `std::thread`?",
+        "a": "`std::jthread` (C++20) and structured concurrency frameworks ensure that every spawned work unit is joined or cancelled before the owning scope exits, eliminating detached threads that outlive their data. This prevents use-after-free from threads accessing destroyed objects — the most common crash pattern in threaded C++ services."
+      }
+    ]
+  },
+  {
+    "q": "How do you set org-wide C++ standards and enforce them across dozens of teams without becoming a bottleneck?",
+    "a": "The model that scales is a 'platform team + advisory council + tooling enforcement' triangle. The platform team owns: the compiler toolchain (Clang/GCC version pinned per quarter), the internal style guide (clang-format config, clang-tidy ruleset), the approved third-party library catalog, and sanitizer/fuzzing CI templates. The advisory council (3-5 senior engineers elected from product teams) shapes policy changes and prevents ivory-tower standards that ignore real constraints. Enforcement: clang-tidy and clang-format run as pre-submit checks — failures block merge. New language features (e.g., coroutines, modules) are 'experimental' until the platform team ships compiler support, a tested third-party library slot, and training material. Exception process: teams file an RFC for deviations; the council reviews in 72 hours. Key metric: time-to-adopt a new approved pattern should be under 2 sprints for any team.",
+    "fj": "I write a coding standards doc and send it to the teams.",
+    "fs": "Standards without tooling enforcement degrade over time — I make the right thing the easy thing by shipping clang-tidy rules and CI templates that enforce the policy automatically, so teams adopt standards as a build-system feature, not a manual review burden.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle an existing large codebase that violates the new standard?",
+        "a": "Incremental migration with a 'no new violations' gate: the clang-tidy config starts with warnings (not errors) on new files only, gated by file-path prefix. A quarterly drive migrates the highest-traffic existing files. Automated fixers (`clang-tidy --fix`) handle mechanical changes (e.g., `nullptr` for `NULL`). The policy is: every PR that touches a file must leave it no worse than it found it."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate a multi-year bet on C++/Rust interop as a memory-safety strategy for a large C++ codebase?",
+    "a": "As of early 2026, the realistic paths are: (1) Rust at the boundary — new subsystems (parsers, cryptographic primitives, network protocol handlers) are written in Rust and called from C++ via a thin `extern 'C'` FFI or the `cxx` crate. This is production-proven (Android OS, ChromiumOS, AWS s2n-tls). (2) Retrofit with safe C++ extensions — LLVM's experimental `-fsafe-buffers` and Carbon language are tracking proposals; not production-ready as of early 2026. (3) C++ hardening without Rust — adopt `-D_LIBCPP_HARDENING_MODE=fast`, HWASAN in staging, `std::span` everywhere, and bounds-checked containers. The evaluation framework: (a) What is the threat model? Internet-exposed code parsing untrusted data has high-severity CVE risk — Rust FFI ROI is clear. (b) What is the team's Rust proficiency and ramp time? A 60-engineer C++ team needs 6-12 months before Rust is net-positive. (c) Can you define a stable FFI surface? Modules with clean C API boundaries are good candidates; modules with complex shared ownership across the boundary are not. Recommendation: pilot on one high-severity boundary module, measure CVE count and developer velocity over 6 months, then decide on expansion.",
+    "fj": "Just rewrite everything in Rust — C++ is inherently unsafe.",
+    "fs": "A full rewrite of a 5M-line codebase in Rust is a 10-year project with high failure probability — I target the Rust bet at the 5% of code that handles untrusted input and accounts for 80% of memory-safety CVEs, using `cxx` for a stable FFI boundary, and harden the rest with HWASAN and hardened libc++.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What does the `cxx` crate provide and what are its limits?",
+        "a": "`cxx` (github.com/dtolnay/cxx) generates safe FFI glue between C++ and Rust: it type-checks the bridge at compile time, ensures ownership rules are respected across the boundary (Rust Box vs C++ unique_ptr, CxxString vs rust::String), and prevents data races on shared references. Limits: it doesn't support arbitrary C++ templates or complex ownership graphs across the boundary; both sides must be rebuilt together; and it requires C++17."
+      },
+      {
+        "q": "How do you measure the success of a Rust-interop pilot?",
+        "a": "Three metrics: (1) CVE rate on the boundary module — should drop toward zero after 6 months in production. (2) Developer velocity — PR cycle time for the pilot team vs baseline; if Rust + cxx boilerplate adds more than 20% to review time, invest in internal tooling. (3) Binary size and latency budget impact — Rust's standard library adds ~300-500 KB; FFI overhead should be under 1 microsecond per crossing with zero-copy interfaces."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern a multi-million-line C++ monorepo — dependency hygiene, build time, and code ownership?",
+    "a": "Governance at this scale requires three independent control planes. (1) Build graph hygiene — use Bazel or CMake with strict `visibility` rules so targets declare exactly what they depend on. Automated tooling (Bazel's `buildozer`, custom CMake linter) detects circular deps and over-broad visibility. Track build time per layer with a 'build health dashboard'; enforce that P95 incremental build time stays under target (e.g., 2 minutes for a typical feature PR). (2) Dependency ownership — every library target has an `OWNERS` file. Owner approval is required for changes to the public API of a target. Automated staleness reports flag owners when a dependency hasn't been touched in 18 months (candidate for deletion). (3) Technical debt governance — a quarterly 'dead code strike': build coverage maps via gcov/llvm-cov plus link-time dead-code stripping reports to identify unused compilation units. Teams have one quarter to revive or delete. Strategic architectural changes go through a lightweight ADR process: 1-pager, council review, 2-week comment period.",
+    "fj": "I'd split it into microservices with separate repos so teams can move independently.",
+    "fs": "Splitting a monorepo doesn't eliminate coupling — it just makes it invisible and harder to refactor. I keep it monorepo but enforce hard dependency visibility rules in the build system so teams are independent within the repo, and I measure build health and ownership coverage as first-class engineering metrics.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you prevent 'dependency sprawl' where every team pulls in different versions of the same library?",
+        "a": "A single pinned version of every third-party library, enforced by the central Conan/vcpkg lockfile or Bazel's MODULE.bazel. Teams file upgrade requests through the platform team; the team applies the upgrade monorepo-wide and fixes all callers. Diamond dependency conflicts are resolved at the platform level, not left to per-team choice. This is the 'One Version Rule' — painful for migration but eliminates the ABI mismatch class of bugs entirely."
+      },
+      {
+        "q": "What is the role of compilation databases and tooling in large codebase governance?",
+        "a": "A `compile_commands.json` (generated by CMake or Bazel) enables all tooling — clang-tidy, clang-format, clangd language server, include-what-you-use — to operate on the full build graph. At scale I run these as async background jobs on the build cache, so engineers get tool results without waiting for a full local build. Include-what-you-use (IWYU) in particular is the primary mechanism to trim include graphs and reduce rebuild cascades."
+      }
+    ]
   }
 ]

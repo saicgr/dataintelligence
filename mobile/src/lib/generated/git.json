@@ -947,5 +947,419 @@
         "a": "Use `git subtree push --prefix=libs/sdk <remote> <branch>`, which extracts the subdirectory's history into commits against the upstream. Subtree's strength is that contributors clone with nothing extra, but contributing back upstream is the awkward part, the inverse trade-off from submodules. Many teams vendor read-only with subtree and contribute upstream via a separate clone."
       }
     ]
+  },
+  {
+    "q": "How do you use git reflog plus reset to rescue work after a catastrophic interactive rebase gone wrong?",
+    "a": "When an interactive rebase finishes but the result is corrupt or wrong, the pre-rebase tip is recorded in reflog as ORIG_HEAD and in the branch's own reflog entries immediately before the rebase lines. Run `git reflog` to find the last good SHA, typically the entry just before the 'rebase (start)' line, then `git reset --hard <sha>` to snap the branch back there. Because reflog entries survive until gc, recovery is reliable if you act within the expiry window (90 days for reachable, 30 for unreachable). Never run `git gc --prune=now` until the branch is confirmed healthy.",
+    "fs": "After a bad rebase, ORIG_HEAD and the branch reflog both point at the pre-rebase tip; reset --hard <sha> from reflog restores it before gc can prune the orphaned commits.",
+    "fj": "If an interactive rebase finishes badly there is no recovery; I have to stash and redo everything because the old commits are gone once rebase completes.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "recover pre-rebase tip from reflog",
+        "lang": "ts",
+        "lines": [
+          "git reflog",
+          "# e.g. abc123 HEAD@{4}: rebase (start)",
+          "#      def456 HEAD@{5}: commit: last good",
+          "git reset --hard def456",
+          "# or shorthand:",
+          "git reset --hard ORIG_HEAD"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "ORIG_HEAD is convenient, but when does it stop being reliable for rebase recovery?",
+        "a": "ORIG_HEAD is a single ref overwritten by the next destructive operation, such as a merge, reset, or another rebase. If you tried anything after the bad rebase before realizing it was wrong, ORIG_HEAD no longer points at the pre-rebase tip. In that case you must walk the reflog manually to find the correct pre-rebase entry, which is why reading the reflog directly is the more robust technique."
+      },
+      {
+        "q": "You rebased interactively, then ran a merge that created a new ORIG_HEAD. How do you still recover the pre-rebase state?",
+        "a": "The branch's per-branch reflog (not HEAD's) still has every tip change in order. Run `git reflog <branchname>` to list them in reverse chronological order, find the entry immediately before the first rebase line, grab that SHA, and `git reset --hard` to it. The per-branch reflog is independent of ORIG_HEAD and persists the full movement history."
+      },
+      {
+        "q": "How do you verify that the SHA you are about to reset to is actually the right one before committing to the reset?",
+        "a": "Run `git log <sha>` or `git show <sha>` to confirm the commit message and parent chain look as expected, then do a dry check with `git diff <sha> HEAD` to see what will change. Only then run `git reset --hard <sha>`. Creating a temporary branch (`git branch verify-recovery <sha>`) lets you inspect the restored state without moving your current branch, then you delete it or keep it."
+      }
+    ]
+  },
+  {
+    "q": "Explain git bisect run with a flaky test and how you harden the bisect script against false verdicts.",
+    "a": "When a test is intermittent, a single run may return the wrong exit code and mislabel a commit, causing bisect to converge on the wrong regression point. Hardening strategies: run the test N times in a loop and require all N to pass before returning 0 (good), so a single flaky pass does not whitewash a bad commit. Distinguish build failures (return 125 to skip) from test failures (return 1), since a build break should be skipped, not treated as the bug. Log output per commit to a file outside the repo so you can audit the verdicts after the fact. For persistent flakiness, consider running a deterministic proxy test that isolates the exact behaviour rather than the full test suite.",
+    "fs": "Harden bisect-run against flaky tests by repeating N times (all must pass for good), returning 125 on build failure, and logging verdicts externally for post-run audit.",
+    "fj": "For bisect run I just pass the test command directly; if the test is flaky I keep re-running bisect until I get the result I expect.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "robust bisect-run wrapper script",
+        "lang": "ts",
+        "lines": [
+          "#!/usr/bin/env bash",
+          "# build; skip if broken",
+          "make build 2>/dev/null || exit 125",
+          "# run 5 times; all must pass",
+          "for i in $(seq 5); do",
+          "  ./run-test.sh >> bisect.log 2>&1 || exit 1",
+          "done",
+          "exit 0"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does exit code 125 tell bisect to skip rather than marking the commit bad?",
+        "a": "Git reserves 125 as the 'untestable' signal for `bisect run`, so it skips the commit and picks a nearby one, equivalent to `git bisect skip`. Codes 128 and above abort the entire session. A build failure is not a test failure, so returning 1 there would mislabel a broken-build commit as the bug's introduction. Distinguishing these three categories keeps the binary search honest."
+      },
+      {
+        "q": "After a bisect run finishes on a large repo, how do you confirm the identified commit is really the cause and not an artifact of the script?",
+        "a": "Manually check out the identified commit and the one before it, run the test multiple times on each, and compare results. Also inspect the commit's diff to see if the change is plausibly related to the symptom. If both passes and failures occur on both commits, the script is unreliable. It is also worth verifying the commit after the bad one does not pass, which would indicate an off-by-one in the bisect."
+      },
+      {
+        "q": "In a monorepo where only certain services are affected, how do you limit bisect to relevant commits?",
+        "a": "Pass a pathspec after `--`: `git bisect start HEAD <good-sha> -- services/payments/`. Git skips commits that do not touch those paths, reducing the search space dramatically. Combine this with a fast service-specific test in the run script so each step tests only the affected component. This is the difference between bisecting through thousands of unrelated UI commits and narrowing to dozens of payment-service changes."
+      }
+    ]
+  },
+  {
+    "q": "How do you use git submodule update --remote and what are its risks in a CI pipeline?",
+    "a": "git submodule update --remote fetches the upstream branch tip of each submodule and checks it out, rather than the SHA pinned in the superproject. This is useful for update workflows where you deliberately want to advance a dependency, but in CI it breaks reproducibility: two runs at different times can check out different upstream commits and produce different builds without any change to the superproject's tree. The safe CI practice is to never use --remote in build pipelines; lock submodules to explicit SHAs in the superproject, run `git submodule update --init --recursive` to check out exactly those SHAs, and advance them deliberately via a dedicated update commit reviewed in a PR.",
+    "fs": "--remote tracks the upstream branch tip for intentional advancement; CI must use locked SHA via `update --init --recursive` for reproducibility, never --remote.",
+    "fj": "I always add --remote to git submodule update in CI so the build always gets the latest code from all dependencies automatically.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "locked vs floating submodule update",
+        "lang": "ts",
+        "lines": [
+          "# CI: locked SHA, reproducible",
+          "git submodule update --init --recursive",
+          "",
+          "# advancement workflow only:",
+          "git submodule update --remote libs/sdk",
+          "git add libs/sdk",
+          "git commit -m \"chore: bump sdk submodule\""
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "A submodule's upstream repo was force-pushed, moving the branch tip. How does this affect your superproject?",
+        "a": "If your superproject still pins the old SHA, `git submodule update --init` will fail or produce an empty checkout because that commit no longer exists on the remote (or is unreachable). You must update the pinned SHA to a new reachable commit. This is why force-pushing a branch that submodule consumers track is a breaking change and should be avoided or coordinated carefully."
+      },
+      {
+        "q": "How do you run a CI matrix that builds both the latest upstream version and the pinned version for regression comparison?",
+        "a": "Have two pipeline jobs: one using `git submodule update --init --recursive` for the pinned SHA, another that runs `git submodule update --remote` followed by the same build and tests. Fail the pipeline only on the locked job; treat the floating job as informational so a new upstream bug shows as a warning without blocking the release. Schedule the floating job on a cron, not every PR."
+      },
+      {
+        "q": "What config option auto-updates submodules on every git pull without requiring an extra command?",
+        "a": "Set `submodule.recurse = true` (or `git config --global submodule.recurse true`). Git then appends `--recurse-submodules` to every pull, fetch, and checkout, keeping submodule working trees in sync automatically. The trade-off is longer pull times in large repos with many submodules, and you must still be deliberate about --remote vs locked-SHA semantics."
+      }
+    ]
+  },
+  {
+    "q": "How does git partial clone (--filter=blob:none or --filter=tree:0) help teams working with large repositories?",
+    "a": "Partial clone delays downloading objects until they are actually needed. `--filter=blob:none` (blobless clone) fetches all commits and trees upfront but omits file contents (blobs), downloading a blob only when you check it out or run a command that needs it. `--filter=tree:0` (treeless clone) goes further, omitting tree objects too, so only commits arrive initially. Both dramatically reduce clone time and disk for monorepos or repos with large binary histories. The trade-off is that some operations (like `git log --all -- path`) trigger on-demand fetches and need network access.",
+    "fs": "blobless clone (--filter=blob:none) omits file content until checkout; treeless (--filter=tree:0) also omits trees; both slash clone time for large repos at the cost of lazy-fetch network hits.",
+    "fj": "Partial clone is experimental and breaks git log and blame so it is not production-ready.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "blobless and treeless clones",
+        "lang": "ts",
+        "lines": [
+          "# blobless: all commits+trees, blobs on demand",
+          "git clone --filter=blob:none <url>",
+          "",
+          "# treeless: only commits upfront",
+          "git clone --filter=tree:0 <url>",
+          "",
+          "# check filter is active:",
+          "git config remote.origin.partialclonefilter"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens when a CI job clones blobless and then runs git log --all -- path/to/file?",
+        "a": "Git needs tree objects to resolve path history, so it issues on-demand fetches for any tree it does not have. On a busy CI machine this can hammer the server with many small requests, slowing the job and adding network load. Warm the cache with a targeted `git fetch --filter=blob:none origin` before path-based log commands, or use a blobless clone with a shallow depth to bound the on-demand fetch scope."
+      },
+      {
+        "q": "How does Microsoft's Scalar tool go beyond partial clone to handle enormous repos like the Windows codebase?",
+        "a": "Scalar combines partial clone, sparse checkout (only materialise the directories you need), background fetch scheduling, GVFS protocol support, and a commit-graph file that makes `git log` and `git status` fast even with millions of commits. It also configures `core.fsmonitor` to avoid full working-tree scans. Partial clone is one layer; Scalar stacks multiple performance features to make a multi-million-file, multi-decade-history repo usable on a laptop."
+      },
+      {
+        "q": "When should you prefer sparse checkout alongside partial clone versus a full blobless clone?",
+        "a": "Prefer sparse checkout (`git sparse-checkout set <patterns>`) when developers routinely work in one sub-area of a large monorepo and should never check out unrelated directories. Sparse checkout materializes only matched paths, reducing I/O and IDE indexing cost. A blobless clone without sparse checkout still materializes every file on checkout. Combining both gives maximum savings: sparse defines which paths, blobless defers the blobs of those paths until needed."
+      }
+    ]
+  },
+  {
+    "q": "What is the commit-graph file and how does enabling it change git log and git status performance on large repos?",
+    "a": "The commit-graph is a precomputed binary file at `.git/objects/info/commit-graph` that caches reachability, generation numbers, and parent relationships for all commits. Without it, commands like `git log`, `git merge-base`, and `git branch --merged` must walk the raw commit objects one by one, which is O(N) over history. With it, generation numbers enable fast reachability checks and topological sorts without traversing full chains. You write it with `git commit-graph write --reachable` and automate updates via `fetch.writeCommitGraph = true`; GitHub, GitLab, and Azure DevOps write it server-side automatically.",
+    "fs": "commit-graph caches parent/reachability/generation data for all commits; enables O(log N) log and merge-base queries instead of O(N) object walks; write via fetch.writeCommitGraph=true.",
+    "fj": "git log is always slow on large repos and there is nothing you can do about it except shallow clone.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "write and automate commit-graph updates",
+        "lang": "ts",
+        "lines": [
+          "# one-off write",
+          "git commit-graph write --reachable",
+          "",
+          "# auto-update on every fetch",
+          "git config fetch.writeCommitGraph true",
+          "",
+          "# verify graph exists",
+          "ls .git/objects/info/commit-graph*"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is a generation number in the commit-graph, and why does it make merge-base lookups faster?",
+        "a": "Each commit gets a generation number equal to one plus the maximum generation of its parents, with root commits starting at 1. During a merge-base search, Git can prune entire subtrees: if one candidate has a higher generation than the other commit under investigation, it cannot be an ancestor without further traversal. This turns an exhaustive graph walk into a bounded search, which on repos with millions of commits can be orders of magnitude faster."
+      },
+      {
+        "q": "After a force-push rewrites history, can the commit-graph become inconsistent, and how is it fixed?",
+        "a": "Yes. The graph may still cache the old commit chains, causing stale results for reachability queries until regenerated. Running `git commit-graph write --reachable --changed-paths` or a `git gc` regenerates it from the current object store. On server-side hosting this happens automatically after a force-push. On local clones, re-running `git fetch` with `fetch.writeCommitGraph = true` will write a fresh graph."
+      },
+      {
+        "q": "How does enabling core.fsmonitor interact with the commit-graph to make git status fast on large working trees?",
+        "a": "`core.fsmonitor` delegates working-tree change detection to an OS file-system watcher (like Watchman), so Git receives only the actually modified paths rather than scanning every file. The commit-graph accelerates the commit-chain side of status (deciding what is staged vs committed). Together they address both the working-tree scan bottleneck and the history traversal bottleneck, which together explain why status is slow on a large, active repo."
+      }
+    ]
+  },
+  {
+    "q": "How do you design and enforce git hooks as part of a team's development workflow, and what are the limits of hook-based enforcement?",
+    "a": "Start by distinguishing client-side hooks (pre-commit, commit-msg, pre-push) from server-side hooks (pre-receive, update, post-receive). Client hooks catch issues early with fast, cheap checks: linting, unit tests, commit-message format. Share them via a committed `.githooks/` directory and `core.hooksPath`, installed automatically in a `prepare` npm/make script so every clone is wired up. However, client hooks can always be bypassed with `--no-verify`, so they are developer ergonomics, not security policy. True enforcement lives on the server: branch protection rules require green CI status checks before merge, block direct pushes to main, require PR approvals, and cannot be circumvented by client flags. Design the system so the client hooks give fast feedback and the server-side CI enforces the gate.",
+    "fs": "Client hooks (pre-commit/commit-msg) give fast feedback via .githooks + core.hooksPath but are --no-verify bypassable; server branch protection + required CI status checks are the unbypassable gate.",
+    "fj": "I added a pre-commit hook that runs the full test suite, so no bad code can ever merge, I do not need CI or branch protection rules.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "wire up shared hooks + set CI gate",
+        "lang": "ts",
+        "lines": [
+          "# package.json prepare script:",
+          "\"prepare\": \"git config core.hooksPath .githooks\"",
+          "",
+          "# .githooks/pre-commit (fast checks):",
+          "#!/bin/sh",
+          "npx eslint --max-warnings=0 $(git diff --name-only HEAD -- '*.ts')",
+          "",
+          "# GitHub: require status check in branch protection",
+          "# so --no-verify cannot bypass CI gate"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "A developer is blocked by a slow pre-commit hook that runs the full test suite. How do you fix the hook design?",
+        "a": "Pre-commit hooks should run in under a few seconds; move the full suite to CI. The hook should run only fast, targeted checks on the staged files: lint the changed files, run related unit tests via affected-test detection (e.g. Jest --findRelatedTests), or do a type-check. Full integration tests belong in a PR status check. Speed is why developers bypass hooks with --no-verify; making them fast removes the temptation."
+      },
+      {
+        "q": "How do you enforce consistent commit-message format across an org without policing every developer manually?",
+        "a": "Add a `commit-msg` hook that validates the message against a pattern (Conventional Commits regex, for example) and exits 1 with a helpful error if it fails. Share it via `core.hooksPath`. On the server side, a `pre-receive` or CI job can re-validate the messages of all pushed commits, rejecting the push if any deviate. Tools like `commitlint` integrate with both layers and can be centrally configured in a shared config package."
+      },
+      {
+        "q": "What is the difference between putting a check in a pre-push hook versus a pre-receive hook?",
+        "a": "`pre-push` runs locally before the push, giving fast feedback on the developer's machine but skippable with `--no-verify`. `pre-receive` runs on the server after the push data arrives but before refs update, so it cannot be bypassed by the pusher. For cheap network-available checks (like calling a policy service to validate branch names), pre-receive is the authoritative gate. Use both: pre-push for fast local feedback and pre-receive for the enforced policy."
+      }
+    ]
+  },
+  {
+    "q": "What are the trade-offs between trunk-based development and GitFlow for a team shipping a SaaS data platform with multiple customers on different release schedules?",
+    "a": "Trunk-based development assumes a single production line and continuous deployment, which works well when all customers run the same version. A SaaS data platform with customers on different release schedules may need to patch v2.1 while shipping v2.3, which trunk-based does not model natively; you bolt on support branches for each version. GitFlow's explicit release, hotfix, and version branches map directly to that multi-version reality but impose significant merge ceremony: a hotfix on main must be back-merged into develop and every active release branch, which compounds as version count grows. The pragmatic middle is a modified trunk: maintain a small number of stable release branches cut from main at each minor version, CI required on all of them, and a policy that any hotfix lands on main first and is cherry-picked to affected release branches by an automated backport job.",
+    "fs": "Trunk-based suits a single deployable version; multi-customer release schedules need release branches (GitFlow-style) or automated cherry-pick backport jobs from trunk to per-version branches.",
+    "fj": "We should use GitFlow because it was designed for enterprise releases; its develop/release/hotfix branches handle all multi-version scenarios without any trade-offs.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "Your automated backport job cherry-picks hotfixes from main to release branches. What do you do when a cherry-pick conflicts because the release branch diverged significantly?",
+        "a": "The job should fail the backport PR rather than silently losing the fix. Set the job to open a conflict-labelled PR assigned to the owning team. Have the engineer resolve the conflict on the release branch, document the divergence reason, and treat the manual backport like a code review. Also track how often conflicts occur per version; frequent conflicts signal the release branch is too old and should be retired or aligned."
+      },
+      {
+        "q": "How does feature flagging change the branching model for a data platform with enterprise customers?",
+        "a": "Flags let you merge code to trunk continuously while controlling per-customer rollout via config, removing the need for long-lived customer-specific branches. Enterprise customers get the same binary, with different flag states. The trade-off is operational complexity: you need a flag management system (LaunchDarkly, Unleash) with per-customer targeting, and the codebase carries dead code paths until a flag is retired. The branching savings are usually worth the flag lifecycle discipline."
+      },
+      {
+        "q": "A customer reports a critical data corruption bug in v2.0 which reached end-of-life a year ago. How do you handle the fix given trunk has moved far ahead?",
+        "a": "Assess whether the vulnerability justifies breaking the EOL policy. If yes, cut a support branch from the v2.0 tag, apply a minimal targeted fix (not cherry-pick from trunk, which carries too much unrelated code), run the v2.0 CI suite against it, and ship a v2.0.1. Communicate to the customer that this is exceptional and set a hard EOL date. If it is not security-critical, use the event to push the customer to upgrade. Document the decision and the cost as rationale for tighter EOL policies."
+      }
+    ]
+  },
+  {
+    "q": "How do you choose and implement a monorepo vs polyrepo strategy for a data engineering organization with 20+ services and shared libraries?",
+    "a": "Monorepo puts all services and libraries in one repo with tooling (Bazel, Nx, Turborepo, or Pants) to scope builds and tests to affected code. It makes cross-service refactors atomic, dependency bumps visible in one PR, and shared library consumers visible with `git log -- libs/`. The cost is build tooling investment, a larger Git object store needing partial clone or Scalar, and CI that must handle path-based change detection to avoid rebuilding everything on every PR. Polyrepo keeps each service independently releasable with its own CI, simpler reviews, and smaller repo size, but cross-team refactors become N-repo PRs, library versioning requires a registry and changelog, and dependency drift is easy to miss. For 20+ services with heavy shared code and a platform team owning the libraries, monorepo usually wins because the alternative is a coordination tax that compounds with headcount.",
+    "fs": "Monorepo enables atomic cross-service changes and shared library visibility but needs build-tool investment and partial-clone for scale; polyrepo is simpler per-service but compounds cross-team coordination and dependency drift.",
+    "fj": "Monorepo is always better for large orgs because you can see all the code in one place, there are no real trade-offs.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you set up CI in a monorepo to avoid rebuilding and retesting every service on every PR?",
+        "a": "Use a change-detection step that runs `git diff --name-only origin/main...HEAD` and maps changed paths to affected services via a dependency graph (your build tool provides this). Only the affected services and their downstream dependents run their full test and build jobs. Label PRs that touch shared libraries as high-blast-radius and run a broader set. Tools like Nx's affected commands, Turborepo's --filter, or Bazel's query automize this mapping. This is the core investment that makes monorepo CI viable at scale."
+      },
+      {
+        "q": "A team in the monorepo wants to version their service independently with a different release cadence than others. How do you accommodate that?",
+        "a": "Introduce a per-service versioning file (e.g. `services/payments/VERSION`) and a tagging convention like `payments/v2.1.0` scoped to that service's path. CI can trigger service-specific deploys based on tag pattern matches. This decouples release cadence without splitting repos. The constraint is that breaking changes to shared libraries still require coordinated bumps across consumers, which is the monorepo's inherent coupling."
+      },
+      {
+        "q": "When does a large monorepo actually degrade developer experience, and what are the early warning signs?",
+        "a": "Warning signs: `git status` and `git add -p` become slow due to thousands of tracked files (fix with fsmonitor and sparse checkout), clone time grows past 10 minutes (fix with partial clone), CI rebuilds everything on every PR (fix with path-based job filtering), and code owners cannot track changes in unrelated services (fix with CODEOWNERS scoping). When these are hitting and build tooling adoption is low, the monorepo is net-negative. The tipping point is usually when the repo history exceeds several GB and the platform team cannot invest in the tooling to manage it."
+      }
+    ]
+  },
+  {
+    "q": "How do you integrate Git-based workflows into a CI/CD pipeline for a microservices platform, handling per-service versioning, automated releases, and rollback?",
+    "a": "The foundation is a branch-protection rule requiring every merge to main to pass a service-specific CI job gated by path change detection. Semantic versioning is automated: merge to main triggers a versioning step (using Conventional Commits + semantic-release or similar) that bumps the service's version file, tags the commit with `<service>/vX.Y.Z`, and publishes a release artifact. CD picks up the tag event and deploys the image. Rollback uses the previous stable tag: the pipeline promotes the old artifact without a code change, and the git tag history is the audit trail. The key design principle is that git history is the single source of truth for what is deployed where, and every deploy is traceable to a commit and a tag.",
+    "fs": "Gate merges on path-scoped CI; semantic-release auto-tags on Conventional Commits; CD deploys on tag events; rollback re-tags/re-deploys the prior artifact; git history = deploy audit trail.",
+    "fj": "Our CD pipeline deploys whatever is in main right now; versioning is manual and we rollback by reverting commits and redeploying.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "tag-driven CD pipeline skeleton",
+        "lang": "ts",
+        "lines": [
+          "# .github/workflows/release.yml",
+          "on:",
+          "  push:",
+          "    tags: ['payments/v*']",
+          "jobs:",
+          "  deploy:",
+          "    steps:",
+          "      - uses: actions/checkout@v4",
+          "      - run: |",
+          "          TAG=${GITHUB_REF#refs/tags/}",
+          "          SERVICE=${TAG%%/v*}",
+          "          VERSION=${TAG#*/v}",
+          "          ./deploy.sh $SERVICE $VERSION"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "If a service's semantic-release automation creates a tag on main but the deploy fails, how do you handle the version already being published?",
+        "a": "Never delete a published tag; treat it as permanently immutable once created. Instead, fix forward: create a new patch release that fixes the broken deploy, so v1.2.3 fails and v1.2.4 is the good deploy. Document v1.2.3 as a broken release in the changelog. Deleting or moving a tag breaks anyone or any system that pinned to it, and git's tag model assumes immutability. A good deploy pipeline validates the artifact in a staging environment before tagging production, preventing this scenario."
+      },
+      {
+        "q": "How do you structure Conventional Commits to drive semantic versioning correctly across many services in a monorepo?",
+        "a": "Scope the commit type with the service name: `feat(payments): add webhook retry` or `fix(ingestion): null pointer in parser`. Your semantic-release config filters by scope per service, so only commits scoped to `payments` influence the payments version. Without scoping, all feat/fix commits across the monorepo would bump every service's version on every release. The scope also serves as the impact annotation in changelogs."
+      },
+      {
+        "q": "A regulatory audit requires you to prove exactly which code was running in production on a specific date three years ago. How does your Git strategy support this?",
+        "a": "Annotated tags created at deploy time (with `git tag -a payments/v1.2.3 -m 'deployed to prod 2023-04-12'`) include tagger identity, timestamp, and GPG signature if configured. A deploy manifest stored in the repo or artifact registry maps each production event to a tag+SHA. `git show payments/v1.2.3` reveals the exact commit, its diff, and the CI run that produced the artifact. For deeper auditability, sign tags with GPG (`git tag -s`) so the timestamp and identity are cryptographically verified, satisfying SOC 2 and similar requirements."
+      }
+    ]
+  },
+  {
+    "q": "As a Staff engineer, how do you evaluate build-vs-buy for Git hosting (GitHub Enterprise, GitLab self-managed, Bitbucket, Gitea) across cost, compliance, and developer experience dimensions?",
+    "a": "The decision matrix has four axes. Cost: SaaS (GitHub.com, GitLab.com) has predictable per-seat pricing but scales linearly; self-managed has infrastructure and ops overhead but can be cheaper at large scale or when you already run Kubernetes. Compliance: air-gapped or on-prem is mandated for financial, government, or healthcare workloads with data residency requirements; SaaS vendors provide SOC 2 and ISO 27001 but you must accept their data handling. Developer experience: GitHub has the largest ecosystem of actions, integrations, and OSS tooling; GitLab is a single DevSecOps platform covering CI/CD, registry, and security scanning, reducing vendor count. Operational burden: self-managed requires capacity planning, upgrades, backup, and HA configuration, which is a real headcount cost. For most data engineering orgs under 500 engineers without strict compliance requirements, GitHub.com or GitLab.com SaaS wins on DX and ops simplicity; above that scale or with compliance mandates, GitLab self-managed on internal cloud is the common choice.",
+    "fs": "Evaluate on cost at scale, data-residency compliance, DX/ecosystem, and ops burden; SaaS wins for most orgs under 500; self-managed GitLab for large-scale or air-gapped compliance needs.",
+    "fj": "Always self-host because you control the data, SaaS is never acceptable for any company regardless of compliance requirements.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A regulated financial firm requires that all code and CI logs never leave their AWS VPC. Which Git hosting option is most practical and what must they configure?",
+        "a": "GitLab self-managed deployed on EC2 or EKS in a private VPC with no public endpoints, or GitHub Enterprise Server in their own cloud account. CI must run self-hosted runners inside the VPC. Key configurations: disable external integrations, set `Allow requests to the local network from hooks` only for internal services, configure S3 for artifact storage with VPC endpoints, and use AWS KMS for secret encryption. Audit logs must be shipped to an internal SIEM. GitHub Enterprise Server and GitLab both support this architecture; the choice comes down to existing GitHub vs GitLab tooling investment."
+      },
+      {
+        "q": "How do you handle the risk of vendor lock-in when choosing a hosted Git provider?",
+        "a": "Git itself is portable; the lock-in is in CI/CD workflows, integrations, and APIs. Mitigate it by keeping CI workflows in standard steps that call scripts rather than provider-specific actions, abstracting the pipeline behind a Makefile or task runner. Mirror repos to a secondary provider using their built-in mirroring. Avoid provider-specific features (GitHub Projects, GitLab Epics) for critical process unless you are willing to rebuild them on migration. Periodically run a drill: can you migrate the top 10 repos and their CI pipelines to an alternative in a week?"
+      },
+      {
+        "q": "GitHub Enterprise Server requires you to manage upgrades. How do you minimize risk when applying a major version update?",
+        "a": "Use GitHub's blue-green upgrade pattern: provision a second instance, restore a backup to it, apply the upgrade, run smoke tests (API health, webhook delivery, CI runner connectivity), then cut DNS over. Keep the old instance warm for a rollback window (typically 24 hours). Test the upgrade in a staging environment first using a recent backup snapshot. Review the release notes for deprecated API endpoints and breaking changes to your CI actions or OAuth apps before cutting over. Automate upgrade testing with a post-upgrade check script that validates key workflows."
+      }
+    ]
+  },
+  {
+    "q": "How do you design an org-wide Git branching and release strategy that scales across 50+ teams with varying release cadences?",
+    "a": "At org scale, a single prescriptive strategy fails because teams have genuinely different constraints: some ship SaaS continuously, others maintain on-prem customer installs, others own shared libraries with strict API stability. The right approach is a tiered standard: establish a baseline policy everyone must follow (branch protection on main, required CI, PR review, commit signing for audit), and offer two approved workflow templates (trunk-based for continuous-delivery products, release-branch model for versioned artifacts) with reference configurations teams can adopt. Governed by a Git platform team that owns the tooling, documents the templates, runs office hours, and reviews deviations. Measure compliance via automated policy checks (branch protection audits, required CI coverage) run weekly and reported to eng leadership. The goal is coordination without uniformity.",
+    "fs": "Set a baseline policy (branch protection, required CI, PR review) + two approved workflow templates (trunk vs release-branch); a platform team governs tooling and audits compliance via automated checks.",
+    "fj": "Every team should use exactly the same Git workflow with no exceptions, and the Git admin should manually enforce it by reviewing every PR.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you enforce the baseline policy across hundreds of repos without a human reviewing every one?",
+        "a": "Write an automated compliance scanner that queries the GitHub/GitLab API for every org repo, checks that branch protection rules match the baseline (required status checks, minimum approvals, no force-push to main), and reports violations to a dashboard and sends weekly Slack summaries to team leads. Repos out of compliance for more than two sprints escalate to the engineering director. Some orgs use Terraform to provision branch protection rules as code and drift-detect daily. The key is making compliance visible and automatic, not a manual audit."
+      },
+      {
+        "q": "A newly acquired company has 200 repos using a completely different branching model and commit convention. How do you migrate them without stopping their roadmap?",
+        "a": "Do not force an overnight cutover. Phase one: apply the minimum baseline (branch protection, required CI) to all repos with automated scripts; this takes a week and is non-disruptive. Phase two: run a 90-day migration where teams voluntarily adopt one of the two approved workflow templates with platform-team support. Phase three: retire the old model by making it unsupported (no shared CI templates, no official runbooks). Key principle: make the new way easier than the old way by providing copy-paste GitHub Actions workflows and branch protection Terraform modules. Measure adoption by tracking which repos use the shared CI templates."
+      },
+      {
+        "q": "How do you set a monorepo vs polyrepo policy at the org level, and what governance structure owns that decision?",
+        "a": "The monorepo/polyrepo decision is architectural and has downstream effects on CI tooling, ownership models, dependency management, and onboarding. It belongs in a published Architecture Decision Record (ADR) owned by the principal/staff engineer council, not left to each team. The ADR defines default (usually polyrepo for new services, monorepo for closely coupled platform components), the criteria for exceptions (number of shared dependencies, cross-team refactor frequency, ownership model), and the approval process. A team wanting to deviate from the default presents to the platform review board, which checks for tooling readiness and infra cost. Document the decision and revisit annually as the org scales."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern commit signing and supply-chain security across an engineering org as a Principal-level Git strategy decision?",
+    "a": "Commit signing (GPG or SSH key via `git config commit.gpgsign`) attaches a cryptographic identity to each commit, so you can verify that code reaching main was authored by a known engineer and not injected by a compromised build system or a social-engineering attack. At org scale, govern it by requiring signed commits via branch protection (GitHub's 'Require signed commits' setting) and enforcing it through the platform team's Terraform-managed branch protection. Pair with Sigstore/Gitsign for keyless signing tied to OIDC identity (no long-lived keys to rotate), and Sigstore's Rekor transparency log to make the signing events tamper-evident and auditable. This is one layer of a SLSA supply-chain framework: also cover artifact signing, provenance attestation in CI, and SBOM generation. The principal's job is to frame the ROI for security leadership and define the roadmap that phases in signing without blocking developer velocity.",
+    "fs": "Require signed commits (GPG/SSH or Sigstore keyless) via branch protection + Rekor audit log; this is one SLSA layer alongside artifact signing and SBOM; phase rollout to avoid velocity impact.",
+    "fj": "Commit signing is unnecessary overhead because GitHub already tracks who pushes code via login.",
+    "level": "Principal",
+    "code": [
+      {
+        "label": "configure Gitsign (Sigstore) for keyless signing",
+        "lang": "ts",
+        "lines": [
+          "# install gitsign and configure globally",
+          "git config --global gpg.format x509",
+          "git config --global gpg.x509.program gitsign",
+          "git config --global commit.gpgsign true",
+          "",
+          "# verify a commit's signature",
+          "git verify-commit HEAD",
+          "",
+          "# Rekor logs the signing event; verify via:",
+          "gitsign verify --certificate-identity=you@corp.com HEAD"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "A developer's GPG key is compromised. What is the blast radius and how do you respond?",
+        "a": "The compromised key can sign arbitrary commits that appear valid, so an attacker could inject malicious code that passes signing verification. Immediate response: revoke the key from the org's keyring and from any key server it was uploaded to, invalidate the developer's GitHub/GitLab SSH and GPG key entries, rotate their access tokens, and audit recent commits signed with that key using `git log --show-signature` to check for unexpected additions. For forward prevention, keyless signing (Sigstore/Gitsign) avoids long-lived keys entirely, reducing the key-compromise blast radius to the OIDC session window."
+      },
+      {
+        "q": "How does requiring signed commits interact with automated bots and CI systems that also commit to repos?",
+        "a": "Bots and CI must also sign their commits, so provision each bot a service account with an SSH signing key or use Gitsign with a bot OIDC identity. Store the bot's private key in your secrets manager (Vault, AWS Secrets Manager) and inject it at commit time. Document the bot identities in the branch protection policy so auditors can distinguish human and machine commits. GitHub Actions supports this natively via SSH signing with a key stored as an Actions secret."
+      },
+      {
+        "q": "What is SLSA (Supply-chain Levels for Software Artifacts) and how does commit signing map to it?",
+        "a": "SLSA is a framework of progressively stronger supply-chain security guarantees. Level 1 requires provenance metadata (what built the artifact). Level 2 requires a hosted build service generating signed provenance. Level 3 requires the build to be hardened (no persistent credentials, hermetic builds). Level 4 adds two-party review and hermetic, reproducible builds. Commit signing contributes to L2/L3 by cryptographically linking the source commit to the identity that authored it, but it is one layer; you also need artifact signing at the container or package level, CI provenance attestations (SLSA provenance format), and SBOM generation. The principal's strategic role is prioritizing which SLSA level to target given regulatory exposure and threat model."
+      }
+    ]
+  },
+  {
+    "q": "How do you build a long-term Git repository health and performance strategy for an engineering org as history and team size grow?",
+    "a": "Repository health degrades predictably: history grows, clone times increase, large binary files accumulate, and tooling slows. The proactive strategy has four pillars. First, never commit large binaries to the main object store; enforce Git LFS for any file above a threshold (images, ML models, compiled artifacts) via a pre-receive hook and a .gitattributes policy. Second, enable partial clone (--filter=blob:none) as the org default clone command and document it in the onboarding guide. Third, write and auto-refresh the commit-graph file (fetch.writeCommitGraph) and enable fsmonitor on all developer machines for fast status. Fourth, run monthly `git gc` and `git maintenance` schedules on the server, and set repacking policies to avoid excessive loose object counts. At the principal level, the strategy is also process-shaped: define a repo size SLO (e.g. unshallow clone under 90 seconds), measure it monthly, and create an escalation path for repos that breach it.",
+    "fs": "Four pillars: LFS for binaries, partial clone as default, commit-graph + fsmonitor for speed, scheduled gc/maintenance; define a clone-time SLO and measure monthly.",
+    "fj": "Git repos get slow naturally over time and the only fix is to archive old repos and start a new one every few years.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "A team accidentally committed 50 GB of ML model binaries to the main object store two years ago. How do you remove them without rewriting their active work?",
+        "a": "Use `git filter-repo --path <model-dir> --invert-paths` to rewrite history removing those paths across all commits, then force-push all branches and tags after coordinating a repo freeze. All existing clones are invalidated; team members must re-clone. This is disruptive but necessary for a 50 GB bloat. After the rewrite, add a pre-receive hook and `.gitattributes` policy that enforces LFS for the file extensions that caused the problem. Run a `git gc --aggressive --prune=now` server-side after the rewrite to reclaim disk space."
+      },
+      {
+        "q": "How do you set up git maintenance as a background health service on developer machines across the org?",
+        "a": "Run `git maintenance start` in each repo or globally (in Git 2.37+ you can set `maintenance.repo` for a global schedule). It schedules background jobs via the system's scheduler (launchd on macOS, systemd on Linux, Task Scheduler on Windows) for prefetch, gc, commit-graph write, and loose-objects packing. Include this in the org's developer onboarding script and dotfiles bootstrap. Server-side, configure the same via cron on the Git server (for self-hosted) or rely on the hosting provider's automatic maintenance (GitHub runs this for all repos automatically)."
+      },
+      {
+        "q": "What leading indicators tell you a repo is approaching an unmanageable size before it becomes an emergency?",
+        "a": "Track these metrics: unshallow clone time (SLO: under 90s), `git count-objects -v` showing loose object count above 10,000, pack file size growth rate per month, and the number of large blobs (files over 5 MB in the object store identified by `git rev-list --objects --all | git cat-file --batch-check | sort -k3 -rn | head`). Alert when any metric crosses a threshold. A sustained upward trend in clone time is the most user-visible signal; loose object accumulation predicts future gc pressure before it impacts users."
+      }
+    ]
   }
 ]

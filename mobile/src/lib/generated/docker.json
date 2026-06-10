@@ -851,5 +851,398 @@
         "a": "The OCI distribution spec now carries arbitrary artifacts via the referrers API: Helm charts, SBOMs, signatures (cosign), provenance attestations, and even AI models are pushed as OCI artifacts linked to an image by digest. So a registry is increasingly a general content-addressable artifact store, with attestations discoverable as referrers of the image they describe."
       }
     ]
+  },
+  {
+    "q": "Why are Docker containers fundamentally Linux-native, and what happens when you run Docker on macOS or Windows?",
+    "a": "Docker containers share the host Linux kernel — they are isolated processes using Linux namespaces and cgroups, not full VMs with their own OS. There is no Windows or macOS equivalent of the container primitives, so Docker Desktop ships a lightweight Linux VM (HyperKit on Mac, Hyper-V/WSL2 on Windows) to provide the Linux kernel. Every container you run on those platforms actually runs inside that Linux guest, which is why host networking, direct device access, and performance characteristics differ from Linux native.",
+    "fs": "Containers are Linux kernel features; macOS/Windows run a Linux VM under Docker Desktop — there is no native container runtime on those OSes.",
+    "fj": "Docker containers are cross-platform and use the native macOS or Windows kernel when run there.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Why does `--network host` behave differently on Docker Desktop versus Linux?",
+        "a": "On Linux, `--network host` removes the container's network namespace so it shares the host's interfaces directly. On Docker Desktop, the 'host' is the Linux VM, not your Mac or Windows machine, so the container joins the VM's network stack — not your laptop's. Docker Desktop added experimental support to bridge this, but truly native host-stack sharing is a Linux-only property."
+      },
+      {
+        "q": "What are the practical latency consequences of the Linux VM layer on Docker Desktop for I/O-heavy workloads?",
+        "a": "Bind mounts on Docker Desktop cross a virtio/9P or gRPC-Fuse filesystem boundary between macOS and the Linux VM, adding significant latency for file-intensive operations like `npm install` or live code reloading. Mitigations include using named volumes (data stays inside the Linux VM), the VirtioFS driver (faster on Apple Silicon), or delegating heavy I/O to the container side entirely."
+      }
+    ]
+  },
+  {
+    "q": "How do Linux namespaces isolate containers, and which namespace types does Docker use?",
+    "a": "Linux namespaces partition global kernel resources so each container sees its own private view. Docker uses six: pid (each container has its own process tree with PID 1), net (private network interfaces and routing table), mnt (private filesystem mount tree, basis for overlayfs), uts (private hostname), ipc (private System V IPC and POSIX message queues), and user (optional — maps in-container UIDs to host UIDs). The kernel does not copy these resources; each namespace is a view that shares the same underlying kernel, which is why container startup is milliseconds rather than the seconds a full VM needs.",
+    "fs": "Docker uses pid/net/mnt/uts/ipc/user Linux namespaces — each is a lightweight view of a kernel resource, not a copy.",
+    "fj": "Docker uses a single hypervisor namespace that wraps the container in a VM.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What does sharing the Linux kernel mean for container security compared to a VM?",
+        "a": "All containers on a host share one Linux kernel, so a kernel-level exploit can break namespace isolation and affect all tenants — something a hypervisor boundary prevents. This is why multi-tenant Kubernetes clusters often add a second isolation layer (gVisor, Kata Containers, or strict seccomp/AppArmor) and why node separation between trust domains is a standard hardening control."
+      },
+      {
+        "q": "When would you explicitly use the pid namespace of another container, and what does that give you?",
+        "a": "`docker run --pid container:<id>` places the new container in another container's pid namespace, so both see the same process tree. This is how ephemeral debug containers work: the debug container can `strace`, inspect `/proc`, or send signals to processes in the target container's tree — without being part of its image or filesystem."
+      }
+    ]
+  },
+  {
+    "q": "Explain Linux cgroups and how Docker uses them to enforce resource limits on containers.",
+    "a": "Control groups (cgroups) are a Linux kernel mechanism that organizes processes into a hierarchy and applies resource accounting and limits per group. Docker creates a cgroup per container and wires container flags to cgroup controllers: `--memory` sets the memory.max limit, `--cpus` maps to cpu.weight/cpu.max in cgroups v2, and `--blkio-weight` throttles block I/O. When a container exceeds its memory limit the Linux OOM killer terminates processes in that cgroup — that is the exit code 137 signal. Docker switched to cgroups v2 as default in recent releases; v2 unifies the hierarchy and adds pressure-stall info for better accounting.",
+    "fs": "Docker maps --memory/--cpus flags directly to Linux cgroup limits; OOM kills inside the container are the kernel enforcing those limits.",
+    "fj": "Docker limits CPU and memory with its own scheduler independent of the Linux kernel.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "set limits via cgroups",
+        "lang": "ts",
+        "lines": [
+          "docker run \\",
+          "  --memory=512m \\",
+          "  --memory-swap=512m \\",
+          "  --cpus=1.5 \\",
+          "  myapp",
+          "# inspect live: cat /sys/fs/cgroup/memory.max",
+          "# inside container (cgroups v2)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the difference between `--memory` and `--memory-swap`, and why set them equal?",
+        "a": "`--memory` caps RAM usage; `--memory-swap` caps RAM + swap together. Setting them equal disables swap for that container — important for latency-sensitive services where swap thrashing is worse than an OOM kill, and for accurate JVM heap sizing so the JVM doesn't overcommit into invisible swap."
+      },
+      {
+        "q": "How do cgroups v1 and v2 differ in how Docker configures CPU limits?",
+        "a": "In cgroups v1 Docker set `cpu.shares` (relative weight) and `cpu.cfs_period_us`/`cpu.cfs_quota_us` for hard throttle. In cgroups v2 those are replaced by `cpu.weight` (relative) and `cpu.max` (quota/period unified). Docker uses the right interface based on the host Linux kernel version; v2 also adds per-cgroup pressure-stall indicators so tooling can detect CPU/memory pressure before OOM."
+      }
+    ]
+  },
+  {
+    "q": "How does the Linux overlayfs storage driver work for Docker, and what is copy-on-write?",
+    "a": "overlayfs is a Linux union filesystem that merges multiple directory trees into a single coherent view. Docker's overlay2 driver stacks read-only image layers as `lowerdir` entries and adds one writable `upperdir` per container. Reads serve the file from the highest layer that contains it. A write to a file that lives only in a lowerdir triggers copy-on-write (CoW): the Linux kernel copies the full file into upperdir, then the process modifies that copy — the original lowerdir byte is untouched. This is why a container that writes a single byte to a 100 MB binary amplifies I/O: the whole file is copied up. CoW is also why the first write to a cold container is slower than subsequent writes.",
+    "fs": "overlayfs CoW copies the entire file from lowerdir to upperdir on first write — a 100 MB binary write amplifies to a 100 MB read+write.",
+    "fj": "overlayfs writes only the changed bytes, so copy-on-write has no I/O overhead.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "overlayfs mount anatomy",
+        "lang": "ts",
+        "lines": [
+          "# mount -t overlay overlay \\",
+          "#   -o lowerdir=L2:L1:L0,\\",
+          "#      upperdir=rw,\\",
+          "#      workdir=work \\",
+          "#   /merged",
+          "# Linux kernel merges: rw shadows L2 shadows L1 shadows L0"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "When is it worth switching away from overlay2, and to what?",
+        "a": "overlay2 is the right default for most Linux workloads. For database containers that do heavy random writes to large files, the CoW overhead per file is significant; those workloads are better served with a named volume on the host filesystem (ext4/xfs directly) bypassing overlay2 entirely. For systems where overlay2 requires a kernel older than 4.0 (rare in 2026), devicemapper was the legacy fallback."
+      },
+      {
+        "q": "What is the `workdir` in an overlayfs mount, and what happens if it's on a different filesystem?",
+        "a": "`workdir` is a temporary staging directory the Linux kernel uses for atomic copy-up operations — files are written there first then moved atomically to `upperdir`. It must be on the same filesystem as `upperdir` because the kernel uses rename(2) which doesn't cross filesystem boundaries. Docker's overlay2 driver enforces this; putting upperdir on a different fs causes mount failures."
+      }
+    ]
+  },
+  {
+    "q": "What are Linux capabilities, and how does Docker use --cap-drop and --cap-add to implement least-privilege containers?",
+    "a": "Linux capabilities split traditional root privilege into discrete units: CAP_NET_BIND_SERVICE binds privileged ports, CAP_SYS_PTRACE allows process tracing, CAP_CHOWN changes file ownership, and so on. Docker starts containers with a default set of about 14 capabilities — enough for most apps but not full root. `--cap-drop ALL` removes everything, then `--cap-add` re-grants only what the app needs. This principle of least privilege means a compromised container has far fewer kernel attack vectors than a fully privileged one, limiting blast radius even if namespace isolation is bypassed.",
+    "fs": "Docker grants ~14 capabilities by default; --cap-drop ALL then --cap-add <specific> applies least privilege so a breach has fewer kernel vectors.",
+    "fj": "If a container runs as non-root it has no capabilities, so --cap-drop is redundant.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "drop all, add only what's needed",
+        "lang": "ts",
+        "lines": [
+          "docker run \\",
+          "  --cap-drop ALL \\",
+          "  --cap-add NET_BIND_SERVICE \\",
+          "  --security-opt no-new-privileges \\",
+          "  myapp"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does --security-opt no-new-privileges do beyond cap-drop?",
+        "a": "It sets the Linux `PR_SET_NO_NEW_PRIVS` flag on the container's init process, preventing any child process from gaining capabilities via setuid binaries or file capabilities — even if a setuid root binary is present in the image. This stops privilege escalation attacks that work by exec-ing a setuid file rather than a kernel exploit."
+      },
+      {
+        "q": "Which default Docker capability is most commonly the source of container escapes, and why?",
+        "a": "CAP_SYS_ADMIN is the broadest and most dangerous capability — it covers dozens of kernel operations including mounting filesystems, manipulating namespaces, and more. It's sometimes added for privileged use cases but is essentially partial root. CAP_NET_ADMIN and CAP_SYS_PTRACE are also frequently misused. Auditing Kubernetes securityContext and Docker run flags for these is a standard security review step."
+      }
+    ]
+  },
+  {
+    "q": "What is seccomp in the context of Linux containers, and how does Docker's default seccomp profile protect you?",
+    "a": "seccomp (secure computing mode) is a Linux kernel feature that filters which system calls a process is allowed to invoke, and kills or returns EPERM for blocked ones. Docker ships a default seccomp profile (a JSON allowlist) that permits the ~300 syscalls a typical container needs and blocks dangerous ones like `ptrace`, `kexec_load`, `open_by_handle_at`, and `perf_event_open`. This is a defense-in-depth layer: even if a container escapes namespace isolation, a blocked syscall prevents many kernel exploits. You can supply a custom profile with `--security-opt seccomp=profile.json` or disable it with `seccomp=unconfined` for debugging.",
+    "fs": "Docker's default Linux seccomp profile blocks ~50 dangerous syscalls; it's defense-in-depth — a complement to, not a replacement for, namespace isolation.",
+    "fj": "seccomp is only needed for containers that run privileged mode; regular containers don't use it.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "custom seccomp profile",
+        "lang": "ts",
+        "lines": [
+          "docker run \\",
+          "  --security-opt seccomp=./my-profile.json \\",
+          "  myapp",
+          "# generate a starting profile:",
+          "# strace -c -f -e trace=all ./myapp"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does seccomp interact with capabilities — are they redundant?",
+        "a": "They operate at different kernel layers and are complementary. Capabilities gate coarse privilege tokens (e.g. CAP_NET_ADMIN). seccomp filters at the syscall level regardless of capability — even a process with CAP_SYS_ADMIN is blocked from a seccomp-denied syscall. Both are needed: capabilities prevent privilege escalation, seccomp limits the exploitable kernel surface once a container has certain capabilities."
+      },
+      {
+        "q": "A container crashes with SIGSYS instead of EPERM after tightening seccomp. Why and how do you debug it?",
+        "a": "SIGSYS means the process was killed by a seccomp KILL action (not just ERRNO). To find the blocked call, switch the action to ERRNO temporarily and watch `strace` or `auditd` logs for EPERM on unexpected syscalls. Alternatively run with `seccomp=unconfined` to confirm the profile is the cause, then narrow by adding suspect syscalls to the allowlist one at a time."
+      }
+    ]
+  },
+  {
+    "q": "What is rootless Docker, and how does it use Linux user namespaces to run without host root?",
+    "a": "Rootless Docker runs both the daemon and all containers as an unprivileged Linux user with no SUID binaries. It uses Linux user namespace remapping to give the container the illusion of being root (UID 0 inside) while mapping that to an unprivileged UID on the host (e.g. UID 100000+). Network namespaces use `slirp4netns` (a userspace TCP/IP stack) instead of kernel bridging since creating veth pairs requires privilege. This eliminates the host-root daemon attack surface and is a strong defense-in-depth control, at the cost of some performance overhead and feature limitations (no privileged port binding, some drivers unavailable).",
+    "fs": "Rootless Docker maps container UID 0 to an unprivileged host UID via Linux user namespaces — the daemon itself needs no host root.",
+    "fj": "Rootless Docker is just running the container with a non-root USER; the daemon still runs as root.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What Linux kernel version and /etc/subuid configuration are required for rootless Docker?",
+        "a": "Rootless Docker needs Linux kernel 5.11+ for cgroups v2 delegation without root, though basic rootless works from ~4.18 with user namespaces enabled. `/etc/subuid` and `/etc/subgid` must grant the user a range of at least 65536 subordinate IDs (e.g. `alice:100000:65536`). The `newuidmap`/`newgidmap` setuid helpers (from shadow-utils) perform the mapping without full root."
+      },
+      {
+        "q": "What are the main functional limitations of rootless Docker compared to the rootful daemon?",
+        "a": "Rootless can't bind ports below 1024 (no CAP_NET_BIND_SERVICE), doesn't support overlay2 on older kernels without kernel patches, can't use host networking (slirp4netns is userspace-only and slower), and some storage drivers aren't available. Privileged containers (`--privileged`) still require the rootful daemon. For most stateless services these are non-issues, but databases and network-intensive workloads may need the rootful path."
+      }
+    ]
+  },
+  {
+    "q": "How does Docker's `--privileged` flag relate to Linux kernel access, and why is it dangerous in production?",
+    "a": "`--privileged` grants the container all Linux capabilities, disables seccomp filtering, disables AppArmor/SELinux confinement, and mounts the host's /dev tree inside the container. In effect the container has near-full access to the Linux kernel and host filesystem — a privileged container can load kernel modules, mount arbitrary filesystems (including the host's root), modify networking, and escape to the host trivially with a few commands. It is used legitimately for Docker-in-Docker CI and some low-level sysadmin tools, but in production it is almost always unnecessary and represents a full security boundary collapse.",
+    "fs": "--privileged drops all Linux security controls: all caps granted, seccomp off, AppArmor off, host /dev exposed — a container escape is trivial.",
+    "fj": "--privileged just gives the container root, same as running the process as root without extra kernel access.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "escape privileged container (demo)",
+        "lang": "ts",
+        "lines": [
+          "# Inside a --privileged container:",
+          "# mount /dev/sda1 /mnt    # host disk",
+          "# chroot /mnt             # host root",
+          "# -> full host compromise in 3 commands",
+          "# Never --privileged in production"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the minimal alternative to --privileged for Docker-in-Docker?",
+        "a": "Use the `docker:dind` image with only `--cap-add SYS_ADMIN` and a mounted tmpfs for `/var/lib/docker`, or better, use Docker socket forwarding (`-v /var/run/docker.sock:/var/run/docker.sock`) so the inner Docker client talks to the host daemon — no privilege needed inside the CI container. Kaniko and Buildah offer fully rootless image builds without needing the Linux kernel socket at all."
+      },
+      {
+        "q": "How would you detect --privileged containers running in a production cluster?",
+        "a": "In Kubernetes, audit `securityContext.privileged: true` via admission controllers (OPA/Gatekeeper, Kyverno) and enforce a policy that denies it except in approved namespaces. For Docker hosts, `docker inspect --format '{{.HostConfig.Privileged}}' $(docker ps -q)` lists privileged containers. Falco can alert at runtime when a container gains an unusual set of Linux capabilities consistent with privileged mode."
+      }
+    ]
+  },
+  {
+    "q": "What Linux kernel feature underlies Docker image layer deduplication, and how does overlay2 manage the on-disk layer graph?",
+    "a": "Docker's overlay2 driver exploits the Linux overlayfs kernel module, which supports stacking up to 128 lowerdir layers in a single mount. On disk, each image layer is stored as a plain directory under `/var/lib/docker/overlay2/<sha>/diff`; Docker builds a `link`/`lower` chain where each layer's `lower` file lists the chain of lower layer IDs. When a container starts, the daemon assembles the full lowerdir list from root to the top image layer, adds a container-specific `upperdir` and `workdir`, and issues one `mount -t overlay` call. The Linux kernel does the rest in-kernel with no data copying. Layers with identical content-addressed digests are stored once and shared across images, which is why `docker pull` only downloads layers a host doesn't already have.",
+    "fs": "overlay2 uses Linux overlayfs: each image layer is a diff directory; the kernel merges them all in one mount with no copying at startup.",
+    "fj": "Docker copies each layer into a merged directory on disk when a container starts.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "inspect overlay2 mount",
+        "lang": "ts",
+        "lines": [
+          "# find the container's merged view:",
+          "docker inspect <cid> \\",
+          "  --format '{{.GraphDriver.Data}}'",
+          "# shows LowerDir, UpperDir, WorkDir, MergedDir",
+          "# LowerDir is colon-delimited chain of image layers"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the practical overlay2 layer limit, and how does a deep multi-stage build hit it?",
+        "a": "The Linux overlayfs kernel module supports at most 128 lowerdir entries in a single mount; that translates to ~128 image layers. A long chain of FROM stages or hundreds of RUN instructions can approach this limit, causing the build or container start to fail with 'too many levels of symbolic links'. The fix is collapsing layers with multi-stage builds, combining RUN chains, or using `--squash`."
+      },
+      {
+        "q": "How does `docker system prune` interact with the overlay2 layer store?",
+        "a": "`docker system prune` removes stopped containers (their upperdir) and dangling image layers (diff directories unreferenced by any image tag). It doesn't touch layers that any tagged image or running container references. `--volumes` also prunes named volumes. The freed space is only visible after the overlay2 directories are deleted; in-use layers are reference-counted by the daemon and won't be removed while a container is running."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern base-image selection across hundreds of microservices so the platform isn't running dozens of different base-image lineages?",
+    "a": "Establish a golden-image catalog: a small set of org-curated base images (distroless, slim, language-specific) built from pinned upstream digests, vulnerability-scanned, and published to an internal registry under a controlled namespace. Enforce catalog membership at admission: a Kyverno or OPA/Gatekeeper policy rejects pods whose FROM doesn't match an approved base pattern, and CI fails builds that don't extend a catalog image. A bot (Renovate or internal tooling) opens PRs to bump catalog bases when the upstream patches; human review flows through a lightweight RFC — every service inherits the fix automatically on next build. Track lineage in image attestations so you can answer 'how many services are on python:3.12 right now' in seconds. The result: vulnerability patches reach all services without per-team action, and the audit trail is machines-readable.",
+    "fs": "Golden-image catalog + admission enforcement + automated bump PRs = org-wide base-image hygiene without per-team toil.",
+    "fj": "Just tell teams to use alpine and update their Dockerfiles quarterly.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A team has a legitimate need for an image not in the catalog — e.g. a proprietary vendor image. What's the process?",
+        "a": "Time-bound exemption with documented justification, a CVE-scan baseline recorded as an attestation, and an owner on the hook for manual patching. The exemption is stored as a policy exception reviewed quarterly and ideally has an expiry date that fires a Jira ticket. The catalog process should be easy enough that going off-catalog feels like more work than contributing a new catalog entry."
+      },
+      {
+        "q": "How do you measure whether the base-image governance program is actually working?",
+        "a": "Track: fraction of running images derived from a catalog base (coverage), mean time from upstream base patch to production for catalog images, and number of active policy exemptions. Alert when a catalog image has a critical unfixed CVE older than the SLA (e.g. 7 days). Dashboard these in your observability platform so leadership sees container hygiene as a first-class metric."
+      },
+      {
+        "q": "Your catalog images are re-scanned nightly. A new critical CVE drops at 2am. How does remediation reach production automatically?",
+        "a": "The nightly scan job opens a high-priority PR against the catalog repo that bumps the base digest to the patched upstream. CI re-scans the resulting image and gates on clean. On merge, a build pipeline publishes the new catalog image; Renovate detects the catalog update and opens follow-on PRs in every consuming service repo. With auto-merge policies for patch-level bumps you can achieve zero-touch propagation within a few hours, with audit trails at every step."
+      }
+    ]
+  },
+  {
+    "q": "Walk through your org-wide container build-cache strategy: what layers of caching do you operate and how does each layer reduce CI cost?",
+    "a": "Layer 1 — BuildKit registry cache: every CI job exports layer blobs to a registry cache (`--cache-to type=registry,mode=max`) keyed on branch and image; subsequent jobs on the same branch import those blobs before building, turning a full rebuild into a cache-hit for unchanged layers. Layer 2 — Shared remote BuildKit builders: persistent daemon machines (or cloud builders) preserve the build-mount caches (pip, npm, Maven) across jobs, so package-download steps stay warm even when the dependency layer itself is invalidated. Layer 3 — Merge-queue / branch inheritance: PR builds inherit the cache from the base branch so a branch created today gets the full base cache immediately. Layer 4 — Golden catalog pre-warming: catalog images are pushed to the registry nightly so their layers are always available as a cold-start baseline. Together these cut P90 build time from 8-12 min to 90s on warm paths while keeping cold builds (new base images) correct.",
+    "fs": "Three-tier caching: registry cache exports (mode=max), persistent remote builders (mount caches warm), and branch-lineage cache inheritance.",
+    "fj": "Just tell teams to order their COPY statements well and buy bigger CI machines.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "buildkit registry cache export/import",
+        "lang": "ts",
+        "lines": [
+          "docker buildx build \\",
+          "  --cache-from type=registry,ref=reg/app:cache \\",
+          "  --cache-to   type=registry,ref=reg/app:cache,mode=max \\",
+          "  --push -t reg/app:$SHA ."
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "mode=max vs mode=min — what does each export and when do you pay extra storage cost?",
+        "a": "`mode=min` exports only the final stage's layers — cheaper storage but multi-stage intermediate stages are always rebuilt. `mode=max` exports every stage including build/test stages, so a changed source file doesn't invalidate the dependency-install layer in intermediate stages either. Use `max` when intermediate stages are expensive (heavy compiles, slow test runs) and the extra registry storage (often 2-5x the final image) is acceptable."
+      },
+      {
+        "q": "How do you prevent cache poisoning where a PR's cache export corrupts the main-branch cache?",
+        "a": "Use a two-key strategy: cache-from reads from `main` cache, cache-to writes to a PR-scoped key (e.g. `ref=reg/app:cache-pr-$PR`). Main-branch builds write to the canonical `ref=reg/app:cache` key after merge only. This way PR builds consume main's cache for speed but can't overwrite it, and a broken PR branch doesn't poison every subsequent build."
+      }
+    ]
+  },
+  {
+    "q": "How do you build and maintain a supply-chain security posture for container images — from source commit to running pod?",
+    "a": "The chain has five control points. (1) Source: enforce signed commits and branch protection so only reviewed code enters the build. (2) Build: use a hermetic, reproducible BuildKit pipeline that emits SLSA provenance attestations and an SBOM (SPDX/CycloneDX) attached to the image manifest. (3) Sign: sign the image with Sigstore/cosign using a keyless workflow tied to the CI OIDC identity — no long-lived keys. (4) Verify at admission: a Kubernetes policy controller (policy-controller, Ratify, or Kyverno with cosign) rejects pods whose image lacks a valid signature from a trusted CI workflow. (5) Runtime: re-scan images in the registry nightly and alert on new CVEs in running images; use Falco for behavioral anomaly detection. This closes the loop: code can't run in production unless it has a verifiable provenance chain, and any new vulnerability in a running image triggers a re-build alert before it becomes an exploit window.",
+    "fs": "Hermetic build → SLSA attestation + SBOM → cosign keyless signature → admission policy verification → nightly re-scan → runtime Falco: provenance all the way through.",
+    "fj": "Scan on push and sign images in CI; that's supply-chain security done.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is keyless signing with Sigstore and why is it better than managing your own cosign key pair?",
+        "a": "Keyless signing uses an OIDC token from the CI provider (GitHub Actions, GitLab, etc.) to request a short-lived certificate from Sigstore's Fulcio CA; the signature is recorded in Rekor's immutable transparency log. There are no long-lived private keys to rotate, leak, or store as secrets — the CI job's OIDC identity IS the credential. Verification checks that the certificate was issued to the expected OIDC subject (e.g. a specific GitHub Actions workflow), making it both simpler to operate and harder to spoof."
+      },
+      {
+        "q": "How do you enforce that only images with a valid SLSA Level 3 provenance can run in production?",
+        "a": "Deploy a Kubernetes admission webhook that calls cosign's policy-controller or Ratify: the webhook fetches the image's OCI referrers, verifies the cosign signature chain against Fulcio/Rekor, and checks that the attached provenance attestation meets the SLSA predicate schema with the expected builder identity (your CI's OIDC subject). Pods whose images lack a valid attestation are rejected. Combined with a registry that allows only signed pushes, this makes out-of-band image injection provably detectable."
+      }
+    ]
+  },
+  {
+    "q": "Your organization runs 50+ internal microservices in a private registry. Walk through how you design the registry architecture — tagging scheme, retention, access control, and replication — to support 200 engineers across 3 regions.",
+    "a": "Registry architecture at this scale has five axes. Tagging: immutable semantics — production tags are `<service>:<semver>@<digest>`, branch tags are `<service>:br-<branch>-<sha>` (mutable, for dev). Never use `:latest` in automation. Retention: lifecycle policies delete untagged blobs older than 30 days and non-production branch tags older than 7 days after the branch closes; semver tags are retained indefinitely for rollback. ACL: separate namespaces per team (`reg/team-a/svc`), write access scoped to CI service accounts via OIDC, read access granted to Kubernetes worker IRSA roles per environment. Engineers have pull-only tokens for local dev. Replication: a primary registry in us-east-1 with geo-replication to eu-west-1 and ap-southeast-1 reduces pull latency and gives regional failover if the primary is degraded; replicas are read-only pull-through so writes always go to primary. Rate limiting: pull-through for upstream registries (Docker Hub, ECR Public) via the internal registry to avoid rate-limit surprises in CI. Vulnerability gate: the registry webhook rejects pushes that fail the scan threshold.",
+    "fs": "Immutable semver+digest tags, per-team namespaces, OIDC-scoped write ACL, 3-region read replicas, lifecycle retention, and upstream pull-through are the seven pillars.",
+    "fj": "One shared registry namespace with :latest tags; clean it up manually when it fills.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle the cold-start problem when a new region comes online and the local registry is empty?",
+        "a": "Pre-warm the regional replica with catalog base images and the most-deployed service images before cutting over any traffic — a one-time sync job from the primary. Then enable pull-through caching so the first pull of a missing image fetches from the primary and caches locally for subsequent pulls. This keeps the cold-path latency acceptable while the cache fills naturally."
+      },
+      {
+        "q": "A leaked CI service-account token could allow an attacker to push a malicious image. How do you bound the blast radius?",
+        "a": "Scope each CI token to write-access only on its own service's namespace, never org-wide. Require cosign signing with the CI OIDC identity — a token stolen from service A can't produce a valid signature for service B's OIDC subject, so a poisoned push still fails admission. Enable registry audit logs streamed to SIEM and alert on writes outside business hours or from unexpected IP ranges. Token TTLs should be short (1 hour) and rotated per-job via OIDC rather than static secrets."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate the build-vs-buy decision for container build infrastructure — self-managed BuildKit clusters vs managed builders (e.g. GitHub Actions larger runners, Docker Build Cloud, AWS CodeBuild)?",
+    "a": "The decision trades three dimensions: cost, operational toil, and capability. Self-managed persistent BuildKit builders give max control — you tune cache volume sizes, pick instance types for CPU/memory-heavy builds, and share caches across all repos on the same host. The cost is platform-team overhead: provisioning, OS patching, disk lifecycle, and on-call for builder outages. Managed builders (Docker Build Cloud, Actions larger runners) eliminate ops and scale elastically but have per-minute pricing that usually breaks even around 500-1000 build-minutes/day per team and may have cache limitations or cold-start delays. A practical pattern for 50-team orgs: use managed builders for small services with light build loads, self-managed for the 10-20 services with > 30 min weekly build time (mono-repos, heavy ML pipelines, native code). Evaluate on: P90 build time, build-failure blast radius (shared builder outage vs. runner pool), cache portability, ARM/multi-arch support, and total cost of ownership at current build volume × 3x growth.",
+    "fs": "Self-managed = max cache control + ops cost; managed = elastic + zero-ops + per-minute cost; hybrid by build volume is the common Staff-level answer.",
+    "fj": "Just use GitHub Actions default runners; scaling will sort itself out.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you justify the cost of persistent self-managed builders to finance?",
+        "a": "Model it: pull the CI build-minutes and compute the equivalent managed-runner cost at their public price, then subtract the persistent-builder cost (EC2/GCE instance + EBS volumes + platform-team hours). At high build volume the persistent builder pays for itself in a week. Equally important: quantify developer-experience cost — each extra minute on build time × builds/day × developers × hourly rate is real money, and faster builds reduce WIP context-switching."
+      },
+      {
+        "q": "Multi-arch (AMD64 + ARM64) builds with QEMU emulation are 10x slower. How do you fix this without running QEMU?",
+        "a": "Use native-arch builder nodes: configure a BuildKit build cluster with one AMD64 and one ARM64 node (e.g. Graviton instances on AWS). `buildx` dispatches the native stage to the matching node and only runs cross-arch steps under emulation if unavoidable. Docker Build Cloud supports native multi-arch builder selection. Alternatively, use `--platform` per stage in the Dockerfile to keep the slow QEMU stage to a single compile step rather than the whole build."
+      }
+    ]
+  },
+  {
+    "q": "As a principal architect, how do you set the org's multi-year container runtime strategy — choosing between containerd + CRI-O, Docker Engine, and emerging sandbox runtimes like gVisor and Kata Containers?",
+    "a": "The decision tree has three branches. (1) Trusted single-tenant or own-metal Kubernetes: containerd (default CRI since K8s 1.24) with runc is the right default — battle-hardened, maintained by CNCF, integrated with every managed K8s offering (EKS, GKE, AKS). Docker Engine is appropriate only where developer-experience tooling (compose, docker-cli) is the priority and you're not running K8s. (2) Multi-tenant or high-sensitivity workloads: add a sandbox runtime as a second RuntimeClass. gVisor (runsc) is appropriate for CPU-bound, latency-tolerant workloads where syscall interception is acceptable; it intercepts Linux syscalls in user-space (Sentry kernel) so a container escape hits gVisor's Go code, not the host kernel. Kata Containers give stronger isolation via a micro-VM per pod — better for strict compliance (PCI/HIPAA) but higher memory overhead (~50 MB per pod) and slower cold start. (3) Emerging: WebAssembly runtimes (runwasi + WasmEdge, Spin) are production-viable for stateless HTTP functions in early 2026 and worth piloting for AI-inference edge deployments. Multi-year bet: containerd everywhere with a declarative RuntimeClass policy; gVisor for the shared ML platform; evaluate Wasm for edge/lightweight functions over 2026.",
+    "fs": "containerd/runc = default; gVisor = syscall-isolation for multi-tenant; Kata = VM-level isolation for compliance; Wasm = emerging lightweight edge runtime.",
+    "fj": "Pick whatever runtime Kubernetes defaults to and don't change it.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What concrete metrics do you track to decide when Kata's overhead is acceptable vs when gVisor is the better fit?",
+        "a": "Track per-pod memory overhead (Kata adds 50-150 MB for the micro-VM agent; gVisor ~15-20 MB for the Sentry), cold-start latency (Kata 300-600ms, gVisor 100-200ms vs runc < 50ms), and syscall-intensive workload regression (gVisor's user-space kernel is 2-10x slower for syscall-heavy code). For batch ML workloads that stay alive for hours, cold-start matters less and gVisor's overhead amortizes; for tight latency SLOs or syscall-heavy databases, neither sandbox is appropriate and you isolate by dedicated node pools instead."
+      },
+      {
+        "q": "How do you avoid vendor lock-in when choosing a managed container runtime strategy across AWS, GCP, and Azure?",
+        "a": "Standardize on containerd + OCI runtime interfaces; avoid cloud-specific CRI extensions or proprietary snapshotters. Use RuntimeClass to declare sandbox needs abstractly (`kata`, `gvisor`) and let each cloud's node pool satisfy the class with its preferred implementation. For builds, use OCI-standard images and multi-arch manifests so an image built on GCP runs on EKS without modification. Validate portability quarterly with a smoke-test suite run cross-cloud via Terragrunt."
+      }
+    ]
+  },
+  {
+    "q": "How do you design an org-wide container compliance and cost-governance model — covering image lifecycle, runtime resource attribution, and regulatory audit trails?",
+    "a": "Compliance and cost governance are two planes wired together. Compliance plane: every image in production must have a cosign-signed SLSA provenance attestation and a CycloneDX SBOM stored as OCI referrers. An admission policy enforces this; a weekly attestation-audit job queries the registry referrers API and reports any running image without a current attestation to the security team. Base images older than the org's patching SLA (e.g. 90 days since last upstream rebuild) trigger a mandatory rebuild alert. Regulatory: for PCI/HIPAA workloads, all pod specs are logged to an immutable audit log (Kubernetes audit + Falco), image digests are recorded at deploy time, and runtime scans produce weekly evidence packages for auditors. Cost plane: tag every container with team, environment, and cost-center labels enforced by a mutating webhook. Namespace-level resource quotas prevent runaway resource consumption; VPA recommendations are surfaced weekly per team. A cloud-cost attribution report (kubecost or OpenCost) maps node spend to team labels and shows over-provisioning outliers — teams running containers at 5% CPU utilization with a 4-CPU request. The two planes share a single dashboard: security posture (CVE SLA compliance, attestation coverage) plus cost efficiency (right-sizing score, orphaned image storage cost) per team per quarter.",
+    "fs": "Signed SLSA attestations + admission enforcement covers compliance; labeled quotas + VPA + kubecost attribution covers cost — unified per-team dashboard closes the loop.",
+    "fj": "Scan images and set namespace quotas; report to finance quarterly.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "A regulatory audit requires you to prove that a specific CVE was not present in your production containers during a specific two-week window. How do you produce that evidence?",
+        "a": "Because every deployment records the image digest and deploy timestamp in the Kubernetes audit log (and ideally a deployment database), you can reconstruct exactly which image digests were running during the window. Look up each digest in your SBOM store and run the CVE scan against the stored SBOM at the CVE's disclosure date using the vulnerability database snapshot from that period. If digests were signed with cosign and stored in Rekor, the transparency log timestamps are independently verifiable. This is the 'point-in-time provenance' argument that SLSA L2+ enables."
+      },
+      {
+        "q": "How do you prevent image storage cost from growing unboundedly as teams ship continuously?",
+        "a": "Registry lifecycle policies are the mechanical answer: delete untagged blobs after 30 days, prune branch tags older than 7 days post-branch-close, and enforce a maximum of N semver tags per repo (delete oldest beyond N). But the deeper lever is tagging discipline enforced by CI: CI never pushes `:latest`, every push carries a unique SHA tag, and promotion to a semver tag is a separate explicit step. Run a monthly 'registry sprawl' report showing storage cost by team to create social accountability — teams seeing their own bill move fast."
+      }
+    ]
+  },
+  {
+    "q": "As a principal, how do you architect the containerization strategy for a greenfield AI/ML platform — from model training containers to inference serving, addressing GPU resource sharing, image size, and reproducibility?",
+    "a": "The platform has three distinct container profiles, each with different constraints. Training containers: GPU-capable base images pinned by digest (CUDA 12.x + cuDNN), large Python dependency layers managed via uv or pip with locked hashes, model checkpoints stored on persistent volumes (not in the image). Key concern: reproducibility — use SOURCE_DATE_EPOCH, pinned bases, and SLSA provenance so a run can be reproduced months later from the same image. Image sizes of 8-15 GB are acceptable here because training jobs are long-lived and pull latency amortizes. Inference containers: aggressively small — strip training-only deps, quantize model weights externally (ONNX/TensorRT artifacts on object storage), mount weights at runtime via a CSI driver rather than baking into the image. Target < 3 GB. GPU sharing: for inference, use MIG (Multi-Instance GPU) partitioning for A100/H100 — each model pod gets a fractional GPU guaranteed slice; for variable-load serving use time-sliced GPU sharing with resource quotas. For batch inference, NVIDIA MPS multiplexes GPU memory across pods. Registry: separate internal registry namespaces for training and serving images with independent lifecycle policies. Governance: a model card is attached as an OCI referrer alongside the image — data lineage, performance metrics, and model provenance in one queryable store. The multi-year bet: GPU-fractional inference with WASM-based model serving for lightweight models at the edge, full-GPU Kata-isolated pods for sensitive fine-tuning.",
+    "fs": "Training: large pinned-digest CUDA images + volume-persisted checkpoints; inference: weight-external small images + MIG GPU slices; model cards as OCI referrers.",
+    "fj": "Use the same GPU container for training and inference and add GPU when it's slow.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you design the image pull strategy so a training cluster doesn't saturate the registry or network when 200 GPU jobs start simultaneously?",
+        "a": "Deploy a cluster-local OCI registry mirror (e.g. Spegel, Harbor pull-through, or a containerd P2P mirror like Dragonfly/Kraken) so the first pull fetches from the central registry and subsequent pods pull from in-cluster peers over high-bandwidth intra-cluster links. Pin images by digest so the mirror can cache deterministically. Pre-warm the mirror with the training image during the job-scheduling phase before pod startup — a DaemonSet pre-pull job or a Kubernetes image pre-pull annotation achieves this."
+      },
+      {
+        "q": "Model weights in the image vs. mounted at runtime — what's the architectural argument for each, and how do you decide?",
+        "a": "Baking weights into the image gives a self-contained, versioned, scannable artifact — ideal for compliance and air-gapped environments where you need one immutable unit to audit. The cost is image size (a 70B model is 140+ GB), slow pushes, and bloated registry storage. Mounting weights from object storage (S3/GCS via a CSI driver or init container) decouples model versioning from container versioning — you can hot-swap a weight checkpoint without rebuilding the image — and keeps the image under 3 GB. The practical rule: small models (< 1 GB) can live in the image for operational simplicity; large models should always be external. In regulated environments, record the weight artifact's SHA-256 in the model card OCI referrer so you get tamper-evidence without baking the bytes."
+      }
+    ]
   }
 ]

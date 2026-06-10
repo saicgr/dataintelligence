@@ -635,6 +635,441 @@
     ]
   },
   {
+    "q": "AI_COMPLETE supports a system prompt and conversation history. How do you use that for a production multi-turn Cortex chatbot?",
+    "a": "AI_COMPLETE accepts an array-of-objects payload (the 'messages' form) where each entry has a role ('system', 'user', 'assistant') and content. The system message sets the persona and constraints once; prior turns are replayed as user/assistant pairs so the model has context without you managing state in weights. For a production chatbot you typically store the turn history in a Snowflake table, fetch the relevant window (last N turns or a summary), and assemble the messages array before the call. The senior discipline is to cap the history window — longer conversations push up token cost per call — and to place guardrails in the system prompt rather than leaking them into the user message where they can be overridden by clever inputs.",
+    "fj": "I just concatenate the whole conversation into one big prompt string.",
+    "fs": "The messages-array form with explicit role separation is how you do multi-turn cleanly — system/user/assistant roles, history stored in a table, windowed to cap tokens. String concatenation loses structure and makes the system prompt overridable.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Multi-turn messages payload",
+        "lang": "sql",
+        "lines": [
+          "SELECT AI_COMPLETE(",
+          "  'claude-3-5-sonnet',",
+          "  [{'role':'system','content':'You are a billing assistant. Answer only from context.'},",
+          "   {'role':'user','content':'What is my outstanding balance?'},",
+          "   {'role':'assistant','content':'Your balance is $240.'},",
+          "   {'role':'user','content':'When is it due?'}]",
+          ");"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens if the conversation history exceeds the model's context window?",
+        "a": "The call errors or truncates, and older context is lost either way. The fix is a sliding window: keep only the last K turns, or summarize earlier turns with AI_COMPLETE into a condensed context object stored alongside the history, then replay only the summary plus recent turns. You design the window strategy before hitting limits, not after — uncapped history is a cost and reliability bomb as threads grow."
+      },
+      {
+        "q": "Why put constraints in the system prompt rather than the user message?",
+        "a": "Most models treat the system message as a privileged instruction layer that user input shouldn't override. If you embed 'answer only from context' in the user turn, a crafted user message can contradict or dilute it. The system prompt is the right boundary layer; keep it owner-authored and static so adversarial user inputs can't redefine the assistant's ground rules."
+      },
+      {
+        "q": "How do you store and retrieve conversation history efficiently in Snowflake for a high-traffic app?",
+        "a": "Store turns in a table with session_id, turn_seq, role, and content columns. On each request, run a simple `SELECT ... WHERE session_id = ? ORDER BY turn_seq DESC LIMIT N` to get the window, then assemble the messages array in your Streamlit or calling layer. For very active sessions use a semi-structured VARIANT column or a materialized summary row to avoid a wide range scan per turn. The table stays inside the governance boundary, audit-queryable, and doesn't require an external session store."
+      }
+    ]
+  },
+  {
+    "q": "Walk through CORTEX.SENTIMENT versus AI_SENTIMENT — what changed and how do you use each correctly?",
+    "a": "The original SNOWFLAKE.CORTEX.SENTIMENT returns a single float in [−1, 1] representing the overall tone of an input string — negative, neutral, or positive. No prompt, no configuration. AI_SENTIMENT is the next-generation surface: it adds aspect-based sentiment, letting you specify one or more aspects (e.g., 'delivery', 'packaging', 'price') and get a per-aspect score with evidence snippets instead of one blended number. In production the practical choice is: use SENTIMENT for a simple overall tone signal when you have no aspect structure in mind and cost matters; use AI_SENTIMENT when you need faceted feedback analysis (e.g., a product review split into taste, price, and service). For bulk scoring of millions of records SENTIMENT is also cheaper since it's a purpose-built task model, not a frontier call.",
+    "fj": "I'd use AI_SENTIMENT for everything since it's the newer one.",
+    "fs": "For a single overall tone score SENTIMENT is cheaper and sufficient. AI_SENTIMENT earns its cost when I need per-aspect scores — e.g., a review broken down by delivery vs product quality. Use the narrower tool when the narrow output is all you need.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Aspect-based vs overall sentiment",
+        "lang": "sql",
+        "lines": [
+          "-- overall (fast, cheap)",
+          "SELECT SNOWFLAKE.CORTEX.SENTIMENT(review) AS score FROM reviews;",
+          "",
+          "-- aspect-based (richer)",
+          "SELECT AI_SENTIMENT(",
+          "  review,",
+          "  ['delivery','packaging','price']",
+          ") AS facets FROM reviews;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does AI_SENTIMENT actually return — a number or a structured object?",
+        "a": "AI_SENTIMENT returns a VARIANT object with per-aspect sentiment scores and evidence snippets — the text fragment that drove the score for each aspect — rather than a single float. You access individual aspects with dot notation (`:delivery.score`) and can `LATERAL FLATTEN` the result if you want one row per aspect per review. That's the tradeoff: richer, structured output at higher token cost versus the single float from SENTIMENT."
+      },
+      {
+        "q": "How do you validate that SENTIMENT scores are calibrated for your domain?",
+        "a": "Sample a stratified set (strongly negative, neutral, positive by human label), run SENTIMENT on it, and compute a confusion matrix or correlation. SENTIMENT is a general model; in a niche domain (medical, legal, financial) 'neutral' language may genuinely skew the score in unexpected ways. If calibration is off, AI_SENTIMENT with explicit aspect definitions or a fine-tuned model is the fix, not just re-prompting SENTIMENT (which takes no prompt)."
+      },
+      {
+        "q": "At what row count does the cost difference between SENTIMENT and AI_SENTIMENT become material?",
+        "a": "It scales linearly — at 10M rows even a small per-token difference becomes significant. SENTIMENT maps to a small, specialized model with minimal input tokens; AI_SENTIMENT invokes a larger model plus aspect context per row. At high volume, prototype on a stratified sample to measure the accuracy uplift, then decide if the aspect granularity is worth the cost multiple. For a million-row table the bill difference can be 5–10× — run the math before committing."
+      }
+    ]
+  },
+  {
+    "q": "How does Cortex Analyst handle ambiguous multi-turn questions, and what's the API contract for clarifying questions?",
+    "a": "Cortex Analyst is invoked via a REST endpoint (or through the Python SDK / Streamlit) and returns a response type that can be either a SQL+answer or a 'clarification request'. When the semantic model has multiple interpretations for a question — ambiguous metric, conflicting date grain, multiple plausible join paths — Analyst signals this by returning one or more clarifying questions rather than guessing. Your application must check the response type and surface those options to the user; the user picks an interpretation; you send the next message with the user's choice. This is the multi-turn loop. The senior error is treating Analyst as a one-shot REST call and ignoring the clarification response type, which means ambiguous questions silently get a guess that can be wrong and is hard to debug.",
+    "fj": "I just take Analyst's first SQL response and run it every time.",
+    "fs": "Analyst can return a clarification-request instead of SQL when the question is ambiguous. My app checks the response type and bounces the options back to the user — ignoring that type means silent wrong answers whenever the question is underdetermined.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Handle Analyst response type in Python",
+        "lang": "python",
+        "lines": [
+          "resp = analyst.send_message(session_id, question)",
+          "if resp['type'] == 'sql':",
+          "    results = session.sql(resp['sql']).collect()",
+          "elif resp['type'] == 'clarification':",
+          "    options = resp['clarification']['options']",
+          "    # surface options to user, then call again with chosen option",
+          "else:",
+          "    raise ValueError(f\"Unknown type: {resp['type']}\")"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you reduce how often Analyst asks clarifying questions without sacrificing accuracy?",
+        "a": "Add synonyms and explicit metric definitions to the semantic model so common ambiguous phrasings resolve deterministically rather than branching. Add verified queries for the most-common question patterns so those reuse trusted SQL without needing to reason about ambiguity. The goal is to narrow the underdetermined space in the semantic layer — the clarifying mechanism is a fallback, not a crutch."
+      },
+      {
+        "q": "Can you pre-supply an interpretation to skip clarification for a known question pattern?",
+        "a": "Yes — verified queries do exactly this: when a new question semantically matches a verified one, Analyst uses that trusted SQL rather than generating fresh SQL or asking for clarification. For frequently asked but previously ambiguous questions, adding a verified query pair is the targeted fix. It's both a quality and UX improvement: users stop being interrupted for questions the semantic model already knows the right answer to."
+      },
+      {
+        "q": "If Analyst generates SQL, what guarantees does the caller have about that SQL — can it harm data?",
+        "a": "Analyst produces read-only SELECT statements grounded by the semantic model; it won't generate INSERT, UPDATE, DELETE, or DDL. The model can only reference tables declared in the semantic model, so scope is constrained at authoring time. Running the SQL still requires the calling role to have SELECT on those tables, so RBAC is the enforcement layer. You should also consider running Analyst-generated SQL through a validation step in regulated environments before executing, since even a SELECT can be expensive."
+      }
+    ]
+  },
+  {
+    "q": "Cortex Search supports column-level attribute filters. How do you use them and why do they matter?",
+    "a": "When you define a Cortex Search service you can include non-text attribute columns alongside the search column, and at query time you filter on those attributes in the API call to scope results before semantic ranking. For example, a support-doc search service that includes a `product_line` and `region` attribute lets you search 'how to cancel a subscription' restricted to product='Enterprise' and region='EU', so the hybrid retrieval only scores within that slice rather than returning results from other products that happen to be semantically close. Without attribute filtering, semantic similarity alone can surface wrong-product passages that look relevant. This is the difference between a 'global search that ignores context' and a governed retrieval that respects the user's organizational scope.",
+    "fj": "I'd filter results in Python after retrieval since the search is already fast.",
+    "fs": "Post-retrieval Python filtering throws away relevance signal — the top-k candidates already excluded the right passages. Attribute filters in the Cortex Search query scope the hybrid index before ranking so you get the top-k within the right slice.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Attribute-scoped Cortex Search query",
+        "lang": "python",
+        "lines": [
+          "results = svc.search(",
+          "    query='how to cancel a subscription',",
+          "    columns=['content', 'doc_id'],",
+          "    filter={",
+          "        '@and': [",
+          "            {'@eq': {'product_line': 'Enterprise'}},",
+          "            {'@eq': {'region': 'EU'}}",
+          "        ]",
+          "    },",
+          "    limit=5",
+          ")"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How are attribute columns declared when you create the search service?",
+        "a": "You include them in the `AS SELECT` clause of the `CREATE CORTEX SEARCH SERVICE` statement alongside the text column. Any non-text columns in the SELECT become filterable attributes — the service indexes them for efficient scoped retrieval. They don't participate in the vector/keyword matching, only in pre-ranking filtering. Choosing the right set of attributes at creation time is the design decision; you can't filter on columns you didn't include."
+      },
+      {
+        "q": "What's the consequence of not using attribute filters in a multi-tenant app?",
+        "a": "Without scoping, a user from Tenant A can retrieve passages indexed from Tenant B's documents if they happen to be semantically similar. This is a data-isolation failure, not just a quality issue. Attribute filters — tenant_id, data_classification, or department — are the enforcement mechanism when multiple tenants share a search service. Alternatively, create separate per-tenant services, but that trades governance simplicity for per-service cost."
+      },
+      {
+        "q": "Can attribute filters combine with a time-range filter for freshness-biased retrieval?",
+        "a": "Yes — if you include a `created_at` or `updated_at` timestamp column as an attribute, you can add a `@gte`/`@lte` filter to restrict retrieval to recent documents, biasing the index toward fresh content even though Cortex Search's hybrid scoring doesn't inherently rank by date. That's useful for support use cases where a six-month-old KB article may have been superseded by a newer one."
+      }
+    ]
+  },
+  {
+    "q": "You're building a pipeline to ingest earnings call audio and extract financial KPIs. Map out the Cortex functions you'd use.",
+    "a": "The pipeline has three stages. First, use AI_TRANSCRIBE on the staged audio files to convert speech to text — it accepts audio/video via a TO_FILE reference and returns transcript text, handling multiple speakers and accents. Second, use AI_PARSE_DOCUMENT in LAYOUT mode on any accompanying slide-deck PDFs (charts, tables) so the financial tables are structure-preserved. Third, join the transcript and parsed deck text and run AI_EXTRACT with a schema specifying fields like revenue_guidance, eps_estimate, and growth_rate — or use AI_COMPLETE with a response_format JSON schema for tighter type guarantees. The whole pipeline runs in SQL, fans out in parallel across the warehouse, and never leaves the Snowflake boundary. The senior touch is schema-constraining the extract step so downstream consumers get typed fields, not free text they have to parse.",
+    "fj": "I'd download the audio files and run a Python speech-to-text script externally first.",
+    "fs": "AI_TRANSCRIBE handles audio-to-text inside Snowflake, AI_PARSE_DOCUMENT handles the slide deck PDFs with tables intact, and AI_EXTRACT pulls typed KPIs. The whole pipeline runs as SQL over staged files — no external service, no data egress.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Transcribe then extract KPIs",
+        "lang": "sql",
+        "lines": [
+          "WITH transcripts AS (",
+          "  SELECT call_id,",
+          "    AI_TRANSCRIBE(TO_FILE('@audio_stg', file_path)) AS txt",
+          "  FROM earnings_calls",
+          "),",
+          "extracted AS (",
+          "  SELECT call_id,",
+          "    AI_EXTRACT(txt,",
+          "      ['revenue_guidance','eps_estimate','growth_rate']",
+          "    ) AS kpis",
+          "  FROM transcripts",
+          ")",
+          "SELECT * FROM extracted;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "AI_TRANSCRIBE vs Whisper via a Python UDF — what's the governance trade-off?",
+        "a": "A Python UDF calling an external Whisper endpoint sends audio outside the Snowflake boundary (or at least outside the account) and bypasses data classification and masking. AI_TRANSCRIBE runs inside the account, governed by the same RBAC as any other function, with no audio egress. For earnings calls or any material non-public information, in-boundary transcription is often non-negotiable from a compliance standpoint, even if an external Whisper model has marginally better accuracy on certain accents."
+      },
+      {
+        "q": "What happens when the earnings call has multiple speakers and AI_TRANSCRIBE can't distinguish them?",
+        "a": "AI_TRANSCRIBE returns the transcript text without guaranteed diarization (speaker labeling) in all cases — the output is text, not labeled turns. If speaker attribution matters (who said what about guidance), you either accept the unsegmented transcript and use context (the CFO always answers after the analyst question pattern) or run a separate diarization step. For KPI extraction, speaker identity is usually less important than finding the stated figures anywhere in the text."
+      },
+      {
+        "q": "Why use AI_EXTRACT over AI_COMPLETE with a schema for KPI extraction — is there a practical difference?",
+        "a": "`AI_EXTRACT` is a targeted function for pulling a list of named fields from text with no custom prompt; it's the faster, simpler path when your fields are named and the text is the sole source. `AI_COMPLETE` with `response_format` gives you stricter type control (you define the full JSON schema with types, optionals, and nested structures) and lets you add instructions — e.g., 'if guidance isn't stated, return null rather than inferring'. For simple field lists, AI_EXTRACT is clean; for typed multi-level schemas, the structured-output AI_COMPLETE is more reliable."
+      }
+    ]
+  },
+  {
+    "q": "Walk me through building and deploying a Streamlit-in-Snowflake app that calls Cortex AI functions. What are the key constraints?",
+    "a": "Streamlit-in-Snowflake (SiS) lets you write and host a Python Streamlit app as a Snowflake object (CREATE STREAMLIT) that runs inside your account — the app and its Cortex calls never leave the boundary, auth is native Snowflake SSO, and you share it like any object. You call Cortex inside the app via the Snowpark session (session.call or session.sql with SNOWFLAKE.CORTEX.*), or via the Python SDK's Cortex functions. Key constraints to know: the app runs in a Snowflake-managed container, so you can't install arbitrary OS packages — only Anaconda-distributed Python packages are available. External network egress is blocked by default; you must create a Network Rule and External Access Integration to reach any outside URL. The app's warehouse provides compute for queries; Cortex serverless functions bill separately. Sharing: grant the STREAMLIT privilege on the object to a role, not file-system access.",
+    "fj": "I'd just deploy a Streamlit app on a VM and have it call Snowflake via JDBC.",
+    "fs": "SiS hosts the app in-account so Cortex calls never leave the boundary and Snowflake auth is automatic. The constraints are: Anaconda-only packages, no arbitrary egress without an External Access Integration, and Cortex functions bill separately from the app's warehouse compute.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Call Cortex from Streamlit-in-Snowflake",
+        "lang": "python",
+        "lines": [
+          "from snowflake.snowpark.context import get_active_session",
+          "from snowflake.cortex import Complete",
+          "",
+          "session = get_active_session()",
+          "",
+          "def ask(question: str) -> str:",
+          "    return Complete('claude-3-5-sonnet', question)",
+          "",
+          "import streamlit as st",
+          "q = st.text_input('Ask a question')",
+          "if q:",
+          "    st.write(ask(q))"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you share a Streamlit app with a business analyst who doesn't have a developer role?",
+        "a": "Grant the `USAGE` privilege on the STREAMLIT object to the analyst's role (and USAGE on the database and schema containing it). The analyst accesses it through Snowsight — no Snowflake client, no development environment. You also ensure the app's warehouse is one their role can use. The app runs under the viewer's own role, so RBAC determines what data it can query — no privilege escalation."
+      },
+      {
+        "q": "What's the External Access Integration needed for and when would you use it in a Cortex app?",
+        "a": "By default SiS is network-isolated. An External Access Integration plus a Network Rule allows the app to make outbound HTTP calls to a specific host/IP — needed if you want to call a REST webhook, send a Slack notification from the app, or reach a custom API. For a pure Cortex app (all calls go to Snowflake's internal AI functions) you don't need one. You add it only when the app must reach something outside Snowflake."
+      },
+      {
+        "q": "How do you handle secrets (API keys for external calls) inside a Streamlit-in-Snowflake app?",
+        "a": "Use Snowflake Secrets — create a SECRET object storing the credential, reference it in the External Access Integration, and access it in the app via the `get_generic_secret_string` API rather than hardcoding or using environment variables. The secret is governed by RBAC (who can read it) and never appears in the app code or query history. That's the in-boundary, auditable path versus env vars in app config files."
+      }
+    ]
+  },
+  {
+    "q": "How does Cortex ML ANOMALY_DETECTION work, and how do you operationalize it for continuous monitoring?",
+    "a": "ANOMALY_DETECTION trains an unsupervised (or supervised, with a labeled anomaly column) model on a time series of numeric values, learns the expected range at each point, and labels new points as anomalies if they fall outside the learned confidence interval. The trained model object is created with CREATE SNOWFLAKE.ML.ANOMALY_DETECTION, then you CALL model!DETECT_ANOMALIES on new data to get each point flagged with a boolean anomaly indicator and an anomaly score. For continuous monitoring you pair it with a Task + Stream: the Stream captures new metric rows as they land, the Task calls DETECT_ANOMALIES on that delta and writes results to a monitoring table, and an Alert fires a notification when anomaly = true. This keeps detection near-real-time without a standing external ML server.",
+    "fj": "I'd write a Python script that pulls the time series to a notebook and runs a z-score check.",
+    "fs": "ANOMALY_DETECTION trains an ML model in SQL and runs DETECT_ANOMALIES in a Task+Stream pipeline inside Snowflake — no Python infra, near-real-time, and the model knows the series' baseline better than a static z-score threshold.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Train then detect in a Task",
+        "lang": "sql",
+        "lines": [
+          "-- train (once or scheduled)",
+          "CREATE OR REPLACE SNOWFLAKE.ML.ANOMALY_DETECTION anom_model(",
+          "  INPUT_DATA => SYSTEM$REFERENCE('VIEW','metric_history'),",
+          "  TIMESTAMP_COLNAME => 'ts',",
+          "  TARGET_COLNAME => 'value');",
+          "",
+          "-- detect on new rows",
+          "CALL anom_model!DETECT_ANOMALIES(",
+          "  INPUT_DATA => SYSTEM$REFERENCE('VIEW','new_metrics'),",
+          "  TIMESTAMP_COLNAME => 'ts',",
+          "  TARGET_COLNAME => 'value');"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the difference between supervised and unsupervised anomaly detection in Cortex ML?",
+        "a": "Unsupervised (the default) learns normal behavior purely from the historical series — no labels needed. Supervised mode lets you supply a label column marking known anomalies in training, so the model learns specifically what 'bad' looks like for your metric rather than inferring it statistically. Use supervised when you have reliable historical incident records and the unsupervised baseline keeps flagging business-as-usual events (e.g., weekly spikes) as anomalies."
+      },
+      {
+        "q": "How do you handle seasonality so the model doesn't flag every Monday spike as an anomaly?",
+        "a": "ANOMALY_DETECTION automatically learns seasonal patterns (daily, weekly) if the training series is long enough (several seasonal cycles) — you don't set seasonality manually, it infers it. The implication is that training data must cover enough history: a model trained on two weeks doesn't see the weekly pattern clearly. Provide at least 2–3 full seasonal cycles in training so the learned interval at each seasonal position is right."
+      },
+      {
+        "q": "What's TOP_INSIGHTS and when do you use it versus ANOMALY_DETECTION?",
+        "a": "`TOP_INSIGHTS` is for root-cause explanation: given a metric that dropped (the 'surprise' input), it scans dimension combinations and identifies which slices account for the change. ANOMALY_DETECTION tells you that something is abnormal; TOP_INSIGHTS tells you which dimension (region + product + channel) drove it. In practice you chain them: detect with ANOMALY_DETECTION, then pass the anomaly window to TOP_INSIGHTS to get an attribution — 'EU + mobile + checkout_error explains 78% of the drop.'"
+      }
+    ]
+  },
+  {
+    "q": "Your team wants to fine-tune a Cortex model to output structured incident reports in a specific Markdown template. Walk through the end-to-end PEFT workflow.",
+    "a": "Start by collecting training pairs: hundreds of (input, desired_output) examples where the output is the exact Markdown incident report format you want — header, timeline, impact, root cause, action items. Quality beats quantity: 300 consistent, high-quality examples outperform 3,000 inconsistent ones. Store them as a Snowflake table with prompt and completion columns. Run CREATE SNOWFLAKE.CORTEX.FINETUNE to start a serverless PEFT training job; you specify the base model (e.g., mistral-7b), the training table, and optionally a validation table. The job runs serverless, no warehouse cost, billed per training token. Once complete, the fine-tuned model appears with a version name you pass to AI_COMPLETE. Before shipping, run an eval: generate outputs on a held-out test set, score structural conformance (does it have all sections, in order), and optionally use AI_COMPLETE or AI_FILTER as an LLM judge for content quality.",
+    "fj": "I'd just put the template in the system prompt and that's enough.",
+    "fs": "A system-prompt template works but can drift under adversarial or complex inputs. Fine-tuning locks the format into the model's weights — after 300+ consistent training pairs the output is structurally reliable across inputs, not prompt-dependent. The eval on held-out structural conformance is what proves it.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Launch a PEFT fine-tune job",
+        "lang": "sql",
+        "lines": [
+          "CREATE SNOWFLAKE.CORTEX.FINETUNE incident_ft",
+          "  BASE_MODEL = 'mistral-7b',",
+          "  TRAINING_DATA = SELECT prompt, completion",
+          "                  FROM incident_training_pairs,",
+          "  VALIDATION_DATA = SELECT prompt, completion",
+          "                    FROM incident_validation_pairs;",
+          "",
+          "-- check status",
+          "SHOW CORTEX FINETUNES LIKE 'incident_ft';",
+          "",
+          "-- call the fine-tuned model",
+          "SELECT AI_COMPLETE('incident_ft', input_text) FROM incidents;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you measure whether the fine-tune actually improved on the prompt-only baseline?",
+        "a": "Run both the base model (with your best system prompt) and the fine-tuned model on the same held-out test set. Score structural conformance programmatically (section headers present, order correct, no extra hallucinated sections) and use an LLM-judge or human review for content quality on a sample. Report pass-rate and quality delta. The fine-tune earns its place only if conformance rate meaningfully improves over the prompt baseline — if the delta is small, the prompt is sufficient and the training cost was wasted."
+      },
+      {
+        "q": "What base models are available for Cortex fine-tuning as of early 2026?",
+        "a": "As of early 2026, Cortex Fine-tuning supports a curated set of smaller open-weight models — the Mistral 7B family and Llama 3/3.1 variants (e.g., Llama-3.1-8B) — since PEFT is most cost-effective on models where the adaptor cost is justified by cheaper inference versus using a frontier model directly. Frontier models like Claude are not fine-tunable in Cortex. Always check Snowflake's current documentation because the available model list expands with each release."
+      },
+      {
+        "q": "How do you roll back if the fine-tuned model regresses on edge cases after deployment?",
+        "a": "Because the fine-tuned model is accessed by its version name string in AI_COMPLETE, rollback is a one-line change: swap the model name back to the base model (or a prior fine-tune version) in the calling SQL or app config. There's no weight swap to orchestrate. The senior practice is to run A/B traffic between the base model and the fine-tune in production — a small percentage of calls to the fine-tune with automated scoring — before full cutover, so you catch regression before it's 100% of traffic."
+      }
+    ]
+  },
+  {
+    "q": "What is Cortex ML TOP_INSIGHTS and how do you set it up to explain a metric drop?",
+    "a": "TOP_INSIGHTS is a Cortex ML function that answers 'which dimension combinations drove a change in this metric between two time windows' — the 'surprise' analysis. You define a contributor period (the anomalous window) and a baseline period, point it at a view with the metric and its dimensions, and CALL model!GET_INSIGHTS. It returns dimension slices ranked by their contribution to the surprise, with the direction (drove it up or down) and a contribution score. The use case is BI triage: metric X dropped 20% — before spending hours querying by hand, let TOP_INSIGHTS rank the suspects. The senior setup point is that the dimension columns in your view must be of appropriate cardinality — very high-cardinality columns (user_id) produce noise, not insights. Pre-aggregate to the right grain.",
+    "fj": "I'd pivot the metric by each dimension and eyeball the bar charts.",
+    "fs": "TOP_INSIGHTS ranks dimension combinations by contribution to the metric change automatically — it replaces hours of manual slicing. The key setup decision is cardinality: pre-aggregate to a dimension grain that makes combinations meaningful, not user-level noise.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "TOP_INSIGHTS setup and call",
+        "lang": "sql",
+        "lines": [
+          "CREATE SNOWFLAKE.ML.TOP_INSIGHTS ti(",
+          "  INPUT_DATA => SYSTEM$REFERENCE('VIEW','daily_metric_dims'),",
+          "  METRIC_COLNAME => 'orders',",
+          "  DATE_COLNAME => 'ds');",
+          "",
+          "CALL ti!GET_INSIGHTS(",
+          "  CONTRIBUTOR_PERIOD => ('2025-11-01','2025-11-07'),",
+          "  BASELINE_PERIOD => ('2025-10-01','2025-10-07'));",
+          ""
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does the 'surprise' score in the output represent?",
+        "a": "The surprise score measures how much a dimension slice's behavior deviated from its expected share of the metric given the baseline — a high positive score means the slice over-performed relative to baseline, a high negative means it under-performed. It's not just the absolute drop in that slice but its proportional contribution to the overall metric change. That lets you distinguish 'EU dropped because EU is always volatile' from 'EU dropped far more than its baseline share explains.'"
+      },
+      {
+        "q": "Can you use TOP_INSIGHTS without first running ANOMALY_DETECTION?",
+        "a": "Yes — TOP_INSIGHTS is independent. You supply the contributor and baseline periods directly; it doesn't require an anomaly detector to have flagged them. In practice teams use ANOMALY_DETECTION to find the anomalous window and then pass those timestamps to TOP_INSIGHTS for root-cause, but you can also call TOP_INSIGHTS on any two periods you already know are interesting (e.g., last week vs the week before for a business review)."
+      },
+      {
+        "q": "What view grain should you pass — daily totals by dimension or raw event rows?",
+        "a": "Daily totals aggregated by the dimension columns you care about — not raw event rows. At event grain the cardinality explodes (user_id, session_id) and the function is looking for meaningful clusters, not individual events. Aggregate to `(date, region, product, channel, metric_value)` first. The right grain is one where each row represents a meaningful slice of the metric, similar to how you'd set up a GROUP BY before doing manual investigation."
+      }
+    ]
+  },
+  {
+    "q": "How do you author and register a semantic view for Cortex Analyst in SQL, and what DDL lets you change it after the fact?",
+    "a": "A semantic view is a schema-level object created with `CREATE SEMANTIC VIEW`, specifying the base tables, dimensions (columns with optional synonyms and descriptions), facts (numeric columns with aggregation expressions), and relationships (join paths between tables). Unlike a YAML on a stage, the semantic view lives in the catalog, is versioned with `CREATE OR REPLACE`, and is altered with `ALTER SEMANTIC VIEW` (add/drop dimensions, modify metric expressions, add synonyms) without full recreation. After authoring, you tell Cortex Analyst to use it by referencing the semantic view name in the Analyst API call instead of a stage path. The operational advantage is that changes to the semantic model are DDL statements your CI pipeline can run and audit — no file upload step.",
+    "fj": "I just re-upload the whole YAML file when I need to change a metric definition.",
+    "fs": "A semantic view is DDL: CREATE, ALTER, or CREATE OR REPLACE. I can add synonyms or fix a metric expression with a targeted ALTER without re-uploading a file, and changes are tracked in ACCOUNT_USAGE DDL history like any other object.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Create and alter a semantic view",
+        "lang": "sql",
+        "lines": [
+          "CREATE SEMANTIC VIEW sales_model",
+          "  TABLES (",
+          "    orders PRIMARY KEY (order_id),",
+          "    customers PRIMARY KEY (cust_id)",
+          "  )",
+          "  RELATIONSHIPS (",
+          "    orders (cust_id) REFERENCES customers",
+          "  )",
+          "  FACTS (",
+          "    orders.amount AS revenue SYNONYMS ['sales','gmv']",
+          "      AGGREGATE SUM",
+          "  );",
+          "",
+          "-- add a synonym without full re-create",
+          "ALTER SEMANTIC VIEW sales_model",
+          "  MODIFY FACT orders.amount ADD SYNONYM 'bookings';"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens to existing Analyst sessions if you ALTER a semantic view they're using?",
+        "a": "Analyst reads the semantic view at query time, so a session that sends the next question after the ALTER sees the updated model. There's no session cache to invalidate manually. The operational implication is that an ALTER that changes a metric expression (e.g., corrects a wrong filter) takes effect immediately for all subsequent questions — good for fixes, but potentially breaking for verified queries that referenced the old logic. After a metric change, re-validate affected verified queries."
+      },
+      {
+        "q": "How do relationships in the semantic view prevent fan-out multiplication errors?",
+        "a": "A declared relationship specifies the join key and optionally the cardinality (one-to-many, many-to-one). Analyst uses this to generate a JOIN that avoids Cartesian products and double-counting: for a one-to-many relationship (one customer, many orders) it knows to SUM the order metric before joining back to the customer grain, not after. Without it, Analyst has to infer the join path and cardinality — and a wrong cardinality assumption silently inflates a SUM."
+      },
+      {
+        "q": "Can you grant different roles access to different semantic views over the same underlying tables?",
+        "a": "Yes — because the semantic view is a catalog object, you GRANT USAGE on it per role, just like a view or table. Role A might have access to a semantic view that exposes revenue and margin metrics (privileged finance reporting), while Role B has access to a separate semantic view over the same orders table that only exposes order counts. RBAC on the semantic view combined with column-level masking on the underlying table gives you fine-grained control over what each role can analyze."
+      }
+    ]
+  },
+  {
+    "q": "Compare CORTEX.COMPLETE (the older function) with AI_COMPLETE — when do you still see the old function in codebases and should you migrate?",
+    "a": "SNOWFLAKE.CORTEX.COMPLETE is the original function-call interface: you call it as `SNOWFLAKE.CORTEX.COMPLETE(model, prompt_or_messages)`. AI_COMPLETE is the newer top-level alias that provides the same capability but with a cleaner name, structured-output response_format support that is more consistently documented, and integration with the PROMPT() helper for safe interpolation. Both are active and support the same model strings and messages-array form. In practice the semantic difference is small: the main reason to migrate existing code is to standardize on AI_COMPLETE so you don't carry two naming conventions, and to access the latest options (Cortex Guard, response_format schema, multimodal inputs as they GA) which may surface on AI_COMPLETE first. Migration is a string substitution; no behavioral change for basic completions.",
+    "fj": "They're totally different — COMPLETE is legacy and doesn't support new features.",
+    "fs": "They're the same engine, different names. AI_COMPLETE is the canonical surface going forward and gets new options first. Migration is a string substitution — no behavior change for basic calls. Standardize on AI_COMPLETE but don't treat COMPLETE as broken.",
+    "level": "Mid",
+    "code": [
+      {
+        "label": "Equivalent calls — old vs new surface",
+        "lang": "sql",
+        "lines": [
+          "-- older surface",
+          "SELECT SNOWFLAKE.CORTEX.COMPLETE(",
+          "  'mistral-large2',",
+          "  'Summarize: ' || body) FROM tickets;",
+          "",
+          "-- current canonical surface",
+          "SELECT AI_COMPLETE(",
+          "  'mistral-large2',",
+          "  PROMPT('Summarize: {0}', body)) FROM tickets;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the most practical new capability AI_COMPLETE has that COMPLETE doesn't expose as cleanly?",
+        "a": "Structured output via `response_format` — the JSON schema constraint mode that forces grammar-based valid JSON output. While COMPLETE supports the messages-array form and many options, the `response_format` parameter with `$ref` support for sub-schemas is documented and validated most clearly on AI_COMPLETE. That's the feature that eliminates regex-parsing of free text downstream and is the most operationally important new option for pipelines."
+      },
+      {
+        "q": "Is there any performance difference between calling COMPLETE and AI_COMPLETE for the same model?",
+        "a": "No — they hit the same inference backend for the same model. Latency, throughput, and billing are identical. The choice is entirely a naming/API hygiene decision: which surface gets future features first and which is better documented. Both count against the same CORTEX_USER role grant and appear in the same ACCOUNT_USAGE usage_history views under their respective function names."
+      },
+      {
+        "q": "What would you check in a codebase audit before migrating COMPLETE calls to AI_COMPLETE?",
+        "a": "Grep for `SNOWFLAKE.CORTEX.COMPLETE` calls and check: (1) the model string — make sure it's still in the current model menu, since some older model names have been updated or retired; (2) the prompt format — if it's string concatenation, refactor to PROMPT() at the same time; (3) any hardcoded options objects — verify the option keys are still valid on the new surface. The migration is mostly mechanical but it's a good hygiene pass to clean up stale model names and inject PROMPT() safety simultaneously."
+      }
+    ]
+  },
+  {
     "q": "What's the difference between a semantic model (YAML) and a semantic view for Cortex Analyst, and which do you pick?",
     "a": "A semantic model is a YAML file you author and upload to a stage; a semantic view is a native schema-level Snowflake object that captures the same logical layer — tables, relationships, metrics, synonyms — but lives in the database. The semantic view is generally the stronger choice for production because it's governed by Snowflake RBAC, can be shared like any other object, and is managed with SQL DDL rather than a file you have to version and ship to a stage. The YAML is handy for quick iteration, external version control, or when you're prototyping. Either way the substance is the same: the quality of the metric and synonym definitions is what determines Analyst's accuracy, not which container you store them in.",
     "fj": "They're the same thing, just file versus object — pick either.",
@@ -653,6 +1088,1470 @@
       {
         "q": "Does switching the storage container change Analyst's answer quality?",
         "a": "No — accuracy comes from the definitions, not the container. A YAML and a semantic view with identical tables, relationships, metrics, and synonyms produce the same Analyst behavior. The container decides governance, sharing, and how you manage changes; the metric and synonym quality (and any verified queries) decides whether the answers are right. Don't expect a quality jump just from moving YAML into a view."
+      }
+    ]
+  },
+  {
+    "q": "You're deploying a Cortex Fine-tuning (PEFT) pipeline to adapt Mistral-7B for a domain-specific task. What LoRA-related hyperparameters does Cortex manage for you, and what do you still control?",
+    "a": "Cortex Fine-tuning is a fully managed PEFT (parameter-efficient fine-tuning) service that internally uses LoRA-style adaptor training: it attaches low-rank weight matrices to the transformer layers and trains only those adaptors rather than the full model, which keeps compute and memory cost low even for multi-billion-parameter base models. What Cortex manages: rank selection, learning rate schedule, gradient accumulation, and mixed-precision — you don't set these. What you control: the base model selection, the training dataset (prompt/completion pairs as a Snowflake table), an optional validation table for early stopping, and the number of epochs (if you want to override the default). The fine-tuned adaptor is merged into the serving path and is invoked like any other model string in AI_COMPLETE. The PEFT approach is why training cost is measured in tokens, not in GPU-hours of full fine-tuning.",
+    "fj": "I'd set learning rate, LoRA rank, and alpha manually in a training config.",
+    "fs": "Cortex PEFT is fully managed — LoRA hyperparameters like rank and learning rate are Snowflake's responsibility. I control the base model, training/validation tables, and optionally epochs. The tradeoff is less tuning knob access in exchange for serverless simplicity.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Minimal PEFT fine-tune DDL",
+        "lang": "sql",
+        "lines": [
+          "CREATE SNOWFLAKE.CORTEX.FINETUNE my_ft",
+          "  BASE_MODEL = 'mistral-7b',",
+          "  TRAINING_DATA = SELECT prompt, completion",
+          "                  FROM domain_training,",
+          "  VALIDATION_DATA = SELECT prompt, completion",
+          "                    FROM domain_validation;",
+          "",
+          "-- check job status",
+          "SELECT SNOWFLAKE.CORTEX.FINETUNE_STATUS('my_ft');"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does PEFT/LoRA training cost be measured in tokens rather than GPU-hours?",
+        "a": "Because only the small low-rank adaptor matrices are trained — not the billions of base-model weights — the compute footprint is a fraction of full fine-tuning. Snowflake can therefore bill by tokens processed (training corpus size × epochs) on shared serverless infrastructure rather than requiring a dedicated GPU cluster you reserve by the hour. The managed billing model is a direct consequence of the PEFT efficiency."
+      },
+      {
+        "q": "Can you mix training data from multiple Snowflake tables in one PEFT job?",
+        "a": "The training and validation references accept any query result, so you can UNION multiple tables or views in the SELECT expression passed as TRAINING_DATA. That lets you combine curated examples from different sources (manual labels, past incidents, synthetic augmentation) into one cohesive corpus without materializing a new table. Keep the combined set consistent in format — mixed instruction styles in the same batch are the main quality risk."
+      },
+      {
+        "q": "What is 'catastrophic forgetting' in PEFT and why does it matter less here than in full fine-tuning?",
+        "a": "Catastrophic forgetting is when a model loses general knowledge as it overfits to the training distribution. PEFT mitigates it structurally: because only the small LoRA adaptors are updated, the frozen base-model weights retain their pre-trained general capabilities — only the adaptor steers domain-specific behavior. In full fine-tuning, all weights shift and the model can regress on tasks outside the training set. For a Cortex PEFT fine-tune, the main forgetting risk is on behaviors the training data didn't cover at all, not on general language ability."
+      }
+    ]
+  },
+  {
+    "q": "Design a Streamlit-in-Snowflake dashboard that surfaces PEFT fine-tune job status and per-epoch validation loss for your team. What are the moving parts?",
+    "a": "The dashboard has two data sources and one Streamlit-in-Snowflake (SiS) app. Data source 1: poll SNOWFLAKE.CORTEX.FINETUNE_STATUS for each fine-tune job name to get state (TRAINING, COMPLETED, FAILED) and any returned metrics. Data source 2: if you log per-epoch validation metrics to a Snowflake table during training (via a Snowpark task or by inspecting the job result), query that table. The SiS app calls the Snowpark session to fetch both, uses st.metric and st.line_chart to render current loss curves and job states, and st.experimental_rerun or a manual refresh button to poll. Because SiS runs inside Snowflake, the FINETUNE_STATUS call executes under the calling role's privileges with no API key management. The PEFT job status and a Streamlit dashboard together give ops teams a single-pane-of-glass view of model training without standing up a separate MLflow server.",
+    "fj": "I'd log into the Snowflake UI and check the fine-tune status manually.",
+    "fs": "A Streamlit-in-Snowflake app polling FINETUNE_STATUS and rendering st.line_chart on logged validation loss is a self-contained monitoring dashboard — no external server, governed by Snowflake RBAC, and shareable by granting USAGE on the STREAMLIT object.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Poll PEFT job status in Streamlit-in-Snowflake",
+        "lang": "python",
+        "lines": [
+          "import streamlit as st",
+          "from snowflake.snowpark.context import get_active_session",
+          "",
+          "session = get_active_session()",
+          "",
+          "jobs = ['incident_ft', 'billing_ft']",
+          "for job in jobs:",
+          "    status = session.sql(",
+          "        f\"SELECT SNOWFLAKE.CORTEX.FINETUNE_STATUS('{job}')\"",
+          "    ).collect()[0][0]",
+          "    st.metric(label=job, value=status['status'])",
+          "",
+          "# render validation loss if logged to a table",
+          "df = session.table('ft_validation_metrics').to_pandas()",
+          "st.line_chart(df, x='epoch', y='val_loss', color='job_name')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you gate the dashboard so only ML engineers can see PEFT job details?",
+        "a": "Grant the STREAMLIT object's USAGE privilege only to a designated ml_engineer role. Because the app runs under the viewer's own session role, only users with that role can open it. Additionally, the underlying ft_validation_metrics table should have SELECT granted only to that role, so even someone who finds the URL can't read the data without the right privilege."
+      },
+      {
+        "q": "What's the correct way to schedule an automatic refresh of the PEFT status without st.experimental_rerun?",
+        "a": "Use `st.rerun()` (the GA replacement for `st.experimental_rerun` in Streamlit ≥1.28) triggered by a timer built with `time.sleep` inside a loop, or simply provide a Refresh button the user clicks. For a background polling pattern, store the last-fetched timestamp in `st.session_state` and re-fetch on each run if the age threshold has passed. Avoid infinite hot loops without a sleep — they burn warehouse credits for the session."
+      },
+      {
+        "q": "Can a Streamlit-in-Snowflake app also trigger a new PEFT fine-tune job, or is it read-only?",
+        "a": "It can execute any SQL the calling role is privileged to run, including `CREATE SNOWFLAKE.CORTEX.FINETUNE` statements. So a Streamlit dashboard can expose a form where a user selects a base model and training table, and the app issues the DDL to start the job. You'd typically gate this behind a confirmation prompt and restrict the STREAMLIT object to a role that also has CREATE FINETUNE privilege — treating the dashboard as both a status monitor and a lightweight job-launcher."
+      }
+    ]
+  },
+  {
+    "q": "Your PEFT fine-tuned model's validation loss plateaued early and evaluation shows the model started echoing prompt structure. Diagnose and fix.",
+    "a": "Early validation loss plateau with prompt-echo is a classic PEFT overfitting signature on a small, low-diversity training set. The fine-tune adapted the LoRA adaptors to the surface form of the training data rather than the underlying task. Diagnosis: check training set size and variance — fewer than ~200 high-quality examples or examples that all share the same preamble or structural pattern are the typical culprit. Also check if completion examples are very short (the model learns to copy input framing). Fixes: (1) augment the training corpus with paraphrased versions of the same examples using AI_COMPLETE on the base model to add phrasing diversity; (2) ensure completions are substantively longer than prompts; (3) add a held-out validation table and monitor loss — if you didn't pass VALIDATION_DATA, re-run with it to detect overfit earlier; (4) consider fewer epochs if Cortex allows it. If the task is format-only, a large structured-output prompt on the base model may be sufficient without PEFT.",
+    "fj": "The training data looks fine — I'd just run more epochs to push the loss lower.",
+    "fs": "More epochs on a small/low-diversity set deepens overfitting. I diagnose by checking corpus size and phrasing variance, augment with paraphrased examples via AI_COMPLETE on the base model, and add VALIDATION_DATA to detect plateau early. If the task is format-enforcement only, a response_format prompt may render PEFT unnecessary.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you use AI_COMPLETE on the base model to generate PEFT training augmentations without a separate service?",
+        "a": "In a SQL or Snowpark script, feed each existing (prompt, completion) example to AI_COMPLETE with an instruction like 'paraphrase this prompt in a different phrasing while preserving meaning' to generate N variants, then INSERT them alongside the originals into the training table. Because it runs inside Snowflake, no data leaves the boundary and the augmented corpus is immediately ready for the PEFT job. This is an effective corpus-size multiplier for format-learning tasks."
+      },
+      {
+        "q": "What validation metric should you track beyond loss for a structured-output fine-tune?",
+        "a": "Schema conformance rate — after each training checkpoint, run the model against a test set and check what fraction of outputs are valid JSON that matches the target structure (all required sections present, correct field names, correct nesting). Loss is a proxy; conformance rate is the actual product metric. A fine-tune with low loss but 70% conformance is still failing production requirements."
+      },
+      {
+        "q": "When would you give up on PEFT and use a structured-output prompt with AI_COMPLETE instead?",
+        "a": "When the task is purely format enforcement (not behavioral/style change) and a well-specified response_format JSON schema already produces ≥95% conformance on the base model. PEFT earns its place when prompt-based control isn't reliable across the full input distribution or when you need a smaller cheap model to behave like a frontier model. If the base model with structured output already does the job, PEFT adds cost and complexity for no gain."
+      }
+    ]
+  },
+  {
+    "q": "How do you expose a Cortex Analyst chatbot inside a Streamlit-in-Snowflake app while keeping conversation history correctly threaded?",
+    "a": "The architecture has three parts: (1) a Streamlit-in-Snowflake (SiS) front-end that renders the chat UI with st.chat_message and st.chat_input; (2) conversation state stored in st.session_state as a list of message dicts with role and content; (3) the Analyst REST call made via session.sql or the Snowflake Python Cortex client, passing the current question plus the thread history. On each turn: append the user message to session_state, call the Analyst endpoint with the messages list, check the response type (sql or clarification), execute the SQL via session.sql if it's a query, render the result as a table or chart, and append the assistant answer to session_state. The senior discipline is to cap the messages list at a sliding window (last N turns) before sending to Analyst so you don't exceed its context ceiling — Streamlit's session_state preserves the full display history for the user while the Analyst call only sees the recent window.",
+    "fj": "I'd just send the latest user message to Analyst each time and ignore thread history.",
+    "fs": "Stateless Analyst calls lose context — 'filter by the same region I mentioned before' fails. I store turns in st.session_state, send a windowed messages list to the Analyst endpoint each turn, and check the response type before executing or surfacing a clarification prompt.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Threaded Analyst chat in Streamlit-in-Snowflake",
+        "lang": "python",
+        "lines": [
+          "import streamlit as st",
+          "from snowflake.snowpark.context import get_active_session",
+          "",
+          "session = get_active_session()",
+          "if 'messages' not in st.session_state:",
+          "    st.session_state.messages = []",
+          "",
+          "# render history",
+          "for m in st.session_state.messages:",
+          "    with st.chat_message(m['role']):",
+          "        st.write(m['content'])",
+          "",
+          "if q := st.chat_input('Ask a data question'):",
+          "    st.session_state.messages.append({'role':'user','content':q})",
+          "    # call Analyst with windowed history (last 10 turns)",
+          "    window = st.session_state.messages[-10:]",
+          "    resp = session.sql(f\"SELECT SNOWFLAKE.CORTEX.ANALYST_CHAT({window!r})\").collect()[0][0]",
+          "    if resp['type'] == 'sql':",
+          "        result = session.sql(resp['sql']).to_pandas()",
+          "        st.dataframe(result)",
+          "        st.session_state.messages.append({'role':'assistant','content':resp['text']})",
+          "    elif resp['type'] == 'clarification':",
+          "        st.session_state.messages.append({'role':'assistant','content':str(resp['clarification'])})"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you persist conversation history across page refreshes in Streamlit-in-Snowflake?",
+        "a": "st.session_state is in-memory per browser session and is lost on refresh. For durable history, write each turn to a Snowflake table (session_id, turn_seq, role, content, ts) using the Snowpark session, and on app load fetch the relevant session rows back into session_state. The table acts as the canonical store; session_state is just the working cache. That also makes conversation history auditable and accessible outside the SiS app."
+      },
+      {
+        "q": "What's the risk of rendering Analyst-generated SQL results in a Streamlit app without review?",
+        "a": "Analyst emits read-only SELECT, so no write-side risk, but a runaway SELECT over a huge table can burn warehouse credits and return a DataFrame too large to render in the browser. Guard with a LIMIT injected before execution (check if the SQL already has one; if not, wrap it) and a max-rows cap on st.dataframe rendering. Also validate the SQL references only the expected databases before running it — defense-in-depth even for read-only."
+      },
+      {
+        "q": "How do you handle Analyst returning a clarification request in the Streamlit chat UI gracefully?",
+        "a": "Surface the clarification options as st.radio or st.selectbox buttons rather than free text — this constrains the user to valid choices and makes the follow-up message deterministic. After the user selects an option, append both the assistant clarification and the user selection to session_state and re-call Analyst with the selection as the next user turn. Displaying raw JSON from the clarification response is technically functional but terrible UX."
+      }
+    ]
+  },
+  {
+    "q": "Explain how PEFT fine-tuning in Cortex handles class imbalance in training data and what you can do about it.",
+    "a": "Cortex PEFT training does not expose explicit class-weighting or sampling parameters — it trains on the rows you supply in the TRAINING_DATA query, treating each row equally. If your training corpus has a strong class imbalance (e.g., 90% of examples are one output category), the LoRA adaptors will bias toward the majority class, producing a fine-tune that rarely outputs minority classes. This is your problem to fix at the data preparation level: over-sample minority examples (via UNION ALL), under-sample the majority, or generate synthetic minority examples with AI_COMPLETE on the base model. After fixing the corpus balance, validate on a stratified held-out set that reflects real-world class distribution — validation loss on a balanced set is what confirms the imbalance was corrected. The PEFT job itself is a black box once started, so all levers are in the training table you construct.",
+    "fj": "The model will figure out the right distribution from the data automatically.",
+    "fs": "PEFT weights every row equally — a skewed corpus produces a skewed adaptor. I fix this in the training table before the job starts: over-sample minorities, under-sample the majority, or generate synthetic examples with AI_COMPLETE. Validation on a balanced held-out set confirms the fix.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Balance training corpus before PEFT",
+        "lang": "sql",
+        "lines": [
+          "-- over-sample minority class 4× before passing to FINETUNE",
+          "CREATE OR REPLACE TABLE balanced_training AS",
+          "SELECT prompt, completion FROM training WHERE label = 'majority'",
+          "UNION ALL",
+          "SELECT prompt, completion FROM training WHERE label = 'minority'",
+          "UNION ALL SELECT prompt, completion FROM training WHERE label = 'minority'",
+          "UNION ALL SELECT prompt, completion FROM training WHERE label = 'minority'",
+          "UNION ALL SELECT prompt, completion FROM training WHERE label = 'minority';"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you generate synthetic minority-class training examples with AI_COMPLETE without inventing facts?",
+        "a": "Use a few-shot prompt that shows the model 2–3 real minority-class examples and asks it to generate N variations with slightly different phrasing, context, or input values — but anchored to the same output structure. Because you're generating format/style variations around known-good examples rather than asking the model to invent from scratch, hallucination risk is low. Review a sample manually before adding synthetic rows to the training table to catch any that drifted from the target form."
+      },
+      {
+        "q": "At what imbalance ratio does the problem become critical for a PEFT format-training task?",
+        "a": "A rough rule: above 3:1 majority-to-minority in a small corpus (under 500 examples) you'll see measurable minority-class degradation. At 10:1 the minority class is often functionally ignored. For large corpora (5,000+), the absolute minority count matters more — 500 minority examples at 10:1 is usually sufficient. Measure by sampling balanced eval outputs before committing: if minority-class conformance drops below 80% relative to majority, the imbalance is actively hurting you."
+      },
+      {
+        "q": "How do you detect output class imbalance in a live fine-tuned model after deployment?",
+        "a": "Log AI_COMPLETE outputs to a table (output_text, job_name, ts) and run a periodic GROUP BY on classified output categories — either via AI_CLASSIFY or a rule-based extractor on the output. A sudden spike in one category or a category that drops to near-zero is the signal. Compare against the expected real-world distribution. Pair this with the ACCOUNT_USAGE Cortex functions history so you have a complete audit trail of outputs by model version."
+      }
+    ]
+  },
+  {
+    "q": "A product manager wants a Streamlit-in-Snowflake app that lets non-technical users trigger Cortex PEFT fine-tune jobs with a form. What safeguards do you build?",
+    "a": "Without safeguards, a non-technical user could accidentally kick off a PEFT job on a huge unfiltered table, running up training-token costs, or overwrite a production fine-tune model by reusing its name. Safeguards: (1) limit the base model dropdown to a pre-approved list; (2) enforce a row-count preview before submission — run a COUNT on the selected training table and surface the expected token cost estimate; (3) name the fine-tune with a user-scoped or date-stamped prefix so it can't clobber production names; (4) require a comment field describing the intent, which you log to an audit table; (5) gate the STREAMLIT object to a role that has CREATE FINETUNE privilege but not access to production model names via RBAC; (6) send a Slack/email notification via External Access Integration on job submission. Streamlit-in-Snowflake handles auth automatically so there's no separate identity to manage, but the form discipline and row-count gate are what prevent accidental runaway jobs.",
+    "fj": "I'd just put a text box for the model name and table name and let the user run it.",
+    "fs": "A raw form with no guardrails means runaway costs and clobbered production fine-tunes. I enforce a pre-approved base model dropdown, a row-count cost preview, a namespaced job name, an audit log, and RBAC limiting which roles can open the STREAMLIT object at all.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Safe PEFT launcher form in Streamlit-in-Snowflake",
+        "lang": "python",
+        "lines": [
+          "import streamlit as st",
+          "from snowflake.snowpark.context import get_active_session",
+          "import datetime",
+          "",
+          "session = get_active_session()",
+          "ALLOWED_MODELS = ['mistral-7b', 'llama3.1-8b']",
+          "",
+          "base = st.selectbox('Base model', ALLOWED_MODELS)",
+          "table = st.text_input('Training table (schema.table)')",
+          "comment = st.text_area('Purpose (required)')",
+          "",
+          "if table and st.button('Preview row count'):",
+          "    n = session.sql(f'SELECT COUNT(*) FROM {table}').collect()[0][0]",
+          "    st.info(f'{n:,} rows — est. training tokens: ~{n*200:,}')",
+          "",
+          "if st.button('Launch fine-tune') and comment:",
+          "    stamp = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M')",
+          "    job = f'user_ft_{stamp}'",
+          "    session.sql(f\"CREATE SNOWFLAKE.CORTEX.FINETUNE {job} BASE_MODEL='{base}',TRAINING_DATA=SELECT prompt,completion FROM {table}\").collect()",
+          "    session.sql(f\"INSERT INTO ft_audit VALUES('{job}','{comment}',CURRENT_USER(),CURRENT_TIMESTAMP())\").collect()",
+          "    st.success(f'Launched {job}')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you estimate training token cost before the user submits the PEFT job?",
+        "a": "Token count is roughly (average prompt + completion character length ÷ 4) × row count × epochs. You can query the table for AVG(LENGTH(prompt) + LENGTH(completion)) to compute average token width, multiply by row count from COUNT(*), multiply by the default epoch count, and show the result in the UI. Snowflake publishes per-training-token credit costs, so you can convert to a credit estimate. Surface this as a warning, not a blocker — the goal is informed consent, not friction."
+      },
+      {
+        "q": "Why is a datestamped job name safer than letting the user name it freely?",
+        "a": "A free-text name means a user can accidentally (or intentionally) reuse a production fine-tune's exact name. CREATE SNOWFLAKE.CORTEX.FINETUNE with a name that already exists will fail unless OR REPLACE is used — but if your form uses OR REPLACE for convenience, a name collision silently overwrites the production model. Datestamped or user-prefixed names make collisions structurally impossible without a deliberate action."
+      },
+      {
+        "q": "How do you notify the team when the PEFT job completes without polling from the Streamlit app?",
+        "a": "Create a Snowflake Task that polls FINETUNE_STATUS on a schedule (every 5 minutes) for jobs in TRAINING state, and when status flips to COMPLETED or FAILED sends a notification via an External Access Integration to Slack or email. The SiS app is session-bound and can't run in the background, so a Task is the right mechanism. This decouples the UI from the completion event and ensures the team is notified even if no one has the app open."
+      }
+    ]
+  },
+  {
+    "q": "How do you version-control and promote Cortex PEFT fine-tune models through dev → staging → production in a Snowflake-native CI/CD pipeline?",
+    "a": "Cortex fine-tunes are created as named schema objects. Version control means the CREATE SNOWFLAKE.CORTEX.FINETUNE statements — with the training table reference and base model — live in a Git-tracked SQL migration file. Promotion across environments (dev/staging/prod) uses Snowflake's database-per-environment pattern: you run the same DDL against dev_db, staging_db, and prod_db in sequence. The training table itself is snapshotted via CREATE TABLE AS SELECT at a specific Git SHA, so a re-run in any environment trains on the exact same corpus. In CI (e.g., GitHub Actions calling the Snowflake CLI), the pipeline: runs the FINETUNE DDL, polls FINETUNE_STATUS until COMPLETED, runs the eval script (generates outputs on the test set, scores conformance), and gates the promote step on passing the threshold. The fine-tuned model name string is written to a config table that application code reads instead of hardcoding, so a production swap is a single-row UPDATE with no code deploy.",
+    "fj": "I'd create the fine-tune manually in prod after it worked in dev.",
+    "fs": "Manual prod deploys are untracked and unrepeatable. I version the FINETUNE DDL in Git, snapshot training data at the SHA, run through dev/staging/prod via the Snowflake CLI in CI, score conformance before promoting, and store the active model name in a config table so app code never has a hardcoded fine-tune name.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you snapshot the training data so re-runs in different environments reproduce the same PEFT model?",
+        "a": "At training time, materialize the training table with a timestamp or Git SHA suffix — `CREATE TABLE training_20260101_abc1234 AS SELECT ...` — and reference that snapshot in the FINETUNE DDL rather than a live view. The snapshot is immutable, so any environment that runs the same DDL trains on the same rows. Without snapshotting, a live view can change between dev and prod runs, producing different models from nominally identical code."
+      },
+      {
+        "q": "What's the conformance eval gate and at what threshold do you block promotion?",
+        "a": "After training, run a test set through AI_COMPLETE with the fine-tuned model name and apply a structural checker (e.g., a SQL or Python script that parses output JSON/Markdown and checks required sections). The gate threshold depends on the task: for a format-critical use case (incident reports, regulated output) you might require ≥98% structural conformance; for a best-effort style guide, ≥90%. Define the threshold before training, not after seeing the results — otherwise you're moving the goalposts."
+      },
+      {
+        "q": "How does the config-table model-name pattern handle rollback in a production incident?",
+        "a": "The config table has a row like (env, model_name, activated_ts, activated_by). Rollback is an UPDATE setting model_name back to the previous fine-tune's name — one SQL statement, no redeploy. If you pair it with a Streamlit-in-Snowflake ops dashboard, an on-call engineer can trigger the rollback from a button rather than writing SQL under pressure. Because the fine-tuned models aren't deleted after promotion, the previous version is still present and immediately available."
+      }
+    ]
+  },
+  {
+    "q": "What Streamlit-in-Snowflake patterns specifically improve cold-start latency and query performance for a Cortex-heavy app?",
+    "a": "Cold-start latency in a SiS app is dominated by two things: warehouse resume time and the first query. Patterns to mitigate: (1) use an X-Small or Small dedicated warehouse with AUTO_SUSPEND = 60 that stays warm during business hours via a keep-alive Streamlit session or a lightweight Task; (2) cache expensive Cortex calls with @st.cache_data (or @st.cache_resource for sessions) so re-runs within the TTL reuse prior results rather than re-invoking an LLM; (3) pre-materialize expensive aggregations and Cortex-enriched columns into a summary table on a schedule, and have the SiS app read from that rather than computing live; (4) for Cortex Search calls, the search service itself is serverless and fast — the SiS app's bottleneck is usually the warehouse query that feeds results into a final ranking or display step. The senior mistake is running a Cortex AI function on every Streamlit widget interaction without caching or debounce, billing LLM tokens on every slider move.",
+    "fj": "I'd increase the warehouse size to reduce latency.",
+    "fs": "Bigger warehouse doesn't reduce LLM token cost or cold-start. I cache Cortex calls with st.cache_data, pre-materialize Cortex-enriched columns into a summary table, and keep the warehouse warm with a short AUTO_SUSPEND — not oversize it. Each widget interaction should not re-invoke an LLM without a cache hit.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Cache Cortex calls in Streamlit-in-Snowflake",
+        "lang": "python",
+        "lines": [
+          "import streamlit as st",
+          "from snowflake.snowpark.context import get_active_session",
+          "from snowflake.cortex import Complete",
+          "",
+          "session = get_active_session()",
+          "",
+          "@st.cache_data(ttl=300)  # 5-min cache",
+          "def get_summary(doc_id: str) -> str:",
+          "    row = session.table('docs').filter(",
+          "        f'id = {doc_id!r}').select('body').collect()[0][0]",
+          "    return Complete('mistral-7b', f'Summarize: {row}')",
+          "",
+          "doc = st.selectbox('Document', ['doc1','doc2','doc3'])",
+          "st.write(get_summary(doc))  # re-uses result within 5 min"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the difference between @st.cache_data and @st.cache_resource for a Snowpark session object?",
+        "a": "`@st.cache_data` serializes and caches the return value — suitable for DataFrames, strings, and JSON that are safe to copy. `@st.cache_resource` caches a singleton resource that should not be copied, like a Snowpark session or a database connection — it returns the same object to every user. For Cortex call results use `@st.cache_data`; for the `session = get_active_session()` call use `@st.cache_resource` (or just call `get_active_session()` once at the top level, since SiS manages session lifecycle)."
+      },
+      {
+        "q": "How do you invalidate the Cortex call cache when source data changes?",
+        "a": "Include a cache-key argument derived from the source data's latest modified timestamp — e.g., query `MAX(updated_at)` from the source table and pass it as a parameter to the cached function. When the data changes, the argument changes and the cache misses, triggering a fresh Cortex call. This is more precise than a blanket TTL and ensures users don't see stale summaries after an update."
+      },
+      {
+        "q": "Why pre-materialize Cortex-enriched columns instead of computing them live in the SiS app?",
+        "a": "An LLM function called per row in a live Streamlit query bills per-token every time any user opens the app, and the latency is proportional to row count. Pre-materializing means the AI_COMPLETE or AI_CLASSIFY call ran once in a nightly Task, results are stored in a flat table, and the SiS app reads them with a fast SELECT. For slowly-changing data this is correct architecture; live Cortex calls are only justified for truly real-time or user-specific content that can't be pre-computed."
+      }
+    ]
+  },
+  {
+    "q": "You want to use Cortex Fine-tuning (PEFT) to make a small model match a frontier model on a narrow extraction task and then deploy it in Streamlit-in-Snowflake. Walk through the end-to-end decision and architecture.",
+    "a": "The goal is knowledge distillation at task scope: use a frontier model (e.g., Claude via AI_COMPLETE) to generate high-quality labeled outputs for your extraction task, then PEFT fine-tune a smaller model (Mistral-7B, Llama-3.1-8B) on those labels so the small model matches frontier quality at a fraction of inference cost. Steps: (1) run the frontier model on a representative sample of your inputs and store (prompt, frontier_output) pairs in a Snowflake training table; (2) human-review a sample for correctness — synthetic labels from an LLM must be spot-checked; (3) CREATE SNOWFLAKE.CORTEX.FINETUNE on the small base model pointing at that table; (4) evaluate the fine-tuned small model against the frontier on a held-out set — if conformance gap ≤5%, the distillation worked; (5) deploy the fine-tuned model in a Streamlit-in-Snowflake app that calls AI_COMPLETE with the fine-tune name. This pipeline is entirely inside Snowflake: no data leaves, and Streamlit-in-Snowflake + PEFT is a self-contained governed system.",
+    "fj": "I'd just use the frontier model in production since it's the most accurate.",
+    "fs": "Frontier models at high volume are expensive. I distill: generate labeled data with the frontier model once, PEFT fine-tune a small model on those labels, verify the gap is ≤5%, then swap the Streamlit-in-Snowflake app to call the fine-tuned name. Same accuracy, fraction of inference cost.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Generate distillation labels then PEFT fine-tune",
+        "lang": "sql",
+        "lines": [
+          "-- step 1: generate labels with frontier model",
+          "CREATE OR REPLACE TABLE ft_labels AS",
+          "SELECT input_text AS prompt,",
+          "  AI_COMPLETE('claude-3-5-sonnet',",
+          "    PROMPT('Extract the KPIs as JSON: {0}', input_text),",
+          "    {'response_format':{'type':'json','schema':{...}}}",
+          "  ) AS completion",
+          "FROM source_docs",
+          "WHERE created > DATEADD(month,-3,CURRENT_DATE);",
+          "",
+          "-- step 2: fine-tune small model on those labels",
+          "CREATE SNOWFLAKE.CORTEX.FINETUNE kpi_ft",
+          "  BASE_MODEL = 'mistral-7b',",
+          "  TRAINING_DATA = SELECT prompt, completion FROM ft_labels;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the risk of using frontier LLM outputs as PEFT training labels without human review?",
+        "a": "The frontier model's hallucinations and errors become ground truth for the fine-tune — the small model learns to replicate mistakes confidently. A PEFT job has no way to distinguish a correct frontier output from a confident hallucination. Human review of at least a statistically significant random sample (e.g., 10% spot-check) is necessary to catch systematic errors before they get baked into the LoRA adaptor. For high-stakes extraction (financial KPIs, legal clauses), the review percentage should be higher."
+      },
+      {
+        "q": "How do you measure the accuracy gap between the fine-tuned small model and the frontier model in Snowflake?",
+        "a": "Run both models on the same held-out test set, store outputs side by side in a table, and apply AI_FILTER with a predicate like 'are these two extractions semantically equivalent' — or a programmatic schema-conformance check if the output is JSON. Compute agreement rate and field-level accuracy. A ≤5% gap on the evaluation set is the typical threshold for justifying the small model in production, but the bar depends on the task's stakes."
+      },
+      {
+        "q": "In the Streamlit-in-Snowflake app, how do you A/B test the fine-tuned model against the frontier before full cutover?",
+        "a": "In the app's AI_COMPLETE call, use a deterministic hash of the input (e.g., HASH(user_id) % 100) to route a percentage of calls to the fine-tuned model and the rest to the frontier. Log both outputs with their model name and a session_id to a results table. After enough traffic, query the table to compare user feedback ratings (if collected) or run an LLM-judge comparison. Cutover is a config-table update, not a code deploy. The SiS app makes this pattern easy because all routing logic is in one Python file."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement role-based multi-tenant access in Streamlit-in-Snowflake so different user roles see different Cortex AI results?",
+    "a": "Streamlit-in-Snowflake runs each user session under their own Snowflake role, so the Snowpark session's SQL executes with the viewer's role's privileges — no extra auth layer needed. To serve role-differentiated Cortex results: (1) define data access at the Snowflake layer with row-access policies and column masking policies on the underlying tables, so the Cortex function only sees the data the role can read; (2) in the SiS app, read the active role via session.get_current_role() and conditionally show UI components (e.g., advanced PEFT fine-tune management panels only for ml_engineer role); (3) for Cortex Analyst, grant CORTEX_ANALYST_USER only to the BI roles that should access it, not the app's general audience. The senior mistake is implementing role checks in Python if/else that a user could circumvent by modifying a URL parameter — enforcement belongs at the Snowflake RBAC layer, Python logic is only for UX presentation.",
+    "fj": "I'd add an if/else in the Python code that checks the user's name.",
+    "fs": "Data access enforcement belongs in Snowflake RBAC — row-access policies, masking, and Cortex function grants. The SiS Python layer reads session.get_current_role() only to adjust UI presentation, not to enforce security. If only the RBAC layer enforces, a user can't bypass it regardless of what they do in the browser.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Role-gated UI in Streamlit-in-Snowflake",
+        "lang": "python",
+        "lines": [
+          "import streamlit as st",
+          "from snowflake.snowpark.context import get_active_session",
+          "",
+          "session = get_active_session()",
+          "role = session.get_current_role()",
+          "",
+          "# UI-layer gate (presentation only; RBAC is the real enforcement)",
+          "if role in ('ML_ENGINEER', 'DATA_SCIENTIST'):",
+          "    st.subheader('PEFT Fine-tune Management')",
+          "    # show fine-tune launcher form here",
+          "else:",
+          "    st.subheader('AI-Powered Insights')",
+          "    # show read-only Cortex AI outputs here",
+          "",
+          "# This query inherits the viewer's role — masking policies apply automatically",
+          "df = session.sql('SELECT id, AI_CLASSIFY(body,[...]) FROM tickets').to_pandas()",
+          "st.dataframe(df)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the difference between a row-access policy and a masking policy in the context of Cortex AI functions?",
+        "a": "A row-access policy filters which rows are visible — so a role that can only see their region's data feeds only those rows to AI_CLASSIFY or AI_COMPLETE, preventing cross-tenant data from entering the prompt. A masking policy substitutes sensitive column values (e.g., PII) with masked versions for roles that shouldn't see the raw data — so the LLM receives the masked value and cannot infer or expose the underlying PII. Both apply at query time before the Cortex function runs, which is the correct enforcement point."
+      },
+      {
+        "q": "How do you let a manager role see an aggregated Cortex AI_AGG summary without seeing individual records?",
+        "a": "Grant the manager role SELECT on a pre-materialized summary view that contains only the AI_AGG output by dimension (e.g., weekly theme summary per product), not the source tickets table. The manager's Snowflake session can read the summary view but not the raw table, so even if they run SQL in the SiS app the source rows are inaccessible. The summary is a safe, privilege-appropriate projection of the AI output."
+      },
+      {
+        "q": "If a Streamlit-in-Snowflake app is shared with PUBLIC, does that mean all Snowflake users can call Cortex from it?",
+        "a": "Only if those users also have SNOWFLAKE.CORTEX_USER granted to their role, which is the case by default (Cortex_user is granted to PUBLIC). If you've revoked CORTEX_USER from PUBLIC and granted it only to specific roles, then a PUBLIC viewer who opens the SiS app and triggers a Cortex call will get a permission error on the SQL, even though they can open the app. The app's share permission and the Cortex function permission are independently governed."
+      }
+    ]
+  },
+  {
+    "q": "How does Cortex PEFT fine-tuning interact with Snowflake's data governance — specifically masking policies, row-access policies, and training data lineage?",
+    "a": "When you pass a training table to CREATE SNOWFLAKE.CORTEX.FINETUNE, the job runs as the creating role, so row-access and masking policies apply to the training query the same way they apply to any SELECT. A role that only sees masked PII trains on masked values — which may be intentional for privacy but will produce a model that learns to generate masked-format outputs. Raw PII should be explicitly excluded or anonymized in the training table before referencing it in the PEFT job, because once PII is baked into model weights it can be elicited without RBAC governing the query. Data lineage: the FINETUNE DDL references the training table name, which is auditable via ACCOUNT_USAGE DDL history, but Snowflake does not currently emit column-level lineage through the model training boundary. For regulatory environments, you must document which tables and columns contributed to training as part of the PEFT job's change-management record.",
+    "fj": "Masking policies protect the data, so I don't need to worry about PII in training.",
+    "fs": "Masking protects query results but PII encoded in model weights isn't governed by RBAC post-training. I explicitly exclude or anonymize PII columns in the training table SELECT before the PEFT job starts, and I record the training table lineage in the change-management ticket since Snowflake doesn't emit column-level lineage through the model boundary.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you anonymize PII in the training table before passing it to PEFT without losing task-relevant signal?",
+        "a": "Use AI_COMPLETE or a rule-based UDF to substitute PII entities (names, emails, SSNs) with synthetic but realistic placeholders — e.g., replace a real name with '[PERSON_1]' consistently within a document. This preserves the structural and task-relevant signal (the sentence still shows how names appear in context) without encoding real identities. Then train the PEFT model on the anonymized table. The fine-tuned model will generalize from the patterns, not from the specific PII values."
+      },
+      {
+        "q": "What audit record should you create when launching a PEFT fine-tune job in a regulated environment?",
+        "a": "At minimum: job name, base model, training table name and row count at snapshot time, creating role and user, timestamp, business justification, and a reference to the approval ticket. Store this in an audit table the PEFT launcher writes to before or immediately after issuing the FINETUNE DDL. For GDPR/CCPA-regulated data, also record that the training data was reviewed for PII exclusion and by whom. This forms the model lineage record that a data-governance audit would request."
+      },
+      {
+        "q": "Can a PEFT fine-tuned model 'leak' training data through its outputs, and how do you test for it?",
+        "a": "Yes — memorization is a known risk in fine-tuning, where the model can reproduce verbatim training examples when prompted with their prefix. For PEFT the risk is lower than full fine-tuning (fewer parameters updated) but not zero, especially on small repeated examples. Test by sampling training set inputs and seeing if the model completes them with the exact training completion unprompted. If hits exceed a threshold, either add training data diversity to reduce memorization, reduce epochs, or exclude the high-memorization examples from the corpus."
+      }
+    ]
+  },
+  {
+    "q": "You need an internal QA tool where engineers test a PEFT fine-tuned Cortex model against the base model and vote on which output is better. How do you build it in Streamlit-in-Snowflake?",
+    "a": "This is a blind side-by-side eval UI — a classic PEFT validation pattern served entirely inside Snowflake. Architecture: a Streamlit-in-Snowflake (SiS) app loads a random sample of test inputs from a held-out table, calls AI_COMPLETE twice in parallel (once with the base model, once with the fine-tuned PEFT model name), displays the two outputs side by side in shuffled order so the reviewer doesn't know which is which, and records the vote (left/right/tie) along with model_a and model_b identifiers to an eval_results table. After enough votes, a summary query computes win-rate, tie-rate, and confidence interval for the PEFT model. Because SiS runs under the engineer's own Snowflake session, you grant USAGE on the STREAMLIT object to the QA role and the eval_results table INSERT to the same role — no separate auth system. This is the governed, in-Snowflake version of a human-eval harness that replaces ad-hoc notebook comparisons.",
+    "fj": "I'd copy outputs into a spreadsheet and have engineers comment in cells.",
+    "fs": "A Streamlit-in-Snowflake blind A/B eval app replaces spreadsheets — engineers vote on shuffled outputs, votes land in a governed table, and a summary query gives win-rate with confidence intervals. PEFT model adoption decision is backed by recorded human signal, not vibes.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Blind PEFT vs base model eval in Streamlit-in-Snowflake",
+        "lang": "python",
+        "lines": [
+          "import streamlit as st, random",
+          "from snowflake.snowpark.context import get_active_session",
+          "from snowflake.cortex import Complete",
+          "",
+          "session = get_active_session()",
+          "",
+          "# load a random test input",
+          "row = session.sql('SELECT id, input_text FROM eval_inputs ORDER BY RANDOM() LIMIT 1').collect()[0]",
+          "input_id, text = row['ID'], row['INPUT_TEXT']",
+          "",
+          "base_out  = Complete('mistral-7b', text)",
+          "peft_out  = Complete('peft_incident_ft', text)  # PEFT model name",
+          "",
+          "# shuffle so reviewer is blind",
+          "options = [('base', base_out), ('peft', peft_out)]",
+          "random.shuffle(options)",
+          "label_a, out_a = options[0]",
+          "label_b, out_b = options[1]",
+          "",
+          "st.write('**Output A**'); st.write(out_a)",
+          "st.write('**Output B**'); st.write(out_b)",
+          "vote = st.radio('Which is better?', ['A','B','Tie'])",
+          "if st.button('Submit') and vote:",
+          "    winner = label_a if vote=='A' else (label_b if vote=='B' else 'tie')",
+          "    session.sql(f\"INSERT INTO eval_results VALUES('{input_id}','{label_a}','{label_b}','{winner}',CURRENT_USER(),CURRENT_TIMESTAMP())\").collect()",
+          "    st.success('Vote recorded')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you compute statistical significance on the PEFT win-rate from the eval_results table?",
+        "a": "Run a binomial test on (PEFT_wins / total_non_tie_votes) vs 0.5 null hypothesis. In SQL, aggregate win counts and pass them to a Python UDF (or a Snowpark DataFrame with scipy.stats.binom_test) to get the p-value. A common threshold is p < 0.05 with at least 100 non-tie votes before claiming the PEFT model is reliably better. Surface the confidence interval alongside the win-rate in the Streamlit-in-Snowflake summary tab so the decision isn't just a point estimate."
+      },
+      {
+        "q": "Why is blind shuffling important in a PEFT vs base model comparison?",
+        "a": "Without blind shuffling, engineers know which output came from the fine-tuned model and bias their votes toward it (or against it, if skeptical) regardless of actual quality. Shuffling and labeling outputs A/B without revealing the model isolates the quality signal from the reviewer's prior. This is the same principle as double-blind drug trials — the only way to get unbiased preference data for a PEFT adoption decision."
+      },
+      {
+        "q": "How do you prevent the same engineer from voting on the same input multiple times?",
+        "a": "On load, filter the random sample to exclude input_ids already voted on by the current user: `WHERE id NOT IN (SELECT input_id FROM eval_results WHERE reviewer = CURRENT_USER())`. This is a single SQL filter the SiS app runs before sampling, using the Snowflake session's `CURRENT_USER()` automatically. No separate session tracking needed — the governed table and CURRENT_USER() together enforce uniqueness."
+      }
+    ]
+  },
+  {
+    "q": "What is Cartesia Sonic and why would a data platform team choose it over ElevenLabs for a real-time voice interface built on Snowflake?",
+    "a": "Cartesia Sonic is a low-latency neural TTS model from Cartesia AI designed for streaming, sub-100 ms time-to-first-audio workloads. Compared to ElevenLabs, Cartesia Sonic's streaming API typically yields lower end-to-end latency because it was built from the ground up for chunk-by-chunk audio delivery rather than full-clip generation. For a Snowflake-backed voice interface, the architecture is: SQL or Cortex generates the text response inside Snowflake, that text is streamed over HTTP to Cartesia's API (or a self-hosted Sonic endpoint), and the PCM/Opus audio chunks flow directly to the client. ElevenLabs has richer voice cloning and more voice choices, but for conversational latency on governed enterprise data Cartesia Sonic is the stronger pick.",
+    "fj": "I'd just use text-to-speech inside the browser — no external API needed.",
+    "fs": "Browser TTS is robotic and not production-grade. Cartesia Sonic streams neural audio at sub-100 ms time-to-first-chunk, making it the right engine for a real-time voice layer on a Snowflake data product.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you call Cartesia from Python in a Snowpark UDF?",
+        "a": "Install the `cartesia` Python SDK in a Snowpark-compatible package stage, import it inside the UDF, and call `client.tts.sse(model_id='sonic-2', transcript=text, voice_id=..., output_format={...})` using a secret stored in a Snowflake External Network Rule. Because UDFs run in the Snowflake runtime, you must explicitly allow the Cartesia domain in a Network Rule and attach it to the UDF's EXTERNAL ACCESS INTEGRATION."
+      },
+      {
+        "q": "What audio format should you request from Cartesia for lowest-latency streaming in a web client?",
+        "a": "Request `raw` PCM at 16 kHz mono for the lowest decode overhead, or `opus` in a WebM container if you need browser-native playback without a JS decoder. Opus has slightly more decode overhead than raw PCM but typically 40–50% the bandwidth, which can help on constrained networks. Avoid mp3 from Cartesia for streaming because the encoder introduces frame-padding latency."
+      }
+    ]
+  },
+  {
+    "q": "How do you integrate Cartesia Sonic TTS into a Snowflake-powered voice assistant so that Cortex inference and audio streaming happen with minimal added latency?",
+    "a": "Pipeline: (1) User utterance arrives at an application server. (2) Server calls Cortex `AI_COMPLETE` (or `COMPLETE`) via Snowflake Python connector with streaming=True to receive the LLM tokens as they generate. (3) As soon as a sentence boundary is detected in the token stream, the server opens a Server-Sent Events (SSE) request to Cartesia's `/tts/sse` endpoint with the sentence fragment as `transcript`, `model_id: 'sonic-2'`, and a suitable `output_format`. (4) Cartesia streams audio chunks back; the server pipelines them to the client over a WebSocket. The key latency trick is sentence-level parallelism: you don't wait for the full LLM response before starting TTS — Cartesia begins encoding audio for sentence 1 while Cortex is still generating sentence 2.",
+    "fj": "Wait for the full LLM answer, then call TTS once on the entire text.",
+    "fs": "Waiting for the full answer adds the entire LLM generation time before audio starts. Sentence-level parallelism — streaming Cortex tokens and sending each sentence to Cartesia as soon as it's complete — can cut perceived latency by 60–80%.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Sentence-level streaming: Cortex → Cartesia",
+        "lang": "python",
+        "lines": [
+          "import snowflake.connector, cartesia, re",
+          "",
+          "def sentence_stream(cursor_stream):",
+          "    buf = ''",
+          "    for chunk in cursor_stream:",
+          "        buf += chunk",
+          "        while m := re.search(r'[.!?]\\s', buf):",
+          "            yield buf[:m.end()].strip()",
+          "            buf = buf[m.end():]",
+          "    if buf.strip():",
+          "        yield buf.strip()",
+          "",
+          "con = snowflake.connector.connect(**cfg)",
+          "cs = con.cursor()",
+          "cs.execute(\"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', :1)\", (prompt,))",
+          "",
+          "client = cartesia.Cartesia(api_key=CARTESIA_API_KEY)",
+          "for sentence in sentence_stream(cs):",
+          "    for audio_chunk in client.tts.sse(",
+          "        model_id='sonic-2',",
+          "        transcript=sentence,",
+          "        voice_id=VOICE_ID,",
+          "        output_format={'container':'raw','encoding':'pcm_f32le','sample_rate':16000},",
+          "        stream=True,",
+          "    ):",
+          "        yield audio_chunk['audio']  # send to WebSocket"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens if Cortex generates a very long first sentence before a punctuation boundary?",
+        "a": "Cap the buffer at a word-count threshold (e.g., 25 tokens) and flush a partial chunk even without terminal punctuation. This prevents a clause-heavy LLM sentence from starving the audio pipeline. Cartesia handles partial sentences just fine — there's no minimum length requirement — and the audio still sounds natural if the fragment is at least a short phrase."
+      }
+    ]
+  },
+  {
+    "q": "Explain how to call Cartesia's voice-cloning API and store the resulting voice_id securely in Snowflake for use across multiple pipelines.",
+    "a": "Cartesia lets you clone a voice by POSTing a short audio clip (typically 5–30 seconds, WAV or MP3) to `/voices/clone/clip`. The API returns a `voice_id` string. To store it securely in Snowflake: create a Snowflake Secret (`CREATE SECRET cartesia_voice TYPE=GENERIC_STRING SECRET_STRING='voice_id::...'`), or store it in a governed `voice_registry` table with columns `(voice_name, cartesia_voice_id, owner, created_at)` protected by row-level-access policy so only the owning team's role can read it. Pipelines retrieve the voice_id by querying the registry table (or reading the Secret via external access) rather than hard-coding it, making voice rotations a single UPDATE with no code deploys.",
+    "fj": "I'd hard-code the voice_id in the Python UDF or Streamlit app code.",
+    "fs": "Hard-coding makes rotation a code change. Store the Cartesia voice_id in a governed Snowflake table or Secret, read it at runtime, and update it with a single SQL row change — no redeploy.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Store and retrieve Cartesia voice_id in Snowflake",
+        "lang": "sql",
+        "lines": [
+          "-- create registry",
+          "CREATE TABLE voice_registry (",
+          "  voice_name     STRING,",
+          "  cartesia_voice_id STRING,",
+          "  owner_role     STRING,",
+          "  created_at     TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()",
+          ");",
+          "",
+          "-- row-level access so only the owner sees their voice",
+          "CREATE ROW ACCESS POLICY voice_owner_policy",
+          "  AS (owner_role STRING) RETURNS BOOLEAN ->",
+          "  owner_role = CURRENT_ROLE();",
+          "",
+          "ALTER TABLE voice_registry",
+          "  ADD ROW ACCESS POLICY voice_owner_policy ON (owner_role);",
+          "",
+          "-- insert",
+          "INSERT INTO voice_registry VALUES",
+          "  ('product_demo_voice', 'abc123-cartesia-id', 'DATA_PROD_ROLE', DEFAULT);",
+          "",
+          "-- retrieve at runtime",
+          "SELECT cartesia_voice_id FROM voice_registry",
+          "WHERE voice_name = 'product_demo_voice';"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle Cartesia voice_id expiry or model deprecation gracefully?",
+        "a": "Add a `valid_until TIMESTAMP_LTZ` column to the registry table and a `deprecated BOOLEAN` flag. Pipelines SELECT with `WHERE deprecated = FALSE AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP())`. When Cartesia deprecates a voice, flip `deprecated = TRUE` and insert the replacement row in one transaction. This pattern avoids any downtime — running jobs naturally pick up the new voice_id on their next query."
+      }
+    ]
+  },
+  {
+    "q": "How do you expose Cartesia Sonic TTS as a Snowflake External Function so any SQL query can generate audio URLs from a text column?",
+    "a": "Create an API Integration pointing to an AWS API Gateway (or Azure/GCP equivalent) that fronts a Lambda (or Cloud Run) function. The Lambda receives the JSON body from Snowflake's External Function protocol, calls Cartesia's `/tts/bytes` endpoint (synchronous full-clip mode) with the text and voice parameters, uploads the resulting audio bytes to an S3 bucket in your account, and returns a presigned URL. The SQL call is then `SELECT generate_audio(transcript) AS audio_url FROM responses`. For latency-sensitive paths use the streaming SSE endpoint instead and store chunked audio to object storage asynchronously. Credentials: store `CARTESIA_API_KEY` in AWS Secrets Manager and have the Lambda fetch it at startup — never embed it in the External Function definition.",
+    "fj": "You can't call external voice APIs from SQL — you'd need a Python script outside Snowflake.",
+    "fs": "Snowflake External Functions let any SQL query invoke an external HTTP endpoint. Wire a Lambda intermediary that calls Cartesia and returns an S3 URL — then `SELECT generate_audio(text)` works in pure SQL.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Create Snowflake External Function for Cartesia TTS",
+        "lang": "sql",
+        "lines": [
+          "CREATE OR REPLACE API INTEGRATION cartesia_api_int",
+          "  API_PROVIDER = aws_api_gateway",
+          "  API_AWS_ROLE_ARN = 'arn:aws:iam::ACCT:role/SnowflakeCartesiaRole'",
+          "  API_ALLOWED_PREFIXES = ('https://abc123.execute-api.us-east-1.amazonaws.com/prod/')",
+          "  ENABLED = TRUE;",
+          "",
+          "CREATE OR REPLACE EXTERNAL FUNCTION generate_audio(transcript VARCHAR)",
+          "  RETURNS VARIANT",
+          "  API_INTEGRATION = cartesia_api_int",
+          "  AS 'https://abc123.execute-api.us-east-1.amazonaws.com/prod/cartesia-tts';",
+          "",
+          "-- usage",
+          "SELECT id, generate_audio(response_text):url::STRING AS audio_url",
+          "FROM call_center_responses",
+          "LIMIT 10;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What are the cost implications of calling Cartesia via an External Function on a large result set?",
+        "a": "Cartesia charges per character synthesized. Running `generate_audio` on 100k rows with 200-char average texts = 20 million characters — check Cartesia's current per-character rate and budget accordingly. Snowflake will also batch rows into the External Function payload (up to 512 rows per call by default), so the Lambda is invoked in batches, not per row — this reduces Lambda invocation overhead but doesn't change Cartesia character billing. Cache audio URLs in a Snowflake table keyed by a hash of (text, voice_id) to avoid regenerating identical clips."
+      }
+    ]
+  },
+  {
+    "q": "Compare Cartesia Sonic vs ElevenLabs for building a production voice layer on a Snowflake Cortex inference pipeline — latency, voice cloning quality, pricing model, and governance fit.",
+    "a": "Latency: Cartesia Sonic's SSE streaming API is optimized for real-time, often achieving <80 ms time-to-first-audio; ElevenLabs streaming is competitive but historically a few hundred ms higher for cold first-chunk. Voice quality: ElevenLabs has a longer head start in expressive voice cloning and multilingual fidelity; Cartesia Sonic 2 has closed the gap significantly and is preferred for low-latency voice agents. Pricing: Cartesia bills per character with a tier structure; ElevenLabs bills by character too but tiers differ — evaluate at your expected monthly character volume. Governance: both require sending text off-platform to a third-party API, which is the same risk either way; Cartesia's data processing agreement is enterprise-tier and supports BAA. For a Snowflake pipeline the architecture is identical — text leaves Snowflake, audio returns — so the governance story is the same; the differentiator is Cartesia Sonic's latency and the tighter real-time streaming SDK.",
+    "fj": "ElevenLabs is always better because it has more voices.",
+    "fs": "More voices doesn't mean better for production pipelines. Cartesia Sonic's latency advantage and streaming-first SDK design make it the superior choice for real-time voice agents even if ElevenLabs has a larger voice catalog.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Is there a self-hosted option for Cartesia so the text never leaves your VPC?",
+        "a": "Yes — Cartesia offers an on-premises / private-cloud deployment of Sonic for enterprise customers, which allows inference to run inside your VPC so synthesized text stays on your network. This is the strongest governance option if your Snowflake data contains PII that must not egress. You'd point the External Function or UDF at your internal Cartesia endpoint URL instead of `api.cartesia.ai`."
+      }
+    ]
+  },
+  {
+    "q": "How do you build a Streamlit-in-Snowflake (SiS) app that queries Cortex and plays back the answer as Cartesia Sonic audio in the browser?",
+    "a": "SiS runs Python server-side in Snowflake but renders HTML/JS in the browser. The pattern: (1) SiS Python calls `session.sql(\"SELECT AI_COMPLETE('mistral-large2', :1)\", [q]).collect()` to get the text answer. (2) SiS Python calls Cartesia's `/tts/bytes` REST endpoint via `requests` (with an External Access Integration allowing `api.cartesia.ai`) and receives PCM or MP3 bytes. (3) Those bytes are base64-encoded and injected into an `st.components.v1.html` block with a short HTML5 `<audio>` tag that autoplay-loads the data URI. Full streaming audio from a SiS app requires the components API because Streamlit's native `st.audio` accepts a bytes buffer that must be fully buffered before play, whereas the HTML component can use a MediaSource Extension to play as bytes arrive. Permissions needed: External Access Integration for `api.cartesia.ai`, and the CARTESIA_API_KEY stored as a Snowflake Secret accessed via `get_secret()`.",
+    "fj": "SiS can't call external APIs — it's locked inside Snowflake.",
+    "fs": "SiS can call external APIs when an External Access Integration is granted. You allow `api.cartesia.ai`, store the key as a Snowflake Secret, and hit Cartesia from SiS Python just like any `requests` call.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "SiS: Cortex answer → Cartesia audio playback",
+        "lang": "python",
+        "lines": [
+          "import streamlit as st, requests, base64",
+          "from snowflake.snowpark.context import get_active_session",
+          "import _snowflake",
+          "",
+          "session = get_active_session()",
+          "q = st.text_input('Ask a data question')",
+          "if st.button('Ask') and q:",
+          "    answer = session.sql(",
+          "        \"SELECT AI_COMPLETE('mistral-large2', ?) AS ans\",",
+          "        params=[q]",
+          "    ).collect()[0]['ANS']",
+          "    st.write(answer)",
+          "",
+          "    api_key = _snowflake.get_generic_secret_string('CARTESIA_API_KEY')",
+          "    resp = requests.post(",
+          "        'https://api.cartesia.ai/tts/bytes',",
+          "        headers={'X-API-Key': api_key, 'Cartesia-Version': '2025-04-16'},",
+          "        json={",
+          "            'model_id': 'sonic-2',",
+          "            'transcript': answer,",
+          "            'voice': {'mode': 'id', 'id': 'VOICE_ID'},",
+          "            'output_format': {'container':'mp3','bit_rate':128000,'sample_rate':44100}",
+          "        },",
+          "        timeout=15",
+          "    )",
+          "    b64 = base64.b64encode(resp.content).decode()",
+          "    st.components.v1.html(",
+          "        f'<audio autoplay src=\"data:audio/mp3;base64,{b64}\"></audio>',",
+          "        height=0",
+          "    )"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you prevent the API key from being visible in SiS logs or query history?",
+        "a": "Use `_snowflake.get_generic_secret_string('CARTESIA_API_KEY')` to read the key from a Snowflake Secret at runtime — it never appears in SQL query text, Streamlit state, or the Python source code stored in the stage. Grant only the SiS app's warehouse role SELECT on the secret. Audit access via `SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY` filtering for the secret name."
+      }
+    ]
+  },
+  {
+    "q": "What Network Rule and External Access Integration configuration is required for a Snowpark Python UDF to call the Cartesia API?",
+    "a": "You need three objects: (1) A Network Rule of type EGRESS covering `api.cartesia.ai` on port 443. (2) A Secret of type GENERIC_STRING holding the Cartesia API key. (3) An External Access Integration that references the Network Rule and the Secret. The UDF is then created with `EXTERNAL_ACCESS_INTEGRATIONS = (cartesia_eai)` and `SECRETS = ('cartesia_key' = cartesia_api_key_secret)`. Inside the UDF body, `import _snowflake` and call `_snowflake.get_generic_secret_string('cartesia_key')` to retrieve the key — it's injected at runtime without ever being hard-coded. Without the Network Rule and EAI, the UDF runtime will block any outbound TCP connection and the `requests.post` call to Cartesia will raise a connection error.",
+    "fj": "Just put the API key in an environment variable or a UDF parameter.",
+    "fs": "UDFs run in a sandboxed Snowflake runtime. Outbound HTTP is blocked unless you create a Network Rule + External Access Integration. The key must come from a Snowflake Secret via `_snowflake.get_generic_secret_string`, not an env var.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Network Rule + EAI + UDF for Cartesia",
+        "lang": "sql",
+        "lines": [
+          "-- 1. Network rule",
+          "CREATE OR REPLACE NETWORK RULE cartesia_nr",
+          "  TYPE = HOST_PORT  MODE = EGRESS",
+          "  VALUE_LIST = ('api.cartesia.ai:443');",
+          "",
+          "-- 2. Secret",
+          "CREATE OR REPLACE SECRET cartesia_api_key_secret",
+          "  TYPE = GENERIC_STRING",
+          "  SECRET_STRING = '<your-cartesia-api-key>';",
+          "",
+          "-- 3. EAI",
+          "CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION cartesia_eai",
+          "  ALLOWED_NETWORK_RULES = (cartesia_nr)",
+          "  ALLOWED_AUTHENTICATION_SECRETS = (cartesia_api_key_secret)",
+          "  ENABLED = TRUE;",
+          "",
+          "-- 4. UDF",
+          "CREATE OR REPLACE FUNCTION tts_audio_url(txt STRING)",
+          "RETURNS STRING",
+          "LANGUAGE PYTHON RUNTIME_VERSION='3.11'",
+          "PACKAGES=('requests','cartesia')",
+          "EXTERNAL_ACCESS_INTEGRATIONS=(cartesia_eai)",
+          "SECRETS=('cartesia_key'=cartesia_api_key_secret)",
+          "HANDLER='run'",
+          "AS $$",
+          "import _snowflake, cartesia as c",
+          "def run(txt):",
+          "    key = _snowflake.get_generic_secret_string('cartesia_key')",
+          "    client = c.Cartesia(api_key=key)",
+          "    audio = client.tts.bytes(",
+          "        model_id='sonic-2', transcript=txt,",
+          "        voice_id='VOICE_ID',",
+          "        output_format={'container':'mp3','bit_rate':128000,'sample_rate':44100}",
+          "    )",
+          "    import boto3, uuid",
+          "    key_path = f'tts/{uuid.uuid4()}.mp3'",
+          "    boto3.client('s3').put_object(Bucket='my-audio-bucket',Key=key_path,Body=audio)",
+          "    return f's3://my-audio-bucket/{key_path}'",
+          "$$;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does Snowflake's Network Rule differ from a standard security group rule?",
+        "a": "A Network Rule is a Snowflake-layer egress allowlist that lives in your account schema and is governed by Snowflake RBAC — it doesn't touch VPC/security groups at all. It controls which external hosts a UDF or stored procedure runtime can reach. A VPC security group controls EC2/Lambda-level network traffic. Both must be configured correctly in a Snowflake-on-AWS setup: the Network Rule allows the call at the Snowflake level, and any underlying infrastructure egress rules must also permit it."
+      }
+    ]
+  },
+  {
+    "q": "How would you benchmark Cartesia Sonic vs a fallback TTS provider within a Snowflake data pipeline, tracking p50/p95 time-to-first-audio using Snowflake telemetry tables?",
+    "a": "Instrument the External Function or UDF wrapper to log `(request_id, provider, text_chars, ts_request, ts_first_chunk, ts_full_audio)` to a `tts_latency_log` table after each call. `ts_first_chunk` is the wall-clock when the first audio byte arrives from Cartesia's SSE stream. Use `TIMEDIFF(millisecond, ts_request, ts_first_chunk)` as your TTFA metric. Query: `SELECT provider, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ttfa_ms) AS p50, PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ttfa_ms) AS p95 FROM tts_latency_log GROUP BY provider`. If Cartesia p95 TTFA drifts above SLA (e.g., 300 ms), route traffic to the fallback provider using a UDF that checks a `provider_routing` control table — a feature-flag pattern without code deploys.",
+    "fj": "I'd just eyeball the audio playback and pick the faster one.",
+    "fs": "Eyeballing is not production telemetry. Log ts_request and ts_first_chunk per call to a Snowflake table, then aggregate with PERCENTILE_CONT to get p50/p95 TTFA. Route traffic based on the data, not gut feel.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "p50/p95 TTFA analysis across providers",
+        "lang": "sql",
+        "lines": [
+          "SELECT",
+          "  provider,",
+          "  COUNT(*) AS calls,",
+          "  ROUND(AVG(ttfa_ms)) AS avg_ms,",
+          "  ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY ttfa_ms)) AS p50_ms,",
+          "  ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ttfa_ms)) AS p95_ms",
+          "FROM (",
+          "  SELECT provider,",
+          "    TIMEDIFF('millisecond', ts_request, ts_first_chunk) AS ttfa_ms",
+          "  FROM tts_latency_log",
+          "  WHERE ts_request >= DATEADD(day, -7, CURRENT_TIMESTAMP())",
+          ")",
+          "GROUP BY provider",
+          "ORDER BY p95_ms;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you implement automatic failover from Cartesia to ElevenLabs when p95 TTFA breaches a threshold?",
+        "a": "Run a scheduled Snowflake Task every 5 minutes that computes the rolling p95 TTFA for the last 100 Cartesia calls. If it exceeds 400 ms, the task UPDATEs `provider_routing SET active_provider='elevenlabs'`. The TTS UDF checks `SELECT active_provider FROM provider_routing LIMIT 1` before each call and routes accordingly. When Cartesia's p95 recovers, a second threshold (e.g., <200 ms sustained for 15 min) flips it back. This is a circuit-breaker pattern implemented entirely in Snowflake SQL and Tasks."
+      }
+    ]
+  },
+  {
+    "q": "Describe an architecture where Snowflake Cortex handles the NLU and intent extraction, and Cartesia Sonic handles voice output, for a production-grade data-question voice bot.",
+    "a": "Components: (1) Audio in — Whisper or Cartesia's (or another provider's) STT transcribes the spoken question to text. (2) Intent extraction — `AI_CLASSIFY` in Cortex classifies intent (e.g., 'query_data', 'explain_metric', 'compare_periods'). (3) Query generation — Cortex Analyst or `AI_COMPLETE` translates the natural language question into a verified SQL query. (4) Execution — the SQL runs in Snowflake; results are formatted to prose by `AI_COMPLETE`. (5) Voice out — the prose is streamed sentence-by-sentence to Cartesia Sonic's SSE TTS endpoint; audio chunks stream to the client. Governance: data stays in Snowflake for steps 2–4; only the prose answer (no raw data) egresses to Cartesia for step 5, minimizing PII exposure. Latency budget: target <2 s end-to-end from voice query to first audio word — Cortex inference + Cartesia TTFA are both sub-500 ms when warmed, making this achievable.",
+    "fj": "You'd need separate systems for each step with custom glue code — this is too complex.",
+    "fs": "Cortex handles all the data-side intelligence in-platform; Cartesia Sonic handles voice output. The integration point is a single HTTP call after the prose answer is formed — no exotic infrastructure.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you prevent PII from the SQL result set from reaching Cartesia?",
+        "a": "Design the prose-generation step so Cortex summarizes aggregate or anonymized findings, not individual rows. Apply a masking policy on sensitive columns (e.g., `user_email`, `account_id`) so they appear as `***` in query results before they reach the summary UDF. The summary prompt instruction should also be `'Return only aggregate findings, no individual identifiers'`. This way the text sent to Cartesia contains business insights, not PII."
+      },
+      {
+        "q": "How do you handle multi-turn conversation state across voice bot sessions in Snowflake?",
+        "a": "Store conversation history in a `voice_sessions` table: `(session_id, turn_number, role, content, ts)`. Each new turn loads the recent turns via `SELECT content FROM voice_sessions WHERE session_id=? ORDER BY turn_number DESC LIMIT 10` and prepends them as context to the `AI_COMPLETE` prompt. Session_id comes from a UUID generated at voice-bot session start and passed with every request. Snowflake table access is sub-10 ms for a single-session point lookup, adding negligible latency."
+      }
+    ]
+  },
+  {
+    "q": "When using Cartesia for voice cloning in a Snowflake-backed enterprise app, what are the key data-residency and consent risks, and how do you mitigate them with Snowflake governance primitives?",
+    "a": "Risks: (1) The speaker's voice biometric (the clone source audio) is highly sensitive PII — some jurisdictions (BIPA in Illinois, GDPR) treat voice prints as biometric data requiring explicit consent and strict retention limits. (2) Cloning a voice without consent is potentially fraudulent and violates Cartesia's terms of service. (3) The synthesized audio could impersonate the voice owner. Mitigations in Snowflake: (a) Store the clone source audio in an encrypted Snowflake stage with an access policy limiting access to a compliance role only. (b) Add a `consent_record` table with the speaker's signed consent timestamp and jurisdiction, linked to the `voice_registry` row. (c) Build a Data Access Policy that blocks access to the voice_id if `consent_valid = FALSE`. (d) Use Cortex AI_FILTER or a governance UDF to detect if generated transcripts could constitute impersonation before sending to Cartesia. (e) Set up a Snowflake Dynamic Data Masking policy that nulls out `cartesia_voice_id` for any role outside the approved pipeline — preventing ad-hoc scripts from triggering voice synthesis.",
+    "fj": "Just add a Terms of Service checkbox on the UI — that's enough for consent.",
+    "fs": "A UI checkbox is not biometric consent under BIPA or GDPR. You need a stored, timestamped, jurisdiction-linked consent record in a governed Snowflake table, a data access policy blocking synthesis without valid consent, and masking to prevent unauthorized voice_id use.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How would you implement a consent expiry check before each Cartesia TTS call at the SQL layer?",
+        "a": "The TTS UDF or External Function first runs: `SELECT consent_valid FROM voice_consent WHERE voice_id=? AND consent_expiry > CURRENT_TIMESTAMP() AND jurisdiction_flag=TRUE`. If it returns no rows or `consent_valid=FALSE`, the UDF raises an error rather than calling Cartesia. This check is SQL-enforced and cannot be bypassed by the caller — it's part of the UDF's handler before the HTTP request fires."
+      }
+    ]
+  },
+  {
+    "q": "How do you call the ElevenLabs TTS API from a Snowpark Python UDF to synthesize text generated by Cortex AI_COMPLETE?",
+    "a": "The pattern mirrors any external TTS call from Snowflake: create a Network Rule allowing `api.elevenlabs.io:443`, store the ElevenLabs API key as a Snowflake Secret, attach both to an External Access Integration (EAI), and create the Python UDF referencing the EAI. Inside the handler, retrieve the key via `_snowflake.get_generic_secret_string`, then POST to ElevenLabs' `/v1/text-to-speech/{voice_id}/stream` endpoint with `model_id: 'eleven_turbo_v2_5'` (ElevenLabs' lowest-latency TTS model as of early 2026). Collect the streaming response bytes, upload to an internal Snowflake stage or S3, and return the presigned URL. From SQL: `SELECT elevenlabs_tts(AI_COMPLETE('mistral-large2', prompt)) AS audio_url FROM responses`. The TTS model choice within ElevenLabs matters: `eleven_turbo_v2_5` is optimized for real-time TTS latency; `eleven_multilingual_v2` gives higher fidelity at more latency.",
+    "fj": "I'd download the ElevenLabs audio in a notebook and upload it manually.",
+    "fs": "Wire ElevenLabs TTS directly into a Snowflake UDF via Network Rule + EAI + Secret. The full Cortex→ElevenLabs TTS pipeline runs in one SQL call with no manual steps.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "ElevenLabs TTS UDF in Snowflake",
+        "lang": "sql",
+        "lines": [
+          "CREATE OR REPLACE NETWORK RULE elevenlabs_nr",
+          "  TYPE = HOST_PORT MODE = EGRESS",
+          "  VALUE_LIST = ('api.elevenlabs.io:443');",
+          "",
+          "CREATE OR REPLACE SECRET elevenlabs_api_key",
+          "  TYPE = GENERIC_STRING SECRET_STRING = '<key>';",
+          "",
+          "CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION elevenlabs_eai",
+          "  ALLOWED_NETWORK_RULES = (elevenlabs_nr)",
+          "  ALLOWED_AUTHENTICATION_SECRETS = (elevenlabs_api_key)",
+          "  ENABLED = TRUE;",
+          "",
+          "CREATE OR REPLACE FUNCTION el_tts(txt STRING, voice_id STRING)",
+          "RETURNS STRING LANGUAGE PYTHON RUNTIME_VERSION='3.11'",
+          "PACKAGES=('requests') EXTERNAL_ACCESS_INTEGRATIONS=(elevenlabs_eai)",
+          "SECRETS=('el_key'=elevenlabs_api_key) HANDLER='run'",
+          "AS $$",
+          "import _snowflake, requests",
+          "def run(txt, voice_id):",
+          "    key = _snowflake.get_generic_secret_string('el_key')",
+          "    r = requests.post(",
+          "        f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream',",
+          "        headers={'xi-api-key': key},",
+          "        json={'text': txt, 'model_id': 'eleven_turbo_v2_5'},",
+          "        stream=True, timeout=20)",
+          "    # upload bytes to stage, return URL",
+          "    return 'stage://audio/...'",
+          "$$;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is ElevenLabs' eleven_turbo_v2_5 model and why pick it for real-time TTS over eleven_multilingual_v2?",
+        "a": "`eleven_turbo_v2_5` is ElevenLabs' lowest-latency TTS model, engineered for real-time voice agent use cases — it trades some expressive fidelity for sub-300 ms time-to-first-audio. `eleven_multilingual_v2` is ElevenLabs' highest-quality model across 29 languages but adds latency. For a Snowflake Cortex voice bot where response time matters, `eleven_turbo_v2_5` is the right TTS model; switch to `eleven_multilingual_v2` only when top-tier audio quality outweighs latency."
+      },
+      {
+        "q": "How do you cache ElevenLabs TTS audio so repeated identical phrases don't incur extra API cost?",
+        "a": "Hash the (text, voice_id, model_id) tuple with MD5 or SHA-256 and store `(hash, audio_stage_url, created_at)` in a Snowflake table. The UDF checks the cache table first; on a hit it returns the stored URL without calling ElevenLabs. This is especially effective for fixed phrases like error messages, greetings, or templated reports where many users hear the same sentence. At ElevenLabs' per-character billing, even a 30% cache hit rate meaningfully lowers monthly TTS cost."
+      },
+      {
+        "q": "How do ElevenLabs' API rate limits interact with a high-concurrency Snowflake pipeline?",
+        "a": "ElevenLabs enforces concurrent-request and per-minute character limits per API key (tier-dependent). A Snowflake UDF running set-based over thousands of rows fans out calls in parallel, which can easily exceed the concurrency cap and return 429s. Mitigate by: (1) choosing a high-concurrency ElevenLabs plan; (2) batch and throttle with a Task+Stream pattern instead of a single SELECT over all rows; (3) handle 429 responses with exponential backoff inside the UDF via `requests.Session` retries; (4) pre-cache repeated text to reduce actual API calls."
+      }
+    ]
+  },
+  {
+    "q": "You need to choose between ElevenLabs and Cartesia Sonic as the TTS engine for a Snowflake Cortex voice data product. What technical evaluation would you run?",
+    "a": "Run a structured benchmark across four axes. (1) Latency: call each TTS API from a Snowflake Snowpark UDF or Python script co-located with your Snowflake region, send 200 representative text fragments, and log `ts_request` and `ts_first_chunk`; compute p50/p95 TTFA. Cartesia Sonic typically wins here. (2) Quality: run the same 30 diverse texts through both, blind-shuffle outputs, and have 5 listeners rate naturalness and prosody 1–5. ElevenLabs tends to score higher on expressive voice cloning. (3) Cost: both bill per character; calculate monthly cost at your expected character volume for each tier. (4) Governance: check if each vendor offers a BAA, data-processing agreement, and region-scoped processing — both have enterprise tiers. Document results in a decision matrix and pick based on which axis your use case weights most: real-time TTS latency → Cartesia Sonic; studio-quality voice cloning → ElevenLabs.",
+    "fj": "Just pick ElevenLabs — it's the most popular TTS provider.",
+    "fs": "Popularity isn't a technical criterion. I run a structured four-axis eval — latency, quality, cost, governance — log results to Snowflake, and let the data decide. For real-time voice bots Cartesia Sonic usually wins on TTS latency; for high-fidelity voice cloning ElevenLabs usually wins on quality.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you instrument the latency benchmark inside Snowflake so it reflects production network conditions?",
+        "a": "Run the UDF benchmark from the same Snowflake account and cloud region as production — don't test from a laptop. Create a benchmark Snowpark task that calls each TTS API 200 times with real text sizes (not toy strings), records wall-clock timestamps using `time.monotonic()` inside the UDF handler, and writes results to a `tts_benchmark_log` table. Aggregate with `PERCENTILE_CONT` in SQL. This captures real-egress latency from the Snowflake runtime to the provider's API, which is the latency your production users experience."
+      },
+      {
+        "q": "What governance question should you ask both ElevenLabs and Cartesia before using them on data containing employee PII?",
+        "a": "Ask whether the text submitted for TTS synthesis is retained, logged, or used to improve models, and for how long. Both providers have enterprise tiers that offer zero data retention on TTS input, which is necessary if the prose answer generated by Cortex might contain names, titles, or other PII. Get the data-processing agreement and confirm it covers your jurisdiction's regulations (GDPR, CCPA). Without zero-retention, any PII in synthesized text is effectively exfiltrated."
+      }
+    ]
+  },
+  {
+    "q": "Walk me through implementing ElevenLabs voice cloning in a Snowflake-governed pipeline: from uploading the sample audio to safely calling the cloned voice in TTS.",
+    "a": "Step 1: store the source audio (WAV, ≥30 seconds recommended by ElevenLabs) in an encrypted Snowflake internal stage with a strict stage privilege granting access only to the compliance-cleared role. Step 2: a governance-gated Snowpark task reads the audio from the stage, POSTs it to ElevenLabs `/v1/voices/add` (the voice cloning endpoint) using an External Access Integration, and writes the returned `voice_id` to a `voice_registry` table along with a `consent_record_id` FK. Step 3: future TTS calls using ElevenLabs retrieve the `voice_id` from `voice_registry` only if the linked consent record is valid and not expired. Step 4: the TTS UDF calls ElevenLabs `/v1/text-to-speech/{voice_id}` with the chosen TTS model and returns audio. No pipeline stage hard-codes the voice_id; it always comes from the governed registry. The governance gate at step 3 is what differentiates a compliant ElevenLabs voice cloning integration from an ad-hoc script.",
+    "fj": "Upload the audio to ElevenLabs manually, copy the voice_id into your code, and call TTS.",
+    "fs": "Manual upload + hard-coded voice_id breaks governance. Store source audio in a Snowflake stage, clone via a governed Task, store voice_id in a consent-linked registry table, and read it at TTS call time — never hard-code it.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Voice cloning and TTS call via ElevenLabs",
+        "lang": "python",
+        "lines": [
+          "import _snowflake, requests",
+          "",
+          "def clone_voice(name: str, audio_bytes: bytes, consent_id: str) -> str:",
+          "    key = _snowflake.get_generic_secret_string('el_key')",
+          "    resp = requests.post(",
+          "        'https://api.elevenlabs.io/v1/voices/add',",
+          "        headers={'xi-api-key': key},",
+          "        files={'files': ('sample.wav', audio_bytes, 'audio/wav')},",
+          "        data={'name': name, 'description': f'consent:{consent_id}'},",
+          "    )",
+          "    return resp.json()['voice_id']   # store in voice_registry",
+          "",
+          "def tts(voice_id: str, text: str) -> bytes:",
+          "    key = _snowflake.get_generic_secret_string('el_key')",
+          "    r = requests.post(",
+          "        f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}',",
+          "        headers={'xi-api-key': key},",
+          "        json={'text': text, 'model_id': 'eleven_turbo_v2_5'},",
+          "    )",
+          "    return r.content"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What ElevenLabs model should you use for cloned-voice TTS to maximize naturalness of the clone?",
+        "a": "`eleven_multilingual_v2` is ElevenLabs' highest-quality TTS model for cloned voices — it was trained specifically to preserve voice characteristics across the 29 supported languages. For cloned voices where expressiveness matters (e.g., an executive's voice on a data briefing), this model produces the most natural result. Use `eleven_turbo_v2_5` only if latency outweighs quality for the specific use case."
+      },
+      {
+        "q": "How do you delete a cloned ElevenLabs voice when consent is revoked?",
+        "a": "DELETE the voice via the ElevenLabs API (`DELETE /v1/voices/{voice_id}`), then UPDATE the `voice_registry` row to set `deprecated = TRUE` and `consent_valid = FALSE`. A Snowflake Alert or Task should monitor the `consent_record` table for revocations and trigger the deletion UDF automatically rather than requiring manual action. Prompt deletion is a GDPR/BIPA requirement — the window between revocation and deletion should be documented and minimized."
+      }
+    ]
+  },
+  {
+    "q": "How do you use ElevenLabs' streaming TTS API to minimize latency for a Cortex-generated answer, and how does it compare to calling the non-streaming endpoint?",
+    "a": "ElevenLabs offers a streaming TTS endpoint (`/v1/text-to-speech/{voice_id}/stream`) that starts returning audio bytes as soon as it has enough text buffered — the client receives PCM or MP3 chunks over a chunked-transfer HTTP response rather than waiting for the full audio clip. For a Cortex AI_COMPLETE response, the optimal architecture is: stream Cortex tokens, detect a sentence boundary, and immediately forward that sentence to ElevenLabs' streaming TTS endpoint. The first audio chunk arrives while Cortex is still generating the second sentence — sentence-level parallelism cuts perceived latency by 50–70% versus wait-full-text-then-TTS. The non-streaming ElevenLabs endpoint (`/v1/text-to-speech/{voice_id}`) generates the full clip before returning — useful for batch audio generation (podcast, narration) where latency doesn't matter, not for real-time conversation.",
+    "fj": "Call ElevenLabs TTS once with the full response and play it when it returns.",
+    "fs": "Wait-full-then-TTS adds the entire ElevenLabs generation time on top of Cortex latency. Use ElevenLabs' streaming TTS endpoint with sentence-level pipelining — sentence 1 audio starts while Cortex generates sentence 2.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Sentence-level pipelining: Cortex → ElevenLabs streaming TTS",
+        "lang": "python",
+        "lines": [
+          "import requests, re",
+          "",
+          "ELEVENLABS_API_KEY = _snowflake.get_generic_secret_string('el_key')",
+          "VOICE_ID = 'YOUR_ELEVENLABS_VOICE_ID'",
+          "TTS_MODEL = 'eleven_turbo_v2_5'",
+          "",
+          "def stream_elevenlabs_tts(sentence: str):",
+          "    \"\"\"Yield raw MP3 chunks from ElevenLabs streaming TTS.\"\"\"",
+          "    with requests.post(",
+          "        f'https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream',",
+          "        headers={'xi-api-key': ELEVENLABS_API_KEY},",
+          "        json={'text': sentence, 'model_id': TTS_MODEL,",
+          "              'output_format': 'mp3_44100_128'},",
+          "        stream=True, timeout=15",
+          "    ) as r:",
+          "        for chunk in r.iter_content(chunk_size=4096):",
+          "            if chunk:",
+          "                yield chunk   # forward to WebSocket / audio buffer",
+          "",
+          "def sentence_pipeline(cortex_token_stream):",
+          "    buf = ''",
+          "    for tok in cortex_token_stream:",
+          "        buf += tok",
+          "        if m := re.search(r'[.!?]\\s', buf):",
+          "            sentence, buf = buf[:m.end()].strip(), buf[m.end():]",
+          "            yield from stream_elevenlabs_tts(sentence)",
+          "    if buf.strip():",
+          "        yield from stream_elevenlabs_tts(buf.strip())"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What output_format should you request from ElevenLabs for lowest-latency browser playback?",
+        "a": "Request `mp3_44100_128` (MP3, 44.1 kHz, 128 kbps) for browser-native playback with no decoder — every browser supports MP3 natively, and ElevenLabs starts returning chunks quickly in this format. For raw PCM use `pcm_16000` (16 kHz, 16-bit), which has slightly lower overhead but requires a custom JS decoder or Web Audio API buffer. `ulaw_8000` is the lowest-bandwidth option (telephony), suitable only for voice calls where audio quality is secondary to payload size."
+      },
+      {
+        "q": "How does ElevenLabs' Turbo v2.5 TTS model compare to their standard models in terms of latency?",
+        "a": "`eleven_turbo_v2_5` is ElevenLabs' lowest-latency streaming TTS model, tuned for real-time voice agents with <300 ms time-to-first-audio in typical conditions. Their standard models (`eleven_multilingual_v2`, `eleven_english_v1`) generate higher-quality, more expressive audio but take 500–800 ms for first audio. For a Cortex-backed voice bot where user experience depends on perceived real-time response, Turbo v2.5 is the correct ElevenLabs TTS model selection."
+      }
+    ]
+  },
+  {
+    "q": "What SSML features does ElevenLabs' TTS API support, and how do you use them to improve prosody in a Snowflake Cortex-generated voice response?",
+    "a": "ElevenLabs supports a subset of SSML (Speech Synthesis Markup Language) tags in the text payload for its TTS models: `<break time='500ms'/>` inserts a pause of the specified duration; `<prosody rate='slow'>...</prosody>` and `<prosody rate='fast'>` adjust speech rate for emphasis; `<say-as interpret-as='date'>` and similar interpret-as tags control how numbers, dates, and currency are spoken. You inject SSML by wrapping the text in an `<speak>` root tag before sending to ElevenLabs' TTS endpoint. In a Cortex pipeline, the practical use is post-processing the AI_COMPLETE response with a template UDF that adds `<break>` tags after key data points and wraps numbers with `<say-as interpret-as='cardinal'>` so `1234567` is read as 'one million two hundred…' rather than as individual digits. Not all ElevenLabs TTS models support all SSML tags — test with `eleven_multilingual_v2` for the broadest coverage.",
+    "fj": "TTS just reads text as-is — I can't control how it sounds.",
+    "fs": "ElevenLabs TTS supports SSML tags like `<break>`, `<prosody rate='slow'>`, and `<say-as interpret-as='cardinal'>`. Post-process Cortex AI_COMPLETE output with a SQL UDF that injects these tags before sending to ElevenLabs to control pauses and number pronunciation.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "SSML injection UDF before ElevenLabs TTS call",
+        "lang": "python",
+        "lines": [
+          "import re",
+          "",
+          "def add_ssml(text: str) -> str:",
+          "    \"\"\"Wrap Cortex AI answer with SSML for ElevenLabs TTS prosody.\"\"\",",
+          "    # add pauses after periods that end a data finding",
+          "    text = re.sub(r'(\\.)\\s+', r'\\1 <break time=\"400ms\"/> ', text)",
+          "    # wrap large numbers so ElevenLabs TTS reads them correctly",
+          "    text = re.sub(",
+          "        r'\\b(\\d{4,})\\b',",
+          "        r'<say-as interpret-as=\"cardinal\">\\1</say-as>',",
+          "        text",
+          "    )",
+          "    return f'<speak>{text}</speak>'"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Which ElevenLabs TTS models support SSML and which do not?",
+        "a": "`eleven_multilingual_v2` has the broadest SSML support including `<break>`, `<prosody>`, and `<say-as>`. `eleven_turbo_v2_5` (the low-latency TTS model) supports `<break>` but has more limited `<prosody>` tag coverage. The legacy `eleven_english_v1` has partial support. Always test your SSML tags with the specific ElevenLabs TTS model you've chosen — ElevenLabs' documentation lists tag support per model, and unsupported tags are typically silently ignored rather than causing errors."
+      },
+      {
+        "q": "How would you use SSML to improve how ElevenLabs TTS reads a SQL metric like '99.7% uptime' from a Cortex data response?",
+        "a": "Wrap with `<say-as interpret-as='ordinal'>` or `<say-as interpret-as='unit'>` for the percentage, and ensure the decimal is formatted for speech: `<say-as interpret-as='unit'>99.7 percent</say-as>`. For currency values like `$1.2M`, expand the abbreviation before TTS — Cortex AI_COMPLETE or a SQL REPLACE can rewrite `$1.2M` to `1.2 million dollars` so ElevenLabs doesn't read it as 'dollar one point two M'. Pre-processing text to be TTS-friendly before calling ElevenLabs is often more reliable than relying solely on SSML interpret-as tags."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a TTS cost control strategy when ElevenLabs and Cartesia Sonic are both in use as fallback providers in a Snowflake data pipeline?",
+    "a": "Both ElevenLabs and Cartesia Sonic bill per character synthesized, so the primary cost levers are: (1) caching — hash (text, voice_id, model_id) and store the audio URL in a `tts_cache` table; before any TTS call, check the cache and skip the API hit if found. (2) Text truncation — cap per-response character count (e.g., 500 chars) in the SQL UDF and emit a '…for full answer, see the screen' tail. (3) Model tiering — use lower-cost ElevenLabs TTS models (e.g., `eleven_turbo_v2_5`) for most requests, escalating to `eleven_multilingual_v2` only for high-visibility outputs. (4) Budget enforcement — create a Snowflake Task that tallies monthly character usage from a `tts_usage_log` table and UPDATE a `tts_budget_status` flag to 'exceeded' when the threshold is crossed; the TTS UDF checks this flag and returns a text-only fallback if tripped. This flag is the circuit-breaker that prevents a runaway pipeline from draining your ElevenLabs and Cartesia TTS budget in one job.",
+    "fj": "Monitor the ElevenLabs dashboard and cancel jobs manually if cost spikes.",
+    "fs": "Manual dashboard monitoring doesn't protect against a runaway job. Cache TTS audio by text hash, cap character length per call, and build a Snowflake Task-driven circuit-breaker that checks monthly character totals against a budget threshold and blocks new ElevenLabs and Cartesia TTS calls when exceeded.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you accurately measure character spend across both ElevenLabs and Cartesia TTS in the same Snowflake cost table?",
+        "a": "Log every TTS call to a `tts_usage_log` table with columns: `(call_id, provider, voice_id, model_id, char_count, ts, cached)`. Compute `char_count` as `LEN(transcript)` before the API call — both ElevenLabs and Cartesia bill on input character count, not on output audio duration. Query: `SELECT provider, SUM(char_count) as total_chars, COUNT(*) as calls FROM tts_usage_log WHERE cached=FALSE AND ts >= DATE_TRUNC('month', CURRENT_DATE) GROUP BY provider`. Multiply by each provider's per-character rate to get estimated monthly cost in the same table."
+      },
+      {
+        "q": "How do you implement the text-only fallback gracefully when the TTS budget is exceeded?",
+        "a": "The UDF reads the `tts_budget_status.active_provider` value; when it's `'text_only'`, the UDF returns `NULL` for audio_url and sets a `fallback_reason='budget_exceeded'` column. The Streamlit-in-Snowflake or application layer checks for NULL audio_url and renders the text answer without an audio player, plus a banner 'Voice responses paused: monthly TTS budget reached.' This keeps the data product functional — users still get the answer — without silently omitting audio or throwing an error."
+      }
+    ]
+  },
+  {
+    "q": "How does SSML differ between Cartesia Sonic and ElevenLabs TTS, and how do you write a provider-agnostic SSML preprocessing layer in Snowflake?",
+    "a": "Cartesia Sonic uses its own markup language called Cartesia's `<ctrl>` tag set (e.g., `<ctrl speed='slow'>`) rather than standard SSML — it does not accept W3C SSML at the `/tts/sse` endpoint. ElevenLabs TTS supports a subset of W3C SSML (`<break>`, `<prosody>`, `<say-as>`) within a `<speak>` root. This means you need a provider-aware SSML translation layer: a Python UDF or Snowpark function that accepts the 'logical intent' (e.g., `pause_after_sentence`, `slow_rate`, `spell_number`) and emits the provider-specific markup. Store the active TTS provider in the `provider_routing` table; the preprocessing UDF reads it and branches: ElevenLabs → emit `<break time='400ms'/>`, Cartesia → emit `<ctrl stop='400'/>` (or omit if unsupported). This keeps the upstream Cortex AI_COMPLETE output provider-agnostic while the translation layer handles the format delta.",
+    "fj": "I'd just use the same SSML tags for both providers and see what happens.",
+    "fs": "Cartesia uses its own `<ctrl>` tags, not W3C SSML. ElevenLabs accepts a subset of W3C SSML. You need a provider-aware translation layer that maps logical prosody intent to the correct markup, reading the active provider from the `provider_routing` table.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Provider-agnostic TTS markup translation",
+        "lang": "python",
+        "lines": [
+          "def preprocess_for_tts(text: str, provider: str) -> str:",
+          "    \"\"\"Translate logical pauses to provider-specific markup.",
+          "    provider: 'elevenlabs' | 'cartesia'\"\"\"",
+          "    import re",
+          "    # logical placeholder injected after sentence-ending punctuation",
+          "    sentences = re.split(r'(?<=[.!?])\\s+', text)",
+          "    if provider == 'elevenlabs':",
+          "        joined = ' <break time=\"350ms\"/> '.join(sentences)",
+          "        return f'<speak>{joined}</speak>'",
+          "    elif provider == 'cartesia':",
+          "        # Cartesia uses plain text; achieve pause via [pause] or <ctrl> tags",
+          "        # as of early 2026 Cartesia supports <ctrl stop='X'> on some voices",
+          "        joined = ' <ctrl stop=\"350\"/> '.join(sentences)",
+          "        return joined",
+          "    return text   # passthrough for unknown provider"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens if you send W3C SSML `<speak><break/>` tags to Cartesia's TTS endpoint?",
+        "a": "Cartesia's TTS endpoint typically strips or ignores XML tags it doesn't recognise — so the `<speak>` and `<break>` tags show up as literal text in the audio output ('less-than speak greater-than…') or are stripped. Either way the prosody intent is lost. Always verify behavior by sending a test payload with the specific markup and listening to the output before shipping to production."
+      },
+      {
+        "q": "How do you test the SSML translation layer automatically in Snowflake CI?",
+        "a": "Write a Snowpark or Python unit test that calls `preprocess_for_tts` for each provider and asserts: (a) ElevenLabs output is valid XML parseable by `xml.etree.ElementTree`; (b) `<break>` tags are present; (c) Cartesia output contains no `<speak>` root. In CI (GitHub Actions calling Snowflake CLI) run these as part of the SQL test suite. For end-to-end validation, also send a known test sentence to each TTS provider using test API keys and confirm the audio duration is approximately correct — a sentence with 3 pauses should be ~1.2 s longer than the same sentence without."
+      }
+    ]
+  },
+  {
+    "q": "How do you build a TTS quality monitoring pipeline in Snowflake that automatically detects degraded audio from ElevenLabs or Cartesia using SQL-native tooling?",
+    "a": "The pipeline has four stages. (1) Logging: every TTS call (ElevenLabs and Cartesia) writes to `tts_usage_log` with `(call_id, provider, model_id, char_count, http_status, response_ms, audio_bytes, ts)`. (2) Anomaly detection: a scheduled Cortex ML `ANOMALY_DETECTION` model runs on `response_ms` per provider per hour, flagging hours where latency exceeds the learned baseline. (3) Content audit: a daily Snowflake Task samples 1% of audio files, extracts the metadata (byte size, duration) from the binary via a Python UDF, and checks that `audio_bytes / char_count` is within the expected range — a far-below-average ratio can indicate ElevenLabs or Cartesia returning empty/truncated audio silently. (4) Alerting: Snowflake Alerts trigger a Slack notification via External Access Integration when anomaly = TRUE or the byte-per-char ratio drops >2 standard deviations. This is a fully Snowflake-native TTS observability system — no external monitoring infrastructure required.",
+    "fj": "I'd check the ElevenLabs dashboard manually if users complain about audio quality.",
+    "fs": "Reactive manual checks miss systemic degradation. Log every ElevenLabs and Cartesia TTS call to a Snowflake table, run Cortex ML ANOMALY_DETECTION on response_ms, check byte-per-char ratios for truncation, and fire Alerts when anomalies appear — proactive TTS quality monitoring in pure Snowflake SQL.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What byte-per-character ratio should you expect from ElevenLabs TTS at 128 kbps MP3, and how do you use it as a quality signal?",
+        "a": "At 128 kbps MP3, ElevenLabs typically generates approximately 16 KB per second of audio. Average English speech is ~4 characters per spoken word and ~130 words per minute, giving roughly 520 characters per minute and ~240 KB of audio — about 460 bytes per character. A ratio below 100 bytes/char or a zero-byte response indicates ElevenLabs returned truncated or empty audio (usually a timeout or API error that returned HTTP 200 with an empty body). Track `AVG(audio_bytes / char_count)` per hour and alert when it drops below a safe threshold."
+      },
+      {
+        "q": "How do you correlate TTS latency spikes with upstream Cortex inference latency to isolate where slowdowns originate?",
+        "a": "Join `tts_usage_log` with `cortex_functions_usage_history` on `session_id` or a custom `request_id` field you log in both tables. Then correlate `tts.response_ms` with the Cortex function's `execution_time_ms`. If Cortex was slow and ElevenLabs was fast, the bottleneck is inference; if Cortex was fast but TTS was slow, the bottleneck is at ElevenLabs or Cartesia. A SQL scatter-plot query (`SELECT cortex_ms, tts_ms FROM joined WHERE ts > ...`) visualized in Streamlit-in-Snowflake gives a clear visual separation of the two latency components."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a multi-voice TTS system in Snowflake where different Cortex AI personas use different ElevenLabs voices, governed by Snowflake RBAC?",
+    "a": "Store personas in a `tts_persona_registry` table: `(persona_name, provider, voice_id, model_id, owner_role, active)`. Apply a row-access policy so a role only sees personas it owns or has been granted. The TTS UDF takes a `persona_name` parameter, resolves the provider and voice_id from the registry, and routes to ElevenLabs or Cartesia accordingly. For ElevenLabs, use the voice_id directly in `/v1/text-to-speech/{voice_id}`; for Cartesia, use it in the `voice.id` field. Cortex AI_COMPLETE generates the text answer; the persona routing determines whose voice reads it. A data product can expose multiple voices — a crisp ElevenLabs voice for executive summaries and a conversational ElevenLabs voice for a support bot — without code changes, by updating the registry. RBAC ensures teams can't accidentally use another team's cloned ElevenLabs voice.",
+    "fj": "I'd hard-code different voice_ids in different functions for each persona.",
+    "fs": "Hard-coded voice_ids require a code deploy per persona change. Store (persona_name, provider, ElevenLabs voice_id) in a governed Snowflake registry table with row-access policies. The TTS UDF resolves the voice dynamically — persona changes are a single SQL UPDATE, no redeploy.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Multi-persona TTS router using voice registry",
+        "lang": "sql",
+        "lines": [
+          "-- registry",
+          "CREATE TABLE tts_persona_registry (",
+          "  persona_name STRING,",
+          "  provider     STRING,   -- 'elevenlabs' | 'cartesia'",
+          "  voice_id     STRING,   -- ElevenLabs voice_id or Cartesia voice_id",
+          "  model_id     STRING,   -- e.g. 'eleven_turbo_v2_5' or 'sonic-2'",
+          "  owner_role   STRING,",
+          "  active       BOOLEAN DEFAULT TRUE",
+          ");",
+          "",
+          "-- row-access: each role sees only its own personas",
+          "CREATE ROW ACCESS POLICY persona_owner_rap",
+          "  AS (owner_role STRING) RETURNS BOOLEAN ->",
+          "  owner_role = CURRENT_ROLE() OR IS_ROLE_IN_SESSION('TTS_ADMIN');",
+          "ALTER TABLE tts_persona_registry",
+          "  ADD ROW ACCESS POLICY persona_owner_rap ON (owner_role);",
+          "",
+          "-- TTS call via persona name",
+          "SELECT tts_by_persona(",
+          "  AI_COMPLETE('mistral-large2', question),",
+          "  'exec_summary_voice'          -- persona_name",
+          ") AS audio_url",
+          "FROM briefings;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens when you need to swap an ElevenLabs voice for a Cartesia voice mid-project without touching application code?",
+        "a": "UPDATE the `tts_persona_registry` row: set `provider = 'cartesia'` and replace the `voice_id` with the Cartesia voice_id, and set `model_id = 'sonic-2'`. The TTS UDF branches on `provider` to route the call. All downstream Streamlit apps, pipelines, and SQL queries using that persona name pick up the new voice on their next call — no code deploy. The registry update itself is a one-row SQL operation, auditable via ACCOUNT_USAGE DDL history."
+      },
+      {
+        "q": "How do you prevent a rogue script from enumerating all voice_ids from the registry and calling TTS for unauthorized personas?",
+        "a": "The row-access policy on `tts_persona_registry` ensures a role can only SELECT the voice_ids it owns. Even if a script queries the table, it only sees its own rows. Combine this with a GRANT on the TTS UDF function limited to approved roles — if the UDF itself isn't callable by the rogue role, it can't invoke TTS even if it guesses a voice_id. Defense-in-depth: registry RAP limits visibility, UDF GRANT limits execution."
+      }
+    ]
+  },
+  {
+    "q": "Your org runs 40+ Cortex AI pipelines across 12 business units. How do you architect a platform-level cost governance model so no single team can silently spike Cortex spend?",
+    "a": "The platform layer owns four controls. First, Snowflake Budgets: create a hierarchy of Budget objects — one org-wide Cortex budget and one per-BU sub-budget — each with a credit threshold and alert at 80 % / 100 %. Second, resource monitors per warehouse with NOTIFY_USERS = alert_list so AI-heavy warehouses trigger a page before they're suspended. Third, a shared governance view over SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY that rolls up token_credits by department tag (stored as a custom attribute on each object or via a naming convention on query tags). Fourth, a platform team–owned Cortex policy table: each BU declares the model tier they're approved to use (small / mid / frontier); a Streamlit-in-Snowflake governance dashboard shows real-time BU spend vs. approved tier and flags mismatches. Runaway jobs are caught by the warehouse monitor before they exceed the budget ceiling. The key insight is that token billing is invisible without instrumentation — the budget object plus the usage view is the minimum viable governance layer.",
+    "fj": "I'd check the monthly Snowflake bill and ask teams to be careful.",
+    "fs": "Reactive billing review misses runaway jobs. I build a budget-object hierarchy per BU, resource monitors on AI warehouses, a usage-history rollup view tagged by team, and a governance dashboard that surfaces drift from approved model tiers in real time.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Per-BU Cortex budget with threshold alert",
+        "lang": "sql",
+        "lines": [
+          "CREATE BUDGET analytics_bu_budget",
+          "  CREDIT_QUOTA = 500",
+          "  FREQUENCY = MONTHLY",
+          "  START_TIMESTAMP = '2026-01-01'",
+          "  NOTIFY_AT = (80, 100)",
+          "  NOTIFY_USERS = ('platform_oncall@corp.com');",
+          "",
+          "-- tag AI queries with team context",
+          "ALTER SESSION SET QUERY_TAG = 'team=analytics_bu';",
+          "",
+          "-- rollup spend by tag",
+          "SELECT QUERY_TAG,",
+          "  SUM(token_credits) AS credits",
+          "FROM SNOWFLAKE.ACCOUNT_USAGE",
+          "  .CORTEX_FUNCTIONS_USAGE_HISTORY",
+          "WHERE start_time >= DATE_TRUNC('month', CURRENT_DATE)",
+          "GROUP BY 1 ORDER BY 2 DESC;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you enforce model-tier limits at query time rather than after the fact?",
+        "a": "Create a thin stored-procedure wrapper around AI_COMPLETE that reads the calling role's approved tier from the governance table and raises an error if the requested model exceeds it. All BU pipelines call the wrapper, not AI_COMPLETE directly. You grant EXECUTE on the wrapper to BU roles and revoke direct USAGE on the higher-cost models from those roles via CORTEX_USER sub-roles if Snowflake exposes that granularity, otherwise rely on the wrapper as the enforcement point with an audit log INSERT on every call."
+      },
+      {
+        "q": "What query-tag discipline makes the ACCOUNT_USAGE rollup actually work across 12 BUs?",
+        "a": "Mandate that every pipeline sets `ALTER SESSION SET QUERY_TAG = 'team=<bu_id>,env=<env>,pipeline=<name>'` as the first statement. Enforce it in CI via a lint check on migration scripts. The usage-history view then has a parseable QUERY_TAG field you GROUP and FILTER on. Without consistent tagging, the usage is one undifferentiated blob and attribution is a manual guessing game."
+      },
+      {
+        "q": "How do you handle a BU that legitimately needs a frontier model but normally operates on a small model tier?",
+        "a": "Add a time-bounded exception record to the governance table: `(bu_id, model_tier, approved_until, approver, ticket_id)`. The wrapper proc checks for an active exception before enforcing the tier cap. Exceptions auto-expire, so the BU doesn't need to remember to revert. The exception record is the audit trail an approver or cost review can query."
+      }
+    ]
+  },
+  {
+    "q": "Design an RBAC schema for Cortex AI features that supports least privilege across Analyst, Search, fine-tuning, and AI functions for 5 distinct user personas.",
+    "a": "Map each persona to a scoped database role rather than the blanket SNOWFLAKE.CORTEX_USER on PUBLIC. The five roles: (1) BI_ANALYST — granted CORTEX_ANALYST_USER only; can ask Analyst questions, cannot call arbitrary AI_COMPLETE. (2) DATA_SCIENTIST — granted CORTEX_USER for AI functions on approved tables, plus SELECT on training-approved datasets. (3) ML_ENGINEER — granted DATA_SCIENTIST plus CREATE SNOWFLAKE.CORTEX.FINETUNE privilege and USAGE on the fine-tune staging schema. (4) SEARCH_CONSUMER — granted USAGE on specific Cortex Search services, no AI function access. (5) PLATFORM_ADMIN — granted all of the above plus MANAGE GRANTS so they can delegate. Revoke CORTEX_USER from PUBLIC immediately. Apply column masking and row-access policies on source tables so each role's AI calls only see what the SQL layer permits. Document the role hierarchy in a `rbac_manifest` table the governance dashboard reads.",
+    "fj": "Grant SYSADMIN to the ML team — they need everything anyway.",
+    "fs": "SYSADMIN grants bypass every governance control. I map each persona to the narrowest Cortex database role — CORTEX_ANALYST_USER for BI, CORTEX_USER only for data scientists, CREATE FINETUNE only for ML engineers — and revoke CORTEX_USER from PUBLIC so no one inherits broad AI access by default.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Least-privilege Cortex role grants",
+        "lang": "sql",
+        "lines": [
+          "-- remove blanket access",
+          "REVOKE DATABASE ROLE SNOWFLAKE.CORTEX_USER FROM ROLE PUBLIC;",
+          "",
+          "-- BI analysts: Analyst only",
+          "GRANT DATABASE ROLE SNOWFLAKE.CORTEX_ANALYST_USER",
+          "  TO ROLE bi_analyst;",
+          "",
+          "-- Data scientists: full AI functions",
+          "GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER",
+          "  TO ROLE data_scientist;",
+          "",
+          "-- ML engineers: fine-tune creation on top",
+          "GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER",
+          "  TO ROLE ml_engineer;",
+          "GRANT CREATE SNOWFLAKE.CORTEX.FINETUNE",
+          "  ON SCHEMA ai_models TO ROLE ml_engineer;",
+          "",
+          "-- Search consumers: specific service only",
+          "GRANT USAGE ON CORTEX SEARCH SERVICE docs_svc",
+          "  TO ROLE search_consumer;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you audit which roles are calling which Cortex functions to detect privilege creep over time?",
+        "a": "Query SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY joined with QUERY_HISTORY on query_id to get the ROLE_NAME per AI function call. A weekly Task materialises this into a `cortex_access_audit` table; the governance dashboard surfaces any role calling a function beyond its declared tier. Roles that drifted into higher-cost models are flagged for a privilege review, and the audit table is the evidence for the review."
+      },
+      {
+        "q": "How does the masking policy interact with AI_COMPLETE when a masked column is passed as the prompt?",
+        "a": "The masking policy applies before the AI function sees the value, so a role that receives a masked token (e.g., '***-***-1234') passes that masked text into the prompt. The model reasons over the masked form. This is intentional: you control what the LLM can see by controlling what the SQL role can see. The implication is you must test masked prompts for coherence — a fully-masked PII field may render the prompt meaningless and produce garbage output."
+      },
+      {
+        "q": "Can a SEARCH_CONSUMER role bypass the Cortex Search service restriction by calling AI_EMBED + VECTOR_COSINE_SIMILARITY directly?",
+        "a": "Yes, if they have CORTEX_USER. That's why the SEARCH_CONSUMER role gets USAGE on specific search services only, not CORTEX_USER. Without CORTEX_USER, they can't invoke AI_EMBED or AI_COMPLETE to build a DIY retrieval pipeline. The narrow role grant is what closes the bypass — least privilege at the role level, not just at the service level."
+      }
+    ]
+  },
+  {
+    "q": "A Cortex Analyst rollout to 500 business users is producing 15% wrong-answer rate on metric questions. What is your systematic remediation plan?",
+    "a": "Wrong answers on metric questions in Cortex Analyst are almost always a semantic model problem, not a model problem. Remediation in four phases. Phase 1 — triage: sample the failing questions, classify failures by type: wrong join (fan-out), wrong metric (wrong column), wrong filter (wrong date grain or exclusion), hallucinated table. Each type points to a different semantic model gap. Phase 2 — semantic model surgery: fix wrong-join failures by declaring cardinality in relationships; fix wrong-metric failures by adding or correcting FACTS with explicit AGGREGATEs and filters; fix wrong-filter failures by adding date-dimension descriptions and default grain; fix hallucinated tables by removing or constraining the available table list. Phase 3 — verified queries: for the top-20 most-asked questions that are now fixed, add Verified Query pairs so Analyst reuses trusted SQL instead of generating. Phase 4 — eval harness: build a weekly Cortex AI Observability / TruLens eval run on a 50-question labeled test set that gates any semantic model change on not regressing accuracy below 92 %. The rollout resumes only after phase 4 shows the threshold is met.",
+    "fj": "Switch to a larger LLM — it will understand the schema better.",
+    "fs": "Accuracy failures are semantic model failures, not model-size failures. I triage by error type, fix each root cause in the semantic model (joins, metric definitions, date grain), add Verified Queries for the top questions, and gate further rollout on a labeled eval harness showing sub-8% error rate.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you build the labeled test set for the eval harness without manually writing 50 SQL queries?",
+        "a": "Start from Cortex Analyst's query history (ACCOUNT_USAGE shows questions asked and SQL generated). Have a data analyst spot-check the 50 most-asked questions and label each AI-generated SQL as correct / wrong, plus record the correct SQL where wrong. Those human-labeled (question, expected_SQL) pairs form the test set. Run weekly: compare Analyst's generated SQL to the expected SQL structurally (not string-match — compare table references, aggregation columns, and filter predicates) and flag divergence."
+      },
+      {
+        "q": "How do you prevent a semantic model change from regressing questions that were already correct?",
+        "a": "The eval harness is a CI gate: before any ALTER SEMANTIC VIEW or semantic YAML change is applied to production, run the full 50-question test set against the candidate model in a dev Snowflake database. If the score drops below the threshold on any previously-passing question, block the merge. This is the same 'don't regress' discipline as software tests — you can't manually check every question on every schema change at 40+ tracks of content."
+      },
+      {
+        "q": "What is the right escalation path when a wrong-answer complaint comes from a C-suite user during the rollout?",
+        "a": "Immediate response: route their question through the human BI team to get a trusted answer while Analyst is under remediation for that question class. Add it to the 'known bad' list and fast-track a Verified Query pair for it so Analyst handles it correctly before the next C-suite use. Separately, set up a feedback button in the Streamlit-in-Snowflake UI that routes thumbs-down answers to a triage queue — surfacing executive failures through a governed triage queue is better than a chat conversation."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a cross-regional Cortex deployment where EU data must never be processed by a US-region model and US data may use any region?",
+    "a": "Snowflake's CORTEX_ENABLED_CROSS_REGION parameter is account-level and controls where inference can route. The architecture requires two separate Snowflake accounts: an EU account (e.g., AWS eu-central-1) with CORTEX_ENABLED_CROSS_REGION = DISABLED or limited to EU regions, and a US account with CORTEX_ENABLED_CROSS_REGION = ANY_REGION. EU data is physically in the EU account; Cortex functions on that account only route to EU-region inference endpoints. US data in the US account can freely use cross-region routing to access a wider model menu. The application layer (Streamlit, API service) connects to the correct account based on the data subject's jurisdiction, determined at session start. You document this in a data residency matrix and audit quarterly: query ACCOUNT_USAGE CORTEX_FUNCTIONS_USAGE_HISTORY to verify no EU-account calls have a cross_region=TRUE flag indicating data left the EU.",
+    "fj": "Set cross-region to ANY_REGION globally — model availability is more important than residency.",
+    "fs": "ANY_REGION on a single account is a GDPR violation for EU data subjects. The design requires separate accounts per jurisdiction, CORTEX_ENABLED_CROSS_REGION = DISABLED on the EU account, and quarterly audits of the usage history to verify no cross-region inference occurred on EU data.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Restrict EU account to in-region inference only",
+        "lang": "sql",
+        "lines": [
+          "-- run on the EU Snowflake account",
+          "ALTER ACCOUNT SET",
+          "  CORTEX_ENABLED_CROSS_REGION = 'DISABLED';",
+          "",
+          "-- audit: confirm no cross-region inference occurred",
+          "SELECT model_name, cross_region_used,",
+          "  COUNT(*) AS calls",
+          "FROM SNOWFLAKE.ACCOUNT_USAGE",
+          "  .CORTEX_FUNCTIONS_USAGE_HISTORY",
+          "WHERE start_time >= DATEADD(month,-1,CURRENT_DATE)",
+          "GROUP BY 1, 2",
+          "HAVING cross_region_used = TRUE;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a model that is only available in US regions but a US engineer needs to use it on EU-resident data?",
+        "a": "You don't — that model is off-limits for EU-resident data under the architecture. The correct approach is to choose a model available in EU regions for EU data, or wait for Snowflake to provision that model in EU. If there is genuinely no EU-region alternative, the workload must be redesigned to use an EU-available model or the data must be anonymized before it can be processed cross-region with explicit legal basis. Data residency is a hard constraint, not a preference."
+      },
+      {
+        "q": "How do you prove to a GDPR auditor that EU data never left the EU Snowflake account?",
+        "a": "Produce a report from SNOWFLAKE.ACCOUNT_USAGE.CORTEX_FUNCTIONS_USAGE_HISTORY showing zero rows with cross_region_used = TRUE for the audit period, plus the ACCOUNT_PARAMETERS history showing CORTEX_ENABLED_CROSS_REGION was DISABLED throughout. Supplement with Snowflake's own Data Processing Agreement confirming in-region inference when cross-region is disabled. That combination — a platform contractual guarantee plus your own audit-log evidence — is the standard form of a technical GDPR compliance attestation."
+      },
+      {
+        "q": "How do you sync a semantic view between EU and US accounts when both need the same Analyst capability?",
+        "a": "Treat the semantic view DDL as code in Git. CI deploys the same CREATE SEMANTIC VIEW statement to both accounts via the Snowflake CLI, targeting each account's credentials separately. The view definition is identical; the underlying tables point to that account's local data. Changes to metrics or synonyms are a single PR that triggers deployment to both accounts, so the semantic layer stays in sync without manual cross-account coordination."
+      }
+    ]
+  },
+  {
+    "q": "Your team is onboarding three new AI use cases per quarter. Design a Cortex feature-flag and staged-rollout framework so no new AI feature ships to all users on day one.",
+    "a": "The framework has four components, all inside Snowflake. First, a `feature_flags` table: `(feature_name, rollout_pct INT, cohort_allowlist ARRAY, enabled BOOLEAN, created_by, created_at)`. Second, a `user_cohorts` table mapping each Snowflake user to cohorts (e.g., early_adopter, power_user, general). Third, a thin routing function `cortex_feature_allowed(user, feature_name)` that returns TRUE if the user's cohort is in the allowlist or HASH(user) % 100 < rollout_pct. Fourth, every new Cortex-backed feature wraps its call in a Streamlit-in-Snowflake component that calls this function first; if FALSE, it shows a 'coming soon' placeholder. Rollout stages: 5 % internal (platform team), 20 % early adopters, 50 % power users, 100 % all. Each stage requires a quality bar met by the eval harness before advancing. The whole framework is SQL DDL — no external feature-flag service, no code deploy per flag flip.",
+    "fj": "We ship each feature to everyone at once and fix bugs as they come in.",
+    "fs": "Big-bang releases of AI features are high-risk — wrong answers at scale erode trust permanently. I maintain a feature_flags table with cohort-gated rollout percentages and a quality-bar eval gate between stages. The flag state is a SQL UPDATE; rollback is another UPDATE — no code deploy.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Feature flag check and rollout gate",
+        "lang": "sql",
+        "lines": [
+          "-- check flag for current user",
+          "CREATE OR REPLACE FUNCTION cortex_feature_allowed(",
+          "  feature_name STRING) RETURNS BOOLEAN AS $$",
+          "  WITH flag AS (",
+          "    SELECT rollout_pct, cohort_allowlist, enabled",
+          "    FROM feature_flags WHERE feature_name = feature_name",
+          "  ),",
+          "  cohort AS (",
+          "    SELECT cohort FROM user_cohorts",
+          "    WHERE username = CURRENT_USER()",
+          "  )",
+          "  SELECT IFF(",
+          "    flag.enabled AND (",
+          "      ARRAY_CONTAINS(cohort.cohort::VARIANT,",
+          "        flag.cohort_allowlist) OR",
+          "      HASH(CURRENT_USER()) % 100 < flag.rollout_pct",
+          "    ), TRUE, FALSE)",
+          "  FROM flag, cohort",
+          "$$;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you measure the quality bar that gates each rollout stage?",
+        "a": "Run the TruLens / AI Observability eval harness on the new feature's test question set. The bar is: groundedness ≥ 0.85, answer relevance ≥ 0.80, and zero critical wrong-answer incidents (a structured complaint logged with severity=critical in the triage queue). All three must pass before the feature_flags row is updated to the next rollout_pct. The eval job is a Snowflake Task that writes pass/fail to an `eval_gates` table; the Streamlit governance dashboard shows the current gate status for each in-flight feature."
+      },
+      {
+        "q": "What's the rollback procedure if a feature at 50 % rollout starts producing wrong answers for a specific cohort?",
+        "a": "One SQL statement: `UPDATE feature_flags SET rollout_pct = 5, cohort_allowlist = ['platform_team'] WHERE feature_name = '...';`. This immediately restricts the feature to the platform team's cohort. The routing function reads the flag at query time so the rollback takes effect on the next user request without a deployment. Simultaneously open an incident with the sample wrong-answer cases and trace them to the semantic model or PEFT adaptor root cause before re-advancing."
+      },
+      {
+        "q": "How do you handle users who complain they lost a feature during a rollback?",
+        "a": "The cohort_allowlist can include a `complained_users` cohort that you populate with the specific user accounts who reported losing the feature. This keeps them on the old version while the general population is on the rolled-back state. When the fix is verified, advance the full rollout. Handling individual complainers through the cohort mechanism means no special-case code — it's a data entry in the user_cohorts table."
+      }
+    ]
+  },
+  {
+    "q": "How do you build a unified observability layer for Cortex AI pipelines — covering latency, cost, accuracy, and model drift — as a Snowflake-native platform service?",
+    "a": "The platform service has three layers. Data collection: every Cortex call writes to a `cortex_call_log` table (pipeline_name, model_name, input_tokens, output_tokens, token_credits, latency_ms, query_id, ts, user_role) using a thin logging wrapper around AI_COMPLETE. Accuracy signals come from the TruLens evaluation Task (groundedness, relevance scores per question) and user feedback (thumbs-down events from Streamlit-in-Snowflake apps) stored in `cortex_feedback_log`. Model drift detection: a scheduled ANOMALY_DETECTION model runs on daily accuracy scores per pipeline — a drop in groundedness over 5 days is a drift signal, not a one-off. Visibility: a Streamlit-in-Snowflake platform dashboard with four tabs: (1) Cost breakdown by team/model/day using the call log; (2) Latency p50/p95 by model using PERCENTILE_CONT; (3) Accuracy trend per pipeline using the TruLens scores; (4) Anomaly alerts table from ANOMALY_DETECTION output. The platform team owns this dashboard and shares it with each BU lead. All data stays inside Snowflake — no external metrics system needed.",
+    "fj": "I'd check the Snowflake UI usage tab and look at the eval scores in a notebook periodically.",
+    "fs": "Ad-hoc notebook reviews miss drift until users complain. I build a Snowflake-native observability layer: call logs + TruLens evals + user feedback + Cortex ML ANOMALY_DETECTION on accuracy trends, surfaced in a Streamlit-in-Snowflake platform dashboard shared with BU leads.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is the minimum viable schema for the cortex_call_log table that still enables all four observability dimensions?",
+        "a": "Seven columns are sufficient: `call_id UUID, pipeline_name STRING, model_name STRING, input_tokens INT, output_tokens INT, token_credits FLOAT, latency_ms INT, ts TIMESTAMP_LTZ, user_role STRING, query_tag STRING`. From these you derive: cost (SUM token_credits by team via query_tag), latency (PERCENTILE_CONT on latency_ms by model), volume (COUNT by pipeline), and join to QUERY_HISTORY on query_id to get the actual SQL for deeper investigation. Accuracy comes from the separate feedback and eval tables joined on call_id or session_id."
+      },
+      {
+        "q": "How do you detect model drift as opposed to a one-time accuracy dip from a bad input batch?",
+        "a": "Apply ANOMALY_DETECTION on the 7-day rolling daily-average groundedness score per pipeline, not on individual call scores. A single-day dip on a bad question set is not a drift signal — a sustained downward trend across multiple days is. The ML model learns the baseline seasonal pattern (pipelines may have different weekday vs. weekend usage patterns) and flags a sustained deviation. This is why point-in-time evals miss drift: you need the time-series view."
+      },
+      {
+        "q": "How do you attribute a latency spike in the platform dashboard to a Snowflake warehouse issue versus a Cortex inference issue?",
+        "a": "The call log captures `latency_ms` as wall-clock time from the wrapper; join to QUERY_HISTORY's `TOTAL_ELAPSED_TIME` on query_id to see Snowflake-side execution time. The delta between wall-clock and TOTAL_ELAPSED_TIME is the Cortex inference time (network + model). If the delta spikes while TOTAL_ELAPSED_TIME is normal, the issue is on Cortex's side (model latency or cross-region routing). If TOTAL_ELAPSED_TIME spikes, the warehouse is the bottleneck. The two metrics together localize the fault layer."
+      }
+    ]
+  },
+  {
+    "q": "As a Principal engineer, articulate the multi-year build-vs-buy decision: when should an enterprise go all-in on Cortex as the company's AI platform versus building a separate ML stack?",
+    "a": "The Cortex all-in bet makes sense when three conditions hold: (1) The company's competitive advantage is in its data, not in novel model architectures — you're an AI consumer, not an AI builder. Cortex provides a curated model menu, managed fine-tuning, and retrieval, all governed within Snowflake, which is exactly the surface you need. (2) Governance and compliance are first-class constraints — financial services, healthcare, regulated industries — because Cortex's in-account inference and no-egress guarantee eliminates the entire class of data-residency problems that a separate ML stack would require you to engineer. (3) Your data engineering team is Snowflake-fluent and not deep in Python ML frameworks; the productivity gain from SQL-native AI functions outweighs the capability ceiling. The separate ML stack is right when: you need fine-grained control over model architecture (custom training from scratch, novel fine-tuning strategies), you're building AI products for external customers where Cortex's model menu limits your roadmap, or you need online inference at latencies (sub-10 ms) that Cortex serverless can't guarantee. The multi-year risk in the Cortex-all-in bet is vendor lock-in on the model tier structure and inference pricing — you hedge by keeping the data layer (training corpora, evals, feature stores) portable in Snowflake independently of which inference platform you use.",
+    "fj": "Use Cortex for everything — it's simpler than maintaining a separate stack.",
+    "fs": "Simplicity isn't the right frame. The Cortex-all-in bet is correct for data-advantage businesses with strict governance requirements and Snowflake-native teams. The separate-stack bet is correct for companies building novel models or needing sub-10 ms inference. The hedge either way is keeping data and evals portable and vendor-agnostic.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What is the concrete multi-year lock-in risk of going all-in on Cortex, and how do you mitigate it?",
+        "a": "Lock-in risk is in three places: model names (if Snowflake retires a model you depend on, you must re-evaluate and potentially re-fine-tune), inference pricing (as Cortex matures Snowflake may change credit-per-token rates), and semantic model format (the YAML/semantic view DDL is Snowflake-proprietary). Mitigate by keeping all training data, eval harnesses, and labeled test sets in standard Snowflake tables exportable to Parquet — these are portable. Abstract model names behind a config table so a pricing-driven model swap is a one-row UPDATE. Document semantic model definitions in Git so they can be rebuilt in a different format if needed. The data is yours; the inference layer is the commodity."
+      },
+      {
+        "q": "How do you make the business case to a CFO for Cortex versus a self-managed ML platform on cloud compute?",
+        "a": "The Cortex case is total cost of ownership: no ML infrastructure team (engineers are ~$250K/yr each), no GPU cluster management, no MLflow/Kubeflow/Ray operational overhead, no separate data-egress security review for each new use case. The per-token cost is higher than self-hosting open weights, but at moderate inference volume the total cost (infra + ops headcount + governance engineering) favors Cortex. The inflection point is roughly >5M inference calls/month at frontier model rates where self-hosting dedicated GPU capacity starts to beat managed pricing — below that, Cortex wins on TCO. Frame it as: we're paying for elimination of operational risk and governance complexity, not just compute."
+      },
+      {
+        "q": "What is the right governance structure for the team that owns the Cortex platform decision?",
+        "a": "A cross-functional AI Platform Council: platform engineering (owns infrastructure and security), data governance (owns policy, RBAC, and compliance), a rotating BU representative (owns use case prioritization), and a finance lead (owns budget allocation). The council meets monthly to review Cortex capability roadmap updates, evaluate new use cases against the build-vs-buy criteria, and approve model-tier expansions. Decisions are documented in a platform ADR (architectural decision record) table in Snowflake itself — meta, but it keeps the decision history in the same governed system as the platform it governs."
+      }
+    ]
+  },
+  {
+    "q": "Define an organization-wide AI governance standard for Cortex that covers model versioning, eval gating, data lineage, and incident response — and explain how you operationalize it.",
+    "a": "The standard has five pillars operationalized as Snowflake-native artifacts. Pillar 1 — Model registry: a `cortex_model_registry` table records every model name, version, base model, training data snapshot ref, eval pass date, approver, and production cutover date. No model goes live without a registry row with eval_passed = TRUE. Pillar 2 — Eval gate: a mandatory TruLens eval run on a domain-specific test set (groundedness ≥ 0.85, relevance ≥ 0.80) must pass before the registry row is approved. The eval job is a CI Task — not a human clicking a button. Pillar 3 — Data lineage: every PEFT training table name is referenced in the registry with a SHA of its content at training time (computed via MD5 over a COUNT/CHECKSUM query), creating a reproducible lineage record. Pillar 4 — Incident response: a Snowflake Alert fires when accuracy drops below 0.75 on any registered model's daily eval. The on-call rotation receives the alert; the runbook is a Snowflake notebook with the SQL to pull failing question samples, identify root cause (retrieval vs. generation), and execute rollback (update the active model name in the config table). Pillar 5 — Annual audit: a scheduled report queries the registry, the eval history, and CORTEX_FUNCTIONS_USAGE_HISTORY to produce a compliance summary: which models ran, on which data, with what eval scores, for which team.",
+    "fj": "We document AI governance in a Confluence page and trust teams to follow it.",
+    "fs": "Documentation in Confluence is unenforceable. I operationalize governance as Snowflake-native enforced artifacts: a model registry with a CI eval gate, content-SHA data lineage, automated accuracy alerts with a codified runbook, and an annual audit query — not a policy page, but a running system.",
+    "level": "Principal",
+    "code": [
+      {
+        "label": "Model registry and lineage schema",
+        "lang": "sql",
+        "lines": [
+          "CREATE TABLE cortex_model_registry (",
+          "  model_id       STRING DEFAULT UUID_STRING(),",
+          "  model_name     STRING NOT NULL,",
+          "  base_model     STRING,",
+          "  training_table STRING,",
+          "  training_sha   STRING,  -- MD5 of training content",
+          "  eval_passed    BOOLEAN DEFAULT FALSE,",
+          "  eval_score     FLOAT,",
+          "  approver       STRING,",
+          "  approved_at    TIMESTAMP_LTZ,",
+          "  active_in_prod BOOLEAN DEFAULT FALSE,",
+          "  created_at     TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()",
+          ");",
+          "",
+          "-- lineage: compute training table SHA",
+          "SELECT MD5(ARRAY_TO_STRING(ARRAY_AGG(",
+          "  prompt || completion) WITHIN GROUP (",
+          "  ORDER BY prompt), '')) AS training_sha",
+          "FROM domain_training_table;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you enforce that no team deploys a Cortex model to production without a registry row with eval_passed = TRUE?",
+        "a": "The production deployment is not a manual step — it's a CI pipeline that reads the registry. The pipeline queries: `SELECT model_name FROM cortex_model_registry WHERE model_name = ? AND eval_passed = TRUE AND approver IS NOT NULL`. If zero rows return, the pipeline fails the deployment step and blocks the config-table UPDATE that would point production traffic at the new model. Teams cannot manually update the config table directly — only the CI pipeline role has that grant. The registry row is the gate key."
+      },
+      {
+        "q": "How do you handle an emergency model rollback during an incident when the normal governance process takes too long?",
+        "a": "The runbook pre-authorizes a break-glass procedure: the incident commander can execute a specific stored procedure (`CALL emergency_model_rollback('pipeline_name')`) that updates the active model name in the config table to the last-known-good entry from the registry, logs the event with the caller's identity and timestamp, and fires a post-incident review Alert. The stored procedure is the auditable break-glass mechanism — it's faster than a PR process and produces a traceable record automatically. A retrospective is mandatory within 48 hours."
+      },
+      {
+        "q": "What does the annual audit report cover, and who reviews it?",
+        "a": "The report covers: (1) all models that ran in production that year (from CORTEX_FUNCTIONS_USAGE_HISTORY joined to the registry); (2) their eval scores at promotion and any mid-year re-evals; (3) total token spend per model per team; (4) any incidents logged (accuracy alerts fired, rollbacks executed); (5) data lineage — which training tables were used and their SHA status. Reviewers: platform lead, data governance officer, and a representative from legal/compliance. The report is generated by a scheduled Task into a governed Snowflake table and rendered in Streamlit-in-Snowflake — accessible to the reviewers without exporting data."
+      }
+    ]
+  },
+  {
+    "q": "How do you make the case to executive leadership for a 3-year Cortex-centered AI roadmap — covering capability gaps, investment milestones, and risk thresholds?",
+    "a": "The roadmap has three one-year phases, each with a measurable outcome, a capability dependency, and a risk threshold. Year 1 — Foundation: ship Cortex Analyst for 200 BI users with a semantic view covering the top 5 data domains, target 85 % answer accuracy on the labeled test set, cost budget $150K in Cortex credits, risk threshold = any wrong answer that reaches C-suite triggers a 30-day pause for semantic model audit. Year 2 — Scale and differentiation: expand to Cortex Agents for multi-source queries (Analyst + Search), add fine-tuned models for the top 3 high-volume narrow tasks, target 92 % accuracy and 20 % reduction in analyst query time (measured by before/after ticket volume). Risk threshold = no single BU's AI spend exceeds 25 % of the annual Cortex budget without approval. Year 3 — Embedded AI: Cortex AI is a first-class layer in every data product, Streamlit-in-Snowflake apps replace 40 % of static BI dashboards for interactive analysis, fine-tuned models are in the model registry with full governance and annual re-eval. KPI: net promoter score from BU leads on the AI platform. The executive pitch: each phase builds on Snowflake investments already made, requires no external ML infrastructure team, and has a quantitative accuracy gate before each phase advances. The risk-adjusted ROI is compared to the alternative — a separate ML platform requiring 4 ML engineers at $300K/yr each.",
+    "fj": "Show leadership a demo and ask for budget to keep building.",
+    "fs": "A demo without milestones and risk thresholds gets one-time budget that evaporates. I present a phased roadmap with measurable accuracy gates, cost ceilings, and explicit risk thresholds that trigger pauses — each phase earns its budget by meeting the previous phase's KPIs, which is the only frame that sustains multi-year executive commitment.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you measure the '20% reduction in analyst query time' KPI for the Year 2 milestone?",
+        "a": "Establish a pre-Cortex baseline: pull the past 6 months of BI ticket counts (questions answered by a human analyst) segmented by domain. After Cortex Analyst deployment, measure the same ticket categories monthly. A 20 % reduction in tickets requiring human analyst intervention for data questions in covered domains is the metric. Confound control: exclude tickets that were always out of Analyst's scope (data pipeline issues, new metric definitions). The ticket system is the measurement instrument — Snowflake isn't needed for this KPI."
+      },
+      {
+        "q": "What is the right risk threshold for declaring a Year 1 semantic model audit 'complete' after a C-suite wrong-answer incident?",
+        "a": "The audit is complete when: the root cause of the wrong answer is in the registry (wrong join, missing metric, ambiguous synonym), the fix is in the semantic view DDL, the labeled test set has been expanded to include the question class that failed, and the eval harness passes on the expanded set. Timeline target: resolution within 14 business days. The C-suite user receives a written root-cause summary and is given a preview of the corrected output before Analyst is re-enabled for their role. Trust is rebuilt through transparency, not by hoping they don't remember."
+      },
+      {
+        "q": "How do you handle a Year 2 scenario where a BU lead argues that their Cortex AI results are 'close enough' and wants to skip the accuracy gate?",
+        "a": "The accuracy gate is non-negotiable as a platform standard — but the conversation is about what 'close enough' means for that BU's specific use case. If their question set genuinely requires a lower accuracy threshold (e.g., exploratory analysis where 80 % is fine), revise the gate threshold for that pipeline in the eval_gates table with the BU lead's written approval and a documented rationale. The gate still runs; it just has a different threshold. Skipping the gate entirely means the platform's governance record has a hole that becomes a liability in any audit. Adjust the threshold, don't remove the gate."
       }
     ]
   }

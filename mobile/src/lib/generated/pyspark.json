@@ -1421,5 +1421,219 @@
         "a": "Without the `repartition`, each of the many in-flight tasks writes its own file into every `dt` directory, producing tasks x dt files (a tiny-file explosion). `repartition('dt')` collocates all rows of a date into one partition, so each `dt` gets one (or few) properly sized file. It aligns the in-memory partitioning with the on-disk layout."
       }
     ]
+  },
+  {
+    "q": "Your Python UDF runs 10× slower than a native Spark SQL equivalent. How do you systematically diagnose and eliminate that gap?",
+    "a": "Python UDFs force row-at-a-time data serialization through a Py4J socket: each row leaves the JVM, is pickled into CPython, processed, and repickled back. That round-trip alone can dominate I/O time. Diagnose with the Spark UI: check 'Shuffle Read/Write' and 'Time in GC'; if executor CPU looks normal but stage duration is extreme, serialization is the culprit. Remediation ladder: (1) Rewrite as a Spark SQL built-in or combination of Column API ops — no serialization at all. (2) If the logic is irreducible Python, convert to a Pandas UDF (GROUPED_MAP or SCALAR) using Arrow-based columnar transfers, typically 5-15× faster. (3) For very hot paths use a Scala/Java UDF registered via spark.udf.register from a JAR. Validate the plan with explain(mode='formatted') to confirm the UDF node is gone and replaced by a native expression.",
+    "fs": "Replace Python UDFs with Column API ops or Arrow-based Pandas UDFs; never tolerate row-at-a-time Py4J serialization on hot paths.",
+    "fj": "Profiling only wall-clock time and missing that executor CPU was low while serialization time was high.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Python UDF → Pandas UDF (Arrow)",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql.functions import pandas_udf",
+          "import pandas as pd",
+          "",
+          "# BAD: row-at-a-time Python UDF",
+          "# @udf('double')",
+          "# def slow(x): return x * 1.05",
+          "",
+          "# GOOD: Arrow columnar Pandas UDF",
+          "@pandas_udf('double')",
+          "def fast(s: pd.Series) -> pd.Series:",
+          "    return s * 1.05",
+          "",
+          "df.withColumn('adj', fast('revenue'))",
+          "# verify: explain() shows no Python UDF node"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "When is a Pandas UDF still not fast enough and you need a JAR-based UDF?",
+        "a": "When the operation requires native JVM libraries (e.g., a C++ cryptography or geospatial library wrapped in Scala) or the sheer volume of Arrow IPC transfers is measurable. In those cases write a Scala UDF, package it into a fat JAR, and register it with `spark.udf.register`. The UDF executes entirely in the JVM with zero cross-language serialization. This is rarely necessary: Pandas UDFs handle the vast majority of custom logic at acceptable cost."
+      },
+      {
+        "q": "How do you unit test a Pandas UDF in isolation without spinning up a Spark session?",
+        "a": "Because a Pandas UDF is just a function from `pd.Series` to `pd.Series`, pytest can call it directly with a fabricated Series. Reserve Spark integration tests for testing the UDF registration and the full DataFrame path. This dramatically cuts test time and lets you iterate in a plain Python environment."
+      }
+    ]
+  },
+  {
+    "q": "Describe a production-grade partitioning strategy for a 50 TB daily events table in Delta Lake, including partition pruning, Z-order, and liquid clustering tradeoffs.",
+    "a": "Physical partitioning by a low-cardinality column (e.g., event_date) limits how many files a query must open; partition pruning is free when the predicate matches. But over-partitioning on high-cardinality columns (user_id, session_id) creates millions of tiny files — the 'small file problem' — which crushes NameNode and driver memory. For multi-dimensional filtering (event_date + country + event_type) layer Z-ordering via OPTIMIZE ZORDER BY (country, event_type) within each date partition: Z-order co-locates rows with similar multi-column values into fewer files, shrinking data skipped by the reader. Delta Lake 3.x Liquid Clustering (CLUSTER BY) is a cleaner alternative: it is incremental (no full re-write on ALTER), automatically reorganizes newly inserted data, and handles skewed distributions better than fixed partition columns. The tradeoff is that liquid clustering requires DBR 14+ or OSS Delta 3.1+ and gives less control over file layout for teams with bespoke read patterns. Choose physical date partitioning + Z-order for cross-cloud portability and explicitness; choose liquid clustering for a pure Databricks stack where writer convenience outweighs layout control.",
+    "fs": "Date-partition for pruning, Z-order for multi-dimensional filtering within partitions; liquid clustering if on Delta 3+ and writer simplicity matters more.",
+    "fj": "Partitioning on a high-cardinality column and creating millions of tiny files, negating all IO benefits.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you detect and fix the small-file problem after a production pipeline has already created it?",
+        "a": "Detect with `DESCRIBE DETAIL <table>` (numFiles, sizeInBytes) or by querying `_delta_log` transaction history for per-file sizes. Fix by running `OPTIMIZE <table>` (or `OPTIMIZE ZORDER BY (...)` to combine compaction and clustering in one pass). Schedule OPTIMIZE as a periodic job — Databricks recommends daily or after every 10 writes. Also enable Auto Optimize (`delta.autoOptimize.optimizeWrite = true`) so the writer coalesces small task outputs before committing."
+      },
+      {
+        "q": "What happens to partition pruning when a query uses a non-equality predicate on the partition column, like event_date BETWEEN '2026-01-01' AND '2026-01-07'?",
+        "a": "Spark's file-listing layer still evaluates the range against the partition directory names and prunes partitions outside the range. BETWEEN on a date partition column works correctly and efficiently — Spark will open only the 7 date directories. The caveat is that the partition column must be in the WHERE clause; if it is buried in a subquery or derived expression Spark may not see it as a filter at all."
+      }
+    ]
+  },
+  {
+    "q": "How do you approach data skew when a groupBy or join creates a handful of enormous tasks that stall the entire stage?",
+    "a": "Skew is the condition where a small number of keys account for a disproportionate share of rows, leaving most executors idle while one slow task sets the stage completion time. Diagnosis: Spark UI → stage tasks → sort by 'Duration' or 'Shuffle Read Size'; a skewed task is typically 10-100× larger than the median. Remediation toolbox: (1) Salting the join key — append a random integer (0 to N-1) to the skewed side and explode N copies of the small side, distributing the hot key across N tasks. (2) Adaptive Query Execution (AQE) skew join optimization (spark.sql.adaptive.skewJoin.enabled = true, default true in Spark 3+) automatically splits skewed partitions mid-query without code changes; tune spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes. (3) Broadcast the small side entirely if it fits in memory — the skewed large side never moves. (4) Isolate null keys: null-keyed rows often explode a join; filter nulls into a separate path and union results. The Staff-level responsibility is to encode which technique applies to which skew pattern in team runbooks, and to wire AQE settings into the cluster's default config so junior engineers get automatic mitigation.",
+    "fs": "Salt hot keys or rely on AQE skew-join splitting; always confirm with task duration histogram in Spark UI before and after.",
+    "fj": "Increasing executor memory or adding cores instead of fixing the key distribution, which only defers the OOM.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Salt a skewed join key",
+        "lang": "pyspark",
+        "lines": [
+          "from pyspark.sql.functions import (",
+          "    col, expr, explode, array, lit, concat_ws",
+          ")",
+          "N = 20  # salt factor",
+          "",
+          "# Skewed large side: append random salt",
+          "big_salted = big.withColumn(",
+          "    'salt_key',",
+          "    concat_ws('_', col('join_key'),",
+          "              (expr('rand()') * N).cast('int'))",
+          ")",
+          "",
+          "# Small side: replicate N times",
+          "small_exp = small.withColumn(",
+          "    '_salt', explode(array([lit(i) for i in range(N)]))",
+          ").withColumn(",
+          "    'salt_key',",
+          "    concat_ws('_', col('join_key'), col('_salt'))",
+          ").drop('_salt')",
+          "",
+          "big_salted.join(small_exp, 'salt_key').drop('salt_key')"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "AQE skew join is on by default — when would you disable it or tune it?",
+        "a": "AQE adds a query planning stage after shuffle materialization; if the query runs in milliseconds the overhead is disproportionate. Also, AQE's statistics are per-stage, so it cannot fix skew in the first shuffle of a pipeline (before any materialization). In those cases pre-salt or broadcast. Tune `skewedPartitionFactor` and `skewedPartitionThresholdInBytes` when default thresholds are too sensitive (too many splits on moderately uneven data) or too coarse (missing real skew)."
+      }
+    ]
+  },
+  {
+    "q": "Design a CI/CD pipeline for a suite of 40 PySpark ETL jobs: how do you test them fast without a full cluster, and what gates block a bad deploy?",
+    "a": "A PySpark CI pipeline has three tiers: (1) Local unit tests using pytest + a local SparkSession (master='local[2]'). These run in 10–30 s on a laptop or CI runner, test transformation logic with fabricated DataFrames, and have no cluster dependency. Use conftest.py to share a module-scope SparkSession. (2) Integration tests on a small ephemeral cluster (Databricks job cluster, EMR spot fleet, or Docker Spark) that validate schema contracts, partitioning, and Delta Lake operations on a realistic sample (e.g., 1% of prod data). Gate the PR merge on these passing. (3) Production smoke tests after deploy: run a canary job on yesterday's data partition and compare row counts and null rates to a baseline. Block promotion if counts drift > 5% or a configured SLO (e.g., p99 duration) is breached. Key CI gates: schema compatibility check (if schema changes, require explicit migration), data quality assertions (Great Expectations or custom count/null checks), and cost estimation (log estimated shuffle bytes from the dry-run explain plan vs. a p95 baseline). On the infrastructure side, pin Spark version in pyproject.toml or requirements.txt and run in Docker to guarantee local-CI-prod parity.",
+    "fs": "Three tiers: local pytest (seconds), ephemeral cluster integration (minutes), canary smoke on prod slice (blocks bad deploy).",
+    "fj": "Only testing in production or relying on ad-hoc notebooks with no repeatable assertions.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Shared SparkSession for pytest",
+        "lang": "python",
+        "lines": [
+          "# conftest.py",
+          "import pytest",
+          "from pyspark.sql import SparkSession",
+          "",
+          "@pytest.fixture(scope='module')",
+          "def spark():",
+          "    return (",
+          "        SparkSession.builder",
+          "        .master('local[2]')",
+          "        .config('spark.sql.shuffle.partitions', '4')",
+          "        .getOrCreate()",
+          "    )",
+          "",
+          "# test_transform.py",
+          "def test_dedup(spark):",
+          "    df = spark.createDataFrame([",
+          "        (1, 'a'), (1, 'a'), (2, 'b')], ['id', 'val'])",
+          "    out = deduplicate(df)",
+          "    assert out.count() == 2"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you keep local test SparkSessions fast when the suite grows to hundreds of tests?",
+        "a": "Use a module-scoped or session-scoped fixture to reuse one SparkSession across all tests — SparkSession startup takes 3–8 s and dominates a fast test suite. Set `spark.sql.shuffle.partitions=4` and `spark.ui.enabled=false` to minimize overhead. Separate integration tests that need a real cluster into a separate pytest mark (`@pytest.mark.integration`) and skip them locally with `-m 'not integration'`."
+      },
+      {
+        "q": "What does a schema compatibility gate look like in practice?",
+        "a": "After each PR, compare the new job's output schema (captured from explain or a dry-run write to a test Delta table) against the registered schema in your data catalog (Unity Catalog, Glue, or a schema registry). If a column is dropped or a type is narrowed (e.g., LongType → IntegerType), fail the CI build and require an explicit `ALTER TABLE` migration with an owner sign-off. Additive changes (new nullable columns) are allowed without manual review. This mirrors the schema evolution contract Delta Lake enforces at runtime but catches it cheaply in CI."
+      }
+    ]
+  },
+  {
+    "q": "How do you model and control Spark compute cost in a platform shared across 20 teams, and what levers prevent runaway spending?",
+    "a": "Cost in a shared Spark platform has four levers: cluster configuration, job duration, data scanned, and idle time. Staff-level ownership means setting guardrails at all four. (1) Cluster configuration: enforce instance type policies via cluster policies (Databricks) or EMR managed scaling with maximum vCPU caps per team. Spot instances for batch jobs save 60–80% but require retry logic for spot reclamations. (2) Job duration: enforce SLO budgets — if a job exceeds its p95 baseline by 2× without an approved exception, it is automatically terminated. (3) Data scanned: mandate partition pruning and column projection in all production jobs; run a linter that parses the explain plan for full-table scans and fails the PR. (4) Idle time: auto-terminate clusters after 10 minutes idle; prohibit persistent all-purpose clusters for production ETL (use job clusters that spin up and down per run). Chargeback via tagging (team tag on each cluster) + cost explorer queries gives each team visibility into their spend and drives self-governance. In practice the highest-leverage intervention is the explain-plan linter: most accidental cost comes from missing partition filters that cause full-table scans on multi-TB tables.",
+    "fs": "Cluster policies + idle auto-termination + explain-plan linter for full-table scans = the three highest-leverage cost levers.",
+    "fj": "Treating cost as an ops problem rather than an engineering standard — no team-level visibility means no incentive to optimize.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle a team that legitimately needs a large cluster for a monthly full-reprocess job?",
+        "a": "Create a named exception workflow: the team submits a cost estimate (expected DBU or node-hours, expected data scanned, expected duration), an on-call engineer approves it, and the job runs with an automatic cost cap (terminate if spend exceeds approved budget × 1.2). This keeps the fast path cheap while giving teams an escape hatch. Track exception frequency — if the same team files monthly exceptions the permanent solution is optimizing their job, not perpetually approving exceptions."
+      }
+    ]
+  },
+  {
+    "q": "When should a team build a custom PySpark streaming micro-batch pipeline versus buying a managed CDC/ELT tool like Fivetran or Airbyte?",
+    "a": "The build-vs-buy decision for streaming data movement has three axes: complexity of transformation, source/sink support, and operational burden. Managed tools (Fivetran, Airbyte, dlt) win when the use case is standard connector-to-warehouse replication with no custom transformation: they handle schema drift, incremental sync, CDC via log-based replication, and retry logic out of the box, and their per-row cost is often lower than the engineer-hours to maintain a custom Spark job. PySpark Structured Streaming wins when: (a) the transformation is non-trivial (windowed aggregations, stateful deduplication, ML feature computation), (b) the source is not covered by managed connectors (proprietary Kafka topic with custom Avro schemas), (c) the team already operates a Spark platform and marginal cost of another streaming job is near zero, or (d) latency SLOs require sub-second processing that managed batch-based tools cannot meet. The anti-pattern is choosing Spark because the team knows Spark, then spending months debugging Kafka source offset management and watermark tuning that Fivetran would have handled automatically. Staff engineers should document a decision matrix for their org and revisit it annually as the managed-tool ecosystem expands.",
+    "fs": "Use managed tools for standard replication; PySpark Streaming for non-trivial stateful transformation, exotic sources, or sub-second SLOs.",
+    "fj": "Defaulting to Spark because it is familiar, then owning operational complexity that a managed tool would handle for less cost.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you evaluate a managed ELT tool's reliability for a 99.9%-SLO pipeline before committing?",
+        "a": "Run a 30-day pilot on a non-critical source. Measure: sync success rate (look for undocumented retries that inflate apparent reliability), schema drift handling (does it silently drop new columns?), support response time for connector bugs, and row count reconciliation against the source. Check the vendor's status page history. For high-stakes pipelines, negotiate SLAs and understand exactly what the vendor's 'best effort' retry means in SLA documents."
+      }
+    ]
+  },
+  {
+    "q": "As a Principal engineer, how do you decide whether your organization's batch compute strategy should center on PySpark or migrate toward Snowpark, DuckDB-on-lambda, or another engine over the next 3 years?",
+    "a": "A multi-year compute strategy decision requires separating four concerns: (1) Workload fit. PySpark dominates large-scale shuffle-heavy ETL (>100 GB per job), ML feature pipelines, and streaming. Snowpark fits well if most workloads already live in Snowflake and are medium-scale SQL + Python transforms where the ops overhead of a separate cluster is a liability. DuckDB (and Arrow-native engines like Polars) are winning for analyst-scale in-process queries (<100 GB) on local or single-node cloud, offering 10–50× faster iteration speed than Spark for that tier. (2) Ecosystem lock-in. Spark is open-source and cloud-agnostic; Snowpark ties you to Snowflake pricing. Evaluate the total cost of ownership over 3 years assuming 20% annual data growth. (3) Talent. Migrating a team fluent in PySpark to Snowpark is a 6–12 month productivity hit. Only worth it if Snowflake consolidation saves more than that in infra cost. (4) Operational complexity. A heterogeneous compute landscape (Spark + Snowpark + DuckDB) is expensive to support. The Principal's job is to draw a clear capability line: PySpark for heavy batch/streaming, Snowpark or dbt-on-Snowflake for analyst transforms, DuckDB for notebooks. Avoid the trap of adopting new engines because they benchmark well in blog posts — benchmark on your actual workloads with your actual team operating them.",
+    "fs": "Separate workload fit, lock-in risk, talent cost, and ops complexity; draw a clear engine-capability line rather than standardizing on one tool for all scales.",
+    "fj": "Choosing a new engine based on vendor benchmarks rather than benchmarking actual org workloads at realistic scale with realistic ops burden.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you convince a VP of Engineering to fund a 12-month Spark→Snowpark migration when ROI is uncertain?",
+        "a": "Don't. A 12-month full migration with uncertain ROI fails the bar. Instead propose a 2-month pilot: migrate the 3 cheapest-to-port high-cost jobs, measure actual DBU vs Snowflake credit cost, and measure engineer productivity. If the pilot shows >30% cost reduction and acceptable productivity, present those numbers to fund phase 2. If it doesn't, you've spent 2 months and preserved optionality. Principals present options with data, not migrations with conviction."
+      },
+      {
+        "q": "What signals in a quarterly infrastructure review would cause you to revisit the PySpark-first decision?",
+        "a": "Three signals: (1) Spark cluster cost growing faster than data volume (suggests inefficiency or wrong-tool-for-workload), (2) median job size dropping below 10 GB as data products proliferate (DuckDB or pandas may now dominate), (3) new hires consistently struggling with Spark's operational model (talent cost is real cost). Review the engine decision annually against these metrics, not just when a new tool gets press."
+      }
+    ]
+  },
+  {
+    "q": "How do you design and govern a multi-team PySpark platform to ensure data reliability, schema contracts, and SLO compliance at org scale?",
+    "a": "At org scale, a PySpark platform is a product, not shared infra. It needs four governance layers. (1) Schema contracts and catalog: all output schemas are registered in Unity Catalog (or Glue + a schema registry). Breaking changes require a migration review board sign-off. Additive changes are auto-approved. A nightly job validates that all registered schemas match actual Delta table schemas and pages on-call if they diverge. (2) SLO framework: each pipeline has a declared p95 duration SLO and a row-count SLO (± N% of trailing 7-day median). A central monitoring job (itself a Spark job) reads pipeline run metadata from the job orchestrator API and publishes SLO breach metrics to a shared Datadog dashboard. Teams own their SLO breaches; the platform team owns the monitoring infrastructure. (3) Cost attribution: every cluster run is tagged with team, pipeline, and environment. Monthly chargeback reports go to engineering managers. The platform team sets a per-team quota; teams that breach quota get a 'cost review' before their next cluster request is approved. (4) Change management: all production cluster config changes go through Terraform + PR review. Spark version upgrades are tested on a canary 10% of jobs for 2 weeks before full rollout. This architecture makes the platform team a force-multiplier rather than a bottleneck: standards are encoded in policy, not in the platform team's approval queue.",
+    "fs": "Schema catalog + SLO framework + cost attribution + Terraform-managed infra = a platform that scales without the platform team becoming a bottleneck.",
+    "fj": "Treating platform governance as a process (tickets, approvals) rather than code (policies, automated checks), which doesn't scale past 5 teams.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle a team that repeatedly breaks SLOs because their upstream data is late, not because of their own code?",
+        "a": "Separate input SLOs from output SLOs in the framework. The pipeline's output SLO is conditioned on input data arriving within its declared SLA. If upstream is late, the pipeline's SLO clock pauses. This requires the orchestrator to record input-data-arrival timestamps (e.g., Delta log commit time) and the SLO framework to join that against pipeline start time. Teams are then accountable for their own code quality but not for upstream latency they don't control. Surface both metrics on the shared dashboard so upstream teams see their downstream impact."
+      }
+    ]
+  },
+  {
+    "q": "Describe how you would architect an org-wide lineage and observability system for PySpark pipelines that spans 200+ jobs and surfaces impact radius for any schema change.",
+    "a": "At 200+ jobs, manual lineage tracking is untenable. The architecture has three tiers. (1) Passive lineage capture: integrate OpenLineage (open standard) with the Spark execution engine via the OpenLineage Spark listener (one JAR on the classpath, zero code change to jobs). Every job emits START/COMPLETE/FAIL events with input datasets, output datasets, and schema at the time of run. Events flow to a lineage backend (Marquez OSS, or DataHub, or the Databricks Unity Catalog lineage API). This gives column-level lineage for free for native Spark SQL; custom UDF outputs require manual OpenLineage facets. (2) Impact analysis: on top of the lineage graph, build an impact API — given a dataset + column, return all downstream jobs and their SLO owners. This is the tool the data governance team uses before approving a breaking schema change: run impact analysis, page every downstream owner, get sign-offs. (3) Observability layer: marry lineage with runtime metrics (job duration, rows written, null rates) to produce a 'pipeline health score' per dataset. Alert when a dataset's health score drops (fewer rows than expected, new nulls in a key column, job runtime exceeds p95 SLO). The Principal's contribution is making this system a standard — every new job onboards via a template that includes the OpenLineage listener, not an optional add-on.",
+    "fs": "OpenLineage listener for passive zero-code lineage capture + impact API for change management + observability metrics per dataset = scalable governance.",
+    "fj": "Building a custom lineage scraper that parses SQL strings — fragile, misses DataFrame API jobs, and breaks on every Spark upgrade.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "OpenLineage captures table-level lineage reliably, but column-level lineage is incomplete for DataFrame API jobs. How do you close that gap?",
+        "a": "For Spark SQL (string queries), Catalyst resolves column references and OpenLineage's Spark integration can extract column-level lineage from the analyzed plan. For DataFrame API jobs, column lineage is harder because Column objects are built programmatically. The pragmatic approach: require teams to document column-level contracts in a machine-readable schema annotations file (a YAML sidecar) that the lineage system ingests as a fallback. For the highest-criticality datasets, enforce a test that the job's output schema matches the declared annotation — this doubles as a regression guard and a lineage input."
+      }
+    ]
   }
 ]

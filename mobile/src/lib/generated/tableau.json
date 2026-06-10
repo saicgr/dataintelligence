@@ -766,5 +766,349 @@
         "a": "Server adds VizQL/cache, concurrency, and network factors that Desktop can't reproduce, so a dashboard fast locally may stall under multi-user load or cold caches. Server performance recording (enabled per workbook via a URL parameter) captures those real-world events. Always validate on the platform users actually hit, not just on the author's machine."
       }
     ]
+  },
+  {
+    "q": "How does Tableau's row-level security work, and what are the three main implementation patterns?",
+    "a": "Row-level security (RLS) in Tableau restricts which data rows a viewer can see without publishing separate workbooks per user. The three main patterns are: (1) User filters — a calculated field like `[Region] = USERNAME()` or a lookup against an entitlements table using CONTAINS/IN, placed on the data source filter layer so it cannot be removed by the viewer; (2) Data source filters on a published data source, locked and applied before anyone accesses it; (3) VizQL-level virtual connection row policies (Tableau Cloud/Server 2022.1+) or Tableau's native Row-Level Security feature, where you define policy tables on the server that the VizQL server enforces at query time, decoupled from any individual workbook. The entitlements-table pattern scales best for orgs with hundreds of users because you manage a single policy table rather than per-workbook user filters.",
+    "fs": "RLS via user-filter calcs (simplest), locked data source filters, or server-side row policies (scalable); entitlements tables beat hardcoded USERNAME() logic at scale.",
+    "fj": "Says 'just filter by username in the calc' without knowing it can be bypassed by a downstream connected app or by downloading the extract.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Entitlements-table RLS calc",
+        "lang": "sql",
+        "lines": [
+          "// Blends or joins an entitlements table on EMAIL()",
+          "CONTAINS(",
+          "  ATTR([Entitlements].[Allowed Regions]),",
+          "  [Region]",
+          ")"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the security risk of relying on a workbook-level user filter on a published extract?",
+        "a": "A viewer with 'Download Data' or 'Download Workbook' permission can pull the full extract, including rows the user filter hides. True RLS requires the filter to live on the data source level with download disabled, or use server-side row policies that enforce at the VizQL query layer before data ever reaches the client. Workbook user filters are a convenience, not a compliance boundary."
+      },
+      {
+        "q": "How do virtual connection row policies differ from a data source filter for RLS?",
+        "a": "A data source filter is a static expression embedded in the published data source; changing it requires republishing. A row policy on a virtual connection is defined in the server's Tableau Catalog metadata layer and applies to every data source and workbook that connects through that virtual connection, with no republish needed. Policies also support USERNAME()/USERATTRIBUTE() dynamically and are managed centrally by a data steward, not buried inside a workbook."
+      },
+      {
+        "q": "How does initial SQL interact with RLS on a live connection?",
+        "a": "Initial SQL runs once per session as the connection opens, before any query. You can use it to SET a session variable (e.g., in Snowflake or BigQuery) that the warehouse then uses in row-access policies, pushing enforcement into the database layer and removing it from Tableau entirely. This is the most robust pattern for regulated data: the warehouse enforces, Tableau just passes the token."
+      }
+    ]
+  },
+  {
+    "q": "Walk through a FIXED LOD cohort retention calculation — first purchase month and subsequent months.",
+    "a": "The classic pattern uses two nested LODs. First, find each customer's cohort (first purchase month): `{ FIXED [Customer ID] : MIN([Order Date (Month/Year)]) }` — call it [Cohort Month]. Second, place [Cohort Month] and [Order Date (Month/Year)] in the view, compute months since cohort as `DATEDIFF('month', [Cohort Month], [Order Date (Month/Year)])` — this is the period offset. Third, count distinct customers active in each cohort×period cell using `COUNTD([Customer ID])`. Finally, for retention rate, divide by cohort size: `{ FIXED [Cohort Month] : COUNTD([Customer ID]) }`. Because [Cohort Month] is a FIXED that ignores the view's date dimension, the denominator stays stable as you slice by period. This is the textbook use case for FIXED — a stable denominator at a grain finer than the leftmost view dimension.",
+    "fs": "Cohort = FIXED MIN(date) per customer; retention rate = COUNTD at the cell divided by FIXED COUNTD per cohort month.",
+    "fj": "Tries to compute cohort size with a table calc, which resets within the view instead of pinning to the cohort grain.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Cohort month per customer",
+        "lang": "sql",
+        "lines": [
+          "{ FIXED [Customer ID] :",
+          "  MIN([Order Date]) }"
+        ]
+      },
+      {
+        "label": "Cohort size (stable denominator)",
+        "lang": "sql",
+        "lines": [
+          "{ FIXED [Cohort Month] :",
+          "  COUNTD([Customer ID]) }"
+        ]
+      },
+      {
+        "label": "Retention rate",
+        "lang": "sql",
+        "lines": [
+          "COUNTD([Customer ID])",
+          "/ ATTR([Cohort Size])"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why must [Cohort Month] be a discrete (blue) date pill on rows, not continuous?",
+        "a": "A discrete date creates a header per distinct cohort, so each row is one cohort band and the FIXED denominator correctly aligns per row. A continuous date axis blends cohorts into a single time line and the FIXED denominator becomes ambiguous across the blended axis. Cohort charts are always a crosstab-style discrete setup."
+      },
+      {
+        "q": "How would you add a 'months since cohort' axis without hard-coding month numbers?",
+        "a": "Compute `DATEDIFF('month', [Cohort Month], [Order Date (Month/Year)])` as a calculated field and put it as a discrete pill on Columns. Tableau generates one column per integer offset (0 = cohort month, 1 = one month later, etc.) and the number of columns grows with your data, so the view is self-scaling as more periods accumulate."
+      },
+      {
+        "q": "What filter-of-operations trap appears on this cohort view when you add a date range slicer?",
+        "a": "A dimension date filter shrinks the data FIXED LODs see only if promoted to context. Without context, the FIXED cohort-size denominator counts all customers in the data, not just those in the filtered window, so retention rates look artificially low. Promote the date range to a context filter so the cohort-size FIXED is scoped to the filtered population."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a parameter-driven metric swap with year-over-year comparison in one view?",
+    "a": "Create a string parameter p_Metric (Sales, Profit, Units). Write a 'Selected Metric' calc using CASE. Write a 'Prior Year' calc: `LOOKUP(SUM([Selected Metric]), -1)` with addressing on Year of Order Date. Write a 'YoY Delta %' calc: `(SUM([Selected Metric]) - [Prior Year]) / ABS([Prior Year])`. Place Year on Columns (discrete), [Selected Metric] and [YoY Delta %] on dual axis, synchronize if same units. Expose p_Metric as a UI control. The CASE calc centralizes the metric; LOOKUP lets you reference the prior-year mark without knowing the data's date range. This pattern is how senior authors build reusable analytics templates: one view, multiple metrics, one YoY formula.",
+    "fs": "CASE calc drives the metric from the parameter; LOOKUP(-1) on Year addressing pulls the prior-year value; dual axis shows level + delta together.",
+    "fj": "Builds a separate sheet for each metric and a different YoY calc per metric, producing six views that drift out of sync.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Metric selector",
+        "lang": "sql",
+        "lines": [
+          "CASE [p_Metric]",
+          "  WHEN 'Sales'  THEN SUM([Sales])",
+          "  WHEN 'Profit' THEN SUM([Profit])",
+          "  WHEN 'Units'  THEN SUM([Quantity])",
+          "END"
+        ]
+      },
+      {
+        "label": "Prior year via LOOKUP",
+        "lang": "sql",
+        "lines": [
+          "LOOKUP(SUM([Selected Metric]), -1)",
+          "// Compute Using: Year of Order Date"
+        ]
+      },
+      {
+        "label": "YoY %",
+        "lang": "sql",
+        "lines": [
+          "( SUM([Selected Metric]) - [Prior Year] )",
+          "/ ABS([Prior Year])"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why use LOOKUP(-1) instead of a FIXED LOD for the prior-year value?",
+        "a": "LOOKUP is a table calc that steps one mark backward along the addressing dimension (Year), making no assumption about the number of years or their values. A FIXED would need you to hard-code or parameterize the prior year, and it can't step relatively. When years are on Columns as discrete marks, LOOKUP(-1) is the clean way to reference 'the mark one step behind.'"
+      },
+      {
+        "q": "What breaks on the YoY calc for the earliest year in the view?",
+        "a": "LOOKUP(-1) on the first year returns null because there is no prior mark, so the delta shows null and the percent formula fails. Handle it with `ZN(LOOKUP(SUM([Selected Metric]), -1))` or `ISNULL(LOOKUP(...))` to blank or zero out the first-year delta gracefully. You can also hide the null mark with a filter or just leave it — but explicitly accounting for it is what separates a polished view from an accidental error cell."
+      },
+      {
+        "q": "How do you make the p_Metric parameter also update the view's axis title automatically?",
+        "a": "Reference the parameter in the sheet's Title or Axis Alias: insert `<Parameters.p_Metric>` in the axis edit dialog so it reads 'Sales' or 'Profit' as the user switches. For the axis label on a dual axis, edit each axis alias separately and include the parameter reference. Dynamic titles are the no-maintenance alternative to manually relabeling."
+      }
+    ]
+  },
+  {
+    "q": "How do you tune a Tableau extract for both query speed and refresh cost at scale?",
+    "a": "Tuning an extract is a four-lever problem: (1) Filter aggressively at the extract level — date ranges, active-record flags, non-null keys — to shrink the row count before Hyper ever sees the data. (2) Aggregate where possible: if the workbook only needs daily totals, pre-aggregate to the day in a custom SQL or initial SQL before extracting, collapsing millions of raw events into thousands of rows. (3) Hide unused fields before extract creation, which tells the Hyper engine to omit those columns from the columnar store, shrinking the file and scan width. (4) Use incremental refresh keyed to an append-only monotonic column (event_time, id) so only new rows are added nightly, with a weekly full refresh to catch updates and deletes. For extra-large sources, partition the extract logic by pushing date windows via parameters into the source query, refreshing slices rather than the whole table.",
+    "fs": "Filter early, pre-aggregate when possible, hide unused columns, and use incremental refresh on a monotonic key to minimize both file size and refresh cost.",
+    "fj": "Extracts the full table without filters, then wonders why refreshes are slow and the file is 50 GB.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "When does a pre-aggregated extract break a workbook and how do you detect it?",
+        "a": "If the workbook has a sheet that needs row-level detail — like a record-level tooltip, a granular scatter, or a join to a detail table — pre-aggregating the extract destroys that grain and the sheet either errors or shows wrong numbers. Detect it by opening the data source and checking whether the lowest-granularity dimension still has multiple rows per intended record. Only pre-aggregate when every sheet works at the aggregate grain."
+      },
+      {
+        "q": "How do you validate incremental refresh isn't silently missing updates to existing rows?",
+        "a": "Compare a key metric from a full-refresh extract vs the incremental one on historical data: pick a month known to have had corrections and check whether they appear. Schedule periodic full refreshes (weekly or monthly) as a safety net, and alert on result divergence. Incremental refresh guarantees new rows; it makes no promise about mutations to existing rows."
+      },
+      {
+        "q": "What is the Hyper API's role in a custom extract pipeline, and when would you use it over Tableau Bridge?",
+        "a": "The Hyper API lets you programmatically build, update, and publish `.hyper` files from any Python/Java process — no Desktop or Bridge needed. Use it when the source is not a standard JDBC/ODBC target (an internal REST API, a custom ML pipeline output, a Kafka consumer), or when you need fine-grained incremental logic beyond Tableau's built-in scheduler. Bridge is simpler but requires a Desktop-based connector and scheduler; the Hyper API is for custom ETL into Tableau."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern Tableau Server/Cloud content at scale — projects, permissions, and certification?",
+    "a": "Governance at scale rests on four pillars. First, project hierarchy: create a locked top-level folder structure aligned to business domains (Finance, Marketing, Ops) with nested sub-projects, and set projects to 'Locked' so permissions inherit from the parent, preventing per-workbook permission sprawl. Second, permission roles: use site roles (Creator, Explorer, Viewer) as coarse access gates and project-level group permissions as the fine gate — never grant permissions to individual users; always to AD/SAML groups. Third, certification: publish a workbook as 'Certified' via the Admin Insights or API to signal it passed data quality review; pair with a description field and an owning team so consumers know who to contact and when it was last validated. Fourth, a deprecation process: mark stale workbooks with a 'Deprecated — do not use' label, archive them to a hidden project, and eventually delete with a 30-day tombstone period.",
+    "fs": "Locked project hierarchy + group-based permissions + certified badge + deprecation process = scalable content governance.",
+    "fj": "Sets permissions on individual workbooks for each user, producing an unmanageable ACL mess within months.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is Admin Insights and how does it help governance?",
+        "a": "Admin Insights is a Tableau-published data source on Tableau Cloud (and available on Server via the REST API) that surfaces usage telemetry — which views were accessed, by whom, when, and how often. You build dashboards on it to find stale content (never accessed in 90 days), identify power users, and track certification adoption. It's the observability layer for a Tableau deployment, turning governance into a data problem you solve with Tableau itself."
+      },
+      {
+        "q": "How do you prevent content sprawl when 400 analysts can all publish to the site?",
+        "a": "Gate publishing: only Creators can publish, and Explorer roles can only view and interact. Set project defaults to 'move to project' on publish so new content lands in a 'Sandbox' project for review. Build a weekly admin workflow that reviews Sandbox, promotes blessed content to certified projects, and archives the rest. Without this gate the site fills with one-off analyses that nobody governs."
+      },
+      {
+        "q": "When would you use Tableau Catalog's lineage view as a governance tool?",
+        "a": "Catalog (part of Data Management) traces the upstream lineage from a Tableau view back through its published data source to the original database table and column. When a warehouse column is deprecated or renamed, Catalog tells you which downstream workbooks are affected before you break them. It also surfaces downstream impact for RLS policy changes and extract schema edits, making it indispensable for safe warehouse evolution."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a Tableau extract strategy for a 500-analyst org with mixed SLAs?",
+    "a": "Segment content by freshness requirement into three tiers. Tier 1 (executive dashboards, SLA < 1 hr): live connections to a fast columnar warehouse (Snowflake, BigQuery) with query acceleration; no extract needed. Tier 2 (daily operational dashboards): nightly incremental extract refreshes of pre-aggregated data sources, published to a shared certified project; analysts use these rather than spawning new connections. Tier 3 (ad-hoc analytics): Creators connect directly and may publish personal extracts to a Sandbox project, with automatic expiry after 90 days. Enforce via a centralized Virtual Connections layer so all connections go through governed definitions, and route refresh schedules through Tableau Bridge or the REST API to avoid overloading the source at peak times via staggered scheduling windows.",
+    "fs": "Three-tier freshness segmentation (live / nightly extract / ad-hoc Sandbox) + Virtual Connections + staggered refresh windows to prevent source overload.",
+    "fj": "Lets every analyst publish their own extract of the same source table, creating hundreds of redundant extract copies with no refresh governance.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is a Virtual Connection and how does it reduce source connection sprawl?",
+        "a": "A Virtual Connection (Tableau Data Management) is a server-managed, sharable connection that centralizes credentials, row policies, and column-level security in one place. Analysts connect to the virtual connection instead of directly to the database, so credential rotation, RLS policy updates, and driver upgrades happen once centrally. Without it, 500 analysts each embed their own credentials and connection strings, making secret rotation a multi-week manual project."
+      },
+      {
+        "q": "How do you prevent extract refresh storms from overwhelming the source warehouse?",
+        "a": "Stagger refresh schedules: identify the source table, find all extracts using it via Catalog lineage, and assign refresh windows in 15-minute offsets so they don't all hit the warehouse at 2 AM. Use Tableau's REST API to programmatically set and audit refresh schedules. For high-priority live dashboards, enforce query resource groups or quotas on the warehouse side so extract jobs don't contend with interactive queries."
+      },
+      {
+        "q": "When should you invest in Tableau Prep Builder pipelines versus letting analysts do their own data prep?",
+        "a": "Invest in Prep when the same transformation appears in multiple published data sources (DRY principle), when the transformation requires joins across many tables that Tableau's query model handles poorly (e.g., multi-level fan-out joins), or when data quality cleansing is a governance requirement before anyone uses the data. Ad-hoc analyst prep is fine for exploration; Prep Flows are for shared, certified data products that all downstream workbooks should depend on."
+      }
+    ]
+  },
+  {
+    "q": "How do you structure a Tableau Server/Cloud build-vs-buy-vs-migrate decision when an org already has Power BI or Looker?",
+    "a": "Frame it as a four-dimension matrix. (1) User profile fit: Tableau's ad-hoc visual analytics and LOD power favor analysts who explore data; Looker's semantic layer and LookML favor engineering-driven, governed metric definitions; Power BI's Microsoft ecosystem integration favors orgs already on Azure/Teams/Fabric. (2) Total cost of ownership: Tableau Cloud/Server licensing is per-Creator seat (high for large analyst counts), Power BI Pro is per-user but cheap within M365, Looker is enterprise-quoted. (3) Technical debt: migrating 1,000 workbooks is a 12-24 month effort — calculate the migration cost against licensing savings and only migrate if the savings clear in < 3 years. (4) Governance fit: if the org's data model lives in dbt or a semantic layer (dbt Semantic Layer, Cube), Looker or Power BI's native model-binding wins; if analysts need freeform visual exploration, Tableau wins. Present the matrix to leadership with a pilot-cohort recommendation before committing to a platform switch.",
+    "fs": "Score on user-profile fit, TCO, migration cost, and governance model fit; pilot before committing; don't flip platforms unless savings clear in < 3 years.",
+    "fj": "Recommends migrating away from Tableau to save on licensing without counting migration labor, which usually exceeds the savings.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is the role of an embedded analytics strategy in this build-vs-buy decision?",
+        "a": "If the org needs to embed BI inside a customer-facing product (SaaS, portal), Tableau Embedded (formerly Tableau Embedded Analytics) and Looker Embedded are both options, but Looker's API-first model tends to be easier to white-label, while Tableau Embedded requires a Tableau Online site and per-viewer licensing which can be cost-prohibitive at scale. Power BI Embedded uses Azure capacity units. The embedded use case often tips the decision independently of internal BI fit."
+      },
+      {
+        "q": "How do you evaluate the risk of a parallel-run migration versus a big-bang cutover?",
+        "a": "Parallel run (both platforms live for 6+ months) is lower risk because users have a fallback, and you can run number parity checks between old and new. But it doubles licensing cost and creates confusion over which platform is authoritative. Big-bang cutover is cheaper but requires rock-solid number validation and retraining before the cutover date. For high-stakes finance or compliance dashboards, always parallel run; for departmental ad-hoc content, big-bang is acceptable."
+      },
+      {
+        "q": "How does the dbt Semantic Layer change the Tableau vs Looker calculus?",
+        "a": "The dbt Semantic Layer (MetricFlow) exposes consistent metric definitions that can be queried by any BI tool. With it, the argument that Looker's LookML gives superior metric governance weakens because dbt is now the semantic layer and Tableau can consume it directly via a connector. Orgs already investing in dbt and wanting visual exploration flexibility can keep Tableau and drop the Looker-for-governance argument. The calculus shifts back to user-experience and licensing."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a certified metrics layer in Tableau to prevent metric proliferation?",
+    "a": "A metric proliferation problem — 'which Sales calc is correct?' — needs a three-part solution. First, publish a single certified, locked data source (or Virtual Connection) that contains all canonical metrics as named calculated fields, peer-reviewed and signed off by Finance/Analytics Engineering. No analyst may override or redefine these fields downstream; they must use the certified source. Second, enforce via Tableau Catalog: tag each canonical metric field with a steward and a certification date; Catalog surfaces these tags in connected workbooks so authors see 'Certified by Finance' before they create a duplicate. Third, run a weekly Metadata API query to detect any field named 'Sales', 'Revenue', or similar in workbooks NOT connected to the certified source and alert the owning team to remediate. This turns metric governance from a cultural ask into a detectable, auto-auditable policy.",
+    "fs": "One locked certified data source with peer-reviewed calcs + Catalog field-level certification tags + Metadata API audit of rogue metric fields.",
+    "fj": "Asks analysts to follow a naming convention and hopes for the best, resulting in seven definitions of 'Net Sales' within a year.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does Tableau's Metadata API enable this kind of metric audit?",
+        "a": "The Metadata API (GraphQL) lets you query field names, data types, and data source lineage across all published content on a site. You write a query that returns all calculated fields containing 'Revenue' or 'Sales' in their name or formula across every workbook, then diff against the certified data source's fields. Any hit outside the certified source is a candidate for review. Run it on a schedule and pipe results to Slack or Jira as governance tickets."
+      },
+      {
+        "q": "What organizational change management is needed alongside the technical enforcement?",
+        "a": "Announce a freeze date after which new workbooks must connect to the certified source; give teams a migration window with self-service tooling (a Tableau Prep flow or Python script that reconnects existing workbooks to the new source). Designate metric stewards per domain who own the certified field definitions and have a 48-hour SLA to review proposed new metric additions. Without the human process, the technical gate gets bypassed by 'I'll just add my calc to my published data source.'"
+      },
+      {
+        "q": "How does Tableau Pulse (2024+) change how certified metrics surface to end users?",
+        "a": "Tableau Pulse surfaces AI-generated metric digests to Slack/email based on a Pulse Metrics definition that points to a data source and a set of certified fields. By building Pulse Metrics on top of the certified data source, you make the canonical metric definition the one that appears in every AI-generated notification, creating a pull mechanism — users see certified metrics in their inbox rather than hunting for them. It's a distribution accelerator for the certified layer."
+      }
+    ]
+  },
+  {
+    "q": "How do you manage Tableau Server capacity planning and multi-node topology for enterprise scale?",
+    "a": "Tableau Server splits work across process types: VizQL Server (renders views), Data Server (manages data source connections and caching), Backgrounder (runs refresh and extract jobs), Cache Server (holds query result cache), and the Repository (PostgreSQL metadata store). For capacity planning: (1) Separate Backgrounder nodes from VizQL nodes so extract refresh storms do not starve interactive rendering. (2) Scale VizQL horizontally for high concurrent viewer counts — budget ~2 VizQL processes per node and size nodes for peak concurrent sessions. (3) Put the Repository on its own node (or use an external repository on PostgreSQL for high availability) to prevent metadata I/O from competing with query I/O. (4) Enable hot standby via the Active-Active cluster or use Tableau Cloud to offload this entirely. Tableau's TSM (Tableau Services Manager) CLI is the tool for all topology changes; test topology changes on a staging environment before production.",
+    "fs": "Separate Backgrounder from VizQL nodes, scale VizQL for concurrency, isolate the Repository, and use TSM for topology management.",
+    "fj": "Runs all processes on one server, then can't understand why nightly extract jobs slow down morning dashboards.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How many VizQL Server processes per node is a reasonable starting point and why?",
+        "a": "Tableau recommends starting with 2 VizQL processes per physical or virtual CPU (cores / 2 as a rough guide, capped at 4 per node for most workloads). Each VizQL process handles one session thread at a time, so process count = max concurrent interactive sessions on that node. Over-provisioning VizQL starves cache and data server processes; profile actual concurrent session peaks from Admin Insights before scaling up."
+      },
+      {
+        "q": "What is the impact of enabling the 'Extract Acceleration' feature on extract query performance?",
+        "a": "Extract Acceleration (Tableau Cloud/Server 2022.1+) pre-materializes common aggregations from a `.hyper` extract into optimized structures that VizQL can hit directly, skipping full-column scans for common queries. It's most impactful on large extracts with predictable filter patterns. The trade-off is additional storage and a one-time acceleration compute cost on first enable; disable it for extracts accessed unpredictably."
+      },
+      {
+        "q": "What's the case for migrating from Tableau Server (self-hosted) to Tableau Cloud for a 1,000-user org?",
+        "a": "Tableau Cloud eliminates server infrastructure, patch management, TSM administration, and hardware capacity planning, trading those for a higher per-seat cost. The break-even typically favors Cloud when the org lacks a dedicated Tableau Server admin team or when MTTR on self-hosted incidents exceeds the Cloud SLA. Against: Cloud requires data residency on Salesforce's infrastructure (EU/NA/APAC pods), which can be a compliance blocker, and Bridge is needed for on-premise data sources, adding latency and complexity."
+      }
+    ]
+  },
+  {
+    "q": "How do you structure a Tableau content certification and deprecation workflow at an enterprise with 2,000 published workbooks?",
+    "a": "At 2,000 workbooks, ungoverned content becomes a trust problem: users don't know which dashboards are authoritative. The certification workflow has three stages. First, discovery: run a Metadata API sweep weekly to identify high-traffic workbooks (>50 views/month) that are uncertified, and auto-create Jira tickets for their owners. Second, certification: the owner submits a Certification Request (a form capturing data source lineage, refresh cadence, business owner, known limitations). Analytics Engineering reviews calc correctness and RLS coverage; Business Stakeholders sign off on business logic. On approval, a REST API call promotes the workbook to 'Certified' status with a badge and tags it in Catalog with the review date and owner. Third, deprecation: a scheduled script checks for certified workbooks with 0 views in 90 days and sends a warning email. After 120 days of zero views, the workbook is moved to an 'Archive' project (still accessible but hidden from search). After 180 days it is permanently deleted with a tombstone record in the governance log. Recertification is required every 12 months, or when the underlying data source schema changes (triggered automatically by Catalog impact analysis).",
+    "fs": "Metadata API weekly sweep → owner submission → Analytics Engineering + business sign-off → REST API certification → zero-view deprecation pipeline with 120-day archive window.",
+    "fj": "Marks things 'Certified' manually whenever someone asks, with no audit trail, no expiry, and no recertification trigger when the underlying data changes.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does Tableau Catalog's impact analysis automate the recertification trigger?",
+        "a": "When a database column referenced by a certified workbook is modified or dropped, Catalog's impact analysis surfaces the affected downstream assets (data sources, workbooks, flows). You hook a Catalog webhook or poll the Metadata API for impact warnings, then automatically revoke the Certified badge and create a recertification Jira ticket. This prevents stale certifications persisting after schema changes — the most common cause of certified dashboards showing wrong numbers."
+      },
+      {
+        "q": "What REST API endpoints power the certification and archive automation?",
+        "a": "Use `PUT /api/{version}/sites/{siteId}/workbooks/{workbookId}` with the `certificationNote` and `certified` body fields to toggle certification status programmatically. Use `POST /api/{version}/sites/{siteId}/workbooks/{workbookId}/move` to move workbooks to the Archive project. The Metadata API (GraphQL) powers the usage queries and impact analysis. All three together give you a fully scriptable governance pipeline with no manual Tableau UI steps."
+      },
+      {
+        "q": "How do you prevent certification from becoming a rubber-stamp process that nobody trusts?",
+        "a": "Publish a public 'Certification Health' dashboard showing time-in-review, rejection rates, and recertification compliance per team. When teams see that 40% of submissions are rejected for calc errors, it creates peer pressure to self-validate first. Also rotate the Analytics Engineering reviewers quarterly so no one team's metric conventions dominate. Transparency and rotating ownership are the cultural levers; the technical enforcement (badge + API) is the enabler."
+      }
+    ]
+  },
+  {
+    "q": "How do you make a multi-year Tableau platform investment decision when the org is also evaluating an AI-native BI tool?",
+    "a": "The 2025-2026 BI landscape has two legitimate camps: established visual analytics platforms (Tableau, Power BI, Looker) and emerging AI-native tools (Sigma, ThoughtSpot, Omni, Databricks Lakeview, Cube). A Principal-level decision framework: (1) Separate the NL-query use case (where AI-native wins) from the governed, published-dashboard use case (where Tableau's expression power and certification model still lead). Most orgs need both. (2) Evaluate incremental AI features within Tableau itself — Tableau Pulse (AI-generated metric digests, GA 2024), Einstein Copilot for Tableau (conversational authoring, 2025 preview), and Tableau's AWS Bedrock / Anthropic integrations for custom AI analytics. If these cover the gap, an incremental upgrade beats a platform switch. (3) Model the switching cost honestly: for a 200-workbook org, migration is $500k-$2M in engineering + retraining, so the new tool must deliver that in value within the contract term. (4) Run a 90-day parallel pilot with a willing team on the candidate tool, measure actual time-to-insight and adoption, then decide from data. Only commit to a full platform switch after the pilot validates the value hypothesis.",
+    "fs": "Separate NL-query vs governed-dashboard use cases, evaluate Tableau's own AI roadmap first, model the full switching cost, then pilot for 90 days before committing.",
+    "fj": "Recommends switching platforms after a demo without piloting or modeling migration cost, leading to a $3M migration that delivers the same dashboards.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What is Tableau Pulse and how does it change the ROI argument for staying on Tableau?",
+        "a": "Tableau Pulse (GA late 2024) delivers AI-generated metric summaries, anomaly callouts, and NL explanations to Slack and email, built on top of existing Tableau Cloud data sources. It narrows the gap with AI-native tools like ThoughtSpot for non-analyst consumers who just want 'what changed and why' without opening a dashboard. If Pulse covers 80% of the NL use case, it removes the main argument for a full platform switch and amortizes the existing Tableau investment."
+      },
+      {
+        "q": "How do you evaluate whether an AI-native BI tool's NL-to-viz actually works for your data domain?",
+        "a": "Run a structured benchmark: take your 20 most common analyst questions (known answers, ground-truth dashboards), ask them in the AI tool's NL interface, and score correctness + completeness. Repeat across three user skill levels. Most AI-native tools perform well on star-schema, clean warehouse data and fail on complex multi-hop joins, custom fiscal calendars, and non-standard naming conventions. Your data's messiness is the real test, not the demo dataset."
+      },
+      {
+        "q": "What governance and compliance questions must a Principal answer before recommending an AI-native BI tool?",
+        "a": "Does the tool send query strings or schema metadata to a third-party LLM provider, and if so what are the data residency and retention policies? Does it support row-level security on par with Tableau's virtual connection policies? Is there an audit log of AI-generated answers so a regulator can reconstruct how a metric was computed? Can sensitive columns (PII, financials) be excluded from the LLM context? These are not optional for regulated industries — get them in writing before the contract."
+      }
+    ]
+  },
+  {
+    "q": "What is an org-wide metrics governance strategy for a 5,000-person company where Tableau is one of three BI tools?",
+    "a": "With multiple BI tools (Tableau, Power BI, Looker), metric definitions fragment unless governed at a layer below all tools. The Principal-level answer is a Semantic Layer strategy: adopt a tool-agnostic metrics store (dbt Semantic Layer / MetricFlow, Cube, or AtScale) that defines metrics once in code (SQL + YAML) and exposes them via a standard API (JDBC/Arrow Flight SQL) that every BI tool consumes. Tableau connects via a Hyper API connector or JDBC; Power BI via DirectQuery; Looker via LookML-to-MetricFlow bridge. Governance process: (1) Metrics are code-reviewed in a Git repo (dbt metrics YAML) with the Analytics Engineering team as owners. (2) A metric promotion workflow (PR → review → merge → publish) replaces ad-hoc analyst field creation. (3) A monthly metric audit compares metric definitions in use across all BI tools against the semantic layer catalog, flagging divergence. (4) Deprecation of raw-SQL metrics in Tableau/Looker is enforced over a 6-month migration window. This makes metric consistency a code-quality problem, which engineering teams know how to solve.",
+    "fs": "Semantic layer below all BI tools (dbt MetricFlow/Cube) + GitOps metric review + monthly cross-tool audit + enforced migration off ad-hoc field calcs.",
+    "fj": "Tries to govern metrics by writing a naming convention doc and distributing it, which fails within one quarter as each team diverges.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What is the political challenge of centralizing metric definitions across three separate tool-owning teams?",
+        "a": "Each BI tool team (Tableau team, Power BI team, Looker team) has built institutional knowledge of their tool's metric layer and sees the semantic layer as a threat to their ownership. The Principal's role is to reframe it: each team still owns their BI tool's presentation layer; the semantic layer only standardizes the metric inputs, not the visualization. Governance of the semantic layer goes to Analytics Engineering (who already own dbt), not to any BI team, removing the turf conflict."
+      },
+      {
+        "q": "How does a GitOps metric review process catch definition errors before they reach production dashboards?",
+        "a": "Metric YAML changes trigger a CI pipeline that runs MetricFlow's validation (schema checks, reference integrity, query compilation) and a set of golden-dataset tests that compare the metric's output against known-correct historical values. A PR that changes the Revenue metric must pass these tests before merging. This catches redefinition bugs before they silently change every downstream dashboard, which is exactly what ad-hoc Tableau calc edits cannot provide."
+      },
+      {
+        "q": "How do you measure the ROI of a semantic layer investment to justify the cost to a CFO?",
+        "a": "Quantify the cost of metric inconsistency: analyst time spent reconciling 'why does Finance's Revenue differ from Marketing's Revenue' (typically 2-4 hours/incident × frequency × headcount), trust incidents where a board metric was wrong, and restatement risk. A semantic layer with CI-validated definitions eliminates the reconciliation cost and the restatement risk. Model the payback period: at $150/hr blended analyst rate and 50 incidents/year, 200 hours saved = $30k/yr, reaching breakeven on a $120k/yr semantic layer tool cost in 4 years — or faster if you include executive trust incidents."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a Tableau deployment that supports both embedded analytics (customer-facing) and internal BI on the same platform?",
+    "a": "Running embedded and internal BI on one Tableau deployment requires strict separation. On Tableau Cloud, use separate sites per use case: an 'Internal' site with Creator/Explorer/Viewer roles for employees, and an 'Embedded' site where all content is accessed via Connected Apps (JWT-based SSO), Viewer-only seats, and a customer-aware RLS policy that filters each embedded session to the customer's data partition. The embedded site uses Tableau's Embedding API v3 (JavaScript) to embed views inside the product UI. Billing: internal Viewer seats are expensive at scale, so internal SSO users often use Tableau Cloud's SAML SSO bulk licensing; embedded customers are billed per-session via capacity-based pricing (not per-seat). The architecturally critical decision is: never share a site between internal employees and external customers, because RLS policies, permission defaults, and audit log separation become unmanageable.",
+    "fs": "Separate Tableau Cloud sites for internal vs embedded; Connected Apps JWT SSO for embedded; capacity pricing for external; strict RLS per customer partition.",
+    "fj": "Puts internal and external users on the same site and tries to use group filters to separate them, creating audit and compliance gaps.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What is a Connected App and how does it enable customer SSO for embedded Tableau?",
+        "a": "A Connected App (Tableau Cloud 2022.1+) is a server-side JWT trust configuration that allows an external application server to mint short-lived signed tokens for any user identity, which Tableau validates and maps to a Viewer session without that user having a Tableau account. The app server signs the JWT with a secret stored server-side, and the token carries the user's identity and optional RLS attributes (USERATTRIBUTE()). This is the modern, Salesforce-supported embedded auth mechanism, replacing the older trusted authentication cookie approach."
+      },
+      {
+        "q": "How do you enforce customer data isolation in an embedded deployment where all customers share one data source?",
+        "a": "Design the data source with a `customer_id` (or tenant_id) column on every fact table. Define a row policy on the Virtual Connection that filters `customer_id = USERATTRIBUTE('tenant_id')`, where `tenant_id` is injected into the JWT by the app server at session time. This means the Tableau server enforces isolation at the VizQL query layer — no Tableau filter that the customer can bypass. Validate by penetration-testing: log in as Customer A and attempt to access Customer B's data via URL manipulation."
+      },
+      {
+        "q": "What is the capacity vs per-seat pricing trade-off for embedded Tableau and when does each win?",
+        "a": "Per-seat (Viewer) pricing works when the embedded user base is small and predictable (< 500 named customers). Capacity-based pricing (Tableau Embedded, which bills by compute tier, not users) wins when user count is large or unpredictable — a SaaS product with 10,000 customers cannot afford 10,000 Viewer seats. Capacity pricing requires a commercial Embedded agreement with Salesforce and minimum commitments, but the unit economics flip dramatically above ~1,000 concurrent embedded users."
+      }
+    ]
   }
 ]

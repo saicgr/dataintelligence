@@ -557,5 +557,126 @@
         ]
       }
     ]
+  },
+  {
+    "q": "How do you tune JVM GC for a latency-sensitive Java service running multi-GB heaps in production?",
+    "a": "Start with ZGC (`-XX:+UseZGC`) or Shenandoah on Java 21 — both achieve sub-millisecond pause times by doing compaction concurrently with application threads. Set a generous heap (e.g., `-Xmx24g`) but leave 30% headroom for concurrent GC work. Pin heap with `-Xms == -Xmx` to avoid OS memory mapping on growth. Enable `-XX:+AlwaysPreTouch` so OS pages are faulted at startup. Watch `gc+heap=info` logs for promotion failure — a sign the heap is too small. For ZGC, `-XX:SoftMaxHeapSize` caps usage to create breathing room. Benchmark with real workload before shipping; never tune blind.",
+    "fj": "Add `-Xmx` and leave the rest to the JVM — GC is automatic.",
+    "fs": "ZGC/Shenandoah for sub-ms pauses; pin heap with Xms==Xmx; AlwaysPreTouch; leave 30% headroom; watch promotion failures in GC logs.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What's the first metric to check when GC pauses spike in a ZGC service?",
+        "a": "Allocation rate vs. concurrent GC throughput — if the app allocates faster than ZGC can reclaim, you hit 'allocation stall' (a brief STW). Reduce object churn in the hot path or increase heap size."
+      },
+      {
+        "q": "When would you choose G1 over ZGC despite higher latency?",
+        "a": "G1's region-based compaction uses less CPU overhead in concurrent mode; ZGC's concurrent relocation uses more CPU. On CPU-constrained instances (small VMs, shared hosts) G1 may give better overall throughput even though its pauses are longer."
+      }
+    ]
+  },
+  {
+    "q": "How do you architect a Java microservice for horizontal scalability and zero shared mutable state?",
+    "a": "Design each service instance to be stateless: store all durable state in an external store (Postgres, Redis, S3) keyed by tenant or request ID. Avoid `static` mutable fields and ThreadLocals that leak across request boundaries. Use immutable request/response objects (Java records or Lombok `@Value`) so no defensive copying is needed at every layer. For in-process fan-out prefer `CompletableFuture` pipelines over `synchronized` blocks. Expose only idempotent HTTP/gRPC endpoints so any instance can handle retries. Pass correlation IDs as context through a `ThreadLocal` set and cleared in a servlet filter — never via constructor injection.",
+    "fj": "Just keep everything in memory and add more RAM as you scale.",
+    "fs": "Stateless instances + external durable store + immutable DTOs + idempotent endpoints = safe horizontal scaling. Correlation IDs via filter-managed ThreadLocal, always removed in finally.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle fan-out to 10 downstream services within a single request budget of 200 ms?",
+        "a": "Fire all downstream calls in parallel with `CompletableFuture.allOf()` using a bounded `ExecutorService` or virtual thread executor. Set per-call timeouts via `orTimeout()`. Fail fast on the first critical error with `exceptionally`; allow non-critical calls to degrade gracefully."
+      }
+    ]
+  },
+  {
+    "q": "How do you adopt Project Loom virtual threads (Java 21) in an existing Spring Boot service without destabilising it?",
+    "a": "Enable virtual threads globally with `spring.threads.virtual.enabled=true` (Spring Boot 3.2+) or explicitly wrap the embedded Tomcat executor: `TomcatProtocolHandlerCustomizer` calling `setExecutor(Executors.newVirtualThreadPerTaskExecutor())`. Virtual threads block cheaply, so blocking JDBC and HTTP calls become fine without thread pool sizing. Pitfalls: (1) `synchronized` blocks pin the carrier thread — replace with `ReentrantLock`. (2) Thread-local caches sized for a bounded pool may now hold millions of entries. (3) Profilers that sample thread stacks may miss mounted virtual threads. Roll out behind a feature flag, compare p99 latency and carrier pinning events (`jdk.VirtualThreadPinned` JFR event) before cutting over.",
+    "fj": "Just flip the virtual thread flag — no existing code needs to change.",
+    "fs": "Replace `synchronized` with `ReentrantLock` to avoid carrier pinning; audit ThreadLocal cache sizes; monitor `jdk.VirtualThreadPinned` JFR events; roll out behind a flag.",
+    "level": "Staff",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "ts",
+        "label": "Spring Boot 3.2+ virtual threads",
+        "lines": [
+          "# application.properties",
+          "spring.threads.virtual.enabled=true",
+          "",
+          "# or programmatically:",
+          "@Bean",
+          "TomcatProtocolHandlerCustomizer<?> virtualThreads() {",
+          "  return h -> h.setExecutor(",
+          "    Executors.newVirtualThreadPerTaskExecutor());",
+          "}"
+        ]
+      }
+    ]
+  },
+  {
+    "q": "How do you establish build and dependency governance standards across a multi-team Java monorepo?",
+    "a": "Centralise dependency version management in a BOM (Bill of Materials) POM (`<dependencyManagement>` with `<scope>import`). All team modules import the BOM and declare dependencies without version numbers. Use a dedicated platform team to bump BOM versions after security scanning (Dependabot + OWASP dependency-check). Enforce with Maven Enforcer Plugin (`<requireUpperBoundDeps>`, `<bannedDependencies>`) or Gradle version catalogs with strict versions. Fail CI on dependency-check CVE score > 7. Gate direct-dependency additions through a lightweight ADR review so transitive dependency trees stay auditable.",
+    "fj": "Teams just declare whatever version they need in their own POM — it's their service.",
+    "fs": "BOM-driven version control + Enforcer plugin CI gates + OWASP dependency-check threshold + ADR-gated new dependencies = auditable, secure dependency graph across all teams.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle a team that needs a newer library version than the BOM provides for a critical bug fix?",
+        "a": "The team opens a BOM upgrade PR with the new version, CVE scan results, and a brief impact note. The platform team fast-tracks it (target < 48 h for CVEs). Meanwhile the team can temporarily override the BOM version in their module with a comment referencing the BOM PR number — this keeps the override visible and time-limited."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate build-vs-buy for Java service infrastructure (e.g., distributed cache, message bus, job scheduler)?",
+    "a": "Frame the decision as operational cost vs. integration cost over the expected service lifetime. Build-it: only when the SLA or data-model is unique enough that no OSS/vendor solution fits (rare), or when an existing dependency is being replaced due to licensing/cost. Buy/adopt: Redis for caching, Kafka for durable messaging, Quartz/DB-based scheduler for jobs — these have known ops runbooks, community support, and Spring integration. For each candidate map: (1) latency/throughput fit, (2) ops complexity per engineer-hour, (3) licensing and vendor lock risk, (4) migration path if requirements change. Present as a lightweight ADR with the team.",
+    "fj": "Always build — you control it and it's tailored exactly to your needs.",
+    "fs": "Default to proven OSS (Redis, Kafka, Postgres) unless your requirements are genuinely unserved. Quantify ops cost per engineer-hour vs. integration cost; document in ADR; revisit when scale or requirements change.",
+    "level": "Staff"
+  },
+  {
+    "q": "How do you profile and diagnose a JVM memory leak in a long-running production Java service?",
+    "a": "Start non-invasively: watch heap usage trend over multiple GC cycles with `jstat -gcutil <pid> 5s`. A steadily growing old-gen after full GC confirms a leak. Enable JFR (`-XX:StartFlightRecording`) and analyse heap-live-objects in JDK Mission Control — identify the top retained types. Take heap dumps with `jcmd <pid> GC.heap_dump` (low-pause) or `jmap -dump:live` for a cleaner snapshot. Load into Eclipse MAT; run Leak Suspects report and dominator tree to find the root accumulation path. Common causes: unbounded caches, `ThreadLocal` without `remove()`, listeners never deregistered, and classloader leaks in hot-redeploy environments.",
+    "fj": "Heap leaks always mean too-small `-Xmx` — just increase the heap.",
+    "fs": "jstat → JFR heap-live-objects → heap dump with jcmd → MAT dominator tree. Root causes: unbounded caches, ThreadLocal leaks, deregistered listeners, classloader leaks.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you take a heap dump from a running Kubernetes pod without restarting it?",
+        "a": "Exec into the pod with `kubectl exec -it <pod> -- jcmd 1 GC.heap_dump /tmp/heap.hprof`, then copy out with `kubectl cp <pod>:/tmp/heap.hprof ./heap.hprof`. Ensure the pod has enough ephemeral storage for the dump."
+      }
+    ]
+  },
+  {
+    "q": "As a Java platform principal, how do you set an org-wide JVM version upgrade strategy across 50+ services?",
+    "a": "Define a formal Java LTS support policy: prod services run N or N-1 LTS (currently Java 21 or 17). Publish a target date 18 months out for the next LTS adoption (Java 25 LTS expected 2025). Run a compatibility scanner (Migration Analysis Tool or OpenRewrite) across all service repos to flag deprecated APIs, removed packages, and illegal-access violations. Identify the three hardest services (Reflection-heavy, agent-instrumented, custom classloaders) and pilot them first; publish the lessons as an internal migration guide. Provide automated codemods via OpenRewrite recipes (`UseTextBlocks`, `MigrateToJava17`, `UsePatternMatchingForInstanceof`) applied in a batch PR per repo. Gate each service's CI on `--release 21` to catch compile-time regressions. Track migration completion in a public dashboard by team.",
+    "fj": "Each team upgrades when they have time — no org-wide coordination needed.",
+    "fs": "LTS support policy + 18-month horizon + OpenRewrite codemod batch PRs + pilot hardest cases first + CI --release gate + public completion dashboard = low-drama coordinated migration.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle a team that refuses to upgrade because of an incompatible third-party library?",
+        "a": "Escalate to the vendor's support channel and check if a maintained fork exists. In parallel, isolate the dependency behind an adapter interface so the library version is decoupled from the service JVM. If no path exists within 6 months, fund an extraction effort or evaluate a replacement library — the team should not block the org on one vendor's cadence."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern Java language and framework adoption decisions across an org (e.g., should teams adopt Kotlin, Quarkus, or GraalVM native)?",
+    "a": "Establish a lightweight Architecture Review Board (ARB) with rotating tech leads from each domain. New language/framework adoption requires an ARB-approved ADR covering: production readiness (maturity, CVE history, LTS roadmap), build toolchain impact (compilation speed, Docker image size, CI cache hit rate), observability (JFR/OpenTelemetry agent compatibility), staffing (team expertise, hiring pool), and migration cost. Default position: proven stack (Java 21 + Spring Boot 3 + Maven/Gradle) unless an ADR demonstrates measurable benefit in at least one tier-1 dimension. Native compilation (GraalVM) is approved only for CLI tools and serverless cold-start-critical functions — not general services — due to reflection/agent restrictions and longer build times.",
+    "fj": "Let teams use whatever stack they're most productive with — standardisation is over-engineering.",
+    "fs": "ARB with rotating leads + ADR with 5 evaluation axes + proven-stack default + GraalVM scoped to CLIs and serverless = innovation without fragmentation.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "A team argues that Kotlin reduces boilerplate and improves productivity — how do you evaluate that claim?",
+        "a": "Run a 90-day trial on one new service: measure PR cycle time, bug density, onboarding time for new hires, and build duration vs a comparable Java service. Present results at ARB with the team's qualitative notes. If trial data supports the claim and the ARB approves, formally add Kotlin to the approved stack with a style guide and shared tooling (detekt, ktlint in CI)."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a multi-year Java platform modernisation roadmap that balances new feature delivery with technical debt reduction?",
+    "a": "Anchor the roadmap to business outcomes, not tech preferences. Phase 1 (0-6 months): reduce carry cost — eliminate EOL dependencies, enforce BOM governance, migrate to Java 21 LTS, add structured logging + distributed tracing as a cross-cutting concern. Phase 2 (6-18 months): improve developer velocity — adopt virtual threads org-wide, introduce project-level OpenRewrite automation for pattern migrations, standardise on Spring Boot 3 + Jakarta EE 10. Phase 3 (18-36 months): architecture evolution — evaluate event-driven decomposition for highest-contention bounded contexts, pilot GraalVM native for CLI/serverless tier, assess reactive (Reactor/WebFlux) vs virtual-thread imperative tradeoffs with production data. Budget 20% of each team's sprint capacity as dedicated tech-debt allocation — visible in the backlog. Track progress via 4 lagging indicators: mean time to onboard (MTTO), deploy frequency, change failure rate, and dependency CVE age.",
+    "fj": "Tech debt gets addressed after all features are done.",
+    "fs": "Phase by outcome: carry cost → velocity → architecture. 20% sprint allocation for debt. Four lagging indicators (MTTO, deploy frequency, CFR, CVE age) make progress visible to leadership.",
+    "level": "Principal"
   }
 ]

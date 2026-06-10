@@ -1079,5 +1079,369 @@
         "a": "When the residual errors cluster on missing or wrong retrieved context, ambiguous or mislabeled eval data, or tasks beyond the model's capability—not on phrasing the model could follow. Inspect the failures: if better wording can't fix them because the needed information isn't present or the model can't do the reasoning, stop tuning the prompt and fix retrieval, data, or model choice."
       }
     ]
+  },
+  {
+    "q": "How do you design a structured-output schema for an LLM tool-call that supports strict mode validation, optional fields, and nested objects without breaking provider constraints?",
+    "a": "OpenAI strict mode requires every property to be in required and additionalProperties:false at every nesting level; optional fields must use type:[\"T\",\"null\"] and still appear in required. Anthropic tool input_schema follows JSON Schema Draft 7 and silently degrades pattern/minimum constraints to soft post-hoc checks. Design tips: keep schemas as flat as possible, use discriminated unions sparingly, avoid oneOf/anyOf since strict mode's support is limited, and put semantic constraints (ranges, regex) in the property description alongside the type so at least the model sees them even if the decoder doesn't enforce them. Validate the decoded object with Pydantic/Zod for the semantic layer, and keep a refusal path for max_tokens truncation.",
+    "fs": "Strict mode demands required+additionalProperties:false at every level; optional fields are required-but-nullable; semantic constraints go in descriptions not just keywords.",
+    "fj": "Adding min/max/pattern keywords expecting hard enforcement under strict mode and omitting the Pydantic/Zod semantic layer.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Strict schema pattern",
+        "lang": "python",
+        "lines": [
+          "schema = {",
+          "  'type': 'object',",
+          "  'required': ['amount', 'note'],",
+          "  'additionalProperties': False,",
+          "  'properties': {",
+          "    'amount': {'type': 'number'},",
+          "    'note': {'type': ['string','null']}",
+          "  }",
+          "}",
+          "# note is required but nullable"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Your strict schema breaks on a recursive type like a nested comment thread. How do you handle recursion under strict mode?",
+        "a": "OpenAI strict mode does not support recursive $ref definitions; you must either flatten the structure to a fixed depth (e.g. parent/children only one level deep) or move recursive data into an untyped string field and parse it separately. Trying to use $ref recursively will be rejected at schema-submission time."
+      },
+      {
+        "q": "After strict mode is enabled, a required field is consistently null when the source has data. What's the diagnostic process?",
+        "a": "First check whether the constraint is semantic (a range or regex) that strict mode silently dropped from enforcement — the field will be null-valid so the model emits null rather than extracting. Second, verify the property appears in required and is not missing from the schema. Third, check if the source text positioning triggers lost-in-the-middle; if the relevant chunk is mid-context the model may miss it. Run field-level accuracy against labeled examples, not just JSON validity."
+      },
+      {
+        "q": "Anthropic and OpenAI tool schemas diverge on keywords. How do you maintain one canonical schema across providers?",
+        "a": "Keep a canonical Pydantic/dataclass model as the source of truth and generate provider-specific schemas from it at build time: the strict-mode OpenAI variant and the Anthropic input_schema variant. This way semantic constraints live in code (validators) not JSON keywords, both schemas stay in sync with one source, and adding a provider is a new exporter not a schema rewrite."
+      }
+    ]
+  },
+  {
+    "q": "How do you use extended thinking (Claude) or o-series reasoning tokens to get correct answers on hard analytical tasks while controlling cost?",
+    "a": "Extended thinking / reasoning tokens let the model do a long internal chain before the final answer, materially helping on multi-step math, planning, and code debugging where a single pass fails. The key levers are: set a thinking budget (e.g. max_tokens for thinking) and tune it per task difficulty — too low under-reasons, too high wastes spend on easy turns. Do not add hand-written CoT prompts or few-shot reasoning chains; they compete with native reasoning and can degrade it. Prompt with the goal, constraints, and exact output format, then let the model reason. For cost control: route only genuinely hard queries to the thinking-enabled model (use a cheap classifier), use the 1-hour cache TTL for the static prefix across slow multi-step runs, and don't show raw thinking tokens to end users — parse only the final structured answer.",
+    "fs": "Tune the thinking budget per task, avoid hand-written CoT scaffolding, route only hard tasks, cache the static prefix, and parse only the final answer for users.",
+    "fj": "Sending every query to extended thinking with a maximum budget and wrapping it in a hand-written step-by-step prompt, which wastes spend and can degrade the model's reasoning.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Thinking budget + parse",
+        "lang": "python",
+        "lines": [
+          "r = client.messages.create(",
+          "  model='claude-opus-4-5',",
+          "  max_tokens=16000,",
+          "  thinking={'type':'enabled',",
+          "    'budget_tokens': 8000},",
+          "  messages=[{'role':'user',",
+          "    'content': goal_prompt}])",
+          "# extract only the text block",
+          "ans = next(b.text for b in r.content",
+          "           if b.type=='text')"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "You set a 10k thinking budget but the model stops reasoning at 3k and gives a shallow answer. Why?",
+        "a": "The budget is a ceiling, not a floor; the model stops when it believes it has enough reasoning, so a simple-seeming prompt may not trigger deep thinking regardless of the budget. If the answer is shallow, make the task complexity explicit in the prompt — include the hard constraint or the tricky case — so the model perceives it needs more exploration before committing."
+      },
+      {
+        "q": "Why are thinking tokens excluded from prompt caching, and what does that mean for multi-turn agents?",
+        "a": "Thinking tokens are ephemeral scratchpad content and cannot be cached or passed back in subsequent turns — only the final answer block is in the conversation history the next call sees. In a multi-turn agent you pass the final answer as context, not the reasoning. This means the agent cannot 'continue thinking' across turns; each step starts a fresh reasoning pass over the accumulated history."
+      },
+      {
+        "q": "How do you decide whether to use extended thinking vs. just a stronger standard model with a well-engineered prompt?",
+        "a": "Extended thinking wins on tasks with genuinely large reasoning search spaces: multi-step proofs, complex planning, hard coding problems. A strong standard model with good retrieval and structured prompting usually wins on factual extraction, classification, and generation where reasoning depth is not the bottleneck. Run an eval comparing both; reasoning tokens add latency and cost so they earn their keep only where the accuracy delta is real."
+      }
+    ]
+  },
+  {
+    "q": "How do you build an eval-driven prompt iteration workflow that converges — not one that overfits and stalls?",
+    "a": "Structure the eval as three separate splits: development (the set you actively iterate against), a hold-out validation set the optimizer never sees until release, and a continuous production sample that feeds new failures back. Metrics must be a blend: deterministic format/schema checks plus a calibrated LLM-as-judge (validated against human labels, kappa > 0.70) plus task-specific domain metrics like citation accuracy or cross-field consistency. Change one prompt variable at a time, treat deltas under noise level as ties, and stop tuning when gains flatten across the hold-out — not just the dev set. Critically, categorize residual errors: if failures are clustered on retrieval gaps or model capability ceilings rather than prompt phrasing, further tuning is futile and retrieval or model upgrades are the fix.",
+    "fs": "Three-split eval, calibrated judge, one-variable-at-a-time, stop on hold-out plateau, and diagnose whether the bottleneck is still the prompt.",
+    "fj": "Tuning endlessly against a fixed dev set, calling every point-gain progress, with no hold-out and no diagnosis of whether remaining errors are prompt-fixable.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Eval structure",
+        "lang": "python",
+        "lines": [
+          "# 3 splits — never tune against val/test",
+          "dev, val, prod_stream = split_eval(data)",
+          "for version in variants:",
+          "    score_dev = run_eval(version, dev)",
+          "    # only check val to confirm release",
+          "    if plateaued(score_dev, noise=0.5):",
+          "        break",
+          "final = run_eval(best, val)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Your calibrated judge agrees with humans on 70% of pairs. Is that good enough to gate prompt changes?",
+        "a": "Kappa around 0.70 is the minimum threshold for a usable judge, but it is not uniformly good: check inter-rater agreement per rubric dimension rather than overall. A judge that agrees well on format compliance but poorly on factual accuracy should not gate factual prompt changes. Decompose agreement by criterion and use deterministic checks for the dimensions the judge is weakest on."
+      },
+      {
+        "q": "A prompt change lifts dev scores by 3 points but the hold-out shows no gain. What do you ship?",
+        "a": "Ship neither the change nor a rollback — this is an overfitting signal. Expand the dev set with more diverse and adversarial cases, re-run the change, and if the hold-out delta remains flat or negative, the change was optimizing to quirks of the dev sample. A legitimate improvement should generalize to the hold-out."
+      },
+      {
+        "q": "How does continuous production sampling feed back into the eval loop without contaminating future iterations?",
+        "a": "Route production failures into a triage queue, manually review and label them, then add them to the dev set only after they are labeled — never unlabeled. Keep a date-partitioned history so you can track when a failure class entered the set and detect if it was fixed or persists. Never let the optimizer see production samples that become part of the hold-out; keep the hold-out frozen and replace it only on major resets."
+      }
+    ]
+  },
+  {
+    "q": "How do you instrument and debug a non-deterministic LLM pipeline so failures are reproducible and root-cause is isolatable?",
+    "a": "Every call must log at minimum: model version, prompt version, input token count, output token count, finish_reason, latency, temperature, and a content hash of the full rendered prompt (not just the template ID). Store the full rendered prompt and raw response for a sample, especially around failures. To reproduce a specific failure, pin the exact model and prompt versions, set temperature 0 and a fixed seed where supported, and replay the same rendered prompt. To isolate root cause in a chain, replay each step individually with the upstream step's actual output rather than an ideal input. Add structured span tracing across steps with a correlation ID so you can reconstruct the full chain from logs. For flaky eval runs, separate randomness sources: model sampling (fix seed/temp), eval judge sampling (fix temp 0), and data shuffling (fix seed).",
+    "fs": "Log model+prompt version+finish_reason+full rendered prompt per call, pin versions and seed for replay, and use correlation IDs to trace chains step-by-step.",
+    "fj": "Logging only the template ID and the final output, so failures are unreproducible because the rendered prompt and intermediate outputs are unrecoverable.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Minimal trace record",
+        "lang": "python",
+        "lines": [
+          "span = {",
+          "  'trace_id': uuid4(),",
+          "  'model': r.model,",
+          "  'prompt_ver': PROMPT_VER,",
+          "  'finish': r.stop_reason,",
+          "  'in_tok': r.usage.input_tokens,",
+          "  'out_tok': r.usage.output_tokens,",
+          "  'prompt_hash': sha256(rendered),",
+          "  'latency_ms': elapsed}",
+          "log(span)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Temperature 0 and a fixed seed still produce different outputs on reruns. Why, and how do you handle it?",
+        "a": "Floating-point non-associativity and batch-dependent MoE routing mean temperature 0 is not bit-exact reproducible across runs or hardware. To handle it: log the full rendered prompt and raw response for any case you want to diagnose; reproduce by re-running the exact prompt and accepting slight variation rather than expecting bit-exact replay; and use the logged response as the ground truth for regression rather than a fresh inference."
+      },
+      {
+        "q": "A multi-step chain fails intermittently and the root step isn't always the same. How do you triage?",
+        "a": "Replay each step independently using the logged actual outputs from the failing trace, not ideal inputs, so you isolate which step fails given the real upstream context. If step 3 fails only when step 2's output has a certain shape, the bug is at the step-2-to-3 handoff. Correlation IDs let you pull the full step sequence for a failed end-to-end trace and replay step-by-step without re-running the whole chain."
+      },
+      {
+        "q": "How do you avoid logging PII from user inputs in trace records?",
+        "a": "Apply a PII scrubber before logging any rendered prompt or raw response — use a regex + NER classifier for structured PII like emails, phone numbers, and IDs. Log only the content hash and token counts for sensitive fields, keeping the scrubbed version in a separate regulated store with tighter retention. Treat the trace pipeline as a data-handling surface with the same compliance requirements as the app."
+      }
+    ]
+  },
+  {
+    "q": "How do you build and operate a company-wide prompt registry that teams can adopt without slowing down?",
+    "a": "A prompt registry is a versioned store where every prompt has an immutable version ID, author, linked eval run, and a status (draft/canary/stable/deprecated). The registry serves prompts at runtime so a behavior change is a config update not a deploy, and each version is cryptographically pinned in call logs for reproducibility. For adoption: make the read path a lightweight SDK call with a local cache fallback so teams see zero latency impact; require an eval run to promote to stable but not to draft; provide a CLI to test a draft version against the golden set without a full environment; and auto-generate changelogs from diffs so reviewers see what changed. Gate stable promotion on no-regression on the shared eval harness, and retire old versions with a deprecation notice plus a migration script.",
+    "fs": "Immutable version IDs, eval-gated stable promotion, runtime fetch with local cache fallback, lightweight SDK, and changelogs from diffs for easy review.",
+    "fj": "Building a registry that requires a full env to test and blocks every change on a lengthy review, causing teams to bypass it for speed.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "Two teams share a base prompt but need different variants. How does the registry avoid diverging forks?",
+        "a": "Introduce a layered composition model: a shared base version that teams override with a thin variant layer specifying only the delta (additional instructions, format changes). The registry merges them at fetch time and the variant pins its base version, so an update to the base propagates to variants that explicitly opt in. This prevents silent divergence while avoiding copy-paste forks."
+      },
+      {
+        "q": "A runtime registry outage takes down your LLM feature. How do you design for resilience?",
+        "a": "The registry should never be a hard dependency on the critical path: cache the most recently fetched version locally with a TTL, fall back to a pinned default baked into the deploy when the cache is cold, and surface the registry as an enhancement (hot-swap and audit) not a gatekeeper. Circuit-break after N consecutive misses and alert on the degraded state so it's visible."
+      },
+      {
+        "q": "How do you handle secret or sensitive content in prompts stored in the registry?",
+        "a": "Never store credentials, PII, or policy text that can't be disclosed in the registry blob. Reference secrets by key name and inject them from a secrets manager at runtime on the serving side. For sensitive policy text, encrypt at rest with KMS and log access. The registry path should be treated as a low-trust surface — assume the prompt text can be read by any service that fetches it."
+      }
+    ]
+  },
+  {
+    "q": "Your org is evaluating whether to build a custom LLM prompting platform or buy an existing one (LangSmith, Braintrust, PromptLayer, etc.). What framework do you use to decide?",
+    "a": "Frame the decision on five axes: (1) Eval harness fit — does the vendor support your scoring logic, custom metrics, and LLM-as-judge? (2) Prompt versioning model — immutable IDs, rollback, runtime fetch, canary splitting? (3) Observability — full trace with rendered prompt, token usage, cost, latency per call? (4) Data governance — where do prompts and traces live, can you meet your data residency and compliance requirements? (5) Integration cost — SDK surface area, how many internal systems need plumbing, and vendor lock-in risk. Build when you have a unique eval metric or data-residency requirement no vendor satisfies, or when the team already maintains infrastructure and the incremental cost is low. Buy when the eval and versioning needs are standard and the team's leverage is elsewhere.",
+    "fs": "Evaluates on eval-harness fit, versioning model, observability, data governance, and integration cost — builds only for unique constraints or data residency gaps.",
+    "fj": "Defaulting to build because 'we know what we need' without accounting for the ongoing maintenance burden of a custom platform.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "You pick a vendor and they add a 3x price hike mid-contract. How do you contain lock-in risk upfront?",
+        "a": "Abstract the registry interface behind an internal SDK from day one so swapping providers is changing the implementation, not rewriting every call site. Keep your eval dataset and golden set in a format you own and can export. Avoid storing evaluated prompt versions only in the vendor's format with no portable export. Review the contract for data-export SLAs before signing."
+      },
+      {
+        "q": "A data-residency requirement says prompts and traces cannot leave EU. How does that affect the decision?",
+        "a": "Many SaaS prompt-management vendors are US-hosted or cannot guarantee regional trace storage; check their DPA and regional deployment options carefully. This is a strong signal to build an internal registry using an EU-hosted store, or to choose a vendor with certified EU data residency and contractual guarantees, not just a best-effort data-processing addendum."
+      },
+      {
+        "q": "How do you evaluate a vendor's LLM-as-judge implementation before committing?",
+        "a": "Request their judge model, scoring rubric, and calibration data: how was the judge validated against human raters, what's the inter-rater agreement, and can you bring your own judge model? Run their judge on your labeled golden set and compute alignment. A vendor that won't expose the judge internals is a risk for regulated or high-stakes evaluation."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a prompt testing and deployment pipeline as a proper SDLC gate (CI/CD for prompts)?",
+    "a": "Treat every prompt change as a code change: PR-gated, reviewed, and evaluated before merge. The pipeline is: (1) author drafts in the registry with a PR; (2) CI runs the PR prompt against the golden eval set and posts a score delta comment; (3) PR gates on no-regression on a regression slice and the absolute rubric floor; (4) merge promotes to canary, routing 5-10% of real traffic; (5) canary monitoring watches live quality, latency, cost, and refusal rate for 24-48 hours; (6) auto-promote to stable or auto-rollback based on thresholds; (7) pin both prompt version and model version in logs for every production call. Prompt-only changes should be deployable in minutes without a code deploy, using runtime fetch.",
+    "fs": "PR-gated CI eval with score delta comments, regression gate, canary with auto-rollback, runtime fetch for decoupled prompt deploys, and dual version pinning in logs.",
+    "fj": "Treating prompt changes as lower-risk than code and shipping them ad hoc without CI, canary, or rollback, then scrambling when quality regresses.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "CI eval gate (GitHub Actions)",
+        "lang": "python",
+        "lines": [
+          "# .github/workflows/prompt-eval.yml",
+          "# runs on PR to any prompt file",
+          "score_pr = run_eval(PR_PROMPT, dev_set)",
+          "score_main = run_eval(MAIN_PROMPT, dev_set)",
+          "delta = score_pr - score_main",
+          "if delta < -REGRESSION_THRESHOLD:",
+          "    fail('Regression: {:.1f}pt'.format(delta))",
+          "post_comment(delta, score_pr)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "The CI eval run takes 20 minutes, blocking every PR. How do you keep the gate fast?",
+        "a": "Run a fast 'smoke' eval on a stratified 30-50 item subset first and block on that; run the full set asynchronously and post results without blocking merge unless the smoke subset reveals a clear regression. Cache model responses for stable, unchanged prompts so reruns on unchanged slices are free. Parallelize eval scoring across instances."
+      },
+      {
+        "q": "A canary shows a quality regression but only on one intent cluster. Should auto-rollback trigger?",
+        "a": "Yes if that cluster is business-critical (e.g. the highest-volume path or a regulated flow); no if it's a minor edge-case cluster where the regression is within noise. Auto-rollback thresholds should be per-segment for critical segments, not just aggregate. The pipeline should surface per-cluster deltas to reviewers, not just a single aggregate number."
+      },
+      {
+        "q": "How do you handle hotfix prompt changes that need to bypass the full pipeline in an incident?",
+        "a": "Define a break-glass path: a hotfix can skip canary and go straight to stable, but requires two approvers, must run the fast smoke eval (not skippable), and triggers a post-incident review within 24 hours to validate quality and document why normal process was bypassed. Log the break-glass usage for audit. Never allow skipping the eval gate entirely — the smoke eval is the minimum safety bar."
+      }
+    ]
+  },
+  {
+    "q": "How do you enable a 50-person engineering org to write better prompts without a central bottleneck?",
+    "a": "Build a self-serve system not a review queue: publish a prompt engineering playbook with concrete anti-patterns, worked examples per task type (extraction, classification, generation, agent), and a rubric teams can self-score against. Give every team access to the eval harness and the registry so they can iterate and measure without waiting for a platform team. Run office hours and async Slack channels rather than mandatory reviews. Establish a prompt review checklist (schema, caching, injection defense, eval coverage) that teams use before registering a stable version. Staff a small prompt engineering guild of embedded champions in high-leverage teams who share learnings, and publish a quarterly report of the most expensive anti-patterns found in prod (cost, quality, security) to drive adoption without policing.",
+    "fs": "Self-serve tooling + playbook + guild model replaces bottlenecked central review; embed champions and share production metrics to pull rather than push adoption.",
+    "fj": "Requiring every prompt to go through a central prompt engineering team for review, which creates a backlog and causes teams to bypass the process.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A team deploys a prompt that leaks PII in outputs. How does the org respond systemically rather than just fixing this instance?",
+        "a": "Add a PII output rail to the deployment pipeline as a required gate, not an optional one — so it catches the next team's mistake automatically. Run a retrospective to identify the process gap (why wasn't the rail there, was there an eval case for PII leakage), update the checklist and playbook, and notify all teams about the pattern. Treat it as a systemic failure of the guardrail layer, not an individual team's error."
+      },
+      {
+        "q": "The playbook says 'use structured output for extraction' but teams keep using free-text prompts. Why does adoption stall, and how do you fix it?",
+        "a": "Documentation alone doesn't drive adoption when the path of least resistance is easier — free-text prompts work well enough locally. Fix the incentive: make structured output the default in the SDK's prompt template, require passing schema validation in CI for extraction-type prompts (tag by task type), and show the cost delta from unconstrained verbosity in the quarterly metrics report. Make the right thing the easy thing."
+      },
+      {
+        "q": "How do you measure whether the enablement program is working?",
+        "a": "Track: time-to-stable for new prompts (is it shrinking), regression rate in production (are prompt-caused incidents dropping), cost per task on key flows (are anti-patterns declining), and guild member self-reported confidence on a quarterly survey. Also track escape rate — bugs that reach prod that a better prompt review would have caught. These leading and lagging indicators together show whether quality is improving or just compliance with process."
+      }
+    ]
+  },
+  {
+    "q": "How do you track, allocate, and optimize LLM cost across a 20-team organization so teams own their spend?",
+    "a": "Instrument every LLM call with team, feature, and environment tags and push to a cost ledger with per-call breakdowns: input tokens, output tokens, cached tokens, model, and batch vs. real-time pricing. Build a real-time dashboard per team with daily and monthly budgets and anomaly alerts when cost spikes more than 2x within a window. Charge cost back to team budgets in planning so it is visible in roadmap trade-offs. Run a monthly cost review with the top three heaviest flows per team and a standard diagnostic checklist: output verbosity, cache hit rate, model routing, batch eligibility, context length. Publish an org-wide cost-per-task leaderboard for similar flows so teams can benchmark and adopt the cheapest approach that meets quality bars.",
+    "fs": "Tagging every call to a team and feature, real-time dashboards with budget alerts, chargebacks in planning, and a monthly diagnostic review with a standard checklist.",
+    "fj": "Pooling all LLM cost into one org budget with no per-team breakdown, so no team has incentive or visibility to optimize their own flow.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A team's cost spikes 5x overnight. What's the diagnostic runbook?",
+        "a": "Check: (1) did a prompt change ship that increased output verbosity or broke caching? (2) did traffic volume spike legitimately? (3) is a retry loop stuck on failures multiplying calls? (4) did a model routing rule break and route cheap calls to a frontier model? Pull the per-call breakdowns for the spike window, compare input/output token ratios to the prior day, and check cache hit rate. Most spikes trace to one of: verbosity, broken caching, or a routing regression."
+      },
+      {
+        "q": "How do you set a per-team budget without penalizing teams doing genuinely hard, high-value work?",
+        "a": "Budget on cost-per-task or cost-per-unit-of-business-value, not absolute token spend, for teams doing complex reasoning work. Separate budget buckets by task category: batch/async (cheapest), interactive simple (mid), interactive reasoning (most expensive). Teams are accountable for optimization within their task category, not penalized for using reasoning models when the task warrants it. Review budgets quarterly against business outcomes."
+      },
+      {
+        "q": "What's the ROI case for investing engineering time in prompt cost optimization versus just absorbing the cost?",
+        "a": "At small scale, optimization is often not worth the engineering cost. The threshold is when a single flow exceeds a monthly spend you'd approve a headcount to fix, or when cost growth is outpacing revenue growth on a key product feature. Prioritize by cost-per-task on your highest-volume flows, since a 50% improvement there beats a 90% improvement on a low-volume experimental feature."
+      }
+    ]
+  },
+  {
+    "q": "How do you design and govern a reusable prompt template library that remains accurate as models and best practices evolve?",
+    "a": "Each template in the library has: a task-type tag (extraction, classification, generation, agent step, guard), a semantic version, the minimum model it was validated on, and a linked eval report. Templates are validated against their golden set on a scheduled CI run so drift from model updates surfaces automatically rather than silently. When a model update degrades a template, the library flags it as 'needs re-evaluation' and notifies template owners. Governance is a lightweight RFC process: propose a new template with an eval, get one champion and one prompt-engineering review, then publish. Deprecation requires a migration path and 60-day notice. The library is a dependency, not an afterthought — version pins in consuming code ensure a model swap doesn't silently change behavior.",
+    "fs": "Semantic versions, minimum-model pins, scheduled CI validation against golden sets, and a flag/notify system for model-update drift keep the library accurate over time.",
+    "fj": "Publishing templates once with no ongoing validation, so they silently degrade as models evolve and teams don't know until production breaks.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "A template that worked on Claude 3 regresses on Claude 4. How does the governance process handle it?",
+        "a": "The scheduled CI run on the new model flags it as regressed and notifies the template owner. The owner has a defined SLA (e.g. 14 days) to either fix the template or escalate to the prompt engineering guild. During the window, the template is marked 'degraded on Claude 4' in the registry so consumers can see the status. Consumers on Claude 4 are notified to pin the prior model or await the fix."
+      },
+      {
+        "q": "Teams want to extend a library template with domain-specific instructions. How do you support extension without forking?",
+        "a": "Use a composition model: the library template defines injection points — clearly-marked slots for domain-specific instructions, persona, output format — that extension layers fill. The base template version is pinned; extensions inherit it and override only their slots. When the base updates, extension owners get a diff and decide whether to rebase. This keeps the shared core coherent while supporting customization."
+      },
+      {
+        "q": "How do you prevent the library from becoming a graveyard of unused, stale templates?",
+        "a": "Track adoption: which templates are fetched and by how many services. Quarterly, flag templates with zero or one consumer as candidates for deprecation. Require a champion (a team that actively uses and owns the template) for any template to stay active. Templates without a champion move to deprecated after notice. This keeps the library small and curated rather than accumulating every experiment anyone ever ran."
+      }
+    ]
+  },
+  {
+    "q": "How do you set and enforce org-wide standards for responsible use of LLMs in production — covering safety, accuracy, and compliance — without killing velocity?",
+    "a": "Frame standards as a tiered risk model rather than a blanket policy: low-risk flows (internal tools, drafts) have lighter gates, high-risk flows (regulated, customer-facing, consequential actions) have mandatory rails, evals, and human-review gates. Publish clear criteria for which tier a flow falls into so teams self-classify with a short checklist, not a committee. Standards cover five areas: data handling (what can go in prompts, PII rules, data residency), accuracy gates (minimum eval bar per task type), output rails (required vs. recommended), model versioning and pinning policy, and incident classification with response SLAs. Enforce through tooling not process: the CI eval gate and the output rail should make the right thing the path of least resistance. Publish escape rates and incident metrics quarterly to demonstrate ROI on the standards rather than just citing compliance.",
+    "fs": "Tiered risk model with self-classification, enforced via tooling (CI, rails) not bureaucracy, and quarterly metrics to show standards drive quality not just overhead.",
+    "fj": "Applying the same heavy review process to every prompt regardless of risk tier, burning velocity on low-stakes internal tools while teams route around the process.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "A team argues their experimental feature doesn't need the accuracy eval gate because it's not customer-facing yet. How do you respond?",
+        "a": "Apply the risk tier, not the current-state tier. If the feature is planned for customer-facing use within a release cycle, it should meet the bar before it ships, not after — retrofitting eval harnesses on a shipped feature is harder and more disruptive than building them in. Offer to help them build the eval as part of the feature work, not as an additional overhead."
+      },
+      {
+        "q": "Two business units interpret the PII-in-prompts policy differently, with one claiming customer emails are fine because they're 'business data'. How do you resolve this org-wide?",
+        "a": "Escalate to a single authoritative interpretation from Legal/Privacy and encode it in a concrete decision tree: field type, data classification, whether the prompt is sent to a third-party model, and whether a DPA is in place. Publish the ruling as a policy FAQ with worked examples covering the disputed case. Ambiguity in policy usually persists because the documentation is abstract; concrete examples eliminate the interpretive wedge."
+      },
+      {
+        "q": "How do you build an incident taxonomy for LLM failures that drives systematic improvement rather than just post-mortems?",
+        "a": "Classify every LLM incident by root cause: prompt engineering failure, retrieval gap, model capability ceiling, guardrail absence, tooling/infra, or process bypass. Track counts and cost by category quarter-over-quarter. This taxonomy reveals whether the org's improvement efforts are reducing the right failure modes or just shifting them. If 70% of incidents are prompt engineering failures and the prompt playbook isn't being adopted, the intervention is different than if 70% are retrieval gaps."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate and decide which foundation model providers to standardize on, and how do you manage multi-provider architecture over a 3-year horizon?",
+    "a": "Evaluate providers on a 5-year TCO, not headline token price: include rate limits and burst capacity, fine-tuning and distillation options, data residency and BAA availability, enterprise SLAs and uptime SLOs, model update cadence and deprecation notice periods, and ecosystem lock-in risk. Standardize on one primary provider for most workloads but build a provider-agnostic abstraction layer so the top 3 to 5 high-value flows can switch providers in a config change rather than a rewrite — this is your negotiating leverage. Maintain at least one validated secondary provider for critical flows (both evaluated, eval parity documented) as a resilience hedge. Over 3 years: plan for at least 2 major model generation upgrades, which require full re-eval and prompt re-tuning, so the eval harness is a long-term asset that compounds. The org's moat is the eval dataset and golden sets, not the prompt text itself.",
+    "fs": "TCO over headline price, provider-agnostic abstraction for negotiating leverage, at least one validated secondary provider, and the eval harness as the durable org asset.",
+    "fj": "Standardizing on one provider with no abstraction layer and no secondary, then discovering a rate-limit crisis or deprecation has no fast remediation path.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "Your primary provider announces a 6-month deprecation of the model your critical flows depend on. What's the execution plan?",
+        "a": "If the secondary provider is already evaluated and at parity, the switch is a config change in the abstraction layer within days. If not, you have 6 months to: (1) run the successor model through the full eval harness and document regressions; (2) re-tune affected prompts and re-eval; (3) canary the switch on lower-traffic flows first; (4) migrate critical flows last with a rollback plan. The eval harness is what makes this 6-month notice enough."
+      },
+      {
+        "q": "A team wants to use a frontier model for a flow that runs 50M times per month. How do you govern that decision?",
+        "a": "Require a cost-quality analysis: what's the per-task accuracy delta between the frontier model and a smaller one on the eval set, and what is the annual cost difference? If a smaller model meets the quality bar, that's the default; the frontier model requires a business case (revenue impact that justifies the cost delta) approved by the product and engineering lead. Set a budget alert for the flow and review quarterly."
+      },
+      {
+        "q": "How do you think about fine-tuning vs. prompt engineering as a strategic org investment over 3 years?",
+        "a": "Fine-tuning makes sense when: (1) prompt engineering has plateaued and the quality gap is real and costly; (2) the task is high-volume enough to amortize the fine-tuning and re-fine-tuning cost on each model generation; (3) latency or cost from long few-shot prompts is a hard constraint. It doesn't make sense when the model generation cycle (every 12-18 months) means constant re-fine-tuning, or when the task distribution shifts frequently. Over 3 years, prioritize prompt engineering and eval infrastructure now; plan a fine-tuning review at 18 months once the org has enough labeled data and stable task definitions to do it well."
+      }
+    ]
+  },
+  {
+    "q": "How do you lead an org's shift from ad-hoc LLM experimentation to a production-grade GenAI discipline — and what are the failure modes of that transformation?",
+    "a": "The transformation has four phases: (1) Visibility — instrument every LLM call in production (cost, quality, latency), publish dashboards, and run a current-state audit of all LLM flows against a quality rubric; most orgs find 30 to 50% of flows have no eval. (2) Foundation — build the eval harness, prompt registry, and deployment pipeline as shared infrastructure, not per-team builds; fund this explicitly or it won't happen. (3) Standards and enablement — publish the risk tier model, playbook, and self-service tooling; embed champions; avoid top-down mandates without tooling. (4) Continuous improvement — quarterly metrics reviews, escape-rate tracking, and a feedback loop from prod incidents to the eval set. The failure modes: moving to phase 3 before the foundation exists (enforcement without tooling causes workarounds), treating the eval set as a one-time artifact (it must grow with the product), and optimizing for compliance metrics rather than quality outcomes (teams learn to pass the gate without improving the product).",
+    "fs": "Four-phase model (visibility, foundation, standards, continuous improvement) with explicit failure modes — most commonly skipping foundation or treating eval as one-time.",
+    "fj": "Announcing standards and requiring compliance before the tooling exists to support them, creating bureaucratic overhead with no quality benefit and motivating teams to route around the process.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "Leadership wants to show a GenAI quality metric to the board in Q1. How do you design a metric that's meaningful rather than gameable?",
+        "a": "Use a composite metric anchored to business outcomes: task success rate on a held-out production sample (human-labeled), not eval pass rate on a dev set. Include cost-per-task and incident rate as co-reported guardrails so optimizing one doesn't hide degradation in another. Make the methodology public internally so teams understand what moves the metric and what doesn't. A metric that can be gamed by adding more eval cases to the golden set is not a board metric."
+      },
+      {
+        "q": "The transformation is 18 months in and quality has improved on measured flows but new team flows still have no evals. How do you address the coverage gap?",
+        "a": "At 18 months the foundation exists but adoption is incomplete — the failure mode is coverage gap, not quality of the covered flows. Shift the success metric from 'eval score on existing flows' to 'percent of production LLM flows with an eval'. Run the audit quarterly, name the teams with uncovered flows, and set a target (e.g. 80% coverage in 6 months). Make eval scaffolding the easiest part of starting a new LLM feature by providing a starter kit that generates a basic golden set from the first 100 production calls."
+      },
+      {
+        "q": "How do you balance innovation speed — teams want to ship LLM features fast — with the rigor the transformation requires?",
+        "a": "The tension resolves with a two-track model: an experiment track (no eval required, internal-only, clearly labeled as experimental, off by default for customers) and a production track (eval required, CI gate, canary). Teams can move fast on the experiment track and graduate to production when the business case is proven and the eval harness is built. The mistake is applying production rigor to experiments or allowing experiment-track flows to silently ship to customers."
+      }
+    ]
   }
 ]

@@ -1849,5 +1849,1736 @@
         "a": "A Stream tracks new rows in the staging table so your MERGE only processes the delta (efficient), but the Stream doesn't dedup — the MERGE key does. Use the Stream to bound the work, the keyed MERGE to guarantee exactly-once."
       }
     ]
+  },
+  {
+    "q": "You're using the Kafka connector in Snowpipe Streaming mode. A partition redelivers messages after a consumer restart. How does the channel offset token prevent duplicates, and where does it break down?",
+    "a": "Each Snowpipe Streaming channel tracks a committed offset token — an opaque string set per ingested batch. On reconnect the client calls getLatestCommittedOffsetToken and resumes from that position; the server silently discards rows whose token is at or behind the committed one, giving channel-level exactly-once. The Kafka connector sets the offset token to the Kafka partition offset, so redelivered messages are idempotent. Breakdown: the guarantee is per-channel. If the same logical event arrives on two channels (e.g. two connector instances), the channel dedup does not help — you still need a keyed MERGE downstream. Also, if you never set an offset token, all rows are accepted on every retry.",
+    "fj": "Kafka redelivery always causes duplicates in Snowflake — I'd dedup with a downstream MERGE.",
+    "fs": "Channel offset tokens deduplicate behind the committed position server-side, giving exactly-once per channel. Multi-channel fan-in or missing tokens still need a keyed MERGE.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Python SDK: set offset token per batch",
+        "lang": "python",
+        "lines": [
+          "# Python Snowpipe Streaming SDK",
+          "channel = conn.open_channel(",
+          "    table='EVENTS', database='PROD')",
+          "channel.insert_rows(",
+          "    rows=batch,",
+          "    offset_token=str(kafka_offset))",
+          "# on reconnect: resume from last token"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does getLatestCommittedOffsetToken return if no batch has ever been committed?",
+        "a": "None (null). If the token has never been set, the client does not know where the server is, so all rows are treated as fresh. This is why you must set the offset token from your very first write — a missing token means no dedup protection from the start."
+      },
+      {
+        "q": "Why does the Kafka connector commit the Kafka partition offset to the broker AFTER Snowflake confirms the channel commit?",
+        "a": "Kafka consumer commits are the checkpoint that prevents redelivery on restart. If the connector commits to Kafka before Snowflake commits, a crash between the two loses data. If it commits after Snowflake confirms the offset token, any redelivery is safely deduped by the channel token. Kafka offset commit is the downstream ack; channel offset token is the upstream dedup guard — both are necessary."
+      },
+      {
+        "q": "Can you reuse a channel across restarts, or must you create a new one?",
+        "a": "You can reuse a channel by name — the committed offset token persists on the server so reconnecting to the same channel picks up exactly where it left off. Creating a new channel with a different name starts fresh with no offset history, which would re-accept all rows. Stable channel names tied to Kafka partition and consumer group are the correct pattern."
+      }
+    ]
+  },
+  {
+    "q": "Walk me through a production-grade Snowpark Python stored procedure: transaction handling, external REST calls via network access, and secure credential management.",
+    "a": "Write the procedure body as a Python handler function that receives a Snowpark Session. For multi-step DML, wrap the logic in an explicit transaction: session.sql('BEGIN').collect() at the start, session.sql('COMMIT').collect() on success, and session.sql('ROLLBACK').collect() in the except block — Snowflake autocommit per statement means you must explicitly scope the transaction. For the REST call, declare an EXTERNAL ACCESS INTEGRATION plus network rules (allowlisting the target host) and a SECRET object on the procedure DDL; the handler retrieves the credential at runtime via _snowflake.get_generic_secret_string('key_name'), which never appears in DDL or QUERY_HISTORY. Use EXECUTE AS OWNER so callers need no direct privileges to the REST endpoint or target warehouse — the procedure body is the governed surface.",
+    "fj": "I'd hard-code the API key in the handler and let Snowflake figure out transactions.",
+    "fs": "Explicit BEGIN/COMMIT/ROLLBACK, SECRET for the API token declared on the DDL, EXECUTE AS OWNER for privilege isolation — those are the three production pillars of a Snowpark Python stored procedure.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Snowpark Python stored procedure skeleton",
+        "lang": "python",
+        "lines": [
+          "def run(session: Session) -> str:",
+          "    try:",
+          "        session.sql('BEGIN').collect()",
+          "        session.sql('MERGE INTO ...').collect()",
+          "        import _snowflake",
+          "        tok = _snowflake.get_generic_secret_string(",
+          "            'api_key')",
+          "        # ... call API using tok ...",
+          "        session.sql('COMMIT').collect()",
+          "        return 'OK'",
+          "    except Exception as e:",
+          "        session.sql('ROLLBACK').collect()",
+          "        raise",
+          "# DDL: EXECUTE AS OWNER",
+          "# EXTERNAL_ACCESS_INTEGRATIONS=(ai_integ)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does a temporary table inside a Snowpark procedure persist across its SQL statements but disappear after the procedure returns?",
+        "a": "A Snowpark Python stored procedure runs within a single Snowflake session, and temporary tables are session-scoped. Every SQL statement the handler issues runs in the same session, so a TEMP TABLE created in step 1 is visible in step 3. When the session ends (procedure returns), the temp table is auto-dropped — unlike a transient or permanent table."
+      },
+      {
+        "q": "Can you call another stored procedure from inside a Snowpark Python procedure?",
+        "a": "Yes — session.sql('CALL other_proc(...)').collect() executes the child procedure in the same session. Nesting is valid but stack traces through nested Snowpark calls can be hard to read; keep the logic flat where possible. You can also import a shared Python module uploaded to a stage and call the handler function directly if it is a pure Python helper."
+      },
+      {
+        "q": "When would you use a SQL scripting block instead of a Snowpark Python procedure?",
+        "a": "When all your logic is expressible as SQL statements — loops, IF/THEN/ELSE, cursors, EXECUTE IMMEDIATE — and you do not need Python libraries, external calls, or pandas. A SQL scripting block has no cold-start Python runtime overhead, is simpler to review, and runs entirely server-side SQL. Use Python when you need a library, complex data manipulation, ML inference, or external network access."
+      }
+    ]
+  },
+  {
+    "q": "What is a Snowflake SQL scripting block and how do you use a cursor and EXECUTE IMMEDIATE inside one for dynamic schema-level automation?",
+    "a": "A SQL scripting block is a first-class procedural SQL dialect that runs as a stored procedure body or an anonymous BEGIN/END block, as an alternative to a Snowpark Python procedure. It supports DECLARE for variables and cursors, LOOP/WHILE/FOR/IF control flow, EXCEPTION WHEN for error handling, and EXECUTE IMMEDIATE for dynamic SQL. A cursor iterates row by row over a query result inside a FOR loop; EXECUTE IMMEDIATE evaluates a string as SQL at runtime — the right tool for schema-level automation where table or column names must be parameterized. A common pattern: loop a cursor over a metadata table of table names, build a dynamic MERGE string per row, and execute it inside one atomic transaction. Blocks can be the direct body of a Task (since Snowflake 2023), removing the need for a separate Snowpark Python stored procedure when the logic is tight.",
+    "fj": "I'd write Python outside Snowflake to loop and build SQL strings dynamically.",
+    "fs": "A SQL scripting block with cursor + EXECUTE IMMEDIATE keeps dynamic schema-level automation entirely in Snowflake: no Python driver, no round-trips, atomic BEGIN TRANSACTION / COMMIT scope.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Cursor + EXECUTE IMMEDIATE loop",
+        "lang": "sql",
+        "lines": [
+          "DECLARE",
+          "  tbl STRING;",
+          "  c CURSOR FOR",
+          "    SELECT table_name FROM meta_tbls;",
+          "BEGIN",
+          "  FOR rec IN c DO",
+          "    tbl := rec.table_name;",
+          "    EXECUTE IMMEDIATE",
+          "      'MERGE INTO ' || tbl || ' ...';",
+          "  END FOR;",
+          "END;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the difference between a scripting block's BEGIN/END and an explicit transaction?",
+        "a": "A scripting block's BEGIN/END is a procedural scope, not automatically a transaction boundary. Snowflake still follows its normal autocommit rules per statement unless you call BEGIN TRANSACTION explicitly inside the block. To make the whole loop atomic, wrap it in an explicit BEGIN TRANSACTION / COMMIT (or ROLLBACK in the EXCEPTION handler)."
+      },
+      {
+        "q": "Why is EXECUTE IMMEDIATE risky and how do you mitigate SQL injection?",
+        "a": "EXECUTE IMMEDIATE evaluates a string at runtime, so a dynamically composed SQL string can execute unintended statements if any input is user-supplied. Mitigate by validating inputs against a whitelist (check table names against INFORMATION_SCHEMA before building the string), never passing uncleaned external strings, and using the IDENTIFIER() notation for dynamic object names where supported."
+      },
+      {
+        "q": "Can an anonymous scripting block be used directly in a Task body?",
+        "a": "Yes — since Snowflake 2023 a task body can be a BEGIN/END scripting block directly, so you write multi-statement procedural logic in the task definition without creating a separate stored procedure. This simplifies deployment when the logic is tight and does not need to be called from other contexts."
+      }
+    ]
+  },
+  {
+    "q": "How do you write a vectorized (batch) Python UDF in Snowflake, and when does it outperform a row-at-a-time handler?",
+    "a": "A vectorized Python UDF processes a pandas DataFrame of column values per batch rather than one scalar per call. You annotate the handler with @vectorized (or set the appropriate DDL flag), letting Snowflake pass batches of rows to a single function call that returns a pandas Series. This eliminates per-row Python dispatch overhead — typically 10 to 100x faster for CPU-bound operations expressible as pandas or numpy operations. Row-at-a-time is fine for trivially fast logic or unavoidable per-row external calls. For ML inference, vectorized UDFs batch-score with the model loaded once at module scope, avoiding reloading the model on every row.",
+    "fj": "Python UDFs process one row at a time — there is no batch mode.",
+    "fs": "Vectorized UDFs receive a pandas DataFrame per batch and return a Series — 10-100x faster for numpy/pandas-expressible transforms. Load models at module scope, not inside the handler, to amortize initialization across the batch.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Vectorized UDF with numpy",
+        "lang": "python",
+        "lines": [
+          "import pandas as pd",
+          "import numpy as np",
+          "",
+          "# module scope: loaded ONCE per worker",
+          "# model = load_model('/tmp/model.pkl')",
+          "",
+          "def score(df: pd.DataFrame) -> pd.Series:",
+          "    # df col[0] = input column values",
+          "    vals = df[0].to_numpy()",
+          "    return pd.Series(np.log1p(vals))",
+          "",
+          "# DDL: HANDLER='score'",
+          "# PACKAGES=('pandas','numpy')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is MAX_BATCH_ROWS and how should you size it?",
+        "a": "MAX_BATCH_ROWS caps how many rows Snowflake sends to a single vectorized call. The default is sufficient for most cases, but if your model's memory footprint means large batches OOM the worker, lower it. If your operation amortizes overhead better with larger batches (e.g. GPU inference), leave it at the default or raise cautiously."
+      },
+      {
+        "q": "How do you load a model once and share it across vectorized calls without reloading on every batch?",
+        "a": "Initialize the model at module scope outside the handler function. Snowflake warms up a Python sandbox per worker and reuses it across batches — module-level code runs once on worker startup. Putting model loading inside the handler re-loads it per batch, defeating the efficiency of vectorized processing."
+      },
+      {
+        "q": "Does Snowpark support vectorized UDTFs for one-to-many expansion?",
+        "a": "Yes — a vectorized UDTF's process() method receives a pandas DataFrame and returns a pandas DataFrame, following the same batch semantics. Module-scope initialization applies: load large objects once at the top of the handler file. The UDTF is invoked in the FROM clause and can expand one input row into many output rows."
+      }
+    ]
+  },
+  {
+    "q": "Beyond simple role-based redaction, what advanced masking patterns does Snowflake's policy body support — tokenization, partial masking, and format-preserving approaches?",
+    "a": "Because a masking policy body is arbitrary SQL, it supports far more than returning a fixed string. Tokenization replaces a value with a deterministic pseudonym by passing it through SHA2 or a mapping table — the same plaintext always yields the same token, enabling GROUP BY and JOIN on the masked column without seeing plaintext. Partial masking exposes only the last four digits of a card or the domain of an email. Format-preserving masking uses Snowflake's ENCRYPT/TRY_DECRYPT or custom AES functions to produce a ciphertext that looks like the original type — a 16-digit number stays 16 digits — useful when downstream systems enforce type or format constraints. Tag-based masking applies the same policy automatically to every newly classified column that carries the sensitivity tag, removing per-column manual ALTER.",
+    "fj": "Masking just replaces the value with stars for unauthorized roles.",
+    "fs": "Masking policy bodies are arbitrary SQL — tokenization (deterministic SHA2 pseudonym), partial reveal (last 4 digits), and format-preserving encryption are all valid branches. Stored data is never touched.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Multi-tier masking: full, partial, token",
+        "lang": "sql",
+        "lines": [
+          "CREATE MASKING POLICY mask_card",
+          "  AS (v STRING) RETURNS STRING ->",
+          "  CASE",
+          "    WHEN IS_ROLE_IN_SESSION('PII_READER')",
+          "      THEN v",
+          "    WHEN IS_ROLE_IN_SESSION('ANALYST')",
+          "      THEN '****-****-****-'||RIGHT(v,4)",
+          "    ELSE SHA2(v)  -- deterministic token",
+          "  END;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does a deterministic token let analysts GROUP BY on a masked column?",
+        "a": "Because the same plaintext always maps to the same token, a GROUP BY on the token column produces the same cardinality and groupings as on the plaintext — analysts count distinct customers or aggregate by card without seeing real values. Non-deterministic masking (e.g. RANDOM()) would break aggregations completely, producing meaningless group counts."
+      },
+      {
+        "q": "When would you use format-preserving masking over simple redaction?",
+        "a": "When downstream systems have type or format constraints — e.g. a card-processing system expecting a 16-digit numeric string, or a system joining on a masked column that needs the token to satisfy a CHECK constraint or foreign key. Format-preserving masking keeps the type and shape so transformations and joins work without schema changes in downstream systems."
+      },
+      {
+        "q": "Can one column have multiple masking policies for different contexts?",
+        "a": "No — one column can only have one masking policy attached at a time. All role-based branches must be encoded inside the single policy expression as a CASE statement. To change who sees what, you ALTER the policy expression or replace it entirely."
+      }
+    ]
+  },
+  {
+    "q": "Design the resource monitor and budget governance strategy for a Snowflake account with 8 teams, active serverless Snowpipe, and automatic clustering on several large tables.",
+    "a": "Layer three levels of governance. Account level: one resource monitor at 90% of the monthly contract as a backstop suspend — the circuit breaker that fires only if team-level controls fail. Team level: a warehouse resource monitor per team with a monthly credit quota summing to roughly 80% of contract, with Notify at 80% and Suspend at 100%. Serverless coverage: resource monitors are blind to Snowpipe, automatic clustering, materialized-view maintenance, and SOS because they only track warehouse compute. Cover those with a custom Snowflake Budget per team, grouping their warehouses and databases, with a monthly spending limit and a forecast alert wired to Slack or PagerDuty. Query ACCOUNT_USAGE.METERING_DAILY_HISTORY weekly for serverless service breakdown. The principle: monitors hard-stop warehouses, budgets catch serverless drift before the invoice.",
+    "fj": "One account-level resource monitor is enough — it covers everything.",
+    "fs": "Warehouse resource monitors hard-stop warehouse compute; custom Budgets cover serverless (Snowpipe, clustering, MV maintenance) which monitors cannot see. You need both layers.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Per-team monitor + serverless budget",
+        "lang": "sql",
+        "lines": [
+          "CREATE RESOURCE MONITOR team_a_mon",
+          "  WITH CREDIT_QUOTA=800 FREQUENCY=MONTHLY",
+          "  TRIGGERS ON 80 PERCENT DO NOTIFY",
+          "           ON 100 PERCENT DO SUSPEND;",
+          "ALTER WAREHOUSE team_a_wh SET",
+          "  RESOURCE_MONITOR=team_a_mon;",
+          "-- serverless: use a Budget",
+          "CREATE BUDGET team_a_budget;",
+          "CALL team_a_budget!SET_SPENDING_LIMIT(800);",
+          "CALL team_a_budget!ADD_RESOURCE(",
+          "  SYSTEM$REFERENCE('WAREHOUSE',",
+          "    'TEAM_A_WH'));"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What ACCOUNT_USAGE view breaks down serverless spend by service type?",
+        "a": "SNOWFLAKE.ACCOUNT_USAGE.METERING_DAILY_HISTORY, which has a service_type column — AUTO_CLUSTERING, SNOWPIPE, MATERIALIZED_VIEW, SEARCH_OPTIMIZATION, SERVERLESS_TASK, etc. — and credits_used per day. Join it with WAREHOUSE_METERING_HISTORY for a complete account-wide picture of every credit, including serverless."
+      },
+      {
+        "q": "How do you prevent automatic clustering from silently consuming a quarter's budget?",
+        "a": "Attach a custom Budget covering the databases where auto-clustering is enabled, and set a monthly limit with a forecast alert at 75%. Also audit AUTOMATIC_CLUSTERING_HISTORY to spot tables with high reclustering credit cost and disable clustering on those that do not earn back their maintenance cost — clustering is opt-in and should be validated against actual pruning improvement."
+      },
+      {
+        "q": "What happens when the account-level backstop monitor fires and suspends all warehouses?",
+        "a": "All virtual warehouses are suspended and all queued and running queries fail immediately. Only ACCOUNTADMIN can resume them or change the monitor threshold. This is intentionally disruptive — it is a circuit breaker of last resort. Per-team monitors at 100% of team quota prevent cascading to the account backstop in practice."
+      }
+    ]
+  },
+  {
+    "q": "What are serverless tasks in Snowflake, and when do you choose them over warehouse-backed tasks?",
+    "a": "A serverless task (declared with USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE instead of a WAREHOUSE clause) runs on Snowflake-managed compute that auto-scales to the task's workload, billed per-second at serverless rates with no warehouse to provision or pay for between runs. The task body is often a CALL to a Snowpark Python stored procedure for complex transformation logic. Warehouse-backed tasks run on a named virtual warehouse; if it was auto-suspended, Snowflake resumes it — adding startup latency and a 60-second billing minimum. Choose serverless for small, frequent tasks or tasks with highly variable workloads that would idle a warehouse between runs, and for dense DAGs where many small nodes would each incur the 60-second warehouse minimum. Choose warehouse-backed when you want to reuse the warehouse cache across runs, have a predictable heavy compute need, or need a resource monitor hard cap — serverless tasks are not governed by warehouse resource monitors.",
+    "fj": "Serverless tasks are always cheaper so I use them everywhere.",
+    "fs": "Serverless is cost-efficient for small/frequent or variable-workload tasks with no idle warehouse cost. Warehouse-backed wins when cache warmth matters or you need a resource monitor hard cap — serverless tasks are budget-visible only via Snowflake Budgets.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Serverless task declaration",
+        "lang": "sql",
+        "lines": [
+          "-- serverless: no WAREHOUSE clause",
+          "CREATE TASK srv_task",
+          "  USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE",
+          "    = 'X-SMALL'",
+          "  SCHEDULE = '5 MINUTE'",
+          "  SUSPEND_TASK_AFTER_NUM_FAILURES = 3",
+          "AS CALL merge_incremental();",
+          "-- Snowflake auto-sizes after first run"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Does a serverless task have a resource monitor?",
+        "a": "No — serverless tasks do not use a virtual warehouse so warehouse resource monitors do not cover them. The only hard-spend bound is a Snowflake Budget that includes the database or schema the task operates on. This is one reason warehouse-backed tasks are preferable when you need an explicit credit cap — the monitor can suspend the warehouse, which stops the task."
+      },
+      {
+        "q": "How does Snowflake size the compute for a serverless task after the first run?",
+        "a": "You provide an initial size hint via USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE for the first run. Snowflake then observes the task's actual resource consumption and auto-scales compute for subsequent runs — you do not pick an explicit warehouse size. Variable-workload tasks benefit because you are not over-provisioning for peak when most runs are small."
+      },
+      {
+        "q": "Can a task graph mix serverless and warehouse-backed tasks?",
+        "a": "Yes — each task in a DAG independently declares its compute source. A root task polling a stream might be serverless (small, frequent), while a downstream heavy aggregation task is warehouse-backed (needs cache warmth and big compute). The task scheduler respects each node's compute setting independently."
+      }
+    ]
+  },
+  {
+    "q": "Your team is building a 12-task DAG across 3 staging layers in Snowflake. Walk me through how to create, activate, and monitor the full graph.",
+    "a": "A Snowflake task graph is a tree connected by AFTER clauses — one root with a SCHEDULE or stream trigger, children that fire when their immediate predecessor succeeds. Define leaf tasks first, then work toward the root; each child task references its parent in AFTER. Create all tasks in SUSPENDED state by default, wire the graph, then activate the whole tree by resuming only the root — Snowflake automatically activates dependents. Monitor with TASK_HISTORY filtered by ROOT_TASK_ID to see the entire run as a unit; CURRENT_TASK_GRAPHS for in-progress runs; COMPLETE_TASK_GRAPHS for historical runs. Wire an ERROR_INTEGRATION on the root to page on any node failure. Use SUSPEND_TASK_AFTER_NUM_FAILURES on the root to auto-suspend the graph after repeated failures and add a FINALIZE task for cleanup that must always run regardless of outcome.",
+    "fj": "I create all tasks together and manually resume each one after the others are ready.",
+    "fs": "Define leaves first, then root; wire AFTER; resume only the root to activate the whole graph. Monitor via TASK_HISTORY by ROOT_TASK_ID — that is the unit of observability for a DAG.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Task DAG: root + two leaves",
+        "lang": "sql",
+        "lines": [
+          "-- create leaves first (SUSPENDED default)",
+          "CREATE TASK leaf_a AFTER root_task",
+          "  WAREHOUSE=wh AS CALL step_a();   -- Snowpark proc",
+          "CREATE TASK leaf_b AFTER root_task",
+          "  WAREHOUSE=wh AS CALL step_b();",
+          "-- root: schedule + resilience",
+          "CREATE TASK root_task",
+          "  WAREHOUSE=wh SCHEDULE='60 MINUTE'",
+          "  SUSPEND_TASK_AFTER_NUM_FAILURES=3",
+          "  ERROR_INTEGRATION=etl_alerts",
+          "AS CALL extract_step();  -- Snowpark Python proc",
+          "ALTER TASK root_task RESUME;  -- activates all"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Can a child task list multiple parents in its AFTER clause?",
+        "a": "Yes — a child can list multiple predecessors in AFTER (fan-in), and the scheduler fires it only after all listed predecessors succeed in the same run. This models a diamond dependency — two parallel branches converge into one downstream task. Verify current docs for any limits on the number of listed predecessors."
+      },
+      {
+        "q": "How do you change the schedule of a root task without dropping and recreating the graph?",
+        "a": "Suspend the root task (ALTER TASK root_task SUSPEND), then ALTER TASK root_task SET SCHEDULE='new_schedule', then ALTER TASK root_task RESUME. Child tasks have no schedule of their own and do not need to be touched. You never need to drop or recreate children to change the root's schedule."
+      },
+      {
+        "q": "What does the FINALIZE clause on a task do?",
+        "a": "FINALIZE designates a task to run after the root task's DAG has completed — whether it succeeded, failed, or was cancelled — similar to a finally block. It is used for cleanup, notifications, or audit logging that must happen regardless of outcome. Only one FINALIZE task is allowed per graph, and it always executes even if the main DAG partially failed."
+      }
+    ]
+  },
+  {
+    "q": "What triggers a Dynamic Table to perform a full refresh instead of an incremental one, and how do you detect and fix it?",
+    "a": "Snowflake refreshes a Dynamic Table incrementally when it can identify precisely which micro-partitions changed upstream and the defining query supports incremental computation. A full refresh is triggered when: change tracking is not enabled on the upstream base tables; the query includes a non-incremental construct such as CURRENT_TIMESTAMP, LIMIT, or certain complex subqueries; or Snowflake determines correctness requires a full scan — e.g. after a schema change. Full refreshes are visible in DYNAMIC_TABLE_REFRESH_HISTORY with refresh_action = 'FULL'. At 0.1% daily change on a 500 GB table, a full refresh is roughly 1000x more expensive than an incremental one. Fix by enabling CHANGE_TRACKING = TRUE on all upstream base tables and removing non-incremental constructs from the defining query.",
+    "fj": "Dynamic Tables always refresh incrementally once set up.",
+    "fs": "Full refresh triggers on missing change tracking, non-incremental SQL constructs, or post-schema-change correctness needs. DYNAMIC_TABLE_REFRESH_HISTORY reveals FULL vs INCREMENTAL; the fix is enabling change tracking and removing CURRENT_TIMESTAMP or LIMIT from the query.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Detect full vs incremental refreshes",
+        "lang": "sql",
+        "lines": [
+          "SELECT name, refresh_action,",
+          "       data_timestamp,",
+          "       DATEDIFF('minute',",
+          "         data_timestamp,",
+          "         refresh_end_time) AS actual_lag_min",
+          "FROM SNOWFLAKE.ACCOUNT_USAGE",
+          "     .DYNAMIC_TABLE_REFRESH_HISTORY",
+          "WHERE name = 'MY_DT'",
+          "ORDER BY refresh_start_time DESC LIMIT 20;",
+          "-- fix: ALTER TABLE src SET",
+          "--   CHANGE_TRACKING = TRUE;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does a schema change to a base table trigger a full refresh of a downstream Dynamic Table?",
+        "a": "When a column is added, renamed, or dropped on a base table, Snowflake cannot safely apply an incremental diff — the schema of change records does not match the DT's prior state. A full refresh re-derives the table from scratch with the new schema to guarantee correctness. This cascades through the entire downstream DT DAG, so planned schema changes should be coordinated to minimize consecutive full refreshes."
+      },
+      {
+        "q": "How do you force a DT to use incremental refresh when it contains a time-based expression?",
+        "a": "Replace CURRENT_TIMESTAMP with a column that comes from the source data (e.g. an event_time column from the base table). CURRENT_TIMESTAMP is non-deterministic and changes on every evaluation, making incremental computation impossible. Anchor time to source columns so Snowflake can diff based on which source rows changed, not the evaluation clock."
+      },
+      {
+        "q": "What causes a Dynamic Table to enter SUSPENDED status?",
+        "a": "Repeated refresh failures — Snowflake suspends the table after consecutive failures, similar to SUSPEND_TASK_AFTER_NUM_FAILURES for tasks. Common causes include the backing warehouse being suspended, an upstream base table being dropped, or a query failing due to a schema mismatch. Check DYNAMIC_TABLE_REFRESH_HISTORY for the failure reason, fix the root cause, then resume with ALTER DYNAMIC TABLE name RESUME."
+      }
+    ]
+  },
+  {
+    "q": "A Stream on a high-volume source table is going stale before the consuming Task runs. What are the failure modes, causes, and fixes?",
+    "a": "A stream stores an offset into the source table's versioned micro-partition history. If that offset ages past the source table's DATA_RETENTION_TIME_IN_DAYS, the stream becomes stale — its offset points to expired history and the stream returns an error on next consumption with no recovery path except recreating it and accepting a data gap. Failure modes: the consuming task is suspended or repeatedly failing so the stream is never consumed; the source table's retention is shorter than the task's schedule (e.g. a transient table with 0-day retention backing a daily task); or the task runs but never commits DML so the stream offset never advances. Fixes: set source retention to at least 2 to 3 times the task schedule; monitor INFORMATION_SCHEMA.STREAMS for STALE=TRUE; never set DATA_RETENTION_TIME_IN_DAYS=0 on a table that backs a stream.",
+    "fj": "If a stream goes stale I'll just recreate it and replay from S3.",
+    "fs": "Staleness is unrecoverable — the offset falls off the retention cliff. Prevention: source retention >= 2-3x task schedule, monitor INFORMATION_SCHEMA.STREAMS for STALE=TRUE, no 0-day retention on stream-backed source tables.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Monitor stream staleness",
+        "lang": "sql",
+        "lines": [
+          "SELECT stream_name, stale, stale_after,",
+          "       source_table_name",
+          "FROM INFORMATION_SCHEMA.STREAMS",
+          "WHERE stale = TRUE;",
+          "-- check source table retention:",
+          "SHOW PARAMETERS LIKE",
+          "  'DATA_RETENTION_TIME_IN_DAYS'",
+          "  IN TABLE source_events;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does a transient source table with DATA_RETENTION_TIME_IN_DAYS=0 immediately make a stream unusable?",
+        "a": "A stream offset requires access to the source table's change history (micro-partition versions). A transient table with 0-day retention keeps no history at all — as soon as any micro-partition is overwritten or a DML commits, the prior version is gone. The stream's offset immediately points to expired history, making it stale the moment any data changes. Streams and 0-day retention are fundamentally incompatible."
+      },
+      {
+        "q": "Can you recover data from a stale stream without recreating from the source system?",
+        "a": "Not via the stream itself — the offset is gone. If the source table has remaining Time Travel history, you can query AT a past timestamp to manually replay the missed changes. If Time Travel is also expired and there is no external source to replay from, the data is unrecoverable. Prevention is the only reliable strategy."
+      },
+      {
+        "q": "What is the difference between a stale stream and an empty stream?",
+        "a": "An empty stream has SYSTEM$STREAM_HAS_DATA returning false — it is healthy but has no unconsumed changes. A stale stream has STALE=TRUE — the offset aged off the retention cliff and any attempt to SELECT from it or call SYSTEM$STREAM_HAS_DATA raises an error. Always check STALE in INFORMATION_SCHEMA.STREAMS as part of pipeline health monitoring."
+      }
+    ]
+  },
+  {
+    "q": "How does Snowpipe handle schema evolution when the source adds a new column, and what governs whether the pipe accepts or rejects the new field?",
+    "a": "By default, Snowpipe (file-based or Streaming via Kafka connector) fails or skips rows that include columns not present in the target table schema. You opt in at the table level: ALTER TABLE ... SET ENABLE_SCHEMA_EVOLUTION = TRUE. With this enabled, the Kafka connector or Snowpipe Streaming SDK automatically issues an ALTER TABLE ADD COLUMN when it first encounters a new nullable column in the source payload. Type changes to existing columns and NOT NULL constraint additions are not auto-evolvable and raise an error — those require manual DDL. Schema evolution events appear in COPY_HISTORY with status SCHEMA_EVOLVED. Control source schema changes with an Avro or JSON schema registry to gate when producers publish new fields, preventing surprise auto-ALTER in production.",
+    "fj": "New source columns are silently ignored by Snowpipe so I do not need to handle schema evolution.",
+    "fs": "ENABLE_SCHEMA_EVOLUTION on the target table lets Snowpipe auto-ALTER to add new nullable columns. Type changes or NOT NULL additions still need manual DDL. A schema registry gates when producers can introduce new fields.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Enable and monitor schema evolution",
+        "lang": "sql",
+        "lines": [
+          "ALTER TABLE events",
+          "  SET ENABLE_SCHEMA_EVOLUTION = TRUE;",
+          "-- Kafka connector will now auto-ALTER",
+          "-- to add new nullable columns",
+          "-- monitor evolution events:",
+          "SELECT * FROM TABLE(",
+          "  INFORMATION_SCHEMA.COPY_HISTORY(",
+          "    TABLE_NAME=>'EVENTS',",
+          "    START_TIME=>DATEADD('hour',-1,",
+          "      CURRENT_TIMESTAMP)))",
+          "WHERE status = 'SCHEMA_EVOLVED';"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens to rows that arrive while the schema evolution ALTER is in progress?",
+        "a": "Snowpipe holds those rows and retries after the ALTER completes. The schema evolution is atomic from the pipe's perspective — once the new column exists, the pending rows are applied with a brief latency spike. If the ALTER fails (e.g. naming conflict), those rows are quarantined to the pipe's error state and appear in COPY_HISTORY as failed."
+      },
+      {
+        "q": "Why should you use a schema registry with Avro when relying on auto-evolution?",
+        "a": "Auto-evolution fires the moment a new field arrives, with no human gate. A schema registry lets you version and explicitly approve schema changes before producers publish new fields; consumers see only approved versions. Without a registry, a producer accident — typo in a field name, wrong data type — can trigger an unwanted ALTER TABLE in production. The registry is the change-gate that auto-evolution lacks."
+      },
+      {
+        "q": "Can column drops be handled by schema evolution?",
+        "a": "No — schema evolution only handles additive changes (new columns). Dropped source columns simply stop sending data for that field; the target column remains and receives NULLs for new rows. To remove a target column you must explicitly ALTER TABLE ... DROP COLUMN — it is a manual, intentional DDL operation and deliberately not automated."
+      }
+    ]
+  },
+  {
+    "q": "What five ACCOUNT_USAGE queries should every Snowflake platform engineer have scripted for cost attribution and warehouse tuning?",
+    "a": "The five essential queries: (1) WAREHOUSE_METERING_HISTORY grouped by warehouse_name for per-team credit spend over a period; (2) QUERY_HISTORY with TOTAL_ELAPSED_TIME, BYTES_SPILLED_TO_REMOTE_STORAGE, and CREDITS_USED to identify the top expensive queries per warehouse; (3) METERING_DAILY_HISTORY for serverless service breakdown — AUTO_CLUSTERING, SNOWPIPE, MATERIALIZED_VIEW, etc. — which warehouse monitors cannot see; (4) WAREHOUSE_LOAD_HISTORY for avg_running and avg_queued_load to detect per-minute concurrency saturation; (5) AUTOMATIC_CLUSTERING_HISTORY for credits spent reclustering per table to identify tables where clustering costs more than it saves. These five cover warehouse credit attribution, expensive query profiling, serverless cost, concurrency saturation, and per-table clustering cost.",
+    "fj": "I check the Snowsight cost dashboard and do not write SQL for cost analysis.",
+    "fs": "Five ACCOUNT_USAGE views give the full picture: per-warehouse credits, expensive queries with spill, serverless service breakdown invisible to monitors, concurrency saturation, and per-table clustering cost.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Warehouse + serverless spend breakdown",
+        "lang": "sql",
+        "lines": [
+          "-- 1: per-warehouse credit spend",
+          "SELECT warehouse_name,",
+          "       SUM(credits_used) AS credits",
+          "FROM snowflake.account_usage",
+          "     .warehouse_metering_history",
+          "WHERE start_time >=",
+          "  DATEADD('day',-30,CURRENT_DATE)",
+          "GROUP BY 1 ORDER BY 2 DESC;",
+          "-- 3: serverless by service type",
+          "SELECT service_type, SUM(credits_used)",
+          "FROM snowflake.account_usage",
+          "     .metering_daily_history",
+          "GROUP BY 1 ORDER BY 2 DESC;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you identify which user or role is responsible for the most warehouse spend?",
+        "a": "Query SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY and GROUP BY user_name, role_name, warehouse_name, summing CREDITS_USED_COMPUTE + CREDITS_USED_CLOUD_SERVICES. This gives per-user, per-warehouse attribution directly without a join. For time-bucketed cost trends, filter by START_TIME and group by TRUNC(start_time, 'day')."
+      },
+      {
+        "q": "What does avg_queued_load > 1 in WAREHOUSE_LOAD_HISTORY signal?",
+        "a": "On average, more than one query was waiting in queue during that minute — the warehouse was saturated. Sustained avg_queued_load > 1 is the signal to add clusters (multi-cluster warehouse) or investigate the top queries causing the backup. One-off spikes are normal; persistent values above 1 indicate a structural throughput problem that warehouse resizing alone cannot fix."
+      },
+      {
+        "q": "How do you find tables where automatic clustering is costing more than it saves?",
+        "a": "Query AUTOMATIC_CLUSTERING_HISTORY for credits_used per table, then cross-reference QUERY_HISTORY for queries on those tables and compare the execution time saved against the reclustering credit cost. If the table is queried rarely or with varied filter columns, the savings rarely justify the reclustering cost — disable AUTO RECLUSTER on those tables."
+      }
+    ]
+  },
+  {
+    "q": "A Dynamic Table in your pipeline is consistently exceeding its declared target lag. Walk me through the diagnosis and fix sequence.",
+    "a": "Start with DYNAMIC_TABLE_REFRESH_HISTORY to determine whether refreshes are FULL or INCREMENTAL, the actual lag vs target, and whether refresh duration is growing. If refreshes are full when they should be incremental, check that all upstream base tables have CHANGE_TRACKING = TRUE and that the defining query has no non-incremental constructs (CURRENT_TIMESTAMP, LIMIT). If incremental but slow, upstream data volume may have grown — increase the warehouse size on the DT or give it a dedicated warehouse if it shares with other queries. If a chain of DTs is lagging, find the slowest node in DYNAMIC_TABLE_REFRESH_HISTORY and fix that node first — lag propagates downstream. Finally check SUSPENDED status; repeated refresh failures auto-suspend the DT. Increasing the target lag is not a fix — it hides the problem.",
+    "fj": "I would increase the target lag so it is less likely to miss.",
+    "fs": "Check REFRESH_HISTORY for FULL vs INCREMENTAL and duration trend. Fix in order: enable change tracking, remove non-incremental constructs, address warehouse contention, find the slowest DAG node. Never increase target lag to hide a performance problem.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Diagnose actual lag in refresh history",
+        "lang": "sql",
+        "lines": [
+          "SELECT name, refresh_action,",
+          "       refresh_start_time,",
+          "       refresh_end_time,",
+          "       DATEDIFF('minute',",
+          "         data_timestamp,",
+          "         refresh_end_time) AS actual_lag_min",
+          "FROM SNOWFLAKE.ACCOUNT_USAGE",
+          "     .DYNAMIC_TABLE_REFRESH_HISTORY",
+          "WHERE name = 'EXEC_KPIS'",
+          "ORDER BY refresh_start_time DESC",
+          "LIMIT 20;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does TARGET_LAG = DOWNSTREAM interact with diagnosing lag propagation?",
+        "a": "A DOWNSTREAM DT refreshes only when its consumer refreshes, so its own lag is not independent — it derives from the slowest consumer in the chain. If the end-of-chain DT is lagging, trace backward through DYNAMIC_TABLE_REFRESH_HISTORY: find the intermediate node with the longest refresh duration. Fixing the slow node unblocks the whole chain; adjusting the leaf consumer's lag setting does not help if an intermediate is the bottleneck."
+      },
+      {
+        "q": "When should you split a complex Dynamic Table into two simpler ones?",
+        "a": "When a single DT's query is so complex that Snowflake cannot compute an incremental diff and falls back to full refreshes. Splitting into an incremental-friendly intermediate DT (simple projection or filter) and a final DT (joins and aggregations on a smaller intermediate) lets each stage refresh incrementally. This is the DT equivalent of staging in an ETL pipeline — smaller, faster, cheaper per refresh."
+      },
+      {
+        "q": "Can you manually trigger a Dynamic Table refresh outside its schedule?",
+        "a": "Yes — ALTER DYNAMIC TABLE name REFRESH triggers an immediate refresh regardless of the target lag schedule. Use this after a large upstream backfill or schema fix to avoid waiting for the next scheduled cycle. The manual refresh counts against credits like any other refresh; check DYNAMIC_TABLE_REFRESH_HISTORY afterward to confirm it completed as INCREMENTAL."
+      }
+    ]
+  },
+  {
+    "q": "How do you structure a Snowpark Python transformation library so the same code runs in local unit tests and inside a Snowflake stored procedure?",
+    "a": "The key is to separate business logic from Snowflake session management. Define transformation functions that accept a Snowpark Session as a parameter and return DataFrames — never import from snowflake.snowpark at module top level if you need the code to run outside Snowflake. For local testing, install the snowflake-snowpark-python package locally and use Session.builder with local credentials, or mock the session entirely by patching the session object. Deploy to Snowflake by staging the library module (PUT to an internal stage) and referencing it in the stored procedure DDL with IMPORTS=('@stage/lib.py'). The handler then imports from the staged module inside the procedure. This pattern means the transformation logic has no Snowflake-specific side effects, runs in pytest locally, and the only Snowflake-specific code is the procedure entrypoint that wires the real session.",
+    "fj": "I write the transformation directly in the stored procedure body and test it by running it in Snowflake dev.",
+    "fs": "Pass Session as a parameter to transformation functions so they're mockable in pytest locally. Stage the module to an internal stage and reference it in IMPORTS on the stored procedure DDL.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Testable transform + proc entrypoint",
+        "lang": "python",
+        "lines": [
+          "# transform.py — no side effects",
+          "from snowflake.snowpark import Session",
+          "from snowflake.snowpark import functions as F",
+          "",
+          "def daily_revenue(session: Session):",
+          "    return (session.table('orders')",
+          "        .group_by('day')",
+          "        .agg(F.sum_('amount').alias('rev')))",
+          "",
+          "# proc.py — entrypoint only",
+          "def run(session: Session) -> str:",
+          "    daily_revenue(session).write.mode('overwrite')",
+          ".save_as_table('daily_rev')",
+          "    return 'done'",
+          "# DDL: IMPORTS=('@my_stage/transform.py')"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you mock a Snowpark DataFrame in pytest without a live Snowflake session?",
+        "a": "Install snowflake-snowpark-python locally and use Session.builder.config('local_testing', True).create() (Snowpark's local testing mode) to get a real Session backed by an in-memory engine without a Snowflake account. Alternatively, mock the session with unittest.mock.MagicMock, patching .table() to return a pandas-backed object. Local testing mode is the preferred path because it runs the actual Snowpark DataFrame API."
+      },
+      {
+        "q": "What does the IMPORTS clause on a stored procedure DDL do?",
+        "a": "IMPORTS lists staged Python files (or zip packages) that Snowflake makes available on the worker's Python path before the handler runs. This lets your handler import from a shared library module uploaded to an internal stage, rather than inlining all code in the DDL body. Changes to the library require re-uploading the file and replacing the procedure; Snowflake does not auto-reload staged imports on change."
+      },
+      {
+        "q": "When would you use a Snowpark DataFrame write vs session.sql for the output step in a stored procedure?",
+        "a": "DataFrame.write (via .save_as_table or .write.csv) is the right choice when your transformation is a Snowpark chain — it compiles to a single in-warehouse query with no intermediate materialization. session.sql('INSERT INTO...') is appropriate when you need fine-grained control over the DML (e.g. a specific ON CONFLICT clause, a MERGE, or schema-bound DDL) that the DataFrame API cannot express. Mix them: Snowpark for transformation, session.sql for the DML-specific steps."
+      }
+    ]
+  },
+  {
+    "q": "Compare writing a Snowflake stored procedure in Snowflake Scripting (SQL scripting) versus JavaScript. When is each the right choice in 2026?",
+    "a": "Snowflake Scripting stored procedures are pure-SQL procedural blocks supporting DECLARE, LOOP, cursor iteration, EXCEPTION handling, and EXECUTE IMMEDIATE — they run natively inside Snowflake with no sandboxing overhead and are the recommended default since 2023. JavaScript stored procedures are the legacy handler: they can iterate result sets and call session.execute(), but they have no pandas, numpy, or external-access ecosystem, require error-prone string concatenation for dynamic SQL, and have higher cold-start overhead than a scripting block. In 2026 choose Snowflake Scripting for all pure-SQL procedural pipelines, JavaScript only when maintaining existing JS stored procedures or when a team has a specific JS library need that Snowflake Scripting can't satisfy. For anything needing real Python logic, use a Snowpark stored procedure instead. From a cost-monitoring perspective, both language options consume warehouse credits identically — the language choice does not affect resource monitor tracking or query attribution in QUERY_HISTORY.",
+    "fj": "JavaScript stored procedures are the modern default for Snowflake automation.",
+    "fs": "Snowflake Scripting is the native SQL-procedural default since 2023. JavaScript stored procedures are legacy — higher overhead, no Python ecosystem. Use Snowpark stored procedures for Python logic. All stored procedure languages consume warehouse credits identically and appear in query attribution. Cost Monitoring treats all CALL entries the same regardless of language.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Snowflake Scripting vs JS skeleton",
+        "lang": "sql",
+        "lines": [
+          "-- Modern: Snowflake Scripting block",
+          "CREATE PROCEDURE process_batch(dt DATE)",
+          "  RETURNS STRING LANGUAGE SQL AS $$",
+          "BEGIN",
+          "  MERGE INTO target t USING (",
+          "    SELECT * FROM src",
+          "    WHERE load_date = :dt",
+          "  ) s ON t.id = s.id",
+          "  WHEN MATCHED THEN UPDATE SET t.v=s.v",
+          "  WHEN NOT MATCHED THEN INSERT VALUES(s.id,s.v);",
+          "  RETURN 'OK';",
+          "END;",
+          "$$;",
+          "-- Legacy: JavaScript stored procedure",
+          "-- LANGUAGE JAVASCRIPT — avoid for new code"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does Snowflake Scripting offer that JavaScript stored procedures cannot do?",
+        "a": "Snowflake Scripting supports native SQL cursors with FOR loops that iterate cleanly, EXCEPTION WHEN blocks with SQL error codes, bind variables (`:variable`) directly in SQL statements without string concatenation, and runs as native server-side SQL with no JavaScript runtime overhead. JavaScript stored procedures require `session.execute({sqlText: ...})` wrappers for every SQL call and have no direct cursor type — making complex procedural logic verbose and error-prone."
+      },
+      {
+        "q": "Can a Snowflake Scripting stored procedure call a Snowpark Python stored procedure?",
+        "a": "Yes — EXECUTE IMMEDIATE 'CALL snowpark_proc(...)' works inside a Snowflake Scripting block. You can also call it directly as CALL inside the block body. This lets you chain the two: orchestrate with Snowflake Scripting (conditionals, cursors, transactions), delegate complex Python logic to a Snowpark stored procedure, and capture its return value into a scripting variable."
+      },
+      {
+        "q": "When is a JavaScript stored procedure still the correct answer?",
+        "a": "Almost never for new code. The main exception is maintaining or extending existing JavaScript stored procedures where the rewrite cost outweighs the benefit. Snowflake Scripting handles every pure-SQL procedural pattern better; Snowpark Python handles every case requiring a library or external call. JavaScript is the legacy middle ground with the worst tradeoffs of both."
+      }
+    ]
+  },
+  {
+    "q": "Walk through how you structure Snowflake Scripting stored procedures for robust error handling: EXCEPTION blocks, transaction rollback, and surfacing diagnostics.",
+    "a": "A Snowflake Scripting stored procedure uses a DECLARE section for variables, a BEGIN / END body for logic, and EXCEPTION WHEN for error handling. Wrap the critical DML in an explicit BEGIN TRANSACTION / COMMIT block; in the EXCEPTION handler call ROLLBACK before re-raising. Capture SQLCODE and SQLERRM into variables for structured diagnostics and log them to an error table before raising so you have a permanent audit trail. Use RAISE to surface the error after logging rather than silently swallowing it — silent exceptions are the root cause of phantom pipelines that appear to succeed while data is silently wrong. EXCEPTION WHEN OTHER covers all un-handled error codes, but you can add specific WHEN STATEMENT_ERROR clauses for nuanced branching. For cost monitoring, log the procedure start and end timestamps alongside warehouse credits consumed (from QUERY_HISTORY via PARENT_QUERY_ID) so each run appears in your query attribution reports with its full credit cost.",
+    "fj": "I wrap stored procedures in a Python try/except outside Snowflake for error handling.",
+    "fs": "Snowflake Scripting has native EXCEPTION WHEN + SQLCODE/SQLERRM. Explicit ROLLBACK in the exception handler + logging to an error table + RAISE is the production pattern for robust stored procedures. Log credits via PARENT_QUERY_ID for query attribution in cost monitoring; resource monitor tracks the backing warehouse.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Exception block with rollback + logging",
+        "lang": "sql",
+        "lines": [
+          "DECLARE",
+          "  err_code INTEGER;",
+          "  err_msg  STRING;",
+          "BEGIN",
+          "  BEGIN TRANSACTION;",
+          "  MERGE INTO target t USING src s",
+          "    ON t.id=s.id",
+          "    WHEN MATCHED THEN UPDATE SET t.v=s.v;",
+          "  COMMIT;",
+          "EXCEPTION WHEN OTHER THEN",
+          "  err_code := SQLCODE;",
+          "  err_msg  := SQLERRM;",
+          "  ROLLBACK;",
+          "  INSERT INTO proc_errors VALUES(",
+          "    CURRENT_TIMESTAMP, err_code, err_msg);",
+          "  RAISE;",
+          "END;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the difference between RAISE and RETURN in a Snowflake Scripting exception handler?",
+        "a": "RAISE re-throws the current exception, propagating it to the caller so the error is visible in TASK_HISTORY and the calling system receives a failure signal. RETURN from an exception handler silently swallows the error and reports success — dangerous because tasks and dependent systems see a 'success' status while data may be in a partial or wrong state. Always RAISE in production exception handlers unless you are intentionally handling an expected condition."
+      },
+      {
+        "q": "Can you define custom exception codes in Snowflake Scripting?",
+        "a": "Yes — DECLARE my_exc EXCEPTION(-20001, 'description') creates a user-defined exception you can RAISE explicitly in the procedure body and catch by code in EXCEPTION handlers. Custom codes fall in the user-defined range (-20000 to -20999). This lets you signal domain-level errors (bad input, validation failure) distinctly from system SQL errors, enabling callers to branch on specific error types."
+      },
+      {
+        "q": "How do SQLCODE and SQLERRM behave outside an EXCEPTION handler?",
+        "a": "SQLCODE and SQLERRM are only populated inside an active EXCEPTION handler — they reflect the most recent exception. Outside a handler they return 0 and empty string. Capture them immediately into local variables at the top of your EXCEPTION block before executing any additional SQL, because any subsequent SQL call (even a logging INSERT) can reset their values."
+      }
+    ]
+  },
+  {
+    "q": "You need a Snowflake stored procedure that loops over every table in a schema, checks its row count, and writes a freshness manifest. Design it using Snowflake Scripting with INFORMATION_SCHEMA and cost-aware warehouse selection.",
+    "a": "Use a Snowflake Scripting stored procedure with a cursor over INFORMATION_SCHEMA.TABLES for the target schema, EXECUTE IMMEDIATE to count rows on each table dynamically (because table names are runtime strings), and INSERT INTO a manifest table per iteration. Choose a small warehouse (XS or S) for this metadata-heavy, low-compute loop since the bottleneck is the per-table SQL round-trips rather than compute; warehouse credits scale with query execution time, and a single-iteration count on a small table completes in milliseconds even at XS. Set a statement timeout on the procedure so a pathologically large table doesn't stall the loop. Stored procedures that produce a manifest like this are a cost-monitoring foundation — the freshness manifest can feed alert logic querying INFORMATION_SCHEMA against expected freshness windows. Pair the procedure's backing warehouse with a resource monitor so the loop can't exceed a per-run credit quota; use query attribution in QUERY_HISTORY (filter on PARENT_QUERY_ID) to confirm per-table credit costs are within expectations.",
+    "fj": "I'd run a Python script outside Snowflake to loop over tables and count rows.",
+    "fs": "Snowflake Scripting with a cursor + EXECUTE IMMEDIATE keeps schema-level automation server-side. Use an XS warehouse — warehouse credits for this are near-zero since it's metadata + small counts. The manifest feeds cost-monitoring freshness alerting. Resource monitor + query attribution confirm cost bounds.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Schema freshness manifest via scripting cursor",
+        "lang": "sql",
+        "lines": [
+          "CREATE OR REPLACE PROCEDURE build_manifest(schema_nm STRING)",
+          "  RETURNS STRING LANGUAGE SQL AS $$",
+          "DECLARE",
+          "  tbl    STRING;",
+          "  cnt    INTEGER;",
+          "  stmt   STRING;",
+          "  c CURSOR FOR",
+          "    SELECT table_name FROM information_schema.tables",
+          "    WHERE table_schema = UPPER(:schema_nm);",
+          "BEGIN",
+          "  FOR rec IN c DO",
+          "    tbl  := rec.table_name;",
+          "    stmt := 'SELECT COUNT(*) FROM ' || :schema_nm || '.' || tbl;",
+          "    cnt  := (EXECUTE IMMEDIATE :stmt);",
+          "    INSERT INTO freshness_manifest",
+          "      VALUES(:tbl, :cnt, CURRENT_TIMESTAMP);",
+          "  END FOR;",
+          "  RETURN 'done';",
+          "END;",
+          "$$;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is EXECUTE IMMEDIATE necessary here instead of a direct SELECT?",
+        "a": "In Snowflake Scripting, the table name in FROM must be a literal at parse time — you can't substitute a variable directly into FROM without dynamic SQL. EXECUTE IMMEDIATE evaluates a string as a SQL statement at runtime, allowing the table name captured from the cursor to be injected. Without it, the procedure would need to list every table name statically, defeating the purpose of a schema-level loop."
+      },
+      {
+        "q": "How do you prevent EXECUTE IMMEDIATE SQL injection when the schema name comes from a parameter?",
+        "a": "Validate the schema_nm parameter against INFORMATION_SCHEMA.SCHEMATA before using it in the dynamic string, or use the IDENTIFIER() quasi-literal notation (where supported) to safely bind identifiers. Never concatenate unvalidated user input into EXECUTE IMMEDIATE strings — even in an owner's-rights procedure, a SQL injection in a schema parameter could execute arbitrary DDL."
+      },
+      {
+        "q": "What warehouse size should drive a stored procedure that only runs INFORMATION_SCHEMA queries and simple COUNT(*)?",
+        "a": "X-Small (XS) — INFORMATION_SCHEMA queries are served from metadata with minimal compute and COUNT(*) on small tables completes in milliseconds. Warehouse credits scale with execution time, so running on XS rather than an L warehouse for metadata loops can cut credits by 8x with no latency impact. Right-sizing stored procedures to the actual compute demand is part of cost-aware Snowflake Scripting design."
+      }
+    ]
+  },
+  {
+    "q": "How do you write a JavaScript stored procedure in Snowflake, and what are the specific syntax pitfalls that have no equivalent in Snowflake Scripting?",
+    "a": "A JavaScript stored procedure in Snowflake uses LANGUAGE JAVASCRIPT with a handler that receives a snowflake object giving access to session.execute() for SQL calls, and a createStatement()/execute() pattern for parameterized queries. The key pitfalls: (1) all SQL calls are string-based — there are no bind variables, so dynamic SQL is error-prone concatenation; (2) you iterate result sets with rs.next() inside a while loop, not a cursor FOR loop; (3) error handling is JavaScript try/catch with throw, not SQL EXCEPTION/RAISE; (4) the JavaScript sandbox has no access to Snowpark DataFrames, no external HTTP calls without an external function wrapper, and no Python packages. In 2026 these constraints mean JavaScript stored procedures should only be maintained, not created; Snowflake Scripting covers every SQL-procedural case better. From a cost-monitoring angle, JavaScript stored procedures consume warehouse credits exactly like any other stored procedure language and appear in QUERY_HISTORY for query attribution — there is no credit cost difference between JS and Snowflake Scripting stored procedures, so cost monitoring via resource monitor tracks them identically.",
+    "fj": "JavaScript stored procedures have the same capabilities as Snowflake Scripting, just different syntax.",
+    "fs": "JS stored procedures use string-SQL only (no bind variables), rs.next() for iteration, try/catch for errors, and have no Snowpark or external access. Every gap is a Snowflake Scripting or Snowpark advantage. Cost monitoring via resource monitor and query attribution works identically across stored procedure languages.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "JavaScript stored procedure pattern",
+        "lang": "sql",
+        "lines": [
+          "CREATE OR REPLACE PROCEDURE js_example(dt STRING)",
+          "  RETURNS STRING LANGUAGE JAVASCRIPT AS $$",
+          "  try {",
+          "    var sql = `SELECT id, val FROM src`,",
+          "             `WHERE load_date = '` + DT + `'`;",
+          "    var rs = snowflake.execute({sqlText: sql});",
+          "    while (rs.next()) {",
+          "      var id = rs.getColumnValue(1);",
+          "      // process row...",
+          "    }",
+          "    return 'OK';",
+          "  } catch(err) {",
+          "    throw 'Error: ' + err;",
+          "  }",
+          "$$;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is string concatenation in a JavaScript stored procedure riskier than EXECUTE IMMEDIATE in Snowflake Scripting?",
+        "a": "In JavaScript stored procedures, every SQL call is a string passed to snowflake.execute() — there are no typed bind variables, so every dynamic value must be concatenated into the SQL string. EXECUTE IMMEDIATE in Snowflake Scripting supports bind syntax (:variable) for values, reducing injection surface. JS stored procedures require careful manual quoting and escaping for every injected value, a discipline that breaks under maintenance."
+      },
+      {
+        "q": "Can a JavaScript stored procedure call a Snowflake Scripting stored procedure?",
+        "a": "Yes — snowflake.execute({sqlText: 'CALL scripting_proc(...)'}) executes any CALL from a JavaScript stored procedure. The result can be captured through the result set. This migration path lets you incrementally replace JavaScript logic: convert the inner logic to Snowflake Scripting or Snowpark stored procedures and have the JavaScript outer shell call them until the outer shell is also replaced."
+      },
+      {
+        "q": "What does EXECUTE AS OWNER vs EXECUTE AS CALLER mean for a JavaScript stored procedure?",
+        "a": "The same as for any Snowflake stored procedure: EXECUTE AS OWNER runs with the owner role's privileges (the default), enabling controlled privilege elevation for callers who lack direct object access. EXECUTE AS CALLER runs with the calling user's privileges, limiting the procedure to what the caller can do. JavaScript stored procedures do not change this semantics — the execution rights model is the same across all stored procedure languages."
+      }
+    ]
+  },
+  {
+    "q": "Design a cost-monitoring stored procedure in Snowflake Scripting that detects runaway query spend and automatically suspends the offending warehouse.",
+    "a": "Write a Snowflake Scripting stored procedure (scheduled via a Task hourly on a serverless or XS warehouse) that queries SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY for credits_used_compute above a threshold in the last hour per warehouse, joins to a policy table of per-warehouse credit limits, and for each violating warehouse executes EXECUTE IMMEDIATE 'ALTER WAREHOUSE ' || wh || ' SUSPEND'. Log the suspension event with query attribution (which warehouse, which user, which query drove the spike) to an ops audit table. Cost monitoring at this level requires ACCOUNTADMIN or a role with MANAGE WAREHOUSES privilege granted to the procedure via EXECUTE AS OWNER so callers with fewer privileges can trigger it. This is the programmatic complement to declarative resource monitors — it catches patterns resource monitors miss, like sustained moderate spend rather than a single spike. Stored Procedures like this — Snowflake Scripting or Snowpark — are the enforcement layer that makes cost monitoring actionable: they read attribution data, take warehouse suspension action, and log results, all within Snowflake's governance boundary with warehouse credits consumed only for the brief hourly check run.",
+    "fj": "I'd set a resource monitor and trust it to catch everything.",
+    "fs": "Snowflake Scripting Stored Procedures querying QUERY_HISTORY for per-warehouse credit attribution and suspending violators catch graduated spend patterns that fixed-threshold resource monitors miss. Cost monitoring via Stored Procedures = read attribution + suspend warehouse. EXECUTE AS OWNER elevates the caller's privilege.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Cost-monitoring procedure skeleton",
+        "lang": "sql",
+        "lines": [
+          "CREATE OR REPLACE PROCEDURE enforce_wh_credit_limits()",
+          "  RETURNS STRING LANGUAGE SQL",
+          "  EXECUTE AS OWNER AS $$",
+          "DECLARE",
+          "  wh_name  STRING;",
+          "  used_cr  FLOAT;",
+          "  limit_cr FLOAT;",
+          "  c CURSOR FOR",
+          "    SELECT q.warehouse_name,",
+          "           SUM(q.credits_used_compute) AS used,",
+          "           p.credit_limit",
+          "    FROM snowflake.account_usage.query_history q",
+          "    JOIN wh_credit_policy p",
+          "      ON q.warehouse_name = p.warehouse_name",
+          "    WHERE q.start_time >= DATEADD('hour',-1,CURRENT_TIMESTAMP)",
+          "    GROUP BY q.warehouse_name, p.credit_limit",
+          "    HAVING SUM(q.credits_used_compute) > p.credit_limit;",
+          "BEGIN",
+          "  FOR rec IN c DO",
+          "    EXECUTE IMMEDIATE 'ALTER WAREHOUSE '||rec.warehouse_name||' SUSPEND';",
+          "    INSERT INTO wh_suspension_log",
+          "      VALUES(rec.warehouse_name, rec.used, CURRENT_TIMESTAMP);",
+          "  END FOR;",
+          "  RETURN 'checked';",
+          "END;",
+          "$$;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What query attribution columns in QUERY_HISTORY should you capture for the ops audit log?",
+        "a": "Capture warehouse_name, user_name, role_name, query_id, query_text (first 1000 chars), credits_used_compute, total_elapsed_time, and start_time. Query attribution — tying credit consumption to the specific user, role, and query — is what makes the audit log actionable for an incident post-mortem rather than just knowing a warehouse was suspended. Also include BYTES_SPILLED_TO_REMOTE_STORAGE to distinguish a runaway query from a legitimate heavy one."
+      },
+      {
+        "q": "Why does a resource monitor miss graduated spend that this stored procedure catches?",
+        "a": "A resource monitor fires at a fixed credit threshold for the billing period — it catches total spend exceeding a budget. It does not detect sustained moderate rate patterns like 'this warehouse spent 5 credits in the last hour, which is 10x its normal rate.' The stored procedure queries QUERY_HISTORY rate over a rolling window and enforces a rate limit, catching slow-burn anomalies that never spike past the resource monitor's absolute threshold."
+      },
+      {
+        "q": "What ACCOUNT_USAGE latency problem affects this procedure's accuracy?",
+        "a": "ACCOUNT_USAGE.QUERY_HISTORY lags by up to ~45 minutes. A stored procedure running hourly may see a spend spike with a 45-minute delay, meaning a warehouse that burned 5 credits in 30 minutes might only appear in the query an hour later. For near-real-time cost monitoring, pair this with INFORMATION_SCHEMA.QUERY_HISTORY (real-time, 7-day window) for the rolling hour check, and ACCOUNT_USAGE for the longer-horizon trending and attribution."
+      }
+    ]
+  },
+  {
+    "q": "What is query attribution in Snowflake's ACCOUNT_USAGE schema, and how do you build a chargeback report that allocates warehouse credits to business units?",
+    "a": "Query attribution in Snowflake means linking each credit consumed to the user, role, and warehouse that executed the query, using SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY which records credits_used_compute and credits_used_cloud_services per query alongside user_name, role_name, and warehouse_name. A chargeback report joins QUERY_HISTORY to a cost-center mapping table (role or warehouse -> BU), aggregates credits over a billing period, and multiplies by Snowflake's credit rate. For serverless spend (Snowpipe, automatic clustering), join METERING_DAILY_HISTORY on the warehouse/database name since those services don't appear in QUERY_HISTORY. Use object tags on warehouses with a cost_center key and join via ACCOUNT_USAGE.TAG_REFERENCES for teams that tag rather than use naming conventions. Automate this into a weekly summary table consumed by a Snowsight dashboard per team lead. Stored procedures appear in query attribution as CALL entries; use Snowflake Scripting or Snowpark stored procedures as the automation layer that reads this attribution data and fires alerts when a team's warehouse credits exceed the resource monitor's early-warning notification threshold.",
+    "fj": "Credit usage is tracked per account — there is no per-user or per-query attribution.",
+    "fs": "QUERY_HISTORY has credits_used_compute per query with user_name, role_name, and warehouse_name — that is query attribution for Cost Monitoring chargeback. Join to a role→BU mapping and aggregate. Stored procedures show as CALL entries. Resource monitor sets hard credit limits; query attribution provides the fine-grained breakdown.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Per-BU credit chargeback query",
+        "lang": "sql",
+        "lines": [
+          "SELECT",
+          "  m.business_unit,",
+          "  q.warehouse_name,",
+          "  q.user_name,",
+          "  SUM(q.credits_used_compute",
+          "    + q.credits_used_cloud_services) AS total_credits",
+          "FROM snowflake.account_usage.query_history q",
+          "JOIN cost_center_mapping m",
+          "  ON q.role_name = m.role_name",
+          "WHERE q.start_time >=",
+          "  DATE_TRUNC('month', CURRENT_DATE)",
+          "GROUP BY 1, 2, 3",
+          "ORDER BY total_credits DESC;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why must you include credits_used_cloud_services in a chargeback and not just credits_used_compute?",
+        "a": "Cloud services credits cover query compilation, metadata operations, and result cache lookups — they can be material for workloads with many small queries or heavy DDL. Total cost is credits_used_compute + credits_used_cloud_services. Omitting cloud services understates spend, especially for automation-heavy teams running many short queries or stored procedures where cloud services fraction is higher than for large analytical queries."
+      },
+      {
+        "q": "How do you attribute Snowpipe ingest costs to a specific team in METERING_DAILY_HISTORY?",
+        "a": "Join METERING_DAILY_HISTORY (where service_type = 'SNOWPIPE') to PIPE_USAGE_HISTORY on pipe_name, then to a pipe-to-BU mapping table that you maintain separately. Alternatively, tag the target tables with a cost_center tag and join via TAG_REFERENCES. Snowpipe credits appear as serverless compute in METERING_DAILY_HISTORY without a user_name or role_name — you must use the object identity (pipe name or target table) as the attribution key."
+      },
+      {
+        "q": "What causes cloud services credits to exceed 10% of compute credits, triggering extra billing?",
+        "a": "Snowflake includes cloud services credits in the daily compute total up to 10% of warehouse compute for free. Excess is billed additionally. Common causes: workloads dominated by metadata queries (SHOW commands, small INFORMATION_SCHEMA queries, small DDL), heavy use of time travel AT queries, or many short queries where compilation overhead is proportionally large. Identify offenders by filtering QUERY_HISTORY for high credits_used_cloud_services with low credits_used_compute."
+      }
+    ]
+  },
+  {
+    "q": "How does a resource monitor's credit quota interact with warehouse credits billing, and what is the exact sequence of events when a monitor fires a Suspend action?",
+    "a": "A resource monitor tracks the warehouse credits consumed by one or more virtual warehouses against a quota over a defined frequency interval (daily, weekly, monthly, or never-reset). Credits accrue per second of warehouse runtime; the monitor polls approximately every minute. When used credits cross a notification threshold, Snowflake sends email or webhook alerts. When used credits cross a Suspend threshold, Snowflake issues a graceful suspend: running queries complete, new queries are rejected with an error, and the warehouse status transitions to SUSPENDED. SUSPEND_IMMEDIATE is harsher — it kills running queries immediately. The monitor does NOT track serverless compute (Snowpipe, clustering, SOS, Cortex), which is why Snowflake Budgets exist for that layer. ACCOUNTADMIN can resume a suspended warehouse or raise the quota; the monitor resets at the start of each new frequency interval. For cost monitoring completeness, pair the resource monitor with query attribution from ACCOUNT_USAGE.QUERY_HISTORY to understand which users, roles, and stored procedures drove the warehouse to suspension. A Snowflake Scripting stored procedure scheduled hourly can query this attribution data and page the relevant team before the resource monitor fires.",
+    "fj": "A resource monitor suspends the warehouse instantly mid-query.",
+    "fs": "Suspend is graceful — running queries finish, new ones are rejected. SUSPEND_IMMEDIATE kills in-flight queries. The monitor only tracks warehouse credits, not serverless spend (that needs Budgets). Pair with query attribution and a Snowflake Scripting stored procedure for proactive cost monitoring.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Resource monitor with both trigger actions",
+        "lang": "sql",
+        "lines": [
+          "CREATE RESOURCE MONITOR etl_mon",
+          "  WITH CREDIT_QUOTA = 500",
+          "  FREQUENCY = MONTHLY",
+          "  START_TIMESTAMP = IMMEDIATELY",
+          "  TRIGGERS",
+          "    ON 75 PERCENT DO NOTIFY",
+          "    ON 90 PERCENT DO NOTIFY",
+          "    ON 100 PERCENT DO SUSPEND",
+          "    ON 110 PERCENT DO SUSPEND_IMMEDIATE;",
+          "ALTER WAREHOUSE etl_wh SET",
+          "  RESOURCE_MONITOR = etl_mon;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens to a query mid-execution when a Suspend action fires?",
+        "a": "SUSPEND is graceful — the currently running query completes normally; only new query submissions are rejected after the suspend signal. The warehouse transitions to SUSPENDED after the last active query finishes. This is important for long-running ETL: a SUSPEND trigger at 100% will not abort a 30-minute job already running, but the next job after it will fail immediately."
+      },
+      {
+        "q": "Why set an additional SUSPEND_IMMEDIATE trigger at 110% in addition to SUSPEND at 100%?",
+        "a": "A long-running query started just before the SUSPEND threshold is crossed can push spend well past 100% before it finishes — potentially to 130% or higher. SUSPEND_IMMEDIATE at 110% is a hard ceiling that kills any still-running query once the overage exceeds a small buffer, bounding total overrun. The 100/110 pair gives one query a grace period while the 110% backstop limits how far over budget you can drift."
+      },
+      {
+        "q": "How do warehouse credits accrue for a multi-cluster warehouse under a resource monitor?",
+        "a": "A multi-cluster warehouse bills credits proportional to the number of active clusters at each second — if three clusters are running, you accrue 3x the single-cluster rate per second. The resource monitor accumulates all credits from all clusters of the monitored warehouse, not per-cluster. Scaling out aggressively burns the quota faster; ECONOMY scaling policy helps by keeping fewer clusters active, which matters when the warehouse is close to its credit limit."
+      }
+    ]
+  },
+  {
+    "q": "Build a Snowpark Python stored procedure that performs incremental model scoring: reads new rows from a Stream, scores them with a staged ML model, writes results, and advances the Stream offset atomically.",
+    "a": "The procedure reads from a Snowpark Stream object (session.table('MY_STREAM')), applies a vectorized Snowpark UDF (or a Snowpark ML Modeling API call) for scoring, writes the scored DataFrame to the target table with mode 'append', and commits — which atomically advances the Stream offset. Load the model at module scope in the handler file from a staged pickle or ONNX file using session.file.get() to a local /tmp path, then deserialize once per worker startup. The entire read-score-write is wrapped in an explicit transaction via session.sql('BEGIN').collect() / COMMIT so that if the write fails, the Stream offset does not advance and the next invocation retries the same batch. Schedule via a serverless Task with WHEN SYSTEM$STREAM_HAS_DATA so no warehouse credits are burned on empty runs. For cost monitoring, attach a resource monitor to the backing warehouse and use query attribution in ACCOUNT_USAGE.QUERY_HISTORY to track per-run credit consumption; stored procedures that score large batches can surprise you with warehouse credits if the model UDF is row-at-a-time rather than vectorized.",
+    "fj": "I'd export new rows to an external API for scoring and insert results back.",
+    "fs": "Snowpark stored procedures score in-warehouse: model at module scope, Stream + COMMIT atomicity, STREAM_HAS_DATA guard for zero-waste scheduling. Resource monitor + query attribution track warehouse credits per scoring run for cost monitoring. Use Snowflake Scripting stored procedures for the orchestration wrapper when you need SQL-level conditionals around when to invoke the Snowpark scoring proc.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Snowpark incremental scoring proc",
+        "lang": "python",
+        "lines": [
+          "import pickle, os",
+          "from snowflake.snowpark import Session",
+          "from snowflake.snowpark import functions as F",
+          "from snowflake.snowpark.types import FloatType",
+          "",
+          "# Module scope: loaded ONCE per worker",
+          "_model = None",
+          "",
+          "def _load_model(session: Session):",
+          "    global _model",
+          "    if _model is None:",
+          "        session.file.get('@models/rf.pkl', '/tmp/')",
+          "        with open('/tmp/rf.pkl', 'rb') as f:",
+          "            _model = pickle.load(f)",
+          "",
+          "def score_new_rows(session: Session) -> str:",
+          "    _load_model(session)",
+          "    stream_df = session.table('EVENTS_STREAM')",
+          "    if stream_df.count() == 0:",
+          "        return 'no new rows'",
+          "    try:",
+          "        session.sql('BEGIN').collect()",
+          "        score_udf = F.udf(",
+          "            lambda v: float(_model.predict([[v]])[0]),",
+          "            return_type=FloatType())",
+          "        result = stream_df.withColumn('score',",
+          "            score_udf(F.col('feature')))",
+          "        result.write.mode('append').save_as_table('SCORES')",
+          "        session.sql('COMMIT').collect()",
+          "        return 'scored'",
+          "    except Exception as e:",
+          "        session.sql('ROLLBACK').collect()",
+          "        raise"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is it critical that the write and commit happen in the same transaction as the Stream read?",
+        "a": "A Snowflake Stream offset only advances when the DML that consumes it is committed. If the write succeeds but the commit never happens (crash, exception), the offset stays at its prior position and the next run re-reads the same rows. If the write fails, the rollback ensures the offset doesn't advance either. The BEGIN/write/COMMIT atomic block guarantees exactly-once processing: either the results are written AND the Stream advances, or neither happens."
+      },
+      {
+        "q": "Why load the model at module scope rather than inside the scoring function?",
+        "a": "Snowflake reuses Python workers across UDF/procedure invocations within a query. Module-scope initialization runs once when the worker starts, amortizing deserialization and file download across all batches processed by that worker. Loading inside the function would re-deserialize the model on every batch or row, multiplying latency and I/O by the number of invocations — especially damaging for large models."
+      },
+      {
+        "q": "What is Snowpark ML Modeling API and when would it replace a manually pickled model in this pattern?",
+        "a": "The Snowpark ML Modeling API provides scikit-learn-compatible estimators (e.g. snowflake.ml.modeling.ensemble.RandomForestClassifier) that train and predict directly on Snowpark DataFrames inside Snowflake, with models stored in Snowflake's Model Registry rather than a pickle on a stage. Use it when you want model versioning, lineage, and deployment management through Snowflake's registry; use a manually staged pickle when the model was trained outside Snowflake or is a custom/non-supported architecture."
+      }
+    ]
+  },
+  {
+    "q": "Your organization needs a single cost-monitoring dashboard for all Snowflake spend: warehouse credits, serverless services, and query attribution. What ACCOUNT_USAGE views power each column and what are the latency caveats?",
+    "a": "Three ACCOUNT_USAGE view families cover the full picture. Warehouse compute: WAREHOUSE_METERING_HISTORY for total credits per warehouse per hour, QUERY_HISTORY for per-query attribution with user_name, role_name, credits_used_compute, and credits_used_cloud_services — ~45-minute lag for QUERY_HISTORY, ~2-hour lag for METERING. Serverless: METERING_DAILY_HISTORY with service_type (AUTO_CLUSTERING, SNOWPIPE, MATERIALIZED_VIEW, SERVERLESS_TASK, SEARCH_OPTIMIZATION) for serverless credit breakdown — no user attribution available here, only object name. Freshness and lineage: ACCESS_HISTORY for who read which tables (Enterprise only), TASK_HISTORY for task credit consumption. Join all via warehouse_name and date for a unified daily cost row. The universal caveat: all ACCOUNT_USAGE views carry 45-minute to 3-hour lag — build the dashboard on yesterday's data, not real-time; for real-time spot checks use INFORMATION_SCHEMA (7-day window, zero lag). Automate the refresh with a Snowflake Scripting stored procedure on a nightly serverless task; the stored procedures themselves appear in QUERY_HISTORY as CALL entries and their warehouse credits are visible in query attribution alongside regular queries. The cost-monitoring dashboard must include resource monitor status — query ACCOUNT_USAGE.RESOURCE_MONITORS to surface active monitors, their quotas, and current utilization.",
+    "fj": "One query on WAREHOUSE_METERING_HISTORY shows all Snowflake spend.",
+    "fs": "WAREHOUSE_METERING_HISTORY covers only virtual warehouse credits. Serverless needs METERING_DAILY_HISTORY. Query attribution needs QUERY_HISTORY. Automate with Snowflake Scripting stored procedures on serverless tasks. Resource monitor status from ACCOUNT_USAGE.RESOURCE_MONITORS completes the cost-monitoring picture.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Unified daily cost summary (warehouse + serverless)",
+        "lang": "sql",
+        "lines": [
+          "-- Warehouse credits by team tag",
+          "SELECT DATE(w.start_time) AS day,",
+          "       t.tag_value         AS cost_center,",
+          "       w.warehouse_name,",
+          "       SUM(w.credits_used) AS wh_credits",
+          "FROM snowflake.account_usage.warehouse_metering_history w",
+          "LEFT JOIN snowflake.account_usage.tag_references t",
+          "  ON t.object_name = w.warehouse_name",
+          "  AND t.tag_name   = 'COST_CENTER'",
+          "GROUP BY 1,2,3",
+          "UNION ALL",
+          "-- Serverless credits by service",
+          "SELECT date, NULL, service_type,",
+          "       SUM(credits_used)",
+          "FROM snowflake.account_usage.metering_daily_history",
+          "GROUP BY 1,2,3;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you surface query attribution (user, role) for the top 10 most expensive queries per warehouse per day?",
+        "a": "Query ACCOUNT_USAGE.QUERY_HISTORY filtered by start_time, group by warehouse_name, user_name, role_name, and ORDER BY SUM(credits_used_compute + credits_used_cloud_services) DESC LIMIT 10 per warehouse using QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_name ORDER BY credits DESC) <= 10. This gives per-warehouse top-cost query attribution — the foundation for both chargeback allocation and anomaly detection in cost monitoring."
+      },
+      {
+        "q": "Why is there no user_name or role_name in METERING_DAILY_HISTORY for serverless services?",
+        "a": "Serverless services like Snowpipe, automatic clustering, and materialized-view maintenance run on Snowflake-managed compute as background processes, not initiated by a user session. There is no interactive user issuing them — they are triggered by data arrival (Snowpipe), data change (clustering, MV), or a schedule (serverless task). Attribution must use the object name (pipe name, table name, task name) instead of user/role identity."
+      },
+      {
+        "q": "What does TAG_REFERENCES provide that WAREHOUSE_METERING_HISTORY alone does not?",
+        "a": "TAG_REFERENCES lists the effective tag values applied to each object, enabling you to join cost data to business metadata (cost_center, team, environment) that was set via object tags. Without the join, you have warehouse_name but not which business unit owns it — unless you encode that in the name, which is brittle. TAG_REFERENCES is the clean separation between compute identity and business ownership in a cost monitoring schema."
+      }
+    ]
+  },
+  {
+    "q": "A Snowflake stored procedure is being called thousands of times per day from dbt macros and costing more warehouse credits than expected. How do you diagnose and reduce the credit overhead?",
+    "a": "Each CALL to a stored procedure occupies warehouse compute for its full duration including startup overhead, so warehouse credits scale with the number of calls and each call's execution time. Start diagnosis in QUERY_HISTORY: filter for query_type = 'CALL' and aggregate total_elapsed_time and credits_used_compute per procedure name — this is query attribution for stored procedures, the same mechanism used for any other query type. Common causes of high credit overhead: the procedure runs on a warehouse that was auto-suspended and must restart (60-second billing minimum per startup), the procedure does redundant work per call (no incremental filtering), or the dbt macro triggers a CALL per model rather than batching. Fixes: run procedures on a pre-warmed always-on warehouse for high-frequency calls, batch the work inside one procedure invocation instead of many small calls, convert pure-SQL procedures to dbt macros or CTEs that compile into the dbt query (no CALL overhead), and switch to serverless tasks for background automation that doesn't need to block dbt's run. For cost monitoring, add a resource monitor to the dbt warehouse with a notification threshold so a runaway stored procedure loop surfaces as an alert before the month-end invoice. For Snowflake Scripting stored procedures specifically, also check whether EXECUTE IMMEDIATE inside a loop is spawning many child queries — query attribution via PARENT_QUERY_ID reveals the sub-query cost breakdown.",
+    "fj": "Stored procedure calls are lightweight — they shouldn't affect credits significantly.",
+    "fs": "Each CALL consumes warehouse credits and appears in query attribution (query_type='CALL'). Pre-warm for high-frequency calls; batch work; convert pure SQL to dbt macros. Cost monitoring: resource monitor on the dbt warehouse catches runaway stored procedure credit burn. Snowflake Scripting loops: check PARENT_QUERY_ID for sub-query attribution.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Identify expensive CALL queries in QUERY_HISTORY",
+        "lang": "sql",
+        "lines": [
+          "SELECT query_text,",
+          "       COUNT(*) AS call_count,",
+          "       AVG(total_elapsed_time)/1000 AS avg_sec,",
+          "       SUM(credits_used_compute",
+          "         + credits_used_cloud_services)",
+          "         AS total_credits",
+          "FROM snowflake.account_usage.query_history",
+          "WHERE query_type = 'CALL'",
+          "  AND start_time >=",
+          "    DATEADD('day', -7, CURRENT_DATE)",
+          "GROUP BY 1",
+          "ORDER BY total_credits DESC",
+          "LIMIT 20;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When does it make sense to replace a stored procedure call with a dbt macro?",
+        "a": "When the stored procedure's logic is pure SQL transformation with no imperative side effects — no DML outside the transformation, no external calls, no conditional DDL. A dbt macro compiles into the query graph and runs as part of the model's SQL, incurring no separate CALL overhead. Stored procedures earn their place when you need transaction control, loops, cursors, external network access, or Python logic that can't be expressed as a dbt model."
+      },
+      {
+        "q": "Why does a 60-second billing minimum affect stored procedure cost for a pre-warmed warehouse?",
+        "a": "The 60-second minimum only applies to each warehouse startup — if the warehouse is already running when CALL is issued, billing is purely per-second for the duration of the call. A pre-warmed warehouse eliminates the startup overhead entirely, so a 2-second procedure call costs 2 seconds of compute, not 60. For high-frequency calls from dbt, keeping the warehouse warm is often a net saving over the repeated 60-second minimums from auto-suspend/resume cycles."
+      },
+      {
+        "q": "Can you profile which operator inside a stored procedure is consuming the most credits?",
+        "a": "Yes — the Query Profile in Snowsight shows the execution plan for the CALL query, broken down by operator. For a Snowflake Scripting or Snowpark stored procedure you can also query QUERY_HISTORY for child queries spawned inside the procedure using PARENT_QUERY_ID to find the sub-queries the procedure issued and their individual credit consumption, pinpointing which internal SQL statement is the bottleneck."
+      }
+    ]
+  },
+  {
+    "q": "How do you tune the cost-monitoring posture of a stored procedure pipeline: right-sizing warehouse credits, adding Snowflake Scripting observability, and wiring query attribution alerts?",
+    "a": "Cost monitoring for a stored-procedure pipeline has three layers. Warehouse credits: each CALL consumes compute at the warehouse's credit rate for its full duration; profile QUERY_HISTORY (query_type = 'CALL') for per-procedure credits_used_compute and total_elapsed_time, then right-size the backing warehouse — stored procedures that run short SQL loops need XS, not L. Snowflake Scripting observability: add a DECLARE section for timing variables (start := CURRENT_TIMESTAMP) and INSERT to a proc_metrics table at procedure end to capture elapsed time and row counts per run; this gives you trend data resource monitors don't provide. Query attribution: join QUERY_HISTORY on PARENT_QUERY_ID to find the sub-queries a stored procedure issued, attributing each sub-query's warehouse credits to the procedure's owner role and the calling user — query attribution at sub-query level is what distinguishes a costly MERGE inside a proc from cheap metadata calls. Wire a Snowflake Budget covering the procedure's warehouse so serverless tasks scheduled alongside it are visible in the same cost envelope as warehouse credits.",
+    "fj": "Stored procedures don't need cost monitoring — they're just individual SQL calls.",
+    "fs": "Profile QUERY_HISTORY by PARENT_QUERY_ID for sub-query attribution inside stored procedures. Add Snowflake Scripting timing inserts for observability. Right-size warehouse credits per procedure type. Budget covers the warehouse + its serverless neighbors in one cost envelope.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Sub-query attribution inside a stored procedure",
+        "lang": "sql",
+        "lines": [
+          "-- Find expensive sub-queries inside a CALL",
+          "SELECT child.query_text,",
+          "       child.credits_used_compute,",
+          "       child.total_elapsed_time/1000 AS sec",
+          "FROM snowflake.account_usage.query_history parent",
+          "JOIN snowflake.account_usage.query_history child",
+          "  ON child.parent_query_id = parent.query_id",
+          "WHERE parent.query_type = 'CALL'",
+          "  AND parent.query_text ILIKE '%my_proc%'",
+          "  AND parent.start_time >=",
+          "    DATEADD('day', -1, CURRENT_DATE)",
+          "ORDER BY child.credits_used_compute DESC;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does PARENT_QUERY_ID link sub-queries to the calling stored procedure for cost attribution?",
+        "a": "When a stored procedure issues SQL statements (via EXECUTE IMMEDIATE, session.sql(), or direct Snowflake Scripting DML), those child queries are recorded in QUERY_HISTORY with a PARENT_QUERY_ID pointing to the CALL query's query_id. Joining on PARENT_QUERY_ID gives you the full credit cost breakdown by individual DML within the procedure — so you can pinpoint which MERGE, SELECT, or INSERT step consumes the bulk of the warehouse credits rather than attributing everything to the CALL as a black box."
+      },
+      {
+        "q": "What Snowflake Scripting pattern gives you per-run execution metrics without an external monitoring tool?",
+        "a": "DECLARE a start_ts TIMESTAMP variable set to CURRENT_TIMESTAMP at the top of BEGIN, then INSERT INTO a proc_metrics table at the end with (procedure_name, start_ts, CURRENT_TIMESTAMP, rows_processed). This turns every stored procedure run into a queryable performance record. Over time, cost monitoring dashboards can trend execution duration and detect regressions without relying on ACCOUNT_USAGE QUERY_HISTORY lag."
+      },
+      {
+        "q": "When should you move a stored procedure's logic to a Dynamic Table for cost reduction?",
+        "a": "When the procedure is a scheduled refresh of a SELECT-based transformation with no imperative side effects — no external calls, no branching DML. A Dynamic Table with TARGET_LAG replaces the stored procedure + Task with a declarative freshness contract, and Snowflake manages incremental refresh (cheaper than a full MERGE on every run). The cost monitoring signal: if QUERY_HISTORY shows full-table scans on every CALL with no filtering on changed rows, the procedure is a candidate for Dynamic Table replacement with incremental refresh."
+      }
+    ]
+  },
+  {
+    "q": "Design the complete cost-monitoring governance stack for a Snowflake account: resource monitors, Budgets, query attribution reporting, and automated stored-procedure enforcement.",
+    "a": "Layer four components. First, warehouse resource monitors: one per team warehouse with CREDIT_QUOTA, NOTIFY at 80%, SUSPEND at 100%, SUSPEND_IMMEDIATE at 110% — resource monitors are the declarative hard caps on warehouse credits per billing cycle. One account-level backstop resource monitor at 90% of total contract as the last resort. Second, Snowflake Budgets: one custom Budget per team, grouping that team's warehouses and databases; set a monthly spending limit and a forecast alert to Slack/PagerDuty — Budgets cover serverless (Snowpipe, clustering, SOS, Cortex) that resource monitors are blind to. Third, query attribution reporting: a weekly table materialized from ACCOUNT_USAGE.QUERY_HISTORY (credits_used per user/role/warehouse) and METERING_DAILY_HISTORY (serverless by service_type), joined via object tags to business units — this chargeback layer surfaces which stored procedures, users, and roles are consuming warehouse credits; query attribution from PARENT_QUERY_ID exposes sub-queries inside stored procedures as well as top-level queries. Fourth, enforcement stored procedure: a Snowflake Scripting stored procedure on a serverless task (hourly) that reads QUERY_HISTORY for rate-based credit anomalies and suspends violating warehouses via EXECUTE IMMEDIATE, logging every action with query attribution. The principle: resource monitors for warehouse credit hard caps, Budgets for serverless forecast, attribution reports for accountability, Snowflake Scripting stored procedures for behavioral enforcement.",
+    "fj": "Just set resource monitors on each warehouse and the cost problem is solved.",
+    "fs": "Four-layer Cost Monitoring stack: per-team + account-level resource monitors (warehouse credits hard caps), Budgets (serverless forecast), query attribution reports (chargeback accountability including Stored Procedures), Snowflake Scripting enforcement stored procedures (rate-anomaly response). Each covers a blind spot of the others.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Full governance stack DDL sketch",
+        "lang": "sql",
+        "lines": [
+          "-- 1. Team warehouse monitor",
+          "CREATE RESOURCE MONITOR team_etl",
+          "  WITH CREDIT_QUOTA=600 FREQUENCY=MONTHLY",
+          "  TRIGGERS ON 80 PERCENT DO NOTIFY",
+          "           ON 100 PERCENT DO SUSPEND",
+          "           ON 110 PERCENT DO SUSPEND_IMMEDIATE;",
+          "ALTER WAREHOUSE etl_wh SET RESOURCE_MONITOR=team_etl;",
+          "",
+          "-- 2. Budget for serverless coverage",
+          "CREATE BUDGET etl_budget;",
+          "CALL etl_budget!SET_SPENDING_LIMIT(600);",
+          "CALL etl_budget!ADD_RESOURCE(",
+          "  SYSTEM$REFERENCE('WAREHOUSE','ETL_WH'));",
+          "",
+          "-- 3. Attribution report (scheduled daily)",
+          "CREATE OR REPLACE DYNAMIC TABLE daily_credit_attr",
+          "  TARGET_LAG='12 hours' WAREHOUSE=reporting_wh",
+          "AS",
+          "SELECT DATE(start_time) AS day, warehouse_name,",
+          "       user_name, role_name,",
+          "       SUM(credits_used_compute",
+          "         + credits_used_cloud_services) AS credits",
+          "FROM snowflake.account_usage.query_history",
+          "GROUP BY 1,2,3,4;",
+          "",
+          "-- 4. Enforcement proc (serverless task, hourly)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the single biggest blind spot of warehouse resource monitors that makes Budgets non-optional?",
+        "a": "Resource monitors track only virtual-warehouse compute credits. Serverless services — Snowpipe, automatic clustering, materialized-view maintenance, Search Optimization Service, Cortex AI inference, serverless tasks — bill outside any warehouse and are completely invisible to resource monitors. An account with aggressive automatic clustering on multiple large tables can spend hundreds of credits monthly that no warehouse monitor will ever see. Budgets cover serverless service spend with forecast alerting — the only mechanism that sees those costs."
+      },
+      {
+        "q": "How does the query attribution Dynamic Table differ from querying ACCOUNT_USAGE directly?",
+        "a": "The Dynamic Table materializes a pre-aggregated, pre-joined attribution result on a 12-hour lag, so the chargeback report queries a small, fast summary table rather than scanning full QUERY_HISTORY (which can contain millions of rows). The Dynamic Table also allows the dashboard to run on a small warehouse against local micro-partitions rather than invoking cloud services for each ACCOUNT_USAGE query, reducing the cost of cost-monitoring itself — a meta-optimization worth making on high-query-volume accounts."
+      },
+      {
+        "q": "When would you escalate from SUSPEND to SUSPEND_IMMEDIATE in the enforcement stored procedure?",
+        "a": "SUSPEND is graceful — running queries complete before the warehouse stops, which is correct for ETL that must not leave data in a half-loaded state. SUSPEND_IMMEDIATE kills all running queries, appropriate only when the spend rate is so anomalous (e.g. a runaway cartesian join burning 50 credits in 10 minutes) that waiting for queries to finish causes more damage than aborting them. Encode this as a higher threshold trigger in the procedure's logic: SUSPEND for moderate overruns, SUSPEND_IMMEDIATE for severe anomalies detected by the rate-based check."
+      }
+    ]
+  },
+  {
+    "q": "How do you configure a named connection in SnowSQL so your CI pipeline never stores credentials in a script?",
+    "a": "SnowSQL reads named connections from ~/.snowsql/config under a [connections.<name>] section. Each stanza can hold accountname, username, authenticator, and a path to a private key, but credentials like password or private_key_passphrase should come from environment variables (snowsql_pwd, snowsql_private_key_passphrase) that SnowSQL resolves at startup. In CI you inject those env vars as secrets and invoke snowsql -c <name> — the connection name is resolved, the env var supplies the secret, and the plain-text credential never appears in any script or log. Using key-pair auth with an encrypted private key is the hardest form since the passphrase is separate from the key file.",
+    "fj": "I embed the password directly in the snowsql connection string in my pipeline script.",
+    "fs": "SnowSQL named connections plus env vars for secrets — the script holds only the connection name, CI injects the env var; no plaintext credential in code or logs.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "~/.snowsql/config named connection",
+        "lang": "sql",
+        "lines": [
+          "# ~/.snowsql/config",
+          "[connections.prod]",
+          "accountname = myorg-myacct",
+          "username = svc_etl",
+          "authenticator = snowflake_jwt",
+          "private_key_path = /secrets/rsa_key.p8",
+          "# passphrase from env:",
+          "# SNOWSQL_PRIVATE_KEY_PASSPHRASE"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does SnowSQL do if both the config file and an env var set the password?",
+        "a": "Environment variables take precedence over the config file value for the same parameter. That ordering lets you set safe defaults in the config and override them in CI without touching the file, which is the safe promotion pattern."
+      },
+      {
+        "q": "Why is key-pair auth preferred over password auth in SnowSQL CI usage?",
+        "a": "A private key file plus an optional encrypted passphrase has no expiry driven by a password policy, is auditable (the public key is registered on the Snowflake user object and visible via DESCRIBE USER), and works cleanly with secrets managers that can inject the key path and passphrase as separate secrets. Password auth in CI means a rotating credential in multiple places."
+      },
+      {
+        "q": "How do you test which connection SnowSQL would resolve without running a query?",
+        "a": "Run `snowsql -c <name> --query 'SELECT 1' --option friendly=false` and inspect the connection metadata in the output header. You can also run `snowsql -c <name> --noup --query 'SELECT CURRENT_USER()'` to confirm identity. There is no dry-run that prints the resolved config without attempting a connection."
+      }
+    ]
+  },
+  {
+    "q": "A long SnowSQL scripting session needs to reuse a computed value across multiple statements. How do you declare and reference a SnowSQL variable, and what is the gotcha?",
+    "a": "SnowSQL variables are session-scope client-side variables set with the !set meta-command: `!set my_var='PROD'`. They are substituted into subsequent SQL text with the &my_var syntax. Gotcha: variable substitution is simple text expansion done by the SnowSQL client before the SQL reaches Snowflake, so there is no quoting or escaping — if the variable contains a single quote or special character the resulting SQL will be malformed. Always wrap string variables in quotes at the usage site (&my_var is typically used inside a quoted literal or with explicit casting). Also, variables are client-side only; they do not exist as Snowflake session variables and are not visible via SHOW VARIABLES.",
+    "fj": "I repeat the value in every statement because SnowSQL does not support variables.",
+    "fs": "SnowSQL !set defines a client-side variable substituted with &var_name. It is text expansion before the SQL reaches Snowflake, so special characters in the value will break the query — quote carefully at the usage site.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "SnowSQL client variable substitution",
+        "lang": "sql",
+        "lines": [
+          "-- set a SnowSQL variable",
+          "!set schema_name='PROD_ETL'",
+          "-- reference it in SQL text",
+          "USE SCHEMA &schema_name;",
+          "SELECT count(*) FROM &schema_name..orders;",
+          "-- client replaces &schema_name",
+          "-- before sending to Snowflake"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you capture the result of a SELECT into a SnowSQL variable?",
+        "a": "SnowSQL does not support capturing a query result directly into a !set variable the way a shell can capture command output. The workaround is to write the SELECT result to a file with !output redirection and parse it outside SnowSQL, or use a Snowflake SQL scripting block (stored procedure) where you can assign a query result to a Snowflake-side variable and then call the procedure from SnowSQL."
+      },
+      {
+        "q": "What is the difference between a SnowSQL !set variable and a Snowflake session variable (SET)?",
+        "a": "A SnowSQL !set variable is client-side only — it lives in the SnowSQL process and is expanded by the client before SQL is sent. A Snowflake SET variable (SET x = 1;) is server-side: it is stored in the Snowflake session state and referenced with $x in SQL, visible to any subsequent SQL within that session. Neither is shared between sessions or visible after the session ends."
+      }
+    ]
+  },
+  {
+    "q": "How do you use SnowSQL's PUT command to stage a local file for bulk loading, and what does it do under the hood?",
+    "a": "PUT <local_path> @<stage_name> compresses the file with gzip by default, encrypts it with AES-256 client-side, and uploads it to the specified internal stage using parallel chunk transfers. The command runs from within a SnowSQL session and reports each file's status (UPLOADED, SKIPPED if already present, or an error). Because the encryption happens before the bytes leave your machine, the file is never in plaintext on Snowflake's object storage. After PUT, run COPY INTO to load from the stage. GET is the reverse: it downloads a staged file to a local path, decrypting it on the way. Neither PUT nor GET is available in the Snowflake web UI or Snowpark — they are SnowSQL (and the Snowflake JDBC/ODBC driver) exclusive operations for local file staging.",
+    "fj": "I upload files directly to Snowflake's S3 bucket through the AWS console.",
+    "fs": "SnowSQL PUT compresses and AES-256 encrypts the file client-side before upload to an internal stage — the file is never plaintext on cloud storage. GET is the reverse. Both are SnowSQL-exclusive (not available in Snowsight).",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "PUT then COPY INTO",
+        "lang": "sql",
+        "lines": [
+          "-- inside a SnowSQL session:",
+          "PUT file:///data/orders.csv.gz",
+          "    @~  -- user's personal stage",
+          "    AUTO_COMPRESS=FALSE;",
+          "COPY INTO orders",
+          "  FROM @~",
+          "  FILE_FORMAT=(TYPE=CSV SKIP_HEADER=1);"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does SnowSQL PUT use parallel chunk uploads and how do you control chunk size?",
+        "a": "Large files are split into chunks and uploaded in parallel to maximize throughput. You control this with the PARALLEL parameter: `PUT file://... @stage PARALLEL=16` tells the client to use up to 16 parallel upload threads. The default is 4. Increasing it helps on high-bandwidth connections; too many threads can saturate the network or run into rate limits."
+      },
+      {
+        "q": "What happens if you PUT a file that already exists at the stage?",
+        "a": "SnowSQL compares the local file to what exists at the stage and skips it (status = SKIPPED) if they match. Use OVERWRITE=TRUE to force re-upload regardless: `PUT ... OVERWRITE=TRUE`. Without it, re-running a PUT in a retry scenario is idempotent for unchanged files."
+      },
+      {
+        "q": "Can you use PUT with an external stage (S3 / GCS / Azure)?",
+        "a": "No. PUT only works with Snowflake-managed internal stages (user stage ~, table stage %, or named internal stages). External stages reference cloud storage you own, so you upload files there directly with the cloud provider's tooling (AWS CLI, gsutil, az copy). COPY INTO then reads from the external stage."
+      }
+    ]
+  },
+  {
+    "q": "Your CI pipeline runs a SnowSQL script that should fail the build immediately if any SQL statement fails. How do you configure SnowSQL for strict error handling?",
+    "a": "Set the SnowSQL option `!set exit_on_error=true` at the top of the script (or pass `-o exit_on_error=true` on the command line). This makes SnowSQL exit with a non-zero status code as soon as any statement returns an error, so CI detects the failure via the process exit code without having to parse SnowSQL output. Also set `!set friendly=false` to suppress the interactive progress bar and banner, keeping CI logs clean, and `!set output_format=tsv` or `csv` for machine-parseable query output. Pair these with `!set timing=false` to drop per-statement timing lines. The canonical CI invocation is `snowsql -c ci_conn -f deploy.sql -o exit_on_error=true -o friendly=false`.",
+    "fj": "I parse the SnowSQL output for the word error in a bash script.",
+    "fs": "SnowSQL -o exit_on_error=true exits with a non-zero code on the first SQL error, so CI catches the failure via exit code — no log parsing needed. Pair with friendly=false to clean up CI output.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "CI-safe SnowSQL invocation",
+        "lang": "sql",
+        "lines": [
+          "# CI step (bash):",
+          "snowsql -c ci_conn \\",
+          "  -f deploy.sql \\",
+          "  -o exit_on_error=true \\",
+          "  -o friendly=false \\",
+          "  -o output_format=tsv",
+          "# non-zero exit = build fails"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What exit codes does SnowSQL return, and how do they map to CI outcomes?",
+        "a": "SnowSQL returns 0 on clean exit, 1 on a SQL or connection error when exit_on_error=true, and other non-zero codes for configuration or authentication failures. In a CI system any non-zero code fails the step. You do not need to inspect the numeric value — just treat non-zero as failure and zero as success."
+      },
+      {
+        "q": "How do you pass a variable to a SnowSQL script from the CI environment?",
+        "a": "Use the -D flag: `snowsql -c ci_conn -f deploy.sql -D env=PROD`. Inside the script, reference it as `&env`. This injects the CI parameter at invocation without hardcoding it in the script, so the same script runs across environments. Avoid injecting secrets this way since -D values appear in process lists."
+      },
+      {
+        "q": "Why is parsing SnowSQL output for errors less reliable than exit codes?",
+        "a": "SnowSQL output format and phrasing can change between versions, warning messages can contain the word error without being failures, and a zero-exit with an error message in output is a false negative for any grep-based check. Exit codes are a stable, version-independent signal — they are what CI systems are designed to consume."
+      }
+    ]
+  },
+  {
+    "q": "How do you use SnowSQL meta-commands beyond basic query execution — specifically !source, !print, !set, and !output for scripted automation?",
+    "a": "SnowSQL !commands are meta-commands processed by the client before any SQL reaches Snowflake. `!source <file>` executes another SQL file inline, enabling modular scripting where a top-level orchestration script sources environment-specific DDL files. `!print <msg>` writes a message to stdout — useful as a progress marker in long migration scripts. `!set <option>=<value>` changes a SnowSQL client option at runtime (exit_on_error, output_format, etc.) without restarting the session. `!output <file>` redirects subsequent query output to a local file, allowing a script to capture results for downstream processing. Combining these lets you write fully autonomous SnowSQL scripts that are modular, self-documenting via !print, and capture results without a shell wrapper.",
+    "fj": "I use SnowSQL only to run one SQL statement at a time and capture output manually.",
+    "fs": "SnowSQL !source enables modular multi-file scripts, !print logs progress, !set changes client options inline, and !output redirects result capture — together they make SnowSQL a capable automation runner without a shell wrapper.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "SnowSQL meta-commands in automation",
+        "lang": "sql",
+        "lines": [
+          "!set exit_on_error=true",
+          "!set friendly=false",
+          "!print === Starting migration v2 ===",
+          "!source migrations/v2_schema.sql",
+          "!output /tmp/row_counts.tsv",
+          "SELECT 'orders', count(*) FROM orders;",
+          "!output stdout",
+          "!print === Migration complete ==="
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does !source handle relative vs absolute file paths?",
+        "a": "SnowSQL resolves !source paths relative to the working directory from which the snowsql process was launched, not relative to the script file that contains the !source command. This means a !source in a subdirectory script may fail if the CWD is the project root but the path is written as if relative to the script. Always use absolute paths or anchor the pipeline CWD explicitly."
+      },
+      {
+        "q": "Can !output append to a file or does it always overwrite?",
+        "a": "!output always overwrites the target file. There is no append mode in SnowSQL's !output command. To accumulate output across multiple !output redirects in one script, route each to a distinct file and concatenate them in the shell after SnowSQL exits, or keep the !output open for the full session and emit all queries while it is active."
+      }
+    ]
+  },
+  {
+    "q": "What is the difference between the SnowSQL CLI and the Snowflake CLI (snow), and when do you reach for each in 2025?",
+    "a": "SnowSQL is the mature, SQL-focused interactive client: it supports named connections, PUT/GET staging, session variables, !commands, and is the standard tool for SQL scripting, bulk loading, and CI pipelines. It connects via JDBC/ODBC under the hood and is packaged as a standalone binary. The Snowflake CLI (snow), GA since late 2024, is an object-management and developer-workflow CLI written in Python: it manages Snowpark applications, Streamlit apps, Snowpark Container Services, stages, Git integrations, notebooks, and cortex flows via subcommands like `snow snowpark deploy` and `snow stage copy`. In 2025, reach for SnowSQL for SQL scripting and bulk data ops; reach for snow for application lifecycle, DevOps workflows, and anything object-management that goes beyond SQL statements.",
+    "fj": "They are the same tool with different names.",
+    "fs": "SnowSQL is the SQL/staging client for scripts and bulk loads; Snowflake CLI (snow) is the developer/object-lifecycle CLI for apps, SPCS, stages, and deployment workflows. Different scopes, both current in 2025.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Distinct use cases for each CLI",
+        "lang": "sql",
+        "lines": [
+          "# SnowSQL: SQL scripting + PUT/GET",
+          "snowsql -c prod -f migrate.sql",
+          "snowsql -c prod -q",
+          "  \"PUT file:///data/f.csv @~\"",
+          "",
+          "# Snowflake CLI: app lifecycle",
+          "snow snowpark deploy",
+          "snow stage copy ./artifacts/ @app_stage"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Can the Snowflake CLI (snow) run arbitrary SQL like SnowSQL?",
+        "a": "Yes — `snow sql -q 'SELECT 1'` or `snow sql -f script.sql` executes SQL via the Snowflake CLI. But it lacks SnowSQL's rich !command set, variable substitution, PUT/GET staging, and the decades of production hardening around interactive SQL workflows. For SQL-heavy pipelines SnowSQL is still the better tool."
+      },
+      {
+        "q": "Which CLI manages Snowpark Python apps in CI/CD in 2025?",
+        "a": "The Snowflake CLI (snow). `snow snowpark build` packages dependencies, `snow snowpark deploy` uploads and registers functions/procedures, and `snow snowpark execute` runs them — all integrated with Git and configurable via snowflake.yml. SnowSQL has no Snowpark application lifecycle commands."
+      },
+      {
+        "q": "How do connection profiles compare between SnowSQL and the Snowflake CLI?",
+        "a": "Both support named connection profiles but in different config files. SnowSQL uses ~/.snowsql/config with [connections.<name>] sections. The Snowflake CLI uses ~/.snowflake/config.toml with [[connections]] tables. They are separate files with separate formats — you maintain both if you use both tools, or consolidate to one tool per workflow type."
+      }
+    ]
+  },
+  {
+    "q": "How do you write a SnowSQL automation script that loops over a list of schemas, runs the same DDL in each, and exits cleanly on any failure?",
+    "a": "SnowSQL does not have native loop constructs — it is a SQL client, not a scripting language. The correct pattern is to generate the SQL script outside SnowSQL (using shell, Python, or Jinja templating) with explicit `USE SCHEMA <name>;` statements per schema, then pipe or source the full list into one SnowSQL invocation with exit_on_error=true. If the loop logic is complex, call a Snowflake SQL scripting stored procedure from SnowSQL using CALL, where the procedure has the FOR loop over a cursor of schema names and runs EXECUTE IMMEDIATE per iteration. A common anti-pattern is spawning one SnowSQL process per schema in a shell loop — it multiplies connection overhead and makes error tracing harder than a single script with exit_on_error.",
+    "fj": "I run a shell for-loop that calls SnowSQL once per schema.",
+    "fs": "SnowSQL has no loop syntax — generate the full per-schema SQL file outside SnowSQL (scripted) and run it in one invocation with exit_on_error=true, or push the looping logic into a Snowflake stored procedure called via CALL.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Generate script then single SnowSQL run",
+        "lang": "sql",
+        "lines": [
+          "# shell: generate the script",
+          "python3 gen_schema_ddl.py > run.sql",
+          "# run once, fail fast",
+          "snowsql -c prod -f run.sql \\",
+          "  -o exit_on_error=true",
+          "# OR: all logic in a stored procedure",
+          "snowsql -c prod -q",
+          "  \"CALL apply_to_all_schemas();\""
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is a single SnowSQL invocation better than a shell loop of many invocations?",
+        "a": "Each SnowSQL invocation creates a new Snowflake connection (authentication round-trip, session setup). Running 50 schemas means 50 connection overhead cycles, each billed at a 60-second warehouse minimum if the warehouse auto-resumes. A single session runs all 50 statements under one connection with shared result cache and one 60-second minimum. Error handling is also simpler — one exit code, one log stream."
+      },
+      {
+        "q": "How does a Snowflake stored procedure handle the looping that SnowSQL cannot?",
+        "a": "A SQL scripting stored procedure can DECLARE a cursor over `SELECT schema_name FROM information_schema.schemata`, loop with FOR rec IN cursor, and run EXECUTE IMMEDIATE with the dynamic DDL per schema — all server-side, in a single transaction, with full error handling in the EXCEPTION block. SnowSQL just calls it once with CALL."
+      }
+    ]
+  },
+  {
+    "q": "How do you use SnowSQL GET to download staged query output files for auditing, and what are the security considerations?",
+    "a": "After staging query output via `COPY INTO @<stage> FROM (SELECT ...) FILE_FORMAT=(...) OVERWRITE=TRUE`, use SnowSQL's GET command to download those files to a local path: `GET @<stage>/<path> file:///local/path/`. SnowSQL decrypts the file client-side (internal stage files are AES-256 encrypted server-side) and writes the plaintext to the local destination. Security considerations: first, the COPY INTO to stage creates files in Snowflake's cloud object storage — ensure the stage has appropriate access grants. Second, GET writes decrypted plaintext to disk, so the local machine must be trusted and the destination directory should have restricted permissions. Third, audit who ran GET commands via QUERY_HISTORY filtering on command_type='GET'.",
+    "fj": "I query the data in Snowsight and copy the result to my clipboard.",
+    "fs": "SnowSQL GET decrypts AES-256 staged files client-side to local disk. Use it only on a trusted machine, restrict the stage grants, and audit GET commands via QUERY_HISTORY (command_type='GET') — the decrypt happens on the client, not Snowflake.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Stage query result then GET locally",
+        "lang": "sql",
+        "lines": [
+          "-- inside SnowSQL session:",
+          "COPY INTO @audit_stage/export/",
+          "  FROM (SELECT * FROM audit_log",
+          "        WHERE dt = '2026-01-15')",
+          "  FILE_FORMAT=(TYPE=CSV)",
+          "  OVERWRITE=TRUE;",
+          "GET @audit_stage/export/",
+          "    file:///secure/exports/;"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Does SnowSQL GET work with external stages (S3, GCS, Azure)?",
+        "a": "No — GET only works with internal stages managed by Snowflake (user stage ~, table stage %, named internal stages). For external stages you use the cloud provider's own download tooling (AWS CLI s3 cp, gsutil cp, az storage blob download). The encryption and decryption that GET handles only applies to Snowflake-managed internal stage encryption."
+      },
+      {
+        "q": "How do you verify the downloaded file's integrity after a SnowSQL GET?",
+        "a": "SnowSQL GET output includes the file name and status. For integrity, compute a hash of the downloaded file (sha256sum on Linux/macOS) and compare it to the MD5 stored in stage metadata accessible via `LIST @stage` — Snowflake records the MD5 of each staged file. A mismatch indicates a corrupt transfer."
+      },
+      {
+        "q": "Can multiple SnowSQL sessions GET the same staged file concurrently?",
+        "a": "Yes — GET reads from object storage and does not lock the stage. Multiple concurrent GETs of the same file are safe. Internal stage files are immutable once staged; there is no write conflict with simultaneous reads. The stage access grants control who is authorized, not concurrency."
+      }
+    ]
+  },
+  {
+    "q": "How do you upgrade SnowSQL in a locked-down enterprise environment where the auto-update bootstrap is blocked, and how do you pin a specific version?",
+    "a": "By default SnowSQL auto-updates by downloading a new binary from Snowflake's CDN on startup. In a locked-down environment the network policy or proxy blocks that download, causing startup errors. Pin the version by setting `version = <major.minor.patch>` under [options] in ~/.snowsql/config, which tells SnowSQL to use exactly that version without checking for updates. For air-gapped or proxy environments, download the SnowSQL installer from the Snowflake distribution page via a jump host or artifact registry, install it on the target machine, and then pin the version in config. Also set `auto_upgrade = false` in the [options] section to prevent any upgrade attempt. Verify the active version with `snowsql --version` and test the connection before promoting a new version to production CI runners.",
+    "fj": "I let SnowSQL auto-update on each CI runner every time it runs.",
+    "fs": "Pin `version=` and `auto_upgrade=false` in ~/.snowsql/config so the binary is deterministic. In air-gapped envs, distribute the installer via an artifact repo and skip the CDN entirely. Treat a SnowSQL version bump like a code change — test and promote deliberately.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Pin SnowSQL version, disable auto-update",
+        "lang": "sql",
+        "lines": [
+          "# ~/.snowsql/config",
+          "[options]",
+          "version = 1.3.2",
+          "auto_upgrade = false",
+          "# install the correct binary once",
+          "# via your artifact registry,",
+          "# then pin to that version"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does auto-update on CI runners cause non-deterministic behavior?",
+        "a": "If SnowSQL auto-upgrades mid-sprint, a new version may change output format, add or remove columns to result sets, change !command behavior, or require a new dependency — breaking scripts silently or loudly in ways that depend on when CI last ran. Pinning a version guarantees the same behavior across every CI run until you explicitly promote."
+      },
+      {
+        "q": "What is the SnowSQL bootstrap process and how do you bypass it?",
+        "a": "The small SnowSQL bootstrap binary on startup checks the CDN for the configured version and downloads the full binary if it does not exist locally. To bypass: download the full installer (not just the bootstrap) from the Snowflake distribution page, install it directly, and pin the version in config. The bootstrap check then finds the version locally and skips the CDN download."
+      },
+      {
+        "q": "How do you test a new SnowSQL version against your scripts before rolling it out to CI?",
+        "a": "Install the new version in a local environment or test runner with the pinned version set, run the full script suite against a dev or clone environment with exit_on_error=true, and diff the output against a baseline. Only promote the version pin in CI config once the test suite passes cleanly, and treat the version bump as a code change requiring review."
+      }
+    ]
+  },
+  {
+    "q": "A SnowSQL script parameterized with &variables works locally but fails in CI with 'substitution variable not found'. What causes this and how do you fix it?",
+    "a": "SnowSQL variable substitution with &var_name requires the variable to be defined before the statement referencing it, either via !set in the script or via -D on the command line. In CI the variable is likely set locally via an interactive session config or a sourced config file that does not exist on the runner. Fix by explicitly passing all variables on the CI command line: `snowsql -c ci_conn -f hook.sql -D target_db=PROD -D target_schema=REPORTING`. Never assume a variable is defined by the environment — make every variable explicit. Also ensure SnowSQL's variable_substitution option is enabled (it is by default, but set `!set variable_substitution=true` at the top of the script to be explicit). If the script must work both interactively and from CI, define fallback defaults at the top with `!set var=default` before any !source or SQL that references them.",
+    "fj": "The CI runner must have a different Snowflake account — that is why it fails.",
+    "fs": "SnowSQL variable substitution requires the variable to be defined before use. In CI, always pass -D vars explicitly on the command line — never assume they are set from a local config or interactive session state.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Explicit CI variable injection via -D",
+        "lang": "sql",
+        "lines": [
+          "# CI invocation - all vars explicit:",
+          "snowsql -c ci_conn -f hook.sql \\",
+          "  -D target_db=PROD \\",
+          "  -D target_schema=REPORTING \\",
+          "  -o exit_on_error=true",
+          "-- top of hook.sql for safety:",
+          "!set variable_substitution=true"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens if &var_name is used in a SnowSQL script and variable_substitution is false?",
+        "a": "SnowSQL sends the literal string &var_name to Snowflake as SQL text. Depending on context, Snowflake may return a syntax error (if it appears in a keyword position) or interpret it as an identifier. With exit_on_error=true this fails the script immediately. Always keep variable_substitution=true for scripts that use &vars."
+      },
+      {
+        "q": "How do you confirm which variables are currently defined in a SnowSQL session?",
+        "a": "Run `!variables` in an interactive SnowSQL session to list all currently defined client-side variables and their values. This is useful for debugging a complex script that sources multiple files, each of which may !set or override variables."
+      },
+      {
+        "q": "Should you pass secrets as -D variables in SnowSQL CI invocations?",
+        "a": "No. -D values appear in the process argument list, which is visible to anyone with ps access on the runner and may be logged by CI orchestrators. Secrets should be injected as environment variables (SNOWSQL_PWD, SNOWSQL_PRIVATE_KEY_PASSPHRASE) which SnowSQL reads from the environment at startup, keeping them out of process lists and logs."
+      }
+    ]
+  },
+  {
+    "q": "Your org runs 40+ Snowflake warehouses across 12 teams. Credit burn has tripled in 18 months. What governance model do you put in place?",
+    "a": "The starting failure is that every team self-provisions with no visibility into cost attribution. I establish three levers: (1) Resource Monitors with NOTIFY_AND_SUSPEND at monthly credit quotas per department — set in Terraform so warehouses cannot be created outside the IaC pipeline. (2) A FinOps tagging schema: COST_CENTER, PROJECT, ENV, TIER tags on every warehouse and database, surfaced via SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY joined to WAREHOUSE_METERING_HISTORY in a shared governance schema reviewed weekly. (3) Auto-suspend defaults: X-Small/Small = 1 min, Medium = 3 min, Large+ = 5 min, configured in the organization-wide warehouse default policy. For visibility, I publish a Sigma (or Mode) dashboard with weekly cost by team, top 20 most expensive queries, and a credit burn forecast. Teams that breach 80% of their quota get a Slack alert; 100% triggers a manager page. Quarterly reviews adjust quotas and right-size warehouses based on utilization percentiles from QUERY_HISTORY.",
+    "fj": "Resource monitors alone solve runaway spend.",
+    "fs": "Monitors are kill switches — governance requires tagging, IaC pipeline enforcement, and a weekly FinOps review cycle.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Resource monitor + tag enforcement (Terraform-style SQL)",
+        "lang": "sql",
+        "lines": [
+          "-- create per-team monitor",
+          "CREATE RESOURCE MONITOR analytics_rm",
+          "  WITH CREDIT_QUOTA = 500",
+          "  FREQUENCY = MONTHLY",
+          "  START_TIMESTAMP = IMMEDIATELY",
+          "  TRIGGERS",
+          "    ON 80 PERCENT DO NOTIFY",
+          "    ON 100 PERCENT DO NOTIFY_AND_SUSPEND;",
+          "",
+          "-- attach to warehouse",
+          "ALTER WAREHOUSE analytics_wh",
+          "  SET RESOURCE_MONITOR = analytics_rm",
+          "      AUTO_SUSPEND = 180;",
+          "",
+          "-- weekly cost attribution query",
+          "SELECT warehouse_name,",
+          "       SUM(credits_used) AS credits,",
+          "       DATE_TRUNC('week', start_time) AS wk",
+          "FROM   SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY",
+          "WHERE  start_time >= DATEADD(month, -3, CURRENT_TIMESTAMP())",
+          "GROUP BY 1, 3",
+          "ORDER BY 2 DESC;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you stop teams from just creating new, unmonitored warehouses?",
+        "a": "Grant CREATE WAREHOUSE only to a service role used by the IaC pipeline (Terraform + Snowflake provider). Human users get no direct CREATE privilege. Every warehouse object is therefore born with the correct RESOURCE_MONITOR, AUTO_SUSPEND, and tags; drift is caught by a nightly Terraform plan in CI."
+      },
+      {
+        "q": "What's the most common source of surprise spend you find in these audits?",
+        "a": "Warehouses with AUTO_SUSPEND = 0 (never suspend) used for one-off exploration. Second most common: large warehouses for simple ETL that would run fine on X-Small — teams default to XL 'just to be safe' and forget about it."
+      }
+    ]
+  },
+  {
+    "q": "Design a multi-tenant RBAC model for Snowflake that serves 5 business units, each with prod/dev/test environments, without object proliferation.",
+    "a": "The naive approach — one role per user per environment — explodes into hundreds of roles and becomes unmaintainable. I use a three-layer hierarchy: (1) Functional roles (lowest): READ_ANALYTICS_PROD, WRITE_ETL_PROD, ADMIN_BU_FINANCE — defined by what the role can do. (2) Persona roles (middle): DATA_ENGINEER, DATA_ANALYST, DATA_ADMIN — bundles of functional roles matching a job type. (3) Environment roles (top): PROD_USER, DEV_USER — gate which databases are accessible. Users are assigned only a persona role + environment role; RBAC inheritance composes the effective permissions. Each BU gets its own DATABASE and a dedicated SCHEMA_OWNER role that can CREATE SCHEMA within it but cannot touch other BUs' databases. Future-GRANT on schemas ensures new objects created by ETL automatically inherit the schema's grants — critical to avoid 'object not found' errors after deploys. I manage the whole model in dbt's YAML grants or a Terraform module that codifies the matrix, so adding a new BU is a one-line change.",
+    "fj": "Grant SYSADMIN to leads — they can manage their own objects.",
+    "fs": "SYSADMIN leaks cross-BU access; a layered functional→persona→environment hierarchy keeps blast radius bounded and IaC-manageable.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Layered role hierarchy",
+        "lang": "sql",
+        "lines": [
+          "-- functional role",
+          "CREATE ROLE read_finance_prod;",
+          "GRANT SELECT ON ALL TABLES",
+          "  IN DATABASE finance_prod TO ROLE read_finance_prod;",
+          "-- future objects auto-granted",
+          "GRANT SELECT ON FUTURE TABLES",
+          "  IN DATABASE finance_prod TO ROLE read_finance_prod;",
+          "",
+          "-- persona role bundles functional roles",
+          "CREATE ROLE data_analyst;",
+          "GRANT ROLE read_finance_prod TO ROLE data_analyst;",
+          "",
+          "-- assign persona to user, not raw functional role",
+          "GRANT ROLE data_analyst TO USER alice;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle row-level security in this model?",
+        "a": "Row Access Policies mapped to a policy admin role separate from the BU roles. The mapping table (user→allowed_region, etc.) lives in a governance database. The policy is attached to the table, not the role, so adding a user to data_analyst automatically subjects them to the row filter — no policy change needed."
+      },
+      {
+        "q": "What breaks when you forget FUTURE GRANTS?",
+        "a": "Any table created after the GRANT statement is invisible to the grantee. ETL deploys that CREATE OR REPLACE TABLE quietly break downstream BI consumers. Future grants on schemas and databases prevent this; they're the most commonly missing piece in hand-rolled RBAC setups."
+      }
+    ]
+  },
+  {
+    "q": "You're leading a migration of 200 TB of historical data from Redshift to Snowflake. How do you de-risk the cutover?",
+    "a": "Phase 1 — Inventory and schema translation: Run AWS Schema Conversion Tool → review output; Snowflake differs in distribution keys (none), sort keys (use clustering keys only where partitions overlap > 30%), and DISTKEY/SORTKEY syntax. Map Redshift-specific functions (DATEDIFF behavior, LISTAGG limits) to Snowflake equivalents. Phase 2 — Parallel load with validation: Export Redshift tables to S3 as Parquet via UNLOAD, then use Snowflake COPY INTO from S3 with FILE_FORMAT = (TYPE = PARQUET). Run row-count checks and checksum validations (MD5 of ordered key columns) for each table before marking it migrated. Phase 3 — Dual-write for hot tables: For tables with active inserts/updates during migration, set up a change stream (DMS or custom Kafka connector from Redshift) to replay into Snowflake in parallel. Phase 4 — Shadow mode: Route 10% of BI queries to Snowflake, compare result sets with a diff framework, catch any SQL incompatibilities before full cutover. Phase 5 — Cutover: Freeze Redshift writes, drain DMS lag to zero, flip DNS/connection strings, run a final row-count reconciliation, and keep Redshift read-only for 30 days as rollback option.",
+    "fj": "Bulk export and import is sufficient — you can fix schema issues after cutover.",
+    "fs": "Schema incompatibilities + SQL dialect differences discovered post-cutover create production incidents; shadow mode and dual-write de-risk the hard parts.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle Redshift materialized views and late-binding views during migration?",
+        "a": "Materialized views get re-implemented as Snowflake dynamic tables or Snowflake materialized views (which have different refresh semantics — Snowflake auto-refreshes on base table change, not on a schedule). Late-binding views (no schema binding) translate directly to Snowflake views. Document each view's refresh SLA and test against production query patterns before declaring migration done."
+      },
+      {
+        "q": "What's the biggest hidden cost in a Redshift-to-Snowflake migration?",
+        "a": "BI tool query rewrites. Tableau, Looker, and Mode often have hard-coded Redshift dialect SQL in custom SQL nodes or LookML. Discovering these after cutover causes emergency incidents. A full grep of your BI tool's project files for Redshift-specific functions before migration is essential."
+      }
+    ]
+  },
+  {
+    "q": "How do you architect Snowflake Secure Data Sharing for a SaaS product where each customer should see only their own data?",
+    "a": "The naive approach — one share per customer — hits the share object limit and creates an operational nightmare at scale. The correct architecture uses a Reader Account per large enterprise customer and a Private Listing with column-level Dynamic Data Masking + Row Access Policies for multi-tenant shares. Design: (1) A single PROVIDER_DB contains all customer data with a CUSTOMER_ID column on every sensitive table. (2) A Row Access Policy referencing CURRENT_ACCOUNT() maps reader accounts to their allowed CUSTOMER_ID values in a policy mapping table. (3) Sensitive PII columns get a masking policy that shows full data only to accounts with the UNMASK_PII privilege. (4) For large enterprise customers, provision a Snowflake Reader Account (you pay for their compute, they can't load data into it), and grant a share that includes the policy-filtered views. (5) For smaller customers, use a Private Listing on the Marketplace — they bring their own Snowflake account and consume the share without needing a reader account you manage. This architecture means one set of policies governs all customers; adding a new customer is an INSERT to the mapping table, not a new share.",
+    "fj": "Create one database per customer and share each separately.",
+    "fs": "Per-customer databases don't scale; a single policy-governed share with row access policies isolates tenants without object proliferation.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What's the difference between a Reader Account and a standard account for data sharing?",
+        "a": "A Reader Account is provisioned by the provider, managed by the provider, and costs are billed to the provider's Snowflake contract. The consumer cannot load external data into it. A standard consumer account is the consumer's own account; they pay their own compute costs and can have full Snowflake capabilities. Reader Accounts are appropriate for customers who don't have Snowflake; standard sharing is preferred when consumers already have accounts."
+      },
+      {
+        "q": "How do you handle schema changes in the shared objects without breaking consumers?",
+        "a": "Share views over the underlying tables, not the tables directly. When you need to add or rename columns, update the view definition rather than the underlying table. This gives you a stable contract surface. Communicate breaking changes with a versioned view (v1_orders, v2_orders) and deprecate the old version after consumers have migrated."
+      }
+    ]
+  },
+  {
+    "q": "A senior engineer proposes replacing all Snowflake Streams + Tasks with a third-party orchestration tool. What's your evaluation framework for build-vs-buy here?",
+    "a": "I evaluate on four axes: (1) Operational complexity: Streams + Tasks are fully managed by Snowflake — no servers, no scheduler to patch, no separate monitoring plane. A third-party tool (Airflow, Dagster, Prefect) adds an ops burden. If the team doesn't already run one of these, the TCO includes infrastructure, upgrades, and on-call. (2) Capability gaps: Streams + Tasks lack cross-account triggers, complex dependency graphs, SLA alerting, and retry logic beyond simple cron. If you need DAG-level dependencies or dynamic task generation, third-party tools win clearly. (3) Portability: Snowflake-native pipelines are opaque to non-Snowflake tools; if you later migrate or need multi-cloud ETL, you've built lock-in. Orchestrators using the Snowflake operator are portable. (4) Cost model: Tasks consume compute credits; an orchestration tool's scheduler is often cheaper for high-frequency small jobs. My recommendation: keep Streams + Tasks for latency-sensitive incremental pipelines on a single table (sub-minute CDC fan-out); use an orchestration tool for cross-system workflows, complex dependencies, or anything requiring SLA monitoring. Don't replace wholesale — hybridize.",
+    "fj": "Tasks and Streams should always be replaced with a proper orchestrator for production use.",
+    "fs": "Native Streams+Tasks excel for single-table CDC and latency-sensitive flows; orchestrators win for DAG-level dependencies and cross-system workflows — hybridize.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you monitor Snowflake Tasks for failures in production?",
+        "a": "Query SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY for FAILED state rows; set up a Snowflake Alert (CREATE ALERT) that fires when that query returns rows, triggering a webhook to PagerDuty or Slack. For critical pipelines, wrap the task body in a TRY/CATCH that INSERTs failure metadata to a pipeline_errors table, giving you structured observability beyond the raw task log."
+      },
+      {
+        "q": "What are the limits of Snowflake Streams that most teams hit first?",
+        "a": "Stream staleness: a stream becomes stale if not consumed within the data retention period (default 14 days for Enterprise). After that, the offset is lost and you must backfill. Second: streams on shared tables (from a data share) are read-only — you cannot create a stream on a shared object. Third: streams don't support non-table objects (external tables have limited stream support, no stream on views)."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement a Snowflake clustering key strategy for a 10 TB fact table that supports both point lookups by ORDER_ID and range scans by EVENT_DATE?",
+    "a": "Snowflake clustering keys are not free — they consume credits for the automatic reclustering service, and a poorly chosen key makes query performance worse by adding reclustering cost without pruning benefit. For a table that needs to serve both ORDER_ID lookups and EVENT_DATE range scans, the answer is almost never a compound clustering key on both, because clustering is expensive and compound keys only help queries that filter on the leading column. My approach: (1) Analyze query patterns from QUERY_HISTORY — what fraction of queries filter on ORDER_ID vs EVENT_DATE vs both? (2) If EVENT_DATE range scans dominate (typical for analytics), cluster on EVENT_DATE alone. ORDER_ID lookups are handled by Snowflake's natural local sort within micro-partitions (appended data tends to cluster on insert order) plus the result cache. (3) If ORDER_ID point lookups are latency-critical (operational use case), evaluate a Search Optimization Service (SOS) on the ORDER_ID column — SOS builds a per-table access path for equality and IN predicates without the reclustering cost of a clustering key. (4) Use SYSTEM$CLUSTERING_INFORMATION to measure clustering depth before and after — depth < 1.5 means excellent clustering, > 3 means the key is wrong. Never cluster a small table (< a few hundred GB) — pruning overhead exceeds benefit.",
+    "fj": "Add a clustering key on every large table to improve all query types.",
+    "fs": "Clustering keys only prune on the leading column and consume credits; use EVENT_DATE for range scans + Search Optimization Service for high-cardinality point lookups.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Check clustering depth + add SOS for point lookups",
+        "lang": "sql",
+        "lines": [
+          "-- measure current clustering",
+          "SELECT SYSTEM$CLUSTERING_INFORMATION(",
+          "  'fact_orders', '(event_date)');",
+          "-- average_depth < 1.5 = good",
+          "",
+          "-- cluster on range-scan column",
+          "ALTER TABLE fact_orders",
+          "  CLUSTER BY (event_date);",
+          "",
+          "-- SOS for point lookup by high-cardinality key",
+          "ALTER TABLE fact_orders",
+          "  ADD SEARCH OPTIMIZATION ON EQUALITY(order_id);"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you know when reclustering is costing more than it saves?",
+        "a": "Query SNOWFLAKE.ACCOUNT_USAGE.AUTOMATIC_CLUSTERING_HISTORY for credits_used over the past 30 days, then compare to query time saved by pulling QUERY_HISTORY partitions_scanned vs partitions_total ratios before and after clustering was enabled. If the credit cost of reclustering exceeds the query credit savings, drop the key or switch to a lower-cardinality expression."
+      },
+      {
+        "q": "What is the Search Optimization Service and when does it beat a clustering key?",
+        "a": "SOS builds an access path index for equality and range predicates on specific columns, stored as a separate Snowflake-managed structure. It does not require continuous reclustering. It beats a clustering key when: (1) the lookup column is high-cardinality (user_id, order_id), (2) query patterns are unpredictable (OLTP-like), or (3) the table is frequently appended to, making reclustering expensive. SOS has a fixed storage overhead (~10-20% of table size) and a per-query charge."
+      }
+    ]
+  },
+  {
+    "q": "Your CTO asks: should we standardize on Snowflake as the org-wide cloud data platform, or adopt Databricks instead? How do you structure this recommendation?",
+    "a": "This is a multi-year architectural bet worth tens of millions, so the recommendation must be structured, not gut-feel. My framework: (1) Workload mapping: Catalog every data workload — BI/SQL analytics, ELT/dbt pipelines, ML model training, real-time streaming, data sharing with external partners, and unstructured data (docs/images). Score Snowflake vs Databricks vs Fabric on each workload type from 1–5. Snowflake wins on SQL analytics, governance, and data sharing; Databricks wins on ML/training, unstructured data, and streaming with Delta Lake. Fabric wins on Microsoft integration if we're an M365-heavy org. (2) Team capability: What does our data team actually know? SQL-first analysts → Snowflake. Python/ML engineers → Databricks. (3) TCO model: Model compute costs at current and 3x scale for each platform. Snowflake's per-credit model is predictable for SQL; Databricks cluster economics favor ML workloads. Include operational costs (RBAC management, infra ops) and training. (4) Ecosystem lock-in risk: Snowflake features like Iceberg external tables, Polaris Catalog, and Snowpark reduce lock-in. Databricks Unity Catalog + Iceberg similarly. Assess how hard it is to move if the vendor relationship changes. My recommendation for most data-engineering-centric orgs in 2026: run Snowflake as the SQL/analytics/sharing plane and Databricks for ML training and heavy streaming — a bimodal architecture is cheaper than forcing one tool to do everything. Only standardize on one if team size is small enough that operational complexity of two platforms outweighs the fit difference.",
+    "fj": "Pick whichever platform your largest vendor pushes — standardize everything on one tool.",
+    "fs": "Bimodal (Snowflake for SQL/sharing, Databricks for ML/streaming) typically beats forced monoculture — map workloads to fit before committing.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you evaluate Microsoft Fabric as a third option?",
+        "a": "Fabric is compelling for orgs deeply invested in Azure and Power BI — the OneLake integration and Power BI semantic layer are genuinely differentiated. Evaluate if: (1) >70% of your BI consumers use Power BI, (2) your data is primarily in Azure, (3) your team has strong Microsoft skills. Fabric's weakness in early 2026 is operational maturity — RBAC, multi-tenant governance, and streaming reliability lag Snowflake/Databricks. I'd weight it seriously for M365-centric enterprises but not recommend it for greenfield cloud-native data orgs."
+      },
+      {
+        "q": "What contractual terms matter most in a multi-year Snowflake commitment?",
+        "a": "Capacity commitment vs on-demand pricing — negotiate a capacity commitment (pre-purchased credits) for a 30-40% discount, but ensure unused credits roll forward at least one quarter. Price escalation caps (3-5% YoY max) are critical for 3-year deals. Egress cost carve-outs for cross-cloud data sharing. And a data portability clause: you must be able to export all data in open format (Parquet/Iceberg) with 90 days notice. Vendors rarely volunteer these; they must be negotiated."
+      }
+    ]
+  },
+  {
+    "q": "How do you build a FinOps operating model for Snowflake at a 500-person company spending $2M/year on cloud data infrastructure?",
+    "a": "At $2M/year, informal governance is a budget risk. A FinOps model has three layers: (1) Visibility: Instrument every credit-consuming resource with cost attribution tags (COST_CENTER, PRODUCT, ENV). Publish a real-time credit dashboard from ACCOUNT_USAGE joined with your cost center hierarchy in a BI tool. Add a 'credit budget vs actual' table updated daily. At this scale, consider Snowflake Budget objects (GA in 2025) which allow hierarchical budget tracking without custom queries. (2) Accountability: Each domain (Analytics, Data Engineering, ML Platform, External APIs) owns a credit budget reviewed monthly by their VP. Anomaly alerts fire to the team Slack channel when a 7-day rolling average exceeds 120% of baseline. FinOps team does a monthly 'Top 10 expensive queries' review with the owning team. (3) Optimization rituals: Quarterly warehouse right-sizing exercise (compare credits_used to query concurrency; warehouse is oversized if avg_queued_load < 0.1 and credits per hour >> query volume). Auto-suspend audit: any warehouse with AUTO_SUSPEND > 600 seconds gets a jira ticket. Result cache review: queries with 0% cache hits on repeated patterns → caching layer (Semantic Layer materialization or Snowflake Materialized Views). Governance: no warehouse can be created outside Terraform; no PROD warehouse can be upsized without a change request approved by the data platform team. At $2M, even a 15% optimization saves $300K — the FinOps function pays for itself.",
+    "fj": "Cloud cost optimization is engineering's job — finance just pays the bill.",
+    "fs": "FinOps requires a shared accountability model: engineering optimizes, finance tracks budgets, leadership reviews monthly — no single team owns it alone.",
+    "level": "Principal",
+    "code": [
+      {
+        "label": "Daily cost attribution query for FinOps dashboard",
+        "lang": "sql",
+        "lines": [
+          "SELECT",
+          "  w.warehouse_name,",
+          "  w.warehouse_size,",
+          "  DATE_TRUNC('day', m.start_time)  AS day,",
+          "  SUM(m.credits_used)              AS credits,",
+          "  SUM(m.credits_used) * 3.00       AS est_cost_usd",
+          "FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY m",
+          "JOIN SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSES w",
+          "  ON w.warehouse_id = m.warehouse_id",
+          "WHERE m.start_time >= DATEADD(month, -1, CURRENT_TIMESTAMP())",
+          "GROUP BY 1, 2, 3",
+          "ORDER BY 4 DESC;"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do Snowflake Budget objects differ from Resource Monitors?",
+        "a": "Resource Monitors track credit consumption against a threshold and can suspend warehouses — they're a hard control. Budget objects (introduced 2024-2025) provide cost tracking across all Snowflake resources (warehouses, Snowpipe, Tasks, etc.) with budget hierarchies and alerts, but cannot suspend resources. Budgets give you a financial management view; monitors give you an operational control. Use both: budgets for domain-level financial accountability, monitors for hard circuit-breakers on runaway warehouses."
+      },
+      {
+        "q": "What's the ROI calculation you use to justify a FinOps headcount investment?",
+        "a": "At $2M annual spend, a 15% optimization (conservative — typical first-year savings are 20-30%) = $300K saved. A senior data engineer or FinOps analyst costs ~$150-180K all-in. First-year ROI is 1.7-2x, improving as the program matures. I present this with a confidence range: 'Our analysis of QUERY_HISTORY shows 23% of credits go to queries that hit no cache and run on warehouses >2x the needed size — this is addressable.' Data-backed estimates close the business case."
+      }
+    ]
+  },
+  {
+    "q": "How do you evolve a Snowflake account from a single-team data warehouse into an org-wide data platform that serves 50 teams with different trust boundaries?",
+    "a": "The core tension is that a single Snowflake account's flat namespace (databases, schemas, roles) doesn't naturally express organizational trust hierarchies. At 50 teams, you need a platform model, not a warehouse model. Architecture principles: (1) Account segmentation: Evaluate whether a single account is sufficient or whether you need a Business Critical account for PII/HIPAA isolation, with a separate non-PCI account for less sensitive workloads. Snowflake's account-level policies apply globally, so mixing trust tiers in one account is risky. (2) Domain ownership model: Each domain (Finance, Product, Marketing, ML Platform) owns a DATABASE. They can create schemas and objects within it; the data platform team owns the account-level objects (warehouses, network policies, resource monitors). This mirrors team topologies. (3) Data mesh enablement: Publish domain datasets as Secure Views in a PUBLISH schema within each domain database. Other domains query these publish views, never the raw tables. This creates explicit data contracts: the owning team can change internal tables freely as long as publish views stay stable. (4) Platform team as enabler not gatekeeper: Provide self-service IaC modules (Terraform) for teams to provision their own warehouses, schemas, and roles within guardrails. The platform team owns the guardrails (network policies, masking policies, budget limits), not the provisioning of every object. (5) Observability plane: A central PLATFORM_GOVERNANCE database (read by all, written only by platform team) contains cost dashboards, data quality metrics, lineage (via dbt or Openlineage), and SLA compliance — transparent to all 50 teams.",
+    "fj": "Give each team their own Snowflake account — that's the only way to achieve true isolation.",
+    "fs": "Separate accounts solve isolation but explode cost and governance complexity; a domain ownership model with IaC guardrails scales to 50+ teams within a single account.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "When does it actually make sense to use multiple Snowflake accounts?",
+        "a": "Three legitimate reasons: (1) Regulatory isolation — HIPAA/PCI data must be in a Business Critical account; keeping it separate from a Standard account is cleaner than upgrading everything. (2) Geographic data residency — EU GDPR requires data to stay in the EU; Snowflake accounts are region-scoped. (3) Full organizational independence — an acquired company or a subsidiary with its own P&L and data governance requirements is better served by its own account. Data sharing between accounts is first-class in Snowflake, so cross-account data access doesn't require data copies."
+      },
+      {
+        "q": "How do you handle breaking schema changes in the publish view contract model?",
+        "a": "Treat publish views as versioned APIs. When a breaking change is needed: create publish_v2 alongside publish_v1, communicate the migration window (typically 30-90 days) to consuming teams via a data catalog entry and Slack announcement, monitor publish_v1 usage via QUERY_HISTORY to know when it's safe to retire. Automate the monitoring: a weekly job that finds consumers still on deprecated views and pages their team's data steward."
+      }
+    ]
   }
 ]

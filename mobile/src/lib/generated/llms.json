@@ -1067,6 +1067,273 @@
     ]
   },
   {
+    "q": "What is NF4 (Normal Float 4) in QLoRA, and why does it outperform plain INT4 for quantizing pretrained weights?",
+    "a": "NF4 is a 4-bit data type introduced by QLoRA that places its 16 quantization bins at the quantiles of a standard normal distribution, matching the actual weight distribution of pretrained transformers rather than spreading bins uniformly like INT4. Because pretrained weights are near-normally distributed, NF4's bins are denser where weights cluster (near zero) and sparser in the tails, minimizing the mean squared quantization error for any given block. QLoRA freezes the base model in NF4 and trains LoRA adapters on top in BF16, so the quantization noise is small and consistent — the adapter learns to work with it — making QLoRA results track full-precision LoRA closely on most tasks.",
+    "fj": "NF4 is just a fancy name for INT4 with better marketing.",
+    "fs": "NF4 tiles its 16 bins at normal-distribution quantiles to match pretrained weight distributions; INT4's uniform grid wastes bins on rare tails — QLoRA exploits this to cut VRAM with minimal accuracy loss.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "python",
+        "label": "QLoRA NF4 load",
+        "lines": [
+          "from transformers import BitsAndBytesConfig",
+          "bnb_cfg = BitsAndBytesConfig(",
+          "  load_in_4bit=True,",
+          "  bnb_4bit_quant_type='nf4',",
+          "  bnb_4bit_compute_dtype=torch.bfloat16)",
+          "model = AutoModelForCausalLM.from_pretrained(",
+          "  'meta-llama/Llama-3.1-70B',",
+          "  quantization_config=bnb_cfg)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does QLoRA keep adapter gradients in BF16 while the base is NF4?",
+        "a": "Gradient computation needs higher precision to make meaningful updates — 4-bit arithmetic can't represent the tiny gradient values that converge adapters. NF4 is used only for the frozen base's storage and the forward-pass matrix multiplies; the LoRA adapter weights, their gradients, and optimizer states all live in BF16. QLoRA dequantizes NF4 blocks to BF16 on the fly for each forward/backward pass."
+      },
+      {
+        "q": "How does block-wise quantization improve NF4's accuracy?",
+        "a": "Each linear weight matrix is split into small blocks (typically 64 values each) and each block gets its own scalar absmax normalizer. This adapts the quantization scale to local magnitude variation — a block of large weights gets a different scale than a block of small ones — so the normal-distribution quantile placement of NF4 applies at block granularity rather than globally, reducing per-weight error."
+      }
+    ]
+  },
+  {
+    "q": "What is double quantization in QLoRA and how many bytes per parameter does it recover?",
+    "a": "Double quantization is a technique in QLoRA that quantizes the quantization constants themselves, not just the weights. Standard 4-bit block quantization stores one FP32 quantization constant per block of 64 weights, adding 32 bits / 64 = 0.5 bits per parameter on top of the 4-bit weights. QLoRA quantizes those FP32 constants to FP8 using blocks of 256, reducing the overhead from 0.5 bits to 0.127 bits per parameter — freeing roughly 0.37 bits per param. On a 65B model that saves approximately 3 GB, which is enough to fit it on a single 80 GB A100 that otherwise wouldn't have room. The secondary constants are cheap to store and their FP8 quantization has negligible quality impact because they change slowly across the weight matrix.",
+    "fj": "Double quantization means the model is quantized twice so it's even smaller.",
+    "fs": "Double quantization in QLoRA quantizes the per-block FP32 scaling constants to FP8, cutting overhead from 0.5 bits/param to ~0.127 bits/param — saving ~3 GB on a 65B model.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "python",
+        "label": "enable double quant in BnB",
+        "lines": [
+          "bnb_cfg = BitsAndBytesConfig(",
+          "  load_in_4bit=True,",
+          "  bnb_4bit_quant_type='nf4',",
+          "  bnb_4bit_use_double_quant=True,  # <--",
+          "  bnb_4bit_compute_dtype=torch.bfloat16)",
+          "# quantization constants -> FP8",
+          "# saves ~0.37 bits/param"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Does double quantization hurt the adapter's learned behavior?",
+        "a": "Negligibly. The double-quantized values are the scaling constants for the frozen base, not the trainable adapter parameters, which remain in full BF16. The small additional quantization noise in the base's forward pass is constant during training, so the adapter simply learns over a slightly noisier base — the final quality loss versus single-quantized NF4 is typically below measurement noise on standard benchmarks."
+      },
+      {
+        "q": "Why quantize the constants to FP8 rather than INT8?",
+        "a": "Quantization constants are themselves near-normally distributed scalars, and FP8's floating-point range handles varying magnitudes more cleanly than INT8's fixed scale. INT8 would require a second meta-constant to set its scale (creating infinite regress), while FP8 self-ranges within its exponent bits — simpler implementation and equivalent accuracy at this level of compression."
+      }
+    ]
+  },
+  {
+    "q": "What are paged optimizers in QLoRA, and what OOM failure mode do they solve?",
+    "a": "Paged optimizers are a memory management technique introduced in QLoRA that uses NVIDIA unified memory to page optimizer states between GPU and CPU RAM on demand, similar to how an OS pages virtual memory to disk. During fine-tuning with Adam, optimizer states (first and second moment) require 8 bytes per trainable parameter — typically the largest training memory cost after the base model. When a gradient accumulation spike would overflow GPU VRAM, unified memory transparently moves cold optimizer state pages to CPU RAM and brings them back only when needed. This prevents out-of-memory crashes on long sequences or large batch sizes and is why QLoRA can sustain training on a single GPU that has just enough VRAM for the base and adapters at rest.",
+    "fj": "Paged optimizers page the model's layers in and out of GPU memory.",
+    "fs": "Paged optimizers in QLoRA use NVIDIA unified memory to move optimizer state (Adam moments) between GPU and CPU during spikes, preventing OOM without changing convergence.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "python",
+        "label": "paged Adam in TRL/BnB",
+        "lines": [
+          "from transformers import TrainingArguments",
+          "args = TrainingArguments(",
+          "  output_dir='./out',",
+          "  optim='paged_adamw_8bit',  # <--",
+          "  per_device_train_batch_size=4,",
+          "  gradient_accumulation_steps=8)",
+          "# optimizer states page to CPU on spikes"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Does paging optimizer states to CPU RAM slow training noticeably?",
+        "a": "In the non-overflow case, unified memory stays resident in GPU VRAM and performs identically to normal GPU tensors. Paging only activates during memory spikes, and those spikes are infrequent during stable training — they're rare enough that average throughput drops are usually under 5%. The alternative (OOM crash) is far worse. If paging happens constantly you need to reduce batch size or sequence length."
+      },
+      {
+        "q": "How do paged optimizers interact with 8-bit Adam in QLoRA?",
+        "a": "QLoRA pairs paged_adamw_8bit: the Adam moment tensors are both stored in 8-bit (halving their memory vs FP32) and backed by NVIDIA unified memory for spill-to-CPU. You get two memory reductions stacked — smaller moment footprint plus safe overflow to CPU. This combination is what lets QLoRA's paper report fine-tuning 65B parameters on a single A100 80GB."
+      }
+    ]
+  },
+  {
+    "q": "How does QLoRA compare to full fine-tuning in memory usage — walk through the numbers for a 7B model?",
+    "a": "Full fine-tuning a 7B model in BF16 requires: 7B × 2 bytes weights ≈ 14 GB, plus 14 GB gradients, plus 56 GB for Adam first/second moments (FP32) = ~84 GB, needing multiple high-end GPUs. QLoRA instead loads the base in NF4 (4 bits): 7B × 0.5 bytes ≈ 3.5 GB, with double quantization saving a further ~0.2 GB. The LoRA adapters at rank 16 targeting all attention projections add roughly 0.02 GB trainable weights. Gradients and Adam states apply only to the ~20 million adapter parameters, adding ~0.5 GB. Total: ~4.5 GB, fitting comfortably on a single 8 GB consumer GPU. QLoRA achieves this by quantizing the frozen base, restricting trainable params to adapters, and using paged optimizers.",
+    "fj": "QLoRA is about half the memory of full fine-tuning.",
+    "fs": "QLoRA cuts a 7B fine-tune from ~84 GB (full FP32 Adam) to ~4.5 GB: NF4 base (3.5 GB) + tiny adapter params + adapter-only Adam states.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "python",
+        "label": "rough memory breakdown",
+        "lines": [
+          "# Full FT (7B, BF16 weights + FP32 Adam):",
+          "# 14 GB weights + 14 GB grads + 56 GB Adam = ~84 GB",
+          "",
+          "# QLoRA (7B NF4 base + rank-16 LoRA):",
+          "# 3.5 GB NF4 base",
+          "# + ~0.5 GB adapter weights/grads/Adam",
+          "# = ~4 GB total -> fits 8 GB GPU"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the main accuracy trade-off of QLoRA vs full fine-tuning?",
+        "a": "QLoRA's paper shows it matches full fine-tuning on instruction-following and reasoning benchmarks within noise for most tasks, but there's a known gap on very knowledge-intensive tasks where updating more parameters matters. The frozen NF4 base can't adapt its knowledge, only behavior. If the gap is large, options are increasing LoRA rank, adding more target modules, or using a larger base model."
+      },
+      {
+        "q": "When does the memory advantage of QLoRA over LoRA (non-quantized) actually matter?",
+        "a": "LoRA without quantization still loads the base in BF16 (~14 GB for 7B), which is fine for a 24 GB GPU but rules out consumer 8-12 GB cards. QLoRA's NF4 base halves that, enabling 13B and 70B models on hardware that otherwise couldn't host them. At data-center scale the difference is fewer GPUs per run rather than possibility, but for researchers on budget hardware it's often the only viable path."
+      }
+    ]
+  },
+  {
+    "q": "How do you merge a QLoRA adapter back into the base weights, and what are the gotchas?",
+    "a": "After QLoRA training the adapter is in BF16 while the base is frozen in NF4. To merge, you dequantize the base to BF16, compute the full-rank update W_merged = W_base + B·A·(alpha/r) for each LoRA target module, and save the merged model in BF16 or FP16. The result is a standard dense checkpoint with zero inference overhead. Key gotchas: first, dequantizing a large NF4 base (e.g. 70B) requires enough CPU RAM or GPU VRAM to hold the full BF16 model temporarily; second, merging is irreversible — keep the original adapter and base if you need to fine-tune further; third, the merged weights now hold any adapter-learned behavior baked in, so you can no longer mix adapter swapping.",
+    "fj": "You just add the adapter weights to the model after training.",
+    "fs": "Merge = dequantize NF4 base to BF16, compute W + B·A·(alpha/r), save dense BF16 checkpoint — needs enough RAM for the full BF16 model, and is irreversible.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "python",
+        "label": "PEFT merge and unload",
+        "lines": [
+          "from peft import PeftModel",
+          "# load NF4 base + adapter",
+          "model = PeftModel.from_pretrained(base, './adapter')",
+          "# dequant base -> BF16, add B*A update",
+          "merged = model.merge_and_unload()",
+          "merged.save_pretrained('./merged-model')",
+          "# saves dense BF16 checkpoint"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens to inference latency before vs after merging the QLoRA adapter?",
+        "a": "Before merging, inference must dequantize NF4 base blocks on the fly and apply the adapter as a side-path on each forward pass — both add overhead. After merging the adapter into a dense BF16 checkpoint, it runs as a normal transformer with no dequantization or adapter branches. For production serving, always merge and then re-quantize to AWQ/GPTQ for deployment; keep the unmerged NF4+adapter only for continued fine-tuning."
+      },
+      {
+        "q": "Can you fine-tune the merged model again with QLoRA?",
+        "a": "Yes, but you restart from scratch: reload the merged BF16 checkpoint with a new BitsAndBytesConfig (NF4) and apply a new LoRA config with get_peft_model. The merged weights are now the new base. There's no built-in 'continue from merged' shortcut — that's why you keep the original unmerged adapter for resumed training rather than starting from the merged artifact."
+      }
+    ]
+  },
+  {
+    "q": "When should you pick QLoRA over vanilla LoRA (full-precision base), and when does LoRA win?",
+    "a": "Pick QLoRA when GPU VRAM is the binding constraint — you want to fine-tune a model larger than the available BF16 budget, or you need to fit fine-tuning onto a smaller/cheaper GPU. It's also the right call for rapid iteration on a wide range of model sizes without provisioning large multi-GPU runs. LoRA over a full-precision base wins when: maximum adapter quality is critical (QLoRA's NF4 noise is real, small but non-zero), training throughput matters (full-precision avoids NF4 dequantization overhead per forward pass), or you're deploying through a pipeline that benefits from a quantization-free base checkpoint. For production at scale on 7-13B models where 24 GB GPUs are available, LoRA in BF16 with adapter merging is often the cleaner choice; QLoRA shines for 30B+ models or constrained hardware.",
+    "fj": "QLoRA is always better because it uses less memory.",
+    "fs": "QLoRA wins on constrained VRAM (30B+ or budget GPU); LoRA BF16 wins on max quality and throughput when VRAM allows — the decision is hardware and accuracy-gap driven.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How does the NF4 quantization noise in QLoRA manifest in practice?",
+        "a": "On instruction-following, summarization, and classification tasks the noise is negligible — benchmarks routinely show within 1-2% of full-precision LoRA. The noise is most visible on math, multi-step reasoning, and long structured generation, where per-token perturbations compound. The QLoRA paper reports Llama fine-tuned with QLoRA matches full fine-tuning on MMLU and commonsense reasoning but has documented gaps on competition-level math."
+      },
+      {
+        "q": "Does choosing a lower LoRA rank help offset QLoRA's accuracy cost?",
+        "a": "No — lower rank reduces adapter capacity, which makes the accuracy gap worse, not better. If QLoRA vs LoRA accuracy matters, increase rank (r=32 or 64) and target more modules (q, k, v, o projections, MLP layers), which keeps the adapter expressive enough to compensate for the base's quantization noise. Rank is your accuracy lever; quantization method is your memory lever."
+      }
+    ]
+  },
+  {
+    "q": "What target modules should you include in LoRA/QLoRA config, and how does the choice affect quality?",
+    "a": "LoRA injects B·A adapters into named linear layers; the choice of which layers to target is a hyperparameter. The original LoRA paper targets attention query and value projections (q_proj, v_proj) as the minimum set. QLoRA's paper shows that targeting all attention projections (q, k, v, o) plus the MLP gate and up/down projections significantly improves quality — roughly the same gain as doubling the rank. For instruction-following and reasoning, targeting all linear layers in transformer blocks (all_linear) is now the recommended default in LLaMA-Factory and PEFT's recent presets. More target modules mean more trainable parameters, so VRAM for adapter states grows linearly; on a 7B model going from q+v to all-linear increases trainable params from ~4M to ~20M, adding ~160 MB at BF16.",
+    "fj": "You target the attention layers; the rest don't matter.",
+    "fs": "Targeting all attention projections + MLP layers (not just q+v) substantially closes the QLoRA vs full FT quality gap at modest extra VRAM — all-linear is the recommended default for production fine-tuning.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "python",
+        "label": "all-linear LoRA targets",
+        "lines": [
+          "from peft import LoraConfig",
+          "cfg = LoraConfig(",
+          "  r=16, lora_alpha=32,",
+          "  target_modules='all-linear',  # recommended",
+          "  lora_dropout=0.05,",
+          "  bias='none')",
+          "# adds ~20M params on 7B, ~160 MB BF16"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does adding MLP layers to QLoRA targets matter more at smaller ranks?",
+        "a": "At low rank (r=4-8) the adapter's capacity is already tight; targeting only attention leaves the MLP's learned transformations completely frozen. MLP layers are responsible for factual knowledge storage and feature synthesis, so tasks requiring knowledge adaptation (domain-specific QA, coding in a new API) benefit most from including them. At high rank the attention adapters alone can compensate, but it's inefficient."
+      },
+      {
+        "q": "What is lora_alpha and how do you tune it relative to rank?",
+        "a": "lora_alpha is a scaling factor applied to the B·A update as alpha/r. With alpha=rank (e.g., both=16) the scaling is 1.0, equivalent to standard full fine-tuning update magnitude. The common heuristic is alpha = 2×rank, which slightly amplifies the adapter contribution without instability. Tune by sweeping alpha while holding rank fixed and measuring validation loss — it's a cheap, impactful hyperparameter often overlooked in favor of rank."
+      }
+    ]
+  },
+  {
+    "q": "How does serving multiple QLoRA-trained adapters over a shared quantized base work in production?",
+    "a": "Once QLoRA training produces multiple task or customer adapters (each a small set of B·A matrices), production serving loads one copy of the shared base — typically re-quantized to AWQ or GPTQ after merging is ruled out — and hot-swaps or batches adapter layers per request. vLLM's punica/S-LoRA kernel fuses adapter application into the base GEMM so many adapters can run concurrently without serializing. The base occupies most VRAM; adapters are tiny (tens to hundreds of MB each) and can be resident for hot paths or fetched from CPU for cold ones. This is fundamentally different from QLoRA training — at serving time the base is usually in production quant (AWQ/GPTQ), not NF4, for higher throughput.",
+    "fj": "You merge each adapter into a separate copy of the base model.",
+    "fs": "One quantized base in VRAM + per-request adapter swap/batch via S-LoRA; training NF4 and serving quant (AWQ/GPTQ) are different — don't serve NF4 in production if throughput matters.",
+    "level": "Sr",
+    "code": [
+      {
+        "lang": "python",
+        "label": "vLLM multi-LoRA serving",
+        "lines": [
+          "from vllm import LLM, SamplingParams",
+          "from vllm.lora.request import LoRARequest",
+          "llm = LLM(model='Llama-3.1-8B-AWQ',",
+          "           enable_lora=True, max_loras=8)",
+          "out = llm.generate(prompt, p,",
+          "  lora_request=LoRARequest(",
+          "    'task-a', 1, './adapters/task-a'))",
+          "# base loaded once, adapter hot-swapped"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why re-quantize from NF4 to AWQ for production serving rather than serving NF4 directly?",
+        "a": "NF4 is designed for training-time memory efficiency during QLoRA and is not optimized for throughput — its dequantization path in BitsAndBytes is not as fast as dedicated CUDA kernels in AWQ/GPTQ. AWQ's calibrated quantization with fast decode kernels achieves higher tokens/second on the same hardware. After QLoRA training, merge the adapter into BF16 and then run AWQ quantization on the merged checkpoint to get a production-grade artifact."
+      },
+      {
+        "q": "What is the memory budget per adapter at serve time and how many can you fit?",
+        "a": "A rank-16 all-linear adapter for a 7B model has ~20M parameters × 2 bytes = ~40 MB. An 80 GB A100 with the base using ~4-5 GB (AWQ 4-bit 7B) plus KV cache and batch state can easily hold dozens of adapters resident. vLLM's S-LoRA supports hundreds by paging cold adapters to CPU, with GPU residency managed by an LRU policy — the hot adapters stay in VRAM and cold ones are fetched on demand."
+      }
+    ]
+  },
+  {
+    "q": "What training data quality and quantity thresholds make QLoRA fine-tuning worth running versus staying with a prompted base model?",
+    "a": "QLoRA fine-tuning shows meaningful gains over prompting when: the task has a stable, unusual output format that few-shot examples can't reliably lock; the domain uses specialized vocabulary or conventions the base tokenizes poorly; or inference volume is high enough that removing a long system prompt (baked in by fine-tuning) cuts per-call token cost substantially. In practice, 500-2,000 high-quality, diverse instruction-response pairs is the minimum for a QLoRA run to consistently beat a well-prompted baseline on a narrow task. Below ~200 examples, the adapter often overfits and regressions on out-of-distribution inputs are common. Data quality dominates quantity: 500 carefully vetted examples outperform 10,000 noisy ones — deduplication and human review of a random sample are non-negotiable before running QLoRA.",
+    "fj": "The more data you have the better — just dump everything in.",
+    "fs": "500-2,000 high-quality pairs is the QLoRA sweet spot for narrow tasks; below ~200 adapters overfit; quality dominates quantity — dedup and spot-review before training.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you detect overfitting in a QLoRA run early?",
+        "a": "Hold out 10-20% of examples as a validation set and log validation loss every few hundred steps alongside training loss. If training loss keeps falling while validation loss flattens or rises, you're overfitting — stop early and checkpoint the best validation step. Also eval on a broad behavioral benchmark (e.g. MT-Bench) at each checkpoint to catch regressions on general capability, since adapter overfitting often hurts out-of-distribution generalization even before val loss rises clearly."
+      },
+      {
+        "q": "When does QLoRA fine-tuning make token economics sense over prompting?",
+        "a": "If your system prompt is 1,000 tokens and you serve 10M calls per month, that's 10B extra input tokens/month. Fine-tuning the behavior in removes that overhead. At GPT-4o-mini rates (~$0.15/1M), that's $1,500/month saved vs the cost of a one-time QLoRA run on a 7B model (~$10-50 GPU-hours). The crossover is roughly 1-2M calls/month for a 500-token system prompt — beyond that, baking behavior into weights is economically dominant."
+      }
+    ]
+  },
+  {
     "q": "Why can't you trust public benchmark scores when picking an LLM, and what do you do instead?",
     "a": "Public benchmarks suffer from contamination — test sets leak into pretraining data, so a high MMLU or HumanEval number can reflect memorization rather than capability. They also measure averaged academic tasks that rarely match your production distribution, and leaderboards get gamed by tuning to the benchmark. Treat published scores as a coarse prior, then build a private eval set of 100-500 representative production inputs with graded expected outputs and run every candidate model through it. Prefer held-out, recent, or dynamically generated cases the models could not have memorized, and re-run the harness on each model release since the best model shifts every few months. Measure quality, cost, and p50/p95 latency together so the choice reflects your task, not a leaderboard.",
     "fj": "Pick whichever model tops the benchmark leaderboard.",
@@ -1085,6 +1352,956 @@
       {
         "q": "Why re-run the eval harness on every model release?",
         "a": "The best model for your task shifts every few months as providers ship updates, and a 'minor' version bump can regress your specific use case even while improving aggregate benchmarks. Re-running your harness on each release turns model selection into a repeatable, data-driven decision and catches silent regressions before they hit users — pin the version until the new one clears your bar."
+      }
+    ]
+  },
+  {
+    "q": "Walk through the Anthropic Messages API request lifecycle — what are the required fields, what happens with multi-turn conversation, and how does stop_reason signal intent?",
+    "a": "Every Messages API call requires model, max_tokens, and messages (a list of {role, content} objects alternating user/assistant). The system prompt is a top-level field, not a message turn. Anthropic returns a Message object containing a content list (one or more content blocks), input_token_count, output_token_count, and a stop_reason: 'end_turn' means the model finished normally, 'max_tokens' means output was truncated and you should increase max_tokens or paginate, 'tool_use' means the model emits a tool call block you must execute and return as a tool_result turn. Treating 'max_tokens' and 'tool_use' stop reasons as equivalent to 'end_turn' is a common production bug — both require branching logic. For multi-turn, you append each assistant Message.content back into messages, interleaving with user turns; you do not re-send the full history as the system prompt.",
+    "fj": "You just send a list of messages and get text back.",
+    "fs": "stop_reason gates your logic: end_turn → done; max_tokens → truncated, handle it; tool_use → execute and loop — treating them all as 'done' is a production bug.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Messages API with stop_reason branch",
+        "lang": "python",
+        "lines": [
+          "import anthropic",
+          "client = anthropic.Anthropic()",
+          "resp = client.messages.create(",
+          "  model='claude-opus-4-5',",
+          "  max_tokens=1024,",
+          "  system='You are a helpful assistant.',",
+          "  messages=[{'role':'user','content':'hi'}])",
+          "if resp.stop_reason == 'end_turn':",
+          "  print(resp.content[0].text)",
+          "elif resp.stop_reason == 'max_tokens':",
+          "  raise ValueError('Truncated — raise max_tokens')",
+          "elif resp.stop_reason == 'tool_use':",
+          "  pass  # execute tool, append result, loop"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you correctly continue a conversation after a tool_use stop?",
+        "a": "Append the assistant's Message.content (which contains the tool_use block) as an assistant turn, then append a new user turn with content type 'tool_result' containing the tool_use_id and the result. Then call the API again. Failing to echo the tool_use block back as an assistant turn before the tool_result causes a 400 error — the API enforces strict role alternation including tool turns."
+      },
+      {
+        "q": "What is the difference between max_tokens and the model's native context window limit?",
+        "a": "max_tokens caps output generation only — it does not affect input. If your input plus the generated output would exceed the model's context window (e.g. 200K for Claude 3.5), the API rejects the request before generation. max_tokens is your cost/truncation knob; context_window is the hard physical limit you stay inside by managing input length."
+      },
+      {
+        "q": "Why is the system prompt a top-level field rather than a special message role?",
+        "a": "Anthropic separates system from conversation to enable prompt caching at the system level independently from the message history, and because the system prompt semantics differ — it persists across all turns and is never part of the role alternation that the API validates. It also makes cache_control placement unambiguous: you annotate system content blocks without touching the messages list."
+      }
+    ]
+  },
+  {
+    "q": "How does Anthropic prompt caching work mechanically — what triggers a cache write vs read, and what are the cost and TTL specifics in early 2026?",
+    "a": "You opt in per content block by setting cache_control: {type: 'ephemeral'} on text, image, or document blocks in the system prompt or messages. On the first call Anthropic writes the KV state of all tokens up to and including the marked block at 1.25x the normal input token price; subsequent calls that share an identical prefix up to that breakpoint pay 0.1x (a 90% discount on those tokens). The TTL is 5 minutes by default for ephemeral; Anthropic's extended cache (beta) extends this. The response usage object reports cache_creation_input_tokens and cache_read_input_tokens separately, so you can verify cache hits programmatically. Critical mechanics: the prefix must be byte-identical (even whitespace differences bust the cache), multi-block caching is allowed (place breakpoints at tools end, then system-prompt end, then large-document end), and the minimum cacheable prefix is 1,024 tokens for most models.",
+    "fj": "Caching is automatic — you don't have to do anything special.",
+    "fs": "Caching is opt-in per block via cache_control; writes cost 1.25x, reads cost 0.1x, 5-min TTL, byte-identical prefix required — verify with cache_read_input_tokens in usage.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "multi-block cache markers",
+        "lang": "python",
+        "lines": [
+          "resp = client.messages.create(",
+          "  model='claude-sonnet-4-5',",
+          "  max_tokens=512,",
+          "  system=[",
+          "    {'type':'text', 'text': TOOLS_SPEC,",
+          "     'cache_control': {'type':'ephemeral'}},",
+          "    {'type':'text', 'text': BIG_STATIC_INSTRUCTIONS,",
+          "     'cache_control': {'type':'ephemeral'}}",
+          "  ],",
+          "  messages=msgs)",
+          "hits = resp.usage.cache_read_input_tokens",
+          "print(f'{hits} tokens served from cache')"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you warm the cache before production traffic hits?",
+        "a": "Fire a preflight request with the static prefix and max_tokens=0 (or 1) at application startup. Confirm cache_creation_input_tokens is nonzero in the response usage. This ensures the first real user request gets a cache hit instead of paying the 1.25x write fee at request time. Re-warm after the 5-minute TTL expires by scheduling a lightweight heartbeat request if your traffic has long idle gaps."
+      },
+      {
+        "q": "What happens to the cache if you add a timestamp or session ID anywhere in the cached prefix?",
+        "a": "The cache is invalidated entirely for that session — you pay 1.25x write on every call and get zero reads. Cache-busting fields (timestamps, random IDs, per-user context) must always come after the last cache_control marker, in the messages list. Audit your system prompt template for any dynamic interpolation before marking it cached."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement streaming with the Anthropic SDK in Python, and what events do you handle to reconstruct the final text and detect tool calls mid-stream?",
+    "a": "Use client.messages.stream() as a context manager; it yields typed streaming events. The key events for production use are: content_block_start (type='text' or 'tool_use' tells you what's arriving), content_block_delta (text_delta.text for prose, input_json_delta.partial_json for tool arguments), content_block_stop, and message_stop which carries the final usage and stop_reason. Accumulate text deltas into a buffer; accumulate input_json_delta partial JSON strings and parse the full JSON only at content_block_stop, not mid-stream, since partial JSON is not valid. A common bug is reading only text_delta events and silently dropping tool call arguments. The SDK's .get_final_message() convenience collects everything for you if you don't need incremental rendering.",
+    "fj": "I just iterate the stream and print each chunk.",
+    "fs": "Handle content_block_start to detect tool_use blocks, accumulate input_json_delta strings, and parse JSON only at content_block_stop — mid-stream partial JSON is not valid.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "stream with tool call detection",
+        "lang": "python",
+        "lines": [
+          "with client.messages.stream(",
+          "  model='claude-opus-4-5',",
+          "  max_tokens=1024,",
+          "  tools=tools,",
+          "  messages=msgs) as stream:",
+          "  for event in stream:",
+          "    if event.type == 'content_block_start':",
+          "      is_tool = event.content_block.type == 'tool_use'",
+          "    elif event.type == 'content_block_delta':",
+          "      if hasattr(event.delta, 'text'):",
+          "        print(event.delta.text, end='')",
+          "      elif hasattr(event.delta, 'partial_json'):",
+          "        json_buf += event.delta.partial_json",
+          "    elif event.type == 'content_block_stop' and is_tool:",
+          "      args = json.loads(json_buf)  # safe here"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why must you parse tool argument JSON only at content_block_stop, not mid-stream?",
+        "a": "input_json_delta delivers the JSON string incrementally — you might receive '{\"city\": \"San' as one delta, meaning it's an incomplete string literal. json.loads() will throw on partial JSON. You must concatenate all input_json_delta values for a block and parse the concatenated string only after content_block_stop signals the block is complete."
+      },
+      {
+        "q": "How do you get total token usage from a streaming response?",
+        "a": "Usage is only available in the message_delta event with type 'message_delta' and its usage field, or via stream.get_final_message() after the stream ends. It is not present mid-stream. Plan your cost tracking to read usage after the stream context manager exits, not during token delivery."
+      }
+    ]
+  },
+  {
+    "q": "What is the Anthropic Message Batches API, when does it unlock meaningful cost savings, and what are its operational constraints?",
+    "a": "The Message Batches API accepts up to 10,000 requests in one API call and processes them asynchronously, completing within 24 hours. The pricing discount is approximately 50% off standard Messages API rates — the same as OpenAI Batch. Each batch is a list of requests each with a custom_id for result matching, and you poll (or use a provided results_url) to retrieve a JSONL response file with one result per custom_id. Operational constraints: no streaming, no real-time SLA, results arrive as a file not a stream, batches cannot be cancelled mid-flight, and there is a 256 MB request payload limit. The 50% discount pays off decisively for nightly enrichment, bulk classification, evaluation runs, and document processing — any workload where 24-hour turnaround is acceptable. It is the wrong tool for user-facing or latency-sensitive tasks.",
+    "fj": "Batch API is just a way to send many requests at once — it's a minor convenience.",
+    "fs": "Batch API gives 50% off at the price of async 24-hour turnaround; a 10K-request batch with results as a JSONL file — decisive for bulk eval/enrichment, wrong for real-time.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "submit and poll a batch",
+        "lang": "python",
+        "lines": [
+          "import time, anthropic",
+          "client = anthropic.Anthropic()",
+          "batch = client.messages.batches.create(requests=[",
+          "  {'custom_id': f'r{i}',",
+          "   'params': {'model':'claude-haiku-4-5',",
+          "              'max_tokens':256,",
+          "              'messages':[{'role':'user','content':t}]}}",
+          "  for i, t in enumerate(texts)])",
+          "while (b := client.messages.batches.retrieve(",
+          "    batch.id)).processing_status == 'in_progress':",
+          "  time.sleep(60)",
+          "for r in client.messages.batches.results(batch.id):",
+          "  print(r.custom_id, r.result.message.content[0].text)"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle partial failures in a batch — some requests error, some succeed?",
+        "a": "Each result in the JSONL file has a result.type field: 'succeeded' or 'errored'. On 'errored', result.error contains a type and message. Your processing loop must branch on type, collect errored custom_ids, and decide whether to retry them (in a new batch or via the live API). Never assume all batch results are successes — partial failure rates of 1-5% are normal for large batches with diverse inputs."
+      },
+      {
+        "q": "What's the economic threshold at which batch API is worth the 24-hour wait?",
+        "a": "The 50% discount is worth it whenever turnaround time doesn't block a user or downstream system. A nightly eval run, a once-daily enrichment job, or a bulk data pipeline processing yesterday's records all tolerate 24 hours. The threshold is purely operational: does your SLA allow it? If yes, always batch. If the result must feed a user session in seconds, it's wrong regardless of cost."
+      }
+    ]
+  },
+  {
+    "q": "How does Anthropic extended thinking work, when should you enable it, and how do you control its cost?",
+    "a": "Extended thinking activates a dedicated thinking budget — a token count the model uses internally to reason before producing its final response. You enable it by passing thinking: {type: 'enabled', budget_tokens: N} where N ranges from 1,024 to the model's per-model maximum (e.g. 32,000 for claude-opus-4-5 as of early 2026). The response includes a thinking content block (visible in the API, not shown to the user) and a text block with the final answer. Cost: thinking tokens are billed at the model's output token rate, so a 10,000-token budget costs 10x more per call than a 1,000-token budget. Route only genuinely hard multi-step math, code planning, and complex reasoning tasks to high-budget thinking; keep budget_tokens low (1,024-2,048) or disabled for simple tasks. You cannot access or inject into the thinking content in tool_use loops — the model always reasons from scratch on each turn.",
+    "fj": "Extended thinking just makes the model smarter — always turn it on.",
+    "fs": "Thinking budget tokens are billed at output rates — a 10K budget costs 10x more than 1K; route only hard math/code tasks to high budgets, disable for simple work.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "enable extended thinking",
+        "lang": "python",
+        "lines": [
+          "resp = client.messages.create(",
+          "  model='claude-opus-4-5',",
+          "  max_tokens=16000,  # must exceed budget_tokens",
+          "  thinking={'type': 'enabled',",
+          "             'budget_tokens': 8000},",
+          "  messages=[{'role':'user',",
+          "             'content': HARD_PROBLEM}])",
+          "for block in resp.content:",
+          "  if block.type == 'thinking':",
+          "    pass   # internal; log but don't show",
+          "  elif block.type == 'text':",
+          "    print(block.text)  # final answer"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why must max_tokens exceed budget_tokens when using extended thinking?",
+        "a": "max_tokens caps total output token production including both the thinking block and the text block. If max_tokens is less than or equal to budget_tokens, the model may exhaust its token budget before producing the final text answer and the response will stop_reason as max_tokens with no user-visible output. Set max_tokens to at least budget_tokens + the expected answer length."
+      },
+      {
+        "q": "How do you decide the right budget_tokens for a task?",
+        "a": "Run a sweep on your eval set: start at the minimum (1,024), then double (2K, 4K, 8K, 16K) and measure accuracy vs cost at each level. Plot the quality-vs-cost Pareto curve. For most math and code tasks quality plateaus around 4K-8K; continuing to 32K adds marginal accuracy at disproportionate cost. The optimal budget is the knee of the curve for your specific task category."
+      }
+    ]
+  },
+  {
+    "q": "What is an LLM gateway, what problems does it solve that direct provider SDK calls cannot, and what are the main open-source options in early 2026?",
+    "a": "An LLM gateway is a proxy layer between your application and multiple provider APIs that provides a unified API surface, provider routing and failover, rate limiting and quota management, cost tracking per team/feature, key management, request/response logging, and semantic or prompt caching. Direct SDK calls scatter all this logic across every service and give you no cross-provider observability. The leading open-source gateways in early 2026 are LiteLLM (Python-native, supports 100+ providers via an OpenAI-compatible surface, built-in Redis caching, virtual keys, and a hosted proxy server), Portkey (routing, fallback, guardrails, and analytics as a managed SaaS or self-hosted), and MLflow AI Gateway. Bedrock's API Gateway model in AWS provides similar routing for models deployed on Bedrock. Gateways are the right call when you have multiple provider keys to manage, need team-level spend caps, or want provider portability without rewriting application code.",
+    "fj": "A gateway is just a proxy — you can always call providers directly.",
+    "fs": "A gateway centralizes key mgmt, routing, fallback, rate limiting, and cost tracking across providers in one layer — direct SDK calls force you to re-implement all of that in every service.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "LiteLLM unified call",
+        "lang": "python",
+        "lines": [
+          "from litellm import completion",
+          "# same call shape for any provider",
+          "r = completion(",
+          "  model='anthropic/claude-opus-4-5',",
+          "  messages=[{'role':'user','content':'hi'}])",
+          "# swap to 'openai/gpt-4o' or",
+          "# 'bedrock/anthropic.claude-...' with no",
+          "# application code change"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does 'virtual keys' mean in LiteLLM and why does it matter for security?",
+        "a": "LiteLLM's proxy server issues virtual API keys to teams or services. These map to real provider keys stored only in the proxy. Applications never see the real key, so rotating a provider credential requires updating one place in the proxy config — not hunting down environment variables across dozens of services. Revocation is instant, and spend limits can be enforced per virtual key."
+      },
+      {
+        "q": "When is a managed gateway service (Portkey, Braintrust) better than self-hosting LiteLLM?",
+        "a": "When your team lacks infra capacity to run, upgrade, and monitor another service in the critical path of every LLM call. Self-hosted LiteLLM is powerful but introduces a single point of failure you own. Managed services handle uptime, TLS, SOC2, and upgrades — the cost premium is justified for teams where gateway reliability and compliance matter more than zero recurring SaaS cost."
+      }
+    ]
+  },
+  {
+    "q": "How does LiteLLM proxy handle provider fallback, and what does the routing config look like for a Claude-primary / GPT-4o fallback setup?",
+    "a": "LiteLLM proxy supports model_list routing with fallbacks declared in a YAML config. You define a router_settings with num_retries, allowed_fails, and a fallbacks list mapping each primary model to one or more backups. When the primary call fails (any 5xx, timeout, or rate-limit 429), the router automatically retries on the fallback model. The fallback request uses the same messages — the application sees a single response and is unaware of which model served it. Context-window fallback is a separate feature: if the prompt exceeds the primary's context limit the router automatically routes to a larger-context backup. In production you also set cooldown_time so a failing provider is excluded from routing for N seconds after repeated failures, preventing thundering-herd retry storms against a degraded provider.",
+    "fj": "If the primary fails I just catch the exception and call the backup myself.",
+    "fs": "LiteLLM router handles fallback transparently via config — the app sees one response; cooldown_time prevents retry storms against a degraded provider.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "litellm_config.yaml with fallback",
+        "lang": "python",
+        "lines": [
+          "# litellm_config.yaml",
+          "model_list:",
+          "  - model_name: claude-primary",
+          "    litellm_params:",
+          "      model: anthropic/claude-opus-4-5",
+          "      api_key: os.environ/ANTHROPIC_API_KEY",
+          "  - model_name: gpt4o-fallback",
+          "    litellm_params:",
+          "      model: openai/gpt-4o",
+          "      api_key: os.environ/OPENAI_API_KEY",
+          "router_settings:",
+          "  num_retries: 2",
+          "  fallbacks: [{claude-primary: [gpt4o-fallback]}]",
+          "  cooldown_time: 60  # skip failing provider 60s"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is context-window fallback and how do you configure it?",
+        "a": "Set context_window_fallbacks in router_settings pointing to a larger-context model. When the prompt exceeds the primary model's context limit, LiteLLM automatically routes to the fallback instead of returning an error. This is separate from error-based fallback — it fires on a 400 context-length error, not on 5xx. Useful for apps with variable-length inputs where most calls fit the primary but occasional long inputs need a larger window."
+      },
+      {
+        "q": "How does cooldown_time prevent thundering-herd retry storms?",
+        "a": "When a provider fails repeatedly (hitting allowed_fails threshold), the router marks it as unhealthy and skips it for cooldown_time seconds. Without this, every incoming request during an outage retries the failing provider on every attempt, amplifying load on a degraded endpoint. Cooldown breaks the loop: traffic shifts to healthy providers and the failing one is polled at low frequency until it recovers."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement per-team cost tracking and spend limits across providers using an LLM gateway?",
+    "a": "In LiteLLM proxy, virtual keys are assigned to teams or budgets, and each virtual key gets a max_budget (in USD) and a budget_duration (e.g. '1mo', '7d'). The proxy tracks spend by summing input and output tokens against each provider's pricing table on every call; when a team exceeds max_budget, subsequent requests return a 429 BudgetExceeded error that you surface as a quota alert. The DB-backed proxy persists spend across restarts. Portkey and other gateways offer similar per-key or per-workspace spend policies. At the architecture level, routing all LLM calls through one gateway is what makes cross-provider spend visible in one place — otherwise each service's token use is invisible to the others and you only discover overruns in billing.",
+    "fj": "I look at the billing dashboard at the end of the month.",
+    "fs": "Gateway virtual keys carry per-team max_budget and budget_duration; the proxy enforces limits in real time and returns 429 on overrun — catch overruns in code, not on the bill.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "create budget-capped virtual key",
+        "lang": "python",
+        "lines": [
+          "# LiteLLM admin API",
+          "import requests",
+          "resp = requests.post(",
+          "  'http://litellm-proxy/key/generate',",
+          "  headers={'Authorization': f'Bearer {MASTER_KEY}'},",
+          "  json={",
+          "    'team_id': 'data-platform',",
+          "    'max_budget': 200,   # USD",
+          "    'budget_duration': '1mo',",
+          "    'models': ['claude-primary','gpt4o-fallback']",
+          "  })",
+          "virtual_key = resp.json()['key']",
+          "# app uses virtual_key; proxy enforces spend"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a 429 BudgetExceeded error in application code?",
+        "a": "Treat it like any other budget signal: catch the 429, log the team_id and call context, and return a user-facing message like 'Monthly AI quota reached — contact your admin.' Do not silently retry — a budget cap is an intentional limit, not a transient error. Set up alerting at 80% of budget so teams can request increases before hitting the cap rather than discovering it mid-task."
+      },
+      {
+        "q": "What metadata should you attach to LLM gateway calls for useful cost attribution?",
+        "a": "Attach: feature_name (which product feature triggered the call), user_id or team_id, environment (prod/staging), and model_version. Pass these as metadata in the request; LiteLLM stores them per-call. This lets you break down spend by feature (which call type is most expensive), by team (who is over-using the API), and by model (is the expensive frontier model being used where a cheaper one would suffice)."
+      }
+    ]
+  },
+  {
+    "q": "How does rate limiting work inside an LLM gateway, and how do you design the policy to prevent one team from starving others while surviving provider TPM limits?",
+    "a": "LLM gateways implement two layers of rate limiting: inbound (your application to the gateway) and outbound (gateway to provider). Inbound uses token-bucket or leaky-bucket algorithms per virtual key or team, enforcing requests-per-minute (RPM) and tokens-per-minute (TPM) caps so one chatty team doesn't consume the shared provider budget. Outbound rate limiting honors the provider's own TPM/RPM limits; when the gateway hits a provider 429, it queues and retries with exponential backoff rather than surfacing the error immediately. In LiteLLM proxy you set tpm_limit and rpm_limit on virtual keys and configure retry_policy in router_settings. The dual-layer design means application code sees a stable gateway SLA even during provider throttling, but you must size the inbound caps to total provider capacity divided by team count with headroom for burst — over-allocating sum of team limits above provider limits causes queuing and latency spikes.",
+    "fj": "Rate limiting is just setting a max number of requests per second.",
+    "fs": "Two layers: inbound token-bucket per team (prevents starvation), outbound retry-with-backoff on provider 429s (hides throttling from app) — size inbound caps to ≤ total provider TPM.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "virtual key with TPM/RPM limits",
+        "lang": "python",
+        "lines": [
+          "# LiteLLM key with inbound rate limits",
+          "resp = requests.post(",
+          "  'http://litellm-proxy/key/generate',",
+          "  headers={'Authorization': f'Bearer {MASTER_KEY}'},",
+          "  json={",
+          "    'team_id': 'realtime-feature',",
+          "    'tpm_limit': 50000,  # tokens/min",
+          "    'rpm_limit': 100,    # requests/min",
+          "    'max_budget': 500,",
+          "    'budget_duration': '1mo'",
+          "  })",
+          "# gateway queues excess; returns 429 over limit"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why use token-bucket instead of fixed-window counting for LLM rate limiting?",
+        "a": "Fixed-window counting resets at the boundary — a team can send all its TPM allowance in the last second of one window and the first second of the next, causing a 2x burst that hits the provider. Token-bucket refills continuously and allows short bursts only up to the bucket capacity, smoothing traffic. This matters especially for LLM calls where a single request can be thousands of tokens and the burst profile is spiky."
+      },
+      {
+        "q": "How do you tune the retry backoff on provider 429s without adding latency for the end user?",
+        "a": "Use exponential backoff with jitter and a short initial delay (100-500ms) for latency-sensitive paths; set max_retries low (2-3) so you fail fast rather than queuing indefinitely. For async/batch paths use longer backoff. Expose a circuit breaker: if the provider returns 429s for more than N seconds, mark it unhealthy and route to a fallback rather than endlessly retrying. The goal is to absorb short bursts invisibly while degrading gracefully on sustained throttling."
+      }
+    ]
+  },
+  {
+    "q": "How does Portkey differ from LiteLLM architecturally, and which fits better for a team that needs guardrails and PII redaction at the gateway level?",
+    "a": "LiteLLM is an open-source Python library with an optional proxy server; you self-host and own the infra, maintenance, and observability stack. It excels at breadth (100+ provider models), virtual-key management, and cost tracking, and is the default choice for cost-conscious teams with DevOps capacity. Portkey is a managed SaaS gateway (self-hosted option available) that adds first-class guardrails — configurable input/output filters for PII detection, content moderation, and prompt injection — plus a visual analytics dashboard, request replays, and prompt versioning. For a team needing PII redaction at the network layer (not application code) and compliance audit trails, Portkey's managed guardrails are faster to deploy than building equivalent middleware into a self-hosted LiteLLM proxy. For a team that wants maximum control, open-source only, and can build their own guardrail middleware, LiteLLM is the better fit.",
+    "fj": "They're basically the same — just pick whichever has more stars on GitHub.",
+    "fs": "LiteLLM = self-hosted, max breadth/control, you own infra; Portkey = managed SaaS with built-in guardrails/PII/analytics — choose Portkey when guardrails-as-a-service outweighs infra ownership cost.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What does 'gateway-level PII redaction' mean and why is it better than application-level?",
+        "a": "Gateway-level PII redaction runs a regex or ML classifier on every request/response before it leaves or enters your network — regardless of which service made the call. Application-level requires every team to instrument their own code. Gateway enforcement is centralized, consistent, and auditable; application enforcement is scattered and easy to miss in a new service. For compliance (HIPAA, GDPR), gateway-level provides a defensible audit trail that you sent no PII to a third-party provider."
+      },
+      {
+        "q": "How do you evaluate a gateway for production readiness — what should you benchmark?",
+        "a": "Measure added p50 and p99 latency on a representative request mix (the gateway must add under 5ms p50 for latency-sensitive paths). Test fallback correctness under simulated provider failures. Verify cost tracking accuracy against the provider's billing page for a known token count. Audit key rotation and revocation speed. Check HA and graceful degradation — does a gateway restart drop in-flight requests? These benchmarks reveal whether the gateway earns its place in the critical path."
+      }
+    ]
+  },
+  {
+    "q": "How do you use the Anthropic Claude API for tool use in a multi-step agent loop — what does the correct message history look like after two tool calls?",
+    "a": "After each tool_use stop the message history must include: the user turn that triggered the call, the assistant turn containing the tool_use content block (with id, name, input), and then a new user turn with content type tool_result containing tool_use_id and the result string. A two-tool-call history is: [user, assistant(tool_use_1), user(tool_result_1), assistant(tool_use_2), user(tool_result_2), assistant(text)]. Violating the structure — skipping the assistant tool_use turn before the tool_result, or sending two consecutive user turns — returns a 400 validation error. The id in tool_use must be echoed exactly as tool_use_id in tool_result; mismatches cause an error. The final assistant turn with stop_reason 'end_turn' is the natural termination; you stop the loop there rather than after a fixed count when possible.",
+    "fj": "I just keep appending the model's response and the tool result and it figures it out.",
+    "fs": "The correct history is user→assistant(tool_use)→user(tool_result) per tool; skipping the assistant tool_use turn or mismatching tool_use_id causes a 400 — the API validates structure strictly.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "correct two-tool-call history",
+        "lang": "python",
+        "lines": [
+          "msgs = [{'role':'user','content':'What is 2^10 then double it?'}]",
+          "# --- turn 1: model calls calculator ---",
+          "r1 = client.messages.create(model=MODEL,",
+          "  max_tokens=512, tools=tools, messages=msgs)",
+          "tool_use = r1.content[0]  # type='tool_use'",
+          "result1 = run_tool(tool_use)  # '1024'",
+          "msgs += [",
+          "  {'role':'assistant','content': r1.content},",
+          "  {'role':'user','content':[{'type':'tool_result',",
+          "    'tool_use_id': tool_use.id, 'content': result1}]}]",
+          "# --- turn 2: model calls calculator again ---",
+          "r2 = client.messages.create(model=MODEL,",
+          "  max_tokens=512, tools=tools, messages=msgs)",
+          "# repeat pattern; stop when stop_reason=='end_turn'"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens if you send a tool_result without a matching tool_use in the preceding assistant turn?",
+        "a": "Anthropic returns a 400 error: 'tool_use_id not found'. The API validates that every tool_result references a tool_use_id that appears in the immediately preceding assistant message. This enforces that you cannot inject tool results the model did not request, preventing prompt injection through the tool result channel."
+      },
+      {
+        "q": "How do you handle a model that calls the same tool in an infinite loop?",
+        "a": "Enforce a max-step limit (e.g. 10 tool calls) in your loop, and additionally track which tool was called with which arguments in the last N turns. If you see the identical tool_use arguments repeated 2-3 times consecutively, break the loop and return a structured error — the model is stuck. Feed the break condition back as a tool_result with an error message so the model can issue a final text response rather than cutting off mid-conversation."
+      }
+    ]
+  },
+  {
+    "q": "How do you authenticate securely with the Claude API in a production backend, and what are the key secrets-management practices?",
+    "a": "The Claude API authenticates via an x-api-key header populated from the ANTHROPIC_API_KEY environment variable — never hardcode keys in source or commit them to version control. In production, inject the key at runtime from a secrets manager (AWS Secrets Manager, HashiCorp Vault, or a Kubernetes secret) and rotate it on a schedule or immediately on suspected exposure. Scope keys to the minimum permissions needed and use separate keys per environment (dev/staging/prod) so a staging leak does not expose prod. Audit key usage via Anthropic's usage dashboard and alert on anomalous spend spikes which can signal a leaked key. The Python SDK reads ANTHROPIC_API_KEY by default, so no code change is needed when you rotate — only the environment variable changes.",
+    "fj": "I store the API key in the .env file and commit it with the app.",
+    "fs": "Claude API key goes into a secrets manager at runtime; separate keys per environment, rotate on schedule, alert on anomalous spend — never in source or .env committed to git.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Claude API key from env only",
+        "lang": "python",
+        "lines": [
+          "import anthropic, os",
+          "# SDK reads ANTHROPIC_API_KEY automatically",
+          "client = anthropic.Anthropic()",
+          "# In prod, key injected by secrets manager",
+          "# never: api_key='sk-ant-...' in code",
+          "# never: committed .env with real keys"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What should you do immediately if a Claude API key is exposed in a public repo?",
+        "a": "Revoke the exposed key in the Anthropic console immediately — before anything else. Then check usage logs for the exposure window to assess damage. Generate a new key, update the secrets manager, and trigger a rotating deployment. Treat the old key as permanently compromised even if you deleted the commit — scrapers capture exposed secrets within seconds of a public push."
+      },
+      {
+        "q": "How do you scope Claude API access across multiple microservices safely?",
+        "a": "Route all Claude API calls through an LLM gateway (LiteLLM or Portkey) that holds the real Anthropic key. Each microservice gets a virtual key from the gateway with spend limits and allowed models. No service ever holds the real Claude API key — only the gateway does. Rotation is one update to the gateway config, not a redeploy of every consumer."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement structured tool definitions for the Claude API and avoid the three most common schema mistakes?",
+    "a": "Tool definitions in the Claude API require a name (alphanumeric + underscores, max 64 chars), description (concise, behavior-focused — this is what the model reads to decide when to call the tool), and input_schema (JSON Schema draft 7 object with properties and required fields). The three most common production mistakes are: (1) vague descriptions that make the model call the wrong tool or call none at all — descriptions should be one to two precise sentences naming the use case; (2) deeply nested schemas that force the model to generate complex JSON it frequently gets wrong — keep schemas flat with scalar values; (3) required set not matching what you actually need — omitting fields from required makes the model omit them, breaking downstream code. Test each tool definition with an eval set before shipping.",
+    "fj": "I just give the tool a name and it figures out when to use it.",
+    "fs": "Tool descriptions are what the model reasons over to decide invocation — precise one-sentence behavior descriptions + flat schemas + correct required set are non-negotiable.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Claude API tool definition",
+        "lang": "python",
+        "lines": [
+          "tools = [",
+          "  {",
+          "    'name': 'query_database',",
+          "    'description': 'Execute a read-only SQL query against",
+          "      the analytics database and return rows as JSON.',",
+          "    'input_schema': {",
+          "      'type': 'object',",
+          "      'properties': {",
+          "        'sql': {'type': 'string', 'description': 'SQL query'}",
+          "      },",
+          "      'required': ['sql']  # omit = model skips it",
+          "    }",
+          "  }",
+          "]"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does tool_choice affect which tools the Claude API will call?",
+        "a": "tool_choice has three modes: 'auto' (model decides whether to call a tool, which tool, and when to stop), 'any' (model must call at least one tool this turn), and {'type': 'tool', 'name': 'X'} (forces the model to call tool X this turn). Use 'any' or forced tool_choice when you need guaranteed structured output from a specific tool and the task is unambiguous — it eliminates the model opting to respond in plain text when you expected a structured call."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement Claude API prompt caching to cut costs on a chatbot that has a large static system prompt shared across thousands of sessions?",
+    "a": "Structure the system prompt so the static, shared portion comes first and is marked with cache_control: {type: 'ephemeral'} on its content block. The per-session dynamic context (user name, tier) goes after the cache breakpoint in an uncached block or in the first user message. Verify cache hits by checking cache_read_input_tokens in the response usage — it should equal the static prefix token count on every request after the first. Warm the cache at server startup with a preflight request. At 0.1x input token cost for cache reads versus 1x for cache misses, a 2,000-token system prompt that gets 100,000 monthly calls saves roughly $18/month at Claude Sonnet rates — small at low volume, decisive at scale. Never include per-session IDs or timestamps in the cached block.",
+    "fj": "I send the full system prompt on every call — caching seems complicated.",
+    "fs": "Claude API cache: static prefix + cache_control marker → reads at 0.1x cost; verify with cache_read_input_tokens in usage; warm at startup; keep dynamic context after the breakpoint.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "cached system prompt per session",
+        "lang": "python",
+        "lines": [
+          "resp = client.messages.create(",
+          "  model='claude-sonnet-4-5',",
+          "  max_tokens=1024,",
+          "  system=[",
+          "    {'type': 'text',",
+          "     'text': SHARED_SYSTEM_PROMPT,  # 2k tokens, static",
+          "     'cache_control': {'type': 'ephemeral'}},",
+          "    {'type': 'text',",
+          "     'text': f'User tier: {user.tier}'}  # dynamic, uncached",
+          "  ],",
+          "  messages=session_history)",
+          "hits = resp.usage.cache_read_input_tokens  # verify"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does adding per-session data before the cache_control marker break all caching?",
+        "a": "The Claude API's prompt cache uses byte-identical prefix matching. Any token that differs between calls invalidates every cache block that comes after it. Per-session data (user ID, name) before the marker makes the prefix unique for every user, so you pay 1.25x write cost on every call and get zero reads — the opposite of the goal. Always put shared static content first, dynamic content after."
+      }
+    ]
+  },
+  {
+    "q": "What is the Claude API's context window and how do you handle long conversations that approach the limit without losing coherence?",
+    "a": "Claude 3.5 and claude-opus-4-5 / claude-sonnet-4-5 support 200,000 input tokens as of early 2026. You hit the limit before you expect because the full conversation history is sent on every turn; a 1,000-turn chat at 100 tokens per turn is already 100,000 input tokens. The standard patterns for management are: summarize-and-compress (periodically call the Claude API to compress the middle of the conversation into a dense summary, then replace those turns with the summary); sliding-window (keep only the system prompt, the last N turns, and the summary); and retrieval-augmented history (embed conversation turns and retrieve the most relevant ones rather than the full history). Track input_tokens from the Claude API response usage on every call and trigger compression when you cross 60-70% of the context window.",
+    "fj": "If the context fills up I just start a new conversation.",
+    "fs": "Track input_tokens from the Claude API response on every call; trigger summarize-and-compress at 60-70% of the 200K window — new conversation loses continuity, compression preserves it.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "track usage and trigger compression",
+        "lang": "python",
+        "lines": [
+          "resp = client.messages.create(...)",
+          "used = resp.usage.input_tokens",
+          "WINDOW = 200_000",
+          "if used / WINDOW > 0.65:",
+          "  # summarize oldest middle turns",
+          "  summary = compress_history(msgs[2:-6])",
+          "  msgs = msgs[:2] + [summary] + msgs[-6:]",
+          "# re-check after compression"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you write a compress_history call to the Claude API that produces a useful summary?",
+        "a": "Prompt the Claude API to produce a dense first-person narrative summary: 'Summarize the following conversation turns into a concise paragraph preserving key decisions, facts established, and any user preferences. Use past tense.' Include the turns as a single user message. Insert the result as an assistant turn with a prefix like '[Prior conversation summarized]'. Keep the summary under 500 tokens to ensure compression actually reduces context size."
+      }
+    ]
+  },
+  {
+    "q": "How do you add observability to Claude API calls in production — what should you log, trace, and alert on?",
+    "a": "Every Claude API call should emit: a structured log entry with model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, stop_reason, latency_ms, and your own metadata (feature_name, user_id, request_id). Trace the full agent loop if applicable — one distributed trace spanning multiple API calls per user request. Alert on: error_rate > 1% (5xx or 400 from the Claude API), p95 latency > 5s, anomalous spend spikes (possible key leak), and stop_reason = 'max_tokens' rate > 2% (output being truncated). PII scrub before logging — never write raw user messages to logs without redaction. Store logs in a way that lets you replay any production call in your eval harness to debug a regression.",
+    "fj": "I just log the model's response text so I can see what it said.",
+    "fs": "Log tokens/cost/stop_reason/latency per call, trace multi-turn agent loops, alert on error rate + latency + spend spikes + truncation rate — and PII-scrub before writing.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "structured Claude API call log",
+        "lang": "python",
+        "lines": [
+          "import time, logging",
+          "start = time.monotonic()",
+          "resp = client.messages.create(**params)",
+          "logger.info({",
+          "  'model': resp.model,",
+          "  'in_tokens': resp.usage.input_tokens,",
+          "  'out_tokens': resp.usage.output_tokens,",
+          "  'cache_read': resp.usage.cache_read_input_tokens,",
+          "  'stop_reason': resp.stop_reason,",
+          "  'latency_ms': int((time.monotonic()-start)*1000),",
+          "  'feature': feature_name,  # your metadata",
+          "})"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does routing Claude API calls through an LLM gateway improve observability versus direct SDK calls?",
+        "a": "An LLM gateway centralizes all Claude API call logs, costs, and errors in one place regardless of which microservice made the call. Each service only needs to send its metadata tag; the gateway records the token counts, provider response codes, and latency. You get a unified cost dashboard, cross-service error rate, and a single place to set alerts — instead of aggregating logs from N services separately."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement retry and error handling for the Claude API in production, covering both transient and hard failures?",
+    "a": "The Anthropic SDK retries automatically with exponential backoff on 429 (rate limit) and 5xx errors, defaulting to 2 retries. In production, set max_retries=3 and add a timeout parameter (connect_timeout + read_timeout) so a hanging connection does not block a thread indefinitely. Classify errors: 429 is transient (rate limit, always retry with backoff), 500/529 are transient (provider overloaded), 400 is client error (bad schema, context overflow — do not retry, fix the request), 401 is credentials failure (don't retry, alert). Add a circuit breaker that opens after N consecutive 5xx responses and routes to a fallback model via an LLM gateway. Log the error type, model, and input token count on every failure so you can correlate errors with specific call patterns.",
+    "fj": "If the API call fails I catch the exception and tell the user to try again.",
+    "fs": "429/5xx are transient → SDK auto-retries with backoff; 400 is client error → fix the call; 401 → alert immediately; add circuit breaker via LLM gateway for sustained outages.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Claude API retry + timeout config",
+        "lang": "python",
+        "lines": [
+          "import anthropic",
+          "client = anthropic.Anthropic(",
+          "  max_retries=3,",
+          "  timeout=anthropic.Timeout(",
+          "    connect=5.0, read=60.0,",
+          "    write=10.0, pool=5.0))",
+          "# 429/5xx: SDK retries w/ backoff",
+          "# 400: anthropic.BadRequestError -> fix call",
+          "# 401: anthropic.AuthenticationError -> alert",
+          "# 529: anthropic.OverloadedError -> retries"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is error code 529 from the Claude API and how does it differ from 500?",
+        "a": "529 is Anthropic's 'API overloaded' response, meaning their servers are at capacity and the request was shed — a transient capacity issue, not an application error. Unlike a 500 which signals an internal server error on a specific request, a 529 means Anthropic is healthy but busy. Both are retryable, but 529 specifically warrants routing to an LLM gateway fallback model if it persists, since it signals sustained provider load rather than a one-off error."
+      },
+      {
+        "q": "How do you implement a circuit breaker on Claude API calls without a gateway?",
+        "a": "Track consecutive failure counts in a shared counter (Redis or in-process for single instances). After N consecutive 5xx responses within a time window, flip a flag to 'open' and route to a fallback (cached response, degraded mode, or alternative provider). After a cooldown period, flip to 'half-open' and let one probe request through. If it succeeds, close the circuit. If not, stay open. The same pattern is built into LiteLLM gateway's cooldown_time setting, which is why using an LLM gateway removes this from every individual service."
+      }
+    ]
+  },
+  {
+    "q": "How do you use the Claude API's vision capability for document understanding pipelines — what are the input formats, token costs, and production trade-offs?",
+    "a": "The Claude API accepts images as base64-encoded blocks or URL references in the messages content list, supporting JPEG, PNG, GIF, and WebP up to 5 MB per image and up to 20 images per request. Token cost for images is significant: a 1568×1568 image costs approximately 1,600 input tokens (roughly $0.0048 at Haiku rates), compared to ~400 tokens for the same content described in text — images are 4x more expensive per equivalent information. In document pipelines, the decision is: use vision for layouts where text extraction destroys structure (tables, charts, forms), use text extraction for dense prose where a PDF parser gives clean text cheaper and faster. Batch vision requests via the Message Batches API for offline document processing to get the 50% discount. Never resize below the model's minimum 1:1 pixel ratio or the model hallucinates image content.",
+    "fj": "I just send the image URL and the Claude API understands it.",
+    "fs": "Claude API vision: base64 or URL, max 5 MB, ~1,600 tokens/full-res image — use for layout-dependent content (tables/forms), text extraction for prose; batch via Message Batches for 50% off.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Claude API image input",
+        "lang": "python",
+        "lines": [
+          "import base64",
+          "with open('invoice.png','rb') as f:",
+          "    b64 = base64.standard_b64encode(f.read()).decode()",
+          "resp = client.messages.create(",
+          "  model='claude-haiku-4-5',",
+          "  max_tokens=512,",
+          "  messages=[{'role':'user','content':[",
+          "    {'type':'image','source':{",
+          "      'type':'base64','media_type':'image/png',",
+          "      'data': b64}},",
+          "    {'type':'text','text':'Extract all line items as JSON'}",
+          "  ]}])"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "When does sending a resized image to the Claude API give worse results than the original?",
+        "a": "Claude's vision scales images internally and is optimized for common aspect ratios. Resizing below ~768px on the short side degrades text readability in the image, causing OCR-style hallucinations on small fonts or fine grid lines. Also, extreme non-standard aspect ratios (very wide or tall images) may cause the model to miss content at the edges. For document pages, send at 1024-1568px width and let the API handle scaling."
+      }
+    ]
+  },
+  {
+    "q": "How do you model LLM gateway latency overhead in a system design, and what SLAs should gateway-layer components target?",
+    "a": "An LLM gateway sits in the critical path of every LLM call, so its added latency directly increases user-visible TTFB. Target < 5ms p50 and < 15ms p99 added latency — benchmarked under production load, not synthetic. The latency budget breaks down as: TLS handshake (amortized via connection pooling to near zero), routing table lookup (< 1ms in-memory), optional semantic cache check (2-5ms for a Redis hit), and response logging (async, non-blocking). Synchronous PII scanning at the gateway adds 5-20ms and must be weighed against security benefit; async PII logging (scan a copy, don't block the path) is the common compromise. Self-hosted LiteLLM proxy adds ~3ms p50 in practice on warm connections. If p99 overhead exceeds 30ms, re-architecture the gateway to move heavy middleware (guardrails, eval) off the hot path.",
+    "fj": "The gateway is just a proxy so it adds barely any latency.",
+    "fs": "LLM gateway budget: < 5ms p50 / < 15ms p99 added overhead; connection pool amortizes TLS; async log; move synchronous guardrails off hot path if p99 > 30ms.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you benchmark an LLM gateway's overhead without polluting results with model generation time?",
+        "a": "Use a stub provider backend that returns an instant fixed response — a mock server or a single-token max_tokens=1 call. Measure round-trip time through the gateway versus direct to the stub. The difference is gateway overhead. Run with a realistic concurrent request load (50-200 RPS) to expose mutex contention, connection pool exhaustion, and per-request memory allocations that only appear under load."
+      }
+    ]
+  },
+  {
+    "q": "What is semantic caching at the LLM gateway level, when does it save meaningfully, and what are the cache invalidation pitfalls?",
+    "a": "Semantic caching at the LLM gateway embeds each incoming request prompt and performs a nearest-neighbor lookup against cached prompt embeddings; if a similar enough prior request (cosine similarity above a threshold, typically 0.95-0.98) exists, the gateway returns the cached response without hitting the provider. This is different from Anthropic prompt caching — it skips the model call entirely. It saves meaningfully for high-volume, narrow-domain Q&A where many users ask semantically equivalent questions (support bots, FAQ pipelines). Pitfalls: (1) threshold calibration — too low and factually distinct questions share a cached answer; (2) stale responses — cached answers go invalid when underlying data changes, requiring TTL or event-driven invalidation; (3) non-determinism — the cache obscures the model's natural response variance, which matters for evals. Disable semantic caching for personalized, context-dependent, or time-sensitive prompts.",
+    "fj": "Semantic caching is like a search index for AI responses — always use it.",
+    "fs": "Semantic cache skips the model call on near-duplicate prompts; set threshold ≥ 0.95, add TTL, and disable for personalized/context-dependent prompts — stale cached answers cause silent correctness failures.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "semantic cache in LiteLLM proxy config",
+        "lang": "python",
+        "lines": [
+          "# litellm_config.yaml",
+          "cache:",
+          "  type: redis",
+          "  similarity_threshold: 0.97  # cosine min",
+          "  ttl: 3600  # 1-hour staleness limit",
+          "  # disables for prompts with 'today' / timestamps",
+          "  # via cache_control: no-cache in request metadata"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you measure semantic cache hit rate and set the right threshold in production?",
+        "a": "Log every cache decision (hit, miss, rejected due to threshold) with the similarity score. Plot the distribution of similarity scores for misses — if most cluster at 0.92-0.96 and you have high miss rate, consider lowering the threshold, but run a correctness eval first: sample 100 cached-response pairs and verify the cached answer is correct for the incoming query. The threshold is a quality gate — lower it only after validating correctness."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate Claude API output quality across model versions — what makes a good LLM-as-judge prompt and what calibration does it need?",
+    "a": "An LLM-as-judge prompt asks a capable model (claude-opus-4-5 or equivalent) to score a response against criteria on a consistent scale. A well-structured judge prompt: (1) states the evaluation criteria explicitly (accuracy, faithfulness to context, format compliance, safety); (2) provides the full context the model had access to (don't let the judge see anything the generation model didn't); (3) uses a structured output score (1-5 or binary) with a chain-of-thought rationale before the score to improve reliability; (4) includes one or two calibration examples of a clearly good and clearly bad response to anchor the scale. Before using the judge in CI, calibrate it against 100 human-rated examples — it must exceed 85% inter-rater agreement with human evaluators to be trustworthy. Use the same judge model version across runs and pin it, otherwise the judge's behavior changes between Claude API version updates.",
+    "fj": "I just ask GPT-4 if the answer looks good.",
+    "fs": "LLM-as-judge needs explicit criteria, context isolation, chain-of-thought before score, calibration examples, and 85%+ human agreement before you trust it in CI — and pin the judge Claude API version.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Claude API judge prompt",
+        "lang": "python",
+        "lines": [
+          "JUDGE = '''You are evaluating an AI assistant's response.",
+          "Criteria: (1) factual accuracy vs context, (2) format adherence.",
+          "Context provided to model: {context}",
+          "User question: {question}",
+          "Model response: {response}",
+          "First reason step-by-step, then output:",
+          "SCORE: <1-5>'''",
+          "resp = client.messages.create(",
+          "  model='claude-opus-4-5',",
+          "  max_tokens=256,",
+          "  messages=[{'role':'user','content': JUDGE.format(**row)}])"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why do you ask the judge to reason before giving a score?",
+        "a": "Chain-of-thought before the verdict — 'think first, then score' — dramatically reduces position bias and anchor effects in LLM-as-judge evaluations. Without reasoning first, the model anchors on surface features (response length, confident tone) rather than actual correctness. The written rationale also makes disagreements auditable: you can inspect why the judge scored low and fix the prompt or criteria rather than treating the score as a black box."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement request deduplication and idempotency for Claude API calls in a distributed system?",
+    "a": "The Claude API does not natively provide idempotency keys as of early 2026 — each call is a new request. You implement idempotency in your application layer: hash the deterministic inputs (model, system prompt, messages, sampling params) into a content-addressable key, check a fast cache (Redis) before calling the Claude API, and store the response keyed to that hash with a TTL matching your freshness requirement. For non-deterministic tasks where the same input can produce different valid responses, skip idempotency caching. In distributed task queues, use exactly-once delivery semantics or a database lock on the input hash before dispatching the Claude API call, so duplicate tasks from at-least-once queues don't fire redundant API calls. Track dedup hit rate in your LLM gateway or application metrics — a high hit rate means you have upstream retry storm or duplicate submission logic to fix.",
+    "fj": "I just let duplicate requests go through — the model handles it.",
+    "fs": "Hash inputs to a content-addressable key, check Redis before calling the Claude API, store responses with TTL — and use a database lock in distributed queues to prevent duplicate dispatch.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Claude API idempotency via Redis",
+        "lang": "python",
+        "lines": [
+          "import hashlib, json, redis",
+          "cache = redis.Redis()",
+          "def call_claude(params: dict, ttl=3600):",
+          "    key = hashlib.sha256(",
+          "        json.dumps(params, sort_keys=True).encode()",
+          "    ).hexdigest()",
+          "    if cached := cache.get(key):",
+          "        return json.loads(cached)",
+          "    resp = client.messages.create(**params)",
+          "    result = resp.content[0].text",
+          "    cache.setex(key, ttl, json.dumps(result))",
+          "    return result"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "When should you NOT cache Claude API responses even if the inputs are identical?",
+        "a": "Skip caching for: calls where the user expects fresh results (news summaries, current-data queries), calls where temperature > 0 and the output variance is the feature (creative generation), calls with tool use where the tool results are real-time data (stock price, live DB query), and calls that include the current time in context. Cache only deterministic, time-insensitive generation — classification, extraction, and format-locked transformation tasks."
+      }
+    ]
+  },
+  {
+    "q": "What is the LLM gateway pattern for A/B testing model versions, and how do you safely roll out a Claude API upgrade without regressions reaching all users?",
+    "a": "An LLM gateway adds a routing layer that lets you split traffic by percentage between model versions — e.g. 10% to claude-opus-4-5 and 90% to the prior version — without any application code change. This is model canary deployment. Configure the router with weighted model_list entries and log which model served each response with a variant tag. Run your eval harness continuously on sampled live outputs per variant, comparing quality scores, error rates, and cost. Only promote the new version when quality is statistically non-inferior on real traffic, not just on your offline eval set. The LLM gateway must tag responses with the model_version so downstream logging, cost attribution, and anomaly detection know which variant served. A/B at the gateway level keeps the split opaque to application code and reversible in seconds by adjusting weights.",
+    "fj": "I upgrade the model version in the code and redeploy — if something breaks I'll revert.",
+    "fs": "Route 10% traffic to the new Claude API model version via LLM gateway weights, measure quality+errors on sampled live outputs, promote only on statistical non-inferiority — reversible in seconds without redeployment.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "LLM gateway weighted A/B routing",
+        "lang": "python",
+        "lines": [
+          "# litellm_config.yaml",
+          "model_list:",
+          "  - model_name: claude-prod",
+          "    litellm_params:",
+          "      model: anthropic/claude-sonnet-4-5",
+          "      weight: 90   # 90% traffic",
+          "  - model_name: claude-canary",
+          "    litellm_params:",
+          "      model: anthropic/claude-opus-4-5",
+          "      weight: 10   # 10% canary",
+          "# both keys from env; gateway tags model_version"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What metric do you use to decide the canary Claude API version is safe to promote to 100%?",
+        "a": "Primary: quality score from your LLM-as-judge eval on sampled canary outputs vs control, with a minimum sample size (200+ for 5% sensitivity). Secondary: error rate, max_tokens truncation rate, and cost per 1K tokens. Treat it as a hypothesis test — canary must be statistically non-inferior at p < 0.05 on the quality metric and show no regression in error rate. Only then promote. If quality is ambiguous, hold at 10% longer rather than rushing the rollout."
+      }
+    ]
+  },
+  {
+    "q": "How do you design an org-wide LLM platform — gateway, eval pipeline, model registry, and cost governance — so that 15+ teams can ship reliably without stepping on each other?",
+    "a": "An LLM platform has four load-bearing layers. First, a central gateway (LiteLLM or Portkey) that holds all provider keys, enforces per-team virtual-key spend caps and TPM limits, routes to provider-agnostic model aliases, and emits structured call logs — teams call the alias, never a raw provider URL. Second, a model registry that maps aliases like 'llm/fast' and 'llm/smart' to current pinned model versions; a platform team cuts a release by updating the registry, not by touching 15 service repos. Third, a shared eval harness in CI: teams register task-specific golden sets; the platform runs them on every registry update and blocks the alias promotion if any team's quality SLO regresses. Fourth, cost governance: Grafana or a data warehouse dashboard showing spend per team-id and feature-tag extracted from gateway logs, with automated budget-exhaustion alerts. The principle is clear ownership boundaries — teams own their prompts and golden sets; the platform team owns the alias, gateway, and infra; neither blocks the other's deploys.",
+    "fj": "We just give each team an API key and let them figure it out.",
+    "fs": "Provider-agnostic aliases in a model registry + gateway enforcing spend caps + shared eval CI that blocks alias promotion on quality regression — teams own prompts, platform owns infra.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle a team whose golden set is too narrow to catch cross-cutting regressions?",
+        "a": "Run a platform-owned shadow eval set that covers representative tasks across all major use-case categories — extraction, summarization, reasoning, code. This is separate from team golden sets and is the platform's safety net for alias promotions. Narrow team evals catch regressions specific to their feature; the shadow set catches broad capability degradation invisible to any single team's slice."
+      },
+      {
+        "q": "How do you enforce model aliases without breaking teams that need to pin to a specific model version?",
+        "a": "Expose an escape hatch: teams can request a hard-pinned alias (e.g. 'llm/claude-opus-4-5-pinned') in the registry with an SLA that it will not be swapped. These require explicit opt-in and an owner who commits to migrating away before the provider deprecation date. Track hard-pinned aliases as tech debt in the platform backlog — they accumulate quickly if you don't gate them."
+      }
+    ]
+  },
+  {
+    "q": "Design a build-vs-buy decision framework for LLM capabilities — when do you self-host open models, when do you use cloud APIs, and how do you quantify the crossover for a 50M-token/day workload?",
+    "a": "Start with a four-axis decision matrix: data sensitivity (PII, HIPAA, regulated data — often forces self-host regardless of cost); capability gap (does any open model clear the quality SLO? If not, frontier API wins by default); volume/cost crossover (see below); and ops capacity (do you have a team to run a GPU cluster with vLLM, on-call, and model upgrades?). At 50M tokens/day (~1.5B/month) of mixed input/output, compare: frontier API (Claude Haiku at $0.80/1M = ~$1,200/month) versus self-hosted Llama-3.1-8B on 2× A100 80GB spot instances on GCP (~$3/h × 2 × 730h = $4,380/month raw, ~$1.5-2k amortized with high utilization and spot discounts) plus ~0.3 FTE SRE. At this volume the frontier API is often cheaper unless you use a model larger than 8B. The crossover for a well-utilized 70B model typically falls between 500M-2B tokens/month. The hybrid answer for most platforms: API for frontier tasks and bursty traffic, self-hosted fine-tuned model for high-volume, steady-state, latency-tolerant pipelines.",
+    "fj": "Self-hosting is always cheaper at scale — just run Llama.",
+    "fs": "Build the matrix: data sensitivity → PII forces self-host; capability gap → open model must clear the SLO; volume crossover for 70B typically 500M-2B tokens/month; ops cost is non-zero — hybrid usually wins.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "cost crossover estimate",
+        "lang": "python",
+        "lines": [
+          "# rough monthly cost estimate",
+          "tokens_per_month = 1_500_000_000",
+          "# API: Haiku $0.80/1M input, $4/1M output",
+          "api_cost = tokens_per_month * 0.80 / 1e6  # ~$1200",
+          "# Self-host: 2x A100 80GB on spot",
+          "gpu_cost = 2 * 3.0 * 730  # ~$4380 raw",
+          "# Break even needs high utilization + spot",
+          "# and open model clearing quality SLO"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle the capability gap if no open model clears your SLO today?",
+        "a": "Track the open-model quality curve — it closes fast. Run your eval set quarterly against current open releases (Llama, Qwen, Mistral) and update the decision memo. In the meantime, use the frontier API for the tasks that require it and route lower-complexity sub-tasks to open models to reduce API spend. Don't do a one-time analysis; the crossover date is predictable and you want to be ready when an open model clears the bar."
+      },
+      {
+        "q": "What hidden costs make self-hosting more expensive than the GPU bill suggests?",
+        "a": "Model upgrade cadence (you re-evaluate every Llama or Qwen release, run benchmarks, re-quantize, and re-deploy), on-call and incident response for a high-availability serving cluster, CUDA and driver compatibility work on each upgrade, and the opportunity cost of the SRE time. A realistic SRE burden is 0.25-0.5 FTE for a mature 2-4 GPU cluster. Factor that into the crossover calculation at your team's labor cost."
+      }
+    ]
+  },
+  {
+    "q": "How do you architect an LLM eval pipeline that serves as the release gate across multiple products, model versions, and business metrics simultaneously?",
+    "a": "A production eval pipeline is a multi-stage gate, not a single test suite. Stage 1 runs in CI on every prompt or model alias change: task-specific golden sets per product with exact-match and LLM-as-judge checks, targeting under 5 minutes. Stage 2 runs on alias promotion candidates: the platform's cross-cutting shadow eval set (300-1,000 curated cases across all use-case categories), plus regression checks against the last 30 days of sampled live traffic scored offline — this catches distribution shift invisible to curated golden sets. Stage 3 is business-metric monitoring in production: conversion, user satisfaction, downstream pipeline error rates — LLM quality ultimately has to map to a business number, and the eval pipeline should predict it. The governance model is: Stage 1 failure blocks the PR; Stage 2 failure blocks alias promotion; Stage 3 degradation triggers a rollback. The eval harness itself is versioned and tested like application code — an eval bug that lets a regression through is a production incident.",
+    "fj": "We run a quick eval before deploying to make sure it looks reasonable.",
+    "fs": "Three-stage gate: CI golden sets (fast, PR-blocking) → shadow eval on alias promotion (cross-cutting, covers distribution) → business-metric monitoring in prod (rollback trigger) — each stage catches what the others miss.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you prevent eval dataset contamination from leaking into model training?",
+        "a": "Never publish your golden sets externally. Store them in a private artifact store, redact them from logs, and rotate a portion quarterly with fresh production examples. If you're working with a provider to fine-tune on your data, contractually exclude eval sets from training data and verify via a held-out canary — a small synthetic set with known answers that a model trained on it would score perfectly but a clean model would score at baseline."
+      },
+      {
+        "q": "How do you correlate Stage 1 eval scores with Stage 3 business metrics to validate the eval is measuring what matters?",
+        "a": "Run a retrospective analysis: for each past model or prompt change, compare the delta in Stage 1 score to the delta in the business metric (e.g. task completion rate, user satisfaction). Compute Spearman correlation. A correlation below 0.5 means your eval proxy is not predictive and you're optimizing a metric decoupled from the business outcome — update the eval criteria. This calibration loop is what separates a vanity eval from a decision-making gate."
+      }
+    ]
+  },
+  {
+    "q": "How do you design LLM cost governance at the platform level — setting budgets, enforcing them in real time, and creating visibility that engineering teams actually act on?",
+    "a": "Cost governance has three components: enforcement, visibility, and accountability. Enforcement: every LLM call routes through the gateway with a virtual key tagged to team-id and feature-name; each key carries a monthly budget cap and a daily soft limit; the gateway returns 429 BudgetExceeded automatically. Visibility: a Grafana dashboard fed from gateway logs showing spend per team per model per feature, 7-day and 30-day trends, and token efficiency (output quality / $ — not just spend). Accountability: monthly cost review where teams present their spend trend, explain spikes, and commit to efficiency improvements; the platform team publishes a quarterly efficiency leaderboard ranking teams by cost-per-successful-task. The governance failure mode is invisible spend — a team uses an expensive model for a task a cheaper model handles equally well, nobody notices, and the bill just grows. The leaderboard and dashboard make that visible without becoming a policing exercise.",
+    "fj": "We look at the API billing page each month to see how much we spent.",
+    "fs": "Enforcement via gateway virtual-key budget caps, visibility via per-team cost dashboards with token efficiency metrics, accountability via monthly spend reviews and a quarterly efficiency leaderboard — invisible spend is the failure mode.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle a team that keeps hitting its budget cap because their use case genuinely requires expensive calls?",
+        "a": "Run a structured cost-efficiency review: what model are they using, what's the task, does a cheaper model clear the quality SLO? If yes, help them migrate. If no, document why and raise their budget cap with a business justification — not as a rubber stamp, but as an explicit cost-vs-value decision recorded in the team's planning documents. The goal is intentional spend, not minimum spend."
+      },
+      {
+        "q": "What token efficiency metric do you use to compare teams fairly across different use cases?",
+        "a": "Cost per successful task completion — not total spend or tokens per call, which penalize high-volume or complex tasks. Define task success per feature (structured output parse success, downstream pipeline success, human-eval score above threshold) and divide monthly cost by successful task count. This normalizes for volume and complexity and focuses the conversation on whether the model spend is creating value, not just whether it is large."
+      }
+    ]
+  },
+  {
+    "q": "How do you manage model reliability at scale — designing for provider outages, model-version drift, and silent quality degradation across 50+ LLM-powered features?",
+    "a": "Reliability at scale requires three overlapping defenses. Availability: all features route through the gateway with automatic fallback configured — primary provider down triggers fallback to a secondary provider or a self-hosted open model, with cooldown to prevent retry storms. Quality drift detection: every feature logs a quality proxy (structured output parse success, faithfulness score from LLM-as-judge, downstream pipeline success rate) and emits it as a metric with feature-level alerting thresholds; a 5% drop in any metric opens a PagerDuty alert. The drift signal must be feature-specific — an aggregate quality metric hides per-feature degradations. Model version management: all provider model identifiers are resolved through the model registry so a provider's silent alias swap (e.g. 'gpt-4o' pointing to a new underlying version) is detectable in gateway logs, and the registry's alias promotion process requires re-running Stage 2 evals. The failure mode this prevents is a provider silently swapping the model behind an alias, degrading three features before anyone notices.",
+    "fj": "If something goes down we'll notice from user complaints.",
+    "fs": "Three defenses: gateway fallback for availability; per-feature quality-proxy metrics with alerting for drift detection; model registry that surfaces provider alias swaps before they hit production at scale.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you set quality-proxy alert thresholds across 50 features without spending months calibrating each?",
+        "a": "Start with relative thresholds: alert when a 7-day rolling average drops more than 5% relative to the prior 7-day window for any feature. This auto-scales with baseline performance and catches sudden drops without requiring feature-by-feature absolute calibration. Refine to absolute thresholds for the highest-criticality features after enough data to establish a stable baseline. The relative threshold catches regressions; the absolute threshold prevents drift below an unacceptable floor."
+      },
+      {
+        "q": "What's the difference between provider downtime and model quality drift, and how do you operationally separate them?",
+        "a": "Provider downtime shows up in gateway error rate (429s, 5xx, timeouts) within seconds — your availability alerting catches it. Quality drift shows up in your quality-proxy metrics over hours or days with no API errors — the model is responding but its behavior changed. Separate alerting paths: error rate from gateway logs for availability; quality scores from your async eval pipeline for drift. Conflating them means a slow quality regression looks like 'everything is fine' until it's severe."
+      }
+    ]
+  },
+  {
+    "q": "How do you set a fine-tune-vs-RAG-vs-API strategy as a platform standard — what's the decision rubric, and how do you enforce it without becoming a bottleneck to 15 product teams?",
+    "a": "Define the rubric as a three-question decision tree documented in the platform's engineering guide: (1) Is the gap primarily about knowledge or facts the model lacks? → RAG first. (2) Is the gap about consistent behavior, format, or domain style with stable labeled data? → Fine-tuning. (3) Does a strong system prompt + few-shot in the current model clear the SLO at acceptable cost? → Prompt engineering first; always try this before escalating. Enforce without becoming a bottleneck by making the decision self-serve: publish the decision tree, provide a starter eval harness teams run themselves, and require a one-page decision memo only for fine-tune or self-host requests (high commitment). The platform reviews memos in a weekly 30-minute slot — not as an approver but as a consultant offering alternatives and sharing prior decisions. The bottleneck trap is requiring platform sign-off on every prompt change; the right gate is the high-cost path, not the default path.",
+    "fj": "We decide case by case — the team lead picks what they think is best.",
+    "fs": "Document the three-question decision tree (knowledge gap → RAG; behavior gap → fine-tune; prompt first always), self-serve eval harness, one-page memo only for fine-tune/self-host — platform consults, doesn't block.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle a team that fine-tuned a model for a task that prompt engineering would have solved?",
+        "a": "Don't relitigate the decision — help them measure whether the fine-tune is actually outperforming a well-prompted baseline (often it isn't). If it isn't, document the lesson in the platform's decision guide with a concrete example: 'We fine-tuned for X; retrospectively, a system prompt with three examples matched quality at zero ops cost.' That case study is worth more than a policy, because it gives teams data to self-correct next time rather than a rule they resent."
+      }
+    ]
+  },
+  {
+    "q": "As the principal owner of AI strategy for an engineering org, how do you set a multi-year model portfolio — which capabilities to build internally, which to buy from vendors, and how do you avoid lock-in?",
+    "a": "A multi-year AI portfolio decision starts with capability classification: frontier reasoning and language capabilities are commodity inputs you buy (the ROI of building your own LLM is negative for every org except a handful of labs), while your domain-specific data, eval sets, and fine-tuned adapters are the durable differentiators you own. Avoid lock-in through provider abstraction at the gateway layer and model aliases that decouple application code from provider identifiers; the rule is that a full provider migration must be possible within one sprint without application code changes. For the three-year roadmap: Year 1, standardize on a gateway and eval infrastructure — this is the foundation; Year 2, build the fine-tuning and adapter management capability for high-value vertical use cases where you have proprietary data and stable task definitions; Year 3, evaluate self-hosting for your two or three highest-volume commodity tasks where open models have crossed quality parity and cost crossover has been reached. Review annually because the model landscape shifts faster than a three-year plan can anticipate — the roadmap is a direction with explicit revision gates, not a committed plan.",
+    "fj": "We commit to one provider and go deep — it's simpler.",
+    "fs": "Buy frontier capability (commodity), own domain data + eval + fine-tuned adapters (durable moat), abstract providers at gateway to enable one-sprint migration, roadmap: infra → fine-tuning → selective self-host, with annual revision gates.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you communicate the AI portfolio strategy to a board or executive leadership who want to know if you're 'using AI enough'?",
+        "a": "Frame it as a value-capture argument, not a technology choice: present the cost per successful AI-powered task trending down year-over-year, the number of product features shipping LLM capabilities, and the proportion of manual work automated. Boards understand unit economics and output metrics, not model names. Include a risk slide showing how provider abstraction and eval gates protect the company from vendor lock-in and silent regressions — those are real business risks framed as governance, not technical debt."
+      },
+      {
+        "q": "How do you structure the governance body that owns the multi-year AI platform roadmap without it becoming bureaucratic?",
+        "a": "An AI platform council with rotating representatives from the three to five largest LLM-consuming teams plus the platform lead, meeting monthly for 45 minutes. Agenda: one metric review (cost, quality, reliability), one decision item (new capability request or vendor evaluation), and one lesson from a recent incident or retrospective. No decisions require more than one meeting — if a decision takes two meetings it's either not ready or not important enough. The council sets direction; individual teams execute without council approval on routine decisions."
+      },
+      {
+        "q": "How do you prevent the 'AI strategy' from becoming an LLM strategy — missing non-LLM ML that still delivers more value for certain tasks?",
+        "a": "Require every AI initiative proposal to answer: 'Why an LLM and not a classical ML model or deterministic code?' Make the answer concrete — e.g. the task requires semantic language understanding over unstructured text, the domain changes too fast for a labeled training set, or no classical classifier cleared the quality SLO. This surfaces cases where a fine-tuned BERT or a simple classifier would deliver the same outcome at 1% of the LLM cost. Include classical ML as a first-class option in the decision rubric, not a footnote."
+      }
+    ]
+  },
+  {
+    "q": "How do you design the safety and governance framework for LLM deployments at an org that handles regulated data — HIPAA, GDPR, and SOC2 — across multiple business units?",
+    "a": "Safety and compliance for regulated LLM deployments requires layered controls at four levels. Data boundary: enforce that no regulated data leaves your network perimeter — this means self-hosted inference or a provider with signed BAA/DPA agreements and data-residency guarantees, and it is a hard constraint that overrides cost or capability arguments. Input/output controls: gateway-level PII detection and redaction before prompts leave the perimeter, output screening for sensitive information leakage, and audit logging of every request with PII scrubbed — retain logs for the compliance period. Access control: virtual keys scoped to minimum data classes, role-based access to the gateway admin, and quarterly access reviews. Incident response: a documented runbook for AI-specific incidents (prompt injection, data leakage, model misbehavior), with a severity classification that maps AI incidents to your existing incident management process. The governance body (your AI platform council or a dedicated AI risk committee) reviews the framework annually and after any significant provider change. The anti-pattern is treating LLM compliance as a one-time checkbox — model behavior and provider terms change, so governance is a living process.",
+    "fj": "We add a disclaimer that the AI might make mistakes and that covers us.",
+    "fs": "Four layers: data boundary (BAA/DPA + no regulated data outside perimeter), gateway PII redaction + audit logs, virtual-key access control with quarterly reviews, AI-specific incident runbook — governance is a living process, not a checkbox.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle a provider that changes their data retention or training policy mid-contract?",
+        "a": "Detect it through automated monitoring of provider ToS change feeds and quarterly manual review by your legal and security team leads. When a policy changes, assess impact against your data classification matrix: does the change affect any data category you send to that provider? If yes, activate your provider migration runbook — swap the gateway alias to an alternative, validate with your eval harness, and complete migration before the new policy takes effect. Provider policy risk is why you maintain the abstraction layer and keep migration under one sprint."
+      },
+      {
+        "q": "What does a useful AI-specific incident runbook contain that a general software incident runbook doesn't?",
+        "a": "AI-specific severity criteria: prompt injection is a P1 (active attack); silent quality regression is a P2 (user harm accumulating but no outage); hallucination that produced incorrect medical or financial advice is a P1 regardless of volume. AI-specific containment actions: disable the affected feature flag without rolling back the whole deployment, route to a cached response or a rule-based fallback, and increase sampling rate on the LLM-as-judge to surface the scope. Post-mortem template that includes: what changed in model or prompt that enabled the failure, what eval would have caught it, and what new test is being added. General runbooks don't distinguish these from API outages."
+      }
+    ]
+  },
+  {
+    "q": "How do you set the org-wide standard for what goes into a system prompt versus what belongs in your application code, and why does this architectural boundary matter at scale?",
+    "a": "The boundary is a safety and velocity boundary, not just a style question. System prompts are the model's behavioral specification — role, output format, constraint rules, and personas — and should be versioned, tested, and deployed through the same process as application code. What never goes in a system prompt: business logic that should fail loudly (put it in code where you get exceptions), authorization decisions (a model that 'knows' a user is an admin is not a security boundary — check it in your auth layer), and runtime data that changes per-request (inject it at the user turn or through retrieved context, not the system prompt, to keep the cached prefix stable). What always goes in the system prompt: the stable behavioral contract that applies to every user in the session. At scale, the failure mode is prompt sprawl — logic scattered between system prompts, user turns, and application code with no clear ownership, making any change risky and no one knowing which layer controls what. Enforce the boundary by treating system prompts as configuration artifacts owned by the feature team, reviewed in code review, stored in version control alongside the service, and covered by the team's eval golden set.",
+    "fj": "We put everything in the system prompt — it's the easiest way to control the model.",
+    "fs": "System prompt = behavioral contract (role/format/constraints), versioned and tested; business logic + auth in code (not prompt); runtime per-request data in user turn after cache breakpoint — prompt sprawl is the org-scale failure mode.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you roll back a bad system prompt change in production across 15 teams' services?",
+        "a": "Each team's system prompt is version-controlled and deployed as a versioned config alongside the service. A bad prompt rollback is a config rollback — the same process as rolling back a feature flag, not a code deploy. At the platform level, the model registry's alias and the team's prompt version are independent axes: you can roll back the prompt without touching the model, and vice versa. If a team doesn't version their prompts in source control, they have no rollback — this is the primary enforcement lever for requiring prompt versioning."
       }
     ]
   }

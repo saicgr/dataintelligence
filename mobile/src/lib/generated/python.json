@@ -1273,5 +1273,1864 @@
         "a": "`nan == nan` is False by IEEE-754 — NaN is unequal to everything including itself — but `x is x` is True for the same object, so `nan in [nan]` can return True (membership tests identity before equality). This breaks dedup, joins, and groupby on NaN keys. In pandas, NaN-aware logic (`.isna()`, `dropna`) exists precisely to sidestep this trap."
       }
     ]
+  },
+  {
+    "q": "What is Python's GIL and how does it constrain Multithreading for CPU-bound vs I/O-bound work?",
+    "a": "The Global Interpreter Lock (GIL) is a mutex inside CPython that allows only one thread to execute Python bytecode at a time. For CPU-bound work — math, parsing, in-memory transforms — Multithreading does not achieve parallelism: all threads share one core and you pay context-switch overhead with no speedup. For I/O-bound work — HTTP calls, database queries, file reads — the GIL is released while the thread waits on a syscall, so other threads run concurrently; Multithreading genuinely helps here. The canonical alternative for CPU parallelism is multiprocessing, which spawns separate processes each with their own GIL.",
+    "fj": "Multithreading is always good — more threads means more speed.",
+    "fs": "Multithreading helps I/O-bound code because the GIL drops during syscalls. For CPU-bound code I reach for multiprocessing or, in Python 3.13+, the free-threaded build.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "I/O-bound: threads win",
+        "lines": [
+          "from concurrent.futures import ThreadPoolExecutor",
+          "import requests",
+          "",
+          "urls = [\"https://api.example.com/item/1\", ...]",
+          "",
+          "# GIL released during each network wait — real concurrency",
+          "with ThreadPoolExecutor(max_workers=20) as ex:",
+          "    results = list(ex.map(requests.get, urls))"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When would you use asyncio instead of Multithreading for I/O-bound work?",
+        "a": "asyncio uses a single thread with an event loop, which scales to thousands of concurrent I/O operations with far less memory than spawning threads (each thread costs ~8MB stack). Use asyncio when you control the code (async libraries available) and cardinality is high. Use Multithreading when integrating blocking third-party libraries that have no async API."
+      },
+      {
+        "q": "Does the GIL affect numpy operations?",
+        "a": "numpy releases the GIL for BLAS/LAPACK calls and most ufuncs, so CPU-bound numpy work can benefit from Multithreading. However, pure Python logic inside a numpy pipeline does not release the GIL. Profile before assuming."
+      }
+    ]
+  },
+  {
+    "q": "How do you use threading.Lock to prevent race conditions in shared-state Multithreading pipelines?",
+    "a": "A race condition occurs when two threads read, modify, and write shared state without coordination, producing non-deterministic results. `threading.Lock` is the primitive: one thread acquires it and others block until it is released. Always use the context manager form (`with lock:`) — it guarantees release even if an exception is thrown. Design data pipelines to minimize shared mutable state; prefer immutable inputs fed to workers and a thread-safe queue for results. Contention on a single lock becomes a serialization bottleneck, so prefer fine-grained locks or lock-free structures (e.g. `queue.Queue`) when throughput matters.",
+    "fj": "I'd just use a global list and append from all threads — lists are thread-safe in Python.",
+    "fs": "List append is GIL-protected so a single append is atomic, but a read-modify-write across multiple statements is not. I wrap shared mutable operations in a Lock and prefer passing results through a Queue to avoid contention.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Lock protects counter",
+        "lines": [
+          "import threading",
+          "",
+          "counter = 0",
+          "lock = threading.Lock()",
+          "",
+          "def increment():",
+          "    global counter",
+          "    with lock:          # atomic read-modify-write",
+          "        counter += 1",
+          "",
+          "threads = [threading.Thread(target=increment) for _ in range(1000)]",
+          "for t in threads: t.start()",
+          "for t in threads: t.join()",
+          "assert counter == 1000"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is a deadlock and how do you avoid it in Multithreading code?",
+        "a": "A deadlock occurs when two threads each hold a lock the other needs, and both wait forever. Avoid by always acquiring locks in the same total order across threads, using `threading.RLock` when a single thread needs to re-enter the same lock, and preferring higher-level abstractions like Queue that handle locking internally."
+      }
+    ]
+  },
+  {
+    "q": "Explain ThreadPoolExecutor's max_workers tuning for Multithreading I/O-bound data pipelines. What is the cost of over-provisioning?",
+    "a": "ThreadPoolExecutor from `concurrent.futures` manages a pool of reusable threads, avoiding spawn overhead per task. For I/O-bound work the optimal `max_workers` is not the CPU count but a multiple of it because threads spend most time blocked. Python's default for I/O tasks is `min(32, os.cpu_count() + 4)` — a reasonable starting heuristic. Over-provisioning has real costs: each thread holds an OS stack (~8 MB), and with hundreds of threads the context-switching overhead can exceed I/O savings. For HTTP pipelines hitting a rate-limited API, too many workers saturates the upstream and triggers backpressure or 429s. Profile with a small sweep (8, 20, 50, 100) and pick the elbow. In Multithreading workloads that also write to a database, connection-pool exhaustion (not CPU) is usually the ceiling.",
+    "fj": "I'd set max_workers=500 so more work happens at once.",
+    "fs": "I benchmark a sweep of worker counts against the actual I/O endpoint, watch for 429s and connection errors, and stop scaling threads well before the connection pool is exhausted.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "ThreadPoolExecutor with bounded workers",
+        "lines": [
+          "from concurrent.futures import ThreadPoolExecutor, as_completed",
+          "import os",
+          "",
+          "# heuristic: cpu_count * 4 for network I/O",
+          "workers = min(32, (os.cpu_count() or 1) * 4)",
+          "",
+          "with ThreadPoolExecutor(max_workers=workers) as pool:",
+          "    futures = {pool.submit(fetch, url): url for url in urls}",
+          "    for fut in as_completed(futures):",
+          "        url = futures[fut]",
+          "        try:",
+          "            result = fut.result()",
+          "        except Exception as e:",
+          "            print(f\"Failed {url}: {e}\")"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does ThreadPoolExecutor compare to ProcessPoolExecutor for Multithreading vs multiprocessing decisions?",
+        "a": "ThreadPoolExecutor shares memory space — zero serialization cost, but subject to the GIL. ProcessPoolExecutor spawns separate processes, bypasses the GIL for true CPU parallelism, but each task argument and result is pickle-serialized, adding overhead. Choose threads for I/O-bound work, processes for CPU-bound work that exceeds what numpy/Cython can offload."
+      }
+    ]
+  },
+  {
+    "q": "What is threading.Event and how do you use it to coordinate graceful shutdown in a Multithreading producer-consumer pipeline?",
+    "a": "threading.Event is a simple signalling primitive: one thread sets it, others call `.wait()` which blocks until the event is set. For graceful shutdown in a Multithreading pipeline: create a `stop_event = threading.Event()`, pass it to all worker threads, and have workers check `stop_event.is_set()` in their loops. The main thread calls `stop_event.set()` on SIGTERM or EOF. Workers drain in-flight work and exit cleanly. Pair with `queue.Queue` for the data channel: producers put items, consumers get them, and the stop signal ends the loop rather than poisoning the queue. Multithreading pipelines that skip clean shutdown lose buffered records or leave database connections open.",
+    "fj": "I'd just kill the process — threads are background daemons anyway.",
+    "fs": "I use threading.Event as a stop signal that all workers check, drain the Queue, then join all threads before exit so no records are dropped.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Graceful shutdown with Event",
+        "lines": [
+          "import threading, queue, signal",
+          "",
+          "stop_event = threading.Event()",
+          "work_queue: queue.Queue = queue.Queue(maxsize=500)",
+          "",
+          "def worker():",
+          "    while not stop_event.is_set():",
+          "        try:",
+          "            item = work_queue.get(timeout=0.5)",
+          "            process(item)",
+          "            work_queue.task_done()",
+          "        except queue.Empty:",
+          "            continue",
+          "",
+          "signal.signal(signal.SIGTERM, lambda *_: stop_event.set())"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the difference between threading.Event and threading.Condition?",
+        "a": "Event is a one-way flag: set/clear/wait. Condition is richer: it wraps a Lock and lets threads wait for an arbitrary predicate to become true, using `.notify()` or `.notify_all()` to wake waiters. Use Condition when wakeup depends on state (e.g. queue not empty) rather than a simple on/off signal."
+      }
+    ]
+  },
+  {
+    "q": "How do thread-local storage and threading.local() solve per-thread state in Multithreading services?",
+    "a": "`threading.local()` creates an object whose attributes are thread-specific: reading `local_obj.conn` in thread A returns thread A's value, never thread B's. This is the canonical solution for per-thread database connections, request contexts, and loggers in Multithreading servers — each thread has its own connection without locking. The pattern is: create one `threading.local()` instance at module level, then initialize the per-thread attribute lazily in the first access or in a thread initializer passed to `ThreadPoolExecutor`. In Multithreading data pipelines, thread-local DB connections avoid connection-pool contention and prevent one thread from seeing another thread's in-progress transaction.",
+    "fj": "I'd pass the connection object as an argument to every function.",
+    "fs": "I use threading.local() for per-thread connections. Each thread in the pool initializes its own connection on first use, so there's no sharing and no locking needed around DB calls.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Per-thread DB connection",
+        "lines": [
+          "import threading",
+          "import psycopg2",
+          "",
+          "_local = threading.local()",
+          "",
+          "def get_conn():",
+          "    if not hasattr(_local, 'conn') or _local.conn.closed:",
+          "        _local.conn = psycopg2.connect(DSN)",
+          "    return _local.conn",
+          "",
+          "def worker(row):",
+          "    conn = get_conn()   # thread's own connection",
+          "    with conn.cursor() as cur:",
+          "        cur.execute(INSERT_SQL, row)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When does threading.local() leak resources, and how do you clean up?",
+        "a": "If a thread-local holds a connection or file handle and the thread exits without closing it, the resource leaks. Pass an `initializer` + `initargs` to ThreadPoolExecutor to set up resources, and wrap the worker in try/finally to close them. For long-lived pools, use weakref finalizers or explicit cleanup hooks."
+      }
+    ]
+  },
+  {
+    "q": "How does free-threaded Python 3.13+ remove the GIL and what does it mean for Multithreading of CPU-bound code in practice?",
+    "a": "Python 3.13 introduced an experimental free-threaded build (`python3.13t`) that disables the GIL (`PYTHON_GIL=0` or `--disable-gil`). Without the GIL, Multithreading can achieve true CPU parallelism on multi-core machines — something that was impossible in CPython for pure Python CPU-bound code. In practice (early 2026) the free-threaded build is production-viable but carries overhead: reference-count operations that previously relied on GIL protection now use atomic increments, adding 10–30 % single-thread overhead in some benchmarks. Extensions must be recompiled and audited for thread safety; many popular packages (numpy, pandas) ship free-threaded wheels but test coverage is still maturing. The pragmatic advice for 2026: benchmark your specific workload on 3.13t, fallback to multiprocessing if the extension ecosystem isn't ready.",
+    "fj": "I'll upgrade to 3.13 free-threaded immediately and all Multithreading code will be parallelized.",
+    "fs": "Free-threaded 3.13 removes the GIL but adds atomic-refcount overhead and requires thread-safe extensions. I benchmark first and keep multiprocessing as the fallback for CPU-heavy work.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Free-threaded CPU parallel test",
+        "lines": [
+          "# python3.13t -c 'import sys; print(sys._is_gil_enabled())'",
+          "# => False (free-threaded build)",
+          "",
+          "import threading, time",
+          "",
+          "def cpu_burn(n=10_000_000):",
+          "    x = 0",
+          "    for i in range(n): x += i",
+          "    return x",
+          "",
+          "threads = [threading.Thread(target=cpu_burn) for _ in range(4)]",
+          "t0 = time.perf_counter()",
+          "for t in threads: t.start()",
+          "for t in threads: t.join()",
+          "# On free-threaded build: ~4x faster than standard 3.13"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the `PYTHON_GIL` environment variable and when would you use it?",
+        "a": "`PYTHON_GIL=0` disables the GIL on a free-threaded-enabled Python build. Setting it at process startup lets you opt in without recompiling, useful for testing Multithreading parallelism. `PYTHON_GIL=1` re-enables it for debugging thread-safety regressions."
+      }
+    ]
+  },
+  {
+    "q": "Describe a real scenario where Multithreading caused a silent data corruption bug and how you would detect and fix it.",
+    "a": "Classic scenario: a Multithreading pipeline writes enriched records to a shared dict (`results[key] = value`) without locking. Two threads compute the same compound key through a read-modify-write sequence: thread A reads the old value, thread B reads the old value, both write their update — one silently overwrites the other. The bug is non-deterministic, rarely surfaces in testing, and shows up in production as row-count mismatches or dropped aggregations. Detection: run with Python's `-X dev` flag which enables thread-safety assertions in some containers; add a deterministic test that spawns many threads writing to the same key and asserts the final count. Fix: replace the shared dict with `collections.defaultdict` protected by a `threading.Lock`, or — better — use per-thread accumulators and merge after `join()`, eliminating contention entirely.",
+    "fj": "Multithreading bugs are obvious — you see an exception.",
+    "fs": "Silent data corruption in Multithreading is the hardest class of bug because it rarely crashes. I design pipelines so threads produce, not mutate: each thread writes to its own buffer and a single thread merges at the end.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Thread-safe accumulation via per-thread buffers",
+        "lines": [
+          "from concurrent.futures import ThreadPoolExecutor",
+          "",
+          "def process_chunk(chunk):",
+          "    # each call returns its own dict — no shared mutation",
+          "    local_counts: dict[str, int] = {}",
+          "    for row in chunk:",
+          "        local_counts[row.key] = local_counts.get(row.key, 0) + 1",
+          "    return local_counts",
+          "",
+          "with ThreadPoolExecutor() as pool:",
+          "    partial_results = list(pool.map(process_chunk, chunks))",
+          "",
+          "# single-threaded merge — no race condition possible",
+          "final: dict[str, int] = {}",
+          "for part in partial_results:",
+          "    for k, v in part.items():",
+          "        final[k] = final.get(k, 0) + v"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you write a deterministic unit test to expose a Multithreading race condition?",
+        "a": "Spawn many threads (e.g. 200) all performing the racy operation, then assert the final state equals the expected deterministic value. Because thread scheduling is non-deterministic, run the test in a loop or under `threading-sanitizer`-style instrumentation. Wrapping the test with `unittest.mock.patch` to insert `time.sleep()` between the read and write steps can reliably expose the window."
+      }
+    ]
+  },
+  {
+    "q": "How does queue.Queue enable safe producer-consumer Multithreading patterns, and what are the semantics of maxsize and join()?",
+    "a": "`queue.Queue` is the canonical thread-safe data channel in Python's Multithreading model. Its internal lock and condition variables let multiple producers and consumers operate without explicit synchronization. `maxsize` applies backpressure: `put()` blocks when the queue is full, naturally throttling fast producers. `task_done()` must be called by the consumer after processing each item; `q.join()` blocks the main thread until `task_done()` has been called for every enqueued item — ideal for waiting on batch completion before checkpointing. Using a sentinel value (`None`) placed by the producer signals consumers to exit. Unlike a shared list, Queue never needs an explicit Lock and exposes no racy size-check methods.",
+    "fj": "I'd use a list with a mutex — it's simpler.",
+    "fs": "Queue is self-synchronizing and gives backpressure via maxsize. I use q.join() for batch-commit checkpoints and a sentinel-per-worker pattern for clean shutdown in Multithreading pipelines.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Bounded queue with task_done/join",
+        "lines": [
+          "import threading, queue",
+          "",
+          "q: queue.Queue = queue.Queue(maxsize=200)  # backpressure",
+          "",
+          "def consumer():",
+          "    while True:",
+          "        item = q.get()",
+          "        if item is None:",
+          "            q.task_done()",
+          "            break",
+          "        process(item)",
+          "        q.task_done()",
+          "",
+          "workers = [threading.Thread(target=consumer, daemon=True) for _ in range(8)]",
+          "for w in workers: w.start()",
+          "",
+          "for record in source:",
+          "    q.put(record)          # blocks if full — backpressure",
+          "for _ in workers:",
+          "    q.put(None)            # one sentinel per worker",
+          "",
+          "q.join()                   # wait for all task_done() calls",
+          "print('batch complete')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When would you use queue.PriorityQueue in a Multithreading pipeline?",
+        "a": "When tasks have different urgency levels — e.g. retries should be processed before new records, or SLA-critical events before best-effort ones. PriorityQueue uses a heap internally; items are tuples `(priority, payload)`. Multithreading access is thread-safe by the same internal lock mechanism as Queue."
+      }
+    ]
+  },
+  {
+    "q": "How do you diagnose and fix a Multithreading deadlock in a Python data service using thread dumps and timeouts?",
+    "a": "Diagnosing Multithreading deadlocks in Python: (1) Send SIGQUIT to the process — Python 3.12+ prints a traceback for every thread to stderr. (2) Use `faulthandler.dump_traceback_later(timeout=10)` to auto-dump on hang. (3) The deadlock pattern shows two threads each in `lock.acquire()` waiting for a lock held by the other. Fix strategies: impose a total lock-ordering rule (always acquire lock_A before lock_B everywhere), replace nested locks with a single coarser lock or a `threading.RLock` for reentrant cases, or restructure so each thread owns its own resources without needing another thread's lock. Using `Lock.acquire(timeout=5)` and treating `False` return as an error breaks the deadlock at the cost of failing the operation — appropriate for an availability-over-correctness trade-off.",
+    "fj": "I'd restart the service — deadlocks are rare and hard to debug.",
+    "fs": "I use faulthandler.dump_traceback_later() to capture the thread state on hang, identify the circular wait in the dump, then enforce a strict lock-acquisition order to eliminate the cycle.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Deadlock detection with faulthandler",
+        "lines": [
+          "import faulthandler, signal",
+          "",
+          "# dump all thread stacks if process hangs >30s",
+          "faulthandler.dump_traceback_later(30, repeat=True)",
+          "",
+          "# ---- Lock ordering to prevent deadlock ----",
+          "lock_A = threading.Lock()",
+          "lock_B = threading.Lock()",
+          "",
+          "def safe_acquire_both():",
+          "    # ALWAYS acquire in the same global order",
+          "    with lock_A:",
+          "        with lock_B:",
+          "            do_work()"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is a livelock and how does it differ from a deadlock in Multithreading systems?",
+        "a": "In a deadlock, threads block forever waiting for each other. In a livelock, threads are active but keep reacting to each other in a way that makes no progress — e.g. two threads each release a lock when they see contention, then immediately retry, forever colliding. Livelocks show as 100 % CPU usage with no throughput. Fix by adding randomized backoff between retry attempts."
+      }
+    ]
+  },
+  {
+    "q": "Compare threading vs multiprocessing vs asyncio for a hybrid pipeline that does file I/O, network calls, and CPU-heavy parsing — which Multithreading strategy wins?",
+    "a": "A hybrid pipeline has three distinct phases and no single concurrency model dominates: (1) File I/O and network calls are I/O-bound — Multithreading (threads or asyncio) releases the GIL and achieves concurrency without process overhead. Asyncio is more memory-efficient at high cardinality; Multithreading with ThreadPoolExecutor is simpler when third-party libraries are synchronous. (2) CPU-heavy parsing (e.g. XML/JSON deserialization, regex on large text) is CPU-bound — multiprocessing bypasses the GIL and scales across cores; free-threaded Python 3.13t is an emerging alternative. (3) Combining them: use an asyncio event loop for network I/O, `loop.run_in_executor(thread_pool)` for blocking file ops, and `ProcessPoolExecutor` for CPU phases. This three-layer design is the production-grade approach for modern Python data pipelines.",
+    "fj": "I'd use Multithreading for the whole pipeline — it's simpler.",
+    "fs": "I map each phase to the right model: asyncio or Multithreading for I/O, ProcessPoolExecutor for CPU, and compose them via run_in_executor so the event loop coordinates everything.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Hybrid asyncio + thread + process",
+        "lines": [
+          "import asyncio",
+          "from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor",
+          "",
+          "thread_pool = ThreadPoolExecutor(max_workers=20)  # file/blocking I/O",
+          "cpu_pool    = ProcessPoolExecutor(max_workers=8)  # CPU parsing",
+          "",
+          "async def pipeline(urls):",
+          "    loop = asyncio.get_running_loop()",
+          "    # network I/O: native async",
+          "    raw_pages = await asyncio.gather(*[fetch_async(u) for u in urls])",
+          "    # blocking file write: offload to thread pool",
+          "    await loop.run_in_executor(thread_pool, write_to_disk, raw_pages)",
+          "    # CPU parse: offload to process pool",
+          "    parsed = await loop.run_in_executor(cpu_pool, heavy_parse, raw_pages)",
+          "    return parsed",
+          "",
+          "asyncio.run(pipeline(url_list))"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does GIL contention manifest as a performance cliff in Multithreading CPU-bound code?",
+        "a": "You'll see near-linear CPU usage on one core while other cores idle, even with many threads active. Wall-clock time barely improves as you add threads; context switches increase and throughput plateaus or regresses. Profile with `py-spy` — if CPU time is concentrated in `_PyEval_EvalFrameDefault` across many threads but only one core is busy, you've hit GIL contention. Switch to ProcessPoolExecutor or move the hot loop to Cython/numpy."
+      },
+      {
+        "q": "When does asyncio beat Multithreading on raw throughput for network I/O?",
+        "a": "asyncio wins at high connection counts (thousands of concurrent requests) because coroutines are user-space constructs — no OS thread creation, no 8 MB stack per task. Multithreading becomes the bottleneck when you hit OS thread limits (~1000 threads on many Linux systems) or when per-thread memory pressure causes swap. For low-cardinality (< 100 concurrent requests), Multithreading is simpler and the difference is negligible."
+      }
+    ]
+  },
+  {
+    "q": "What is ydata-profiling (formerly pandas-profiling) and what does a ProfileReport actually generate?",
+    "a": "ydata-profiling wraps pandas DataFrames in a single `ProfileReport(df)` call and emits a self-contained HTML (or JSON/widget) EDA report covering dataset overview, per-variable stats and distributions, missing-value heatmaps, correlations (Pearson, Spearman, Kendall, Cramér's V, Phik), and alerts for high cardinality, skewness, zeros, imbalanced categoricals, and constant columns. The report is generated lazily via a description object and rendered separately, so you can compute once and render multiple times. As of ydata-profiling 4.x, the package uses a typed config (ProfileReport(df, config_file='my.yaml')) and a structured `ProfileReport.description_set` object, making it scriptable in CI pipelines. For a quick exploration of an unfamiliar dataset it replaces hours of manual `.describe()`, `.value_counts()`, and seaborn plots.",
+    "fj": "I'd just run df.describe() and look at the numbers.",
+    "fs": "describe() misses distributions, correlations, missing-value patterns, and outlier alerts. ydata-profiling gives all of that in a single call and exports structured JSON for automated quality gates in CI.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "minimal EDA report",
+        "lines": [
+          "from ydata_profiling import ProfileReport",
+          "import pandas as pd",
+          "",
+          "df = pd.read_parquet('train.parquet')",
+          "report = ProfileReport(",
+          "    df,",
+          "    title='Train EDA',",
+          "    explorative=True",
+          ")",
+          "report.to_file('eda.html')",
+          "# or: report.to_json() for CI parsing"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the difference between ProfileReport's minimal, explorative, and sensitive presets?",
+        "a": "`minimal=True` disables correlations and interactions, trading depth for speed — suitable for a quick first pass on a large dataset. `explorative=True` enables full interactions and all correlation matrices, the richest view but slowest. `sensitive=True` is an alias for minimal designed for PII-heavy data where you don't want sample values rendered in the HTML. Presets are shortcuts over the typed config."
+      },
+      {
+        "q": "How do you consume a ProfileReport programmatically instead of just opening the HTML?",
+        "a": "Call `report.to_json()` to get a structured JSON string (or `report.get_description()` for a Python dict) that includes per-column stats, alert codes, and correlation values. In CI you can parse this JSON to assert thresholds — e.g. fail a pipeline if `missing_percentage` on a key column exceeds 5%, or if an `HIGH_CORRELATION` alert appears for a feature that should be independent. This makes profiling a testable quality gate rather than a one-off human review."
+      },
+      {
+        "q": "When does comparing two ProfileReports become valuable?",
+        "a": "Use `ProfileReport.compare([baseline_df, current_df])` to diff training vs serving data for data drift — distribution shifts, new categories, or changed missing rates surface as side-by-side columns in the HTML. This is the canonical first step in a data-drift investigation before reaching for EvidentlyAI or Whylogs."
+      }
+    ]
+  },
+  {
+    "q": "ydata-profiling is slow on a 5M-row DataFrame. What config knobs do you pull first?",
+    "a": "Profile on a representative sample rather than the full frame: `ProfileReport(df.sample(n=100_000, random_state=42), ...)` — for distribution shapes, 100k rows captures the same statistics as 5M at 1/50th the compute. If you must profile the full dataset, set `minimal=True` to skip interaction plots and correlation matrices (the most expensive steps), set `samples={'head': 5, 'tail': 5}` to limit sample rows in the HTML, and set `correlations=None` to disable all correlation computation. The `pool_size=4` config key controls Pandas-level parallelism for per-column statistics. For a CI gate where you only care about alerts, parse `report.get_description()['alerts']` instead of rendering the full HTML at all — that eliminates the rendering pass entirely.",
+    "fj": "I'd just wait for it — it has to scan all the data.",
+    "fs": "Sample first: 100k rows gives the same distributional picture as 5M. If you need the full dataset, minimal=True kills the correlation matrix which is the costliest step. For CI, skip HTML rendering and parse the description dict directly.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "fast profile: sample + minimal",
+        "lines": [
+          "from ydata_profiling import ProfileReport",
+          "",
+          "report = ProfileReport(",
+          "    df.sample(n=100_000, random_state=42),",
+          "    minimal=True,",
+          "    correlations=None,",
+          "    samples={'head': 3, 'tail': 3},",
+          "    pool_size=4,",
+          "    title='Quick EDA'",
+          ")",
+          "alerts = report.get_description()['alerts']",
+          "# parse alerts without rendering HTML"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does the `pool_size` config key do in ydata-profiling?",
+        "a": "`pool_size` controls how many processes are used in the parallel per-variable description step. Setting it to the number of available cores (e.g. 4 or 8) speeds up the per-column statistics phase when the DataFrame has many columns. It uses `multiprocessing.Pool` internally. For a DataFrame with fewer than 10 columns the overhead outweighs the gain — leave it at 1 or omit it."
+      },
+      {
+        "q": "How do you profile only a subset of columns when the DataFrame has hundreds of them?",
+        "a": "Pass a column subset: `ProfileReport(df[cols_of_interest], ...)`. For wide DataFrames with 500+ columns, profiling all of them is both slow and produces an unreadable report. Select the columns that matter for the QA gate (key IDs, target, critical features) and profile those. The config key `vars.num.chi_squared_threshold` can also be set to 0 to skip chi-squared tests, trimming runtime further."
+      }
+    ]
+  },
+  {
+    "q": "How do you use ydata-profiling alerts to build an automated data-quality gate in a pipeline?",
+    "a": "ProfileReport's `get_description()['alerts']` returns a list of Alert objects, each with a `.alert_type` (HIGH_CARDINALITY, HIGH_CORRELATION, MISSING, ZEROS, CONSTANT, SKEWED, IMBALANCE, etc.) and the `.column_name` it applies to. In a pipeline quality gate you extract these alerts, filter for severity conditions relevant to your schema (e.g. MISSING on a not-null column, or HIGH_CORRELATION between features that should be independent), and raise a PipelineQualityError with a description. This gives you an assertion-based gate that blocks a DAG run before bad data reaches training or serving. Wire it as an Airflow sensor or a dbt test step that the profiling job passes its JSON output to.",
+    "fj": "I'd review the HTML report manually before each pipeline run.",
+    "fs": "Manual review doesn't scale. I parse get_description()['alerts'] in code, assert on specific alert types for columns that matter, and raise a structured exception with the offending columns so the DAG fails fast with context.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "alert-based quality gate",
+        "lines": [
+          "from ydata_profiling import ProfileReport",
+          "from ydata_profiling.model.alerts import AlertType",
+          "",
+          "report = ProfileReport(df, minimal=True)",
+          "desc   = report.get_description()",
+          "",
+          "critical_cols = {'user_id', 'event_ts', 'revenue'}",
+          "for alert in desc['alerts']:",
+          "    if (alert.alert_type == AlertType.MISSING",
+          "            and alert.column_name in critical_cols):",
+          "        raise ValueError(",
+          "            f'MISSING alert on {alert.column_name}'",
+          "        )"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Which alert type most often signals a data-leakage risk in a feature store?",
+        "a": "HIGH_CORRELATION — when two features are near-perfectly correlated (Pearson > 0.9) it often means one is a linear transformation or aggregation of the other, or worse, one is a proxy for the label (target leakage). Alert-gating on HIGH_CORRELATION between feature columns and the target column catches leakage before model training and is a standard MLOps quality check."
+      },
+      {
+        "q": "How does the CONSTANT alert catch a subtle pipeline bug?",
+        "a": "A column flagged CONSTANT (all values identical) usually means a join went wrong (cross-product filling a default), a filter accidentally selected a single partition, or an upstream ETL wrote a hardcoded fallback. In a training dataset a constant feature adds no signal but its presence in the alert means the upstream bug exists — the data quality gate surfaces this before model training silently ignores the column."
+      }
+    ]
+  },
+  {
+    "q": "How do you configure ydata-profiling to handle sensitive PII columns and prevent sample values from leaking into HTML reports?",
+    "a": "Three config levers: (1) `minimal=True` or the `sensitive` preset disables sample-value rendering globally; (2) Use `ProfileReport(df.drop(columns=pii_cols), ...)` to exclude PII columns before profiling — the safest approach when the column content must never appear in any artifact; (3) Use `vars.cat.words=False` and `vars.cat.characters=False` to disable word/character frequency distributions that can reconstruct sensitive text. For a GDPR-compliant audit pipeline, profile only derived statistics (null rate, cardinality, entropy) extracted from `get_description()` and never write the HTML to a shared store. Document the PII columns separately via a data catalog rather than in the profile report.",
+    "fj": "The HTML is internal-only so I don't need to worry about it.",
+    "fs": "Internal-only doesn't mean safe — HTML reports get shared in Slack, committed to repos, or sent over email. I drop PII columns before profiling, set minimal=True, and only store the JSON description (which contains no sample values) in the artifact store.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "PII-safe profile",
+        "lines": [
+          "PII_COLS = ['email', 'phone', 'ssn']",
+          "",
+          "report = ProfileReport(",
+          "    df.drop(columns=PII_COLS, errors='ignore'),",
+          "    minimal=True,          # no sample values",
+          "    title='Audit Profile'",
+          ")",
+          "# store only stats dict, not the HTML",
+          "import json",
+          "stats = report.get_description()",
+          "json.dump(stats['variables'],",
+          "          open('stats.json', 'w'))"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you extend ydata-profiling to add a custom column-level check not included in the built-in alerts?",
+        "a": "Post-process the `get_description()['variables']` dict. Each key is a column name and the value contains full statistics (mean, std, histogram bins, value counts). You can run your own rule on top of these stats — e.g. flag any column where `p_zeros > 0.5` and `type == 'Numeric'` — and append to a custom alert list. For recurring checks, wrap this logic in a function and call it as part of your pipeline's assertion layer rather than patching ydata-profiling internals."
+      }
+    ]
+  },
+  {
+    "q": "How do you run a shell command from Python using subprocess, and why is shell=True dangerous?",
+    "a": "Use `subprocess.run(['cmd', 'arg1', 'arg2'], capture_output=True, text=True, check=True)` — the list form passes arguments directly to the OS without invoking a shell, so no shell metacharacters are interpreted. `shell=True` passes a string to `/bin/sh -c`, which means user-supplied or config-read values in the string can inject arbitrary shell code (command injection via semicolons, backticks, `$(...)`, redirection). `check=True` raises `CalledProcessError` on non-zero exit so you can't silently ignore failures. `capture_output=True` is shorthand for `stdout=PIPE, stderr=PIPE`. `text=True` decodes bytes to str using the system locale — pass `encoding='utf-8'` explicitly for reproducibility.",
+    "fj": "I use os.system('cmd arg') — it's simpler.",
+    "fs": "os.system returns only the exit code and prints directly to the terminal — you can't capture output. subprocess.run with a list arg is the safe form: no shell injection risk, captures stdout/stderr, and raises on failure with check=True.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "python",
+        "label": "shell=True injection risk",
+        "lines": [
+          "# user_input could be: '; rm -rf /'",
+          "os.system(f'grep {user_input} log.txt')",
+          "# or:",
+          "subprocess.run(",
+          "    f'grep {user_input} log.txt',",
+          "    shell=True)  # dangerous"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "list form, no shell",
+        "lines": [
+          "result = subprocess.run(",
+          "    ['grep', user_input, 'log.txt'],",
+          "    capture_output=True,",
+          "    text=True,",
+          "    check=True,",
+          "    encoding='utf-8'",
+          ")",
+          "print(result.stdout)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When is shell=True actually the right choice?",
+        "a": "When you need shell features that can't be replicated with the list form: globbing (`*.log`), pipelines (`cmd1 | cmd2`), built-ins like `cd` or variable expansion that aren't separate binaries. In those cases, construct the string with no user input embedded, or sanitize with `shlex.quote()` for individual arguments. A plain fixed-string shell command with no interpolation is safe; interpolated user/config data is not."
+      },
+      {
+        "q": "How do you handle a subprocess that hangs and needs a timeout?",
+        "a": "Pass `timeout=N` seconds to `subprocess.run()`. If the process hasn't finished by the deadline it raises `subprocess.TimeoutExpired` and the process is NOT automatically killed — you must catch the exception and call `.kill()` on `proc` (using `Popen` for this). With `subprocess.run`, the process is automatically killed on timeout in Python 3.3+. Always set a timeout for any subprocess call in a pipeline so a hung tool doesn't stall the whole DAG."
+      },
+      {
+        "q": "How do you pipe the output of one subprocess into another without shell=True?",
+        "a": "Use two `Popen` calls with `proc1.stdout` as the `stdin` of `proc2`: `p1 = Popen(['cmd1'], stdout=PIPE); p2 = Popen(['cmd2'], stdin=p1.stdout, stdout=PIPE)`. Then `p1.stdout.close()` (so p2 gets EOF when p1 exits) and `out, _ = p2.communicate()`. This replicates `cmd1 | cmd2` without a shell. Alternatively, capture p1's output into Python and feed it as p2's input — simpler but buffers the intermediate data in memory."
+      }
+    ]
+  },
+  {
+    "q": "Your Python glue script runs bash steps in sequence. How do you propagate exit codes correctly and handle step failures?",
+    "a": "Use `subprocess.run(..., check=True)` — it raises `CalledProcessError` on any non-zero exit, giving you the exit code in `.returncode`, stdout in `.stdout`, and stderr in `.stderr`. Wrap each step in a try/except to add context before re-raising, log stderr explicitly on failure so operators see the root cause, and never swallow the exception with a bare `except: pass`. For a sequence of steps where partial state matters, implement a cleanup/rollback step in the except block. The equivalent shell idiom `set -e` stops on first error; `check=True` is the Python equivalent. Exit the Python script with `sys.exit(1)` (or let the exception propagate) so the calling orchestrator (Airflow, Make, CI) sees a non-zero code.",
+    "fj": "I check the return code manually after each call and if it's non-zero I print a message.",
+    "fs": "check=True raises immediately with the full stdout/stderr attached — no manual if-then and no silent swallow. I catch CalledProcessError to add context, log stderr, and re-raise so the caller sees a real failure, not a successful exit.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "propagate exit codes",
+        "lines": [
+          "import subprocess, sys",
+          "",
+          "steps = [",
+          "    ['dbt', 'run', '--select', 'my_model'],",
+          "    ['python', 'validate.py'],",
+          "]",
+          "",
+          "for cmd in steps:",
+          "    try:",
+          "        subprocess.run(cmd,",
+          "            check=True,",
+          "            capture_output=True,",
+          "            text=True)",
+          "    except subprocess.CalledProcessError as e:",
+          "        print(f'FAILED: {e.cmd}',",
+          "              file=sys.stderr)",
+          "        print(e.stderr, file=sys.stderr)",
+          "        sys.exit(e.returncode)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does `CalledProcessError` expose and how do you use it for alerting?",
+        "a": "`CalledProcessError` has `.returncode` (the exit code), `.cmd` (the command list), `.stdout`, and `.stderr`. For alerting, log `.cmd` and `.stderr` to your observability system (Datadog, PagerDuty) alongside the pipeline run ID. The `.returncode` can encode specific failure modes (many tools use well-defined exit codes like dbt's 2 for compilation error vs 1 for runtime error), letting you route different failures to different on-call channels."
+      },
+      {
+        "q": "How do you run multiple shell steps in parallel from Python and collect all failures?",
+        "a": "Use `subprocess.Popen` to start all processes simultaneously, then call `.communicate()` or `.wait()` in a loop. With `concurrent.futures.ThreadPoolExecutor`, map `subprocess.run` over the command list and collect results via `as_completed`. Gather all `CalledProcessError` exceptions instead of stopping on first failure — return a failure list so the operator sees all broken steps in one report rather than playing whack-a-mole."
+      }
+    ]
+  },
+  {
+    "q": "What does `set -euo pipefail` do in a bash script, and how do you replicate those guarantees in a Python subprocess wrapper?",
+    "a": "`set -e` exits the script on the first command that returns a non-zero status. `set -u` treats unset variables as errors. `set -o pipefail` makes a pipeline fail if any stage fails (without it, `false | true` exits 0 because the last command succeeded). Together they prevent scripts from silently continuing past errors. In a Python subprocess wrapper: `check=True` replicates `set -e` per command. Pipelines have no direct equivalent — capture both commands and check both return codes via `Popen`. For variables, Python has actual types so the `set -u` concept doesn't apply, but you should validate all config inputs before constructing command lists rather than discovering missing values mid-run.",
+    "fj": "I add `set -e` to my bash scripts and that's good enough.",
+    "fs": "set -e doesn't catch pipeline failures — `false | true` exits 0. set -o pipefail is needed for that. In Python, check=True gives set -e semantics per call; for pipelines I check both Popen return codes explicitly.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "pipefail equivalent with Popen",
+        "lines": [
+          "from subprocess import Popen, PIPE",
+          "",
+          "p1 = Popen(['generate_data'],",
+          "           stdout=PIPE)",
+          "p2 = Popen(['load_to_db'],",
+          "           stdin=p1.stdout,",
+          "           stdout=PIPE)",
+          "p1.stdout.close()   # allow p1 SIGPIPE",
+          "out, _ = p2.communicate()",
+          "p1.wait()",
+          "# check BOTH — set -o pipefail",
+          "if p1.returncode != 0:",
+          "    raise RuntimeError('generate_data failed')",
+          "if p2.returncode != 0:",
+          "    raise RuntimeError('load_to_db failed')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does closing p1.stdout before p2.communicate() matter?",
+        "a": "If you don't close `p1.stdout` in the parent process, p2 (reading from that pipe) never gets EOF even after p1 exits — because the parent still holds an open file descriptor to the write end of the pipe. p2 then blocks waiting for more data forever. Closing `p1.stdout` in the parent ensures p2 sees EOF when p1 exits, letting `p2.communicate()` complete."
+      },
+      {
+        "q": "How do you add `set -euo pipefail` to an inline bash script invoked via subprocess?",
+        "a": "Pass the whole script as a string with `shell=True` and prepend the options: `subprocess.run('set -euo pipefail\\n' + script, shell=True, check=True, executable='/bin/bash')`. Specifying `executable='/bin/bash'` is important because `sh` may not support all bash options (pipefail is bash-specific). This is the one legitimate use of shell=True: a controlled, hardcoded multi-statement script with no user input."
+      }
+    ]
+  },
+  {
+    "q": "How do you schedule and manage a cron job that runs a Python script, and what traps make Python cron jobs silently fail?",
+    "a": "Add a crontab entry using `crontab -e` or deploy a file to `/etc/cron.d/`. The critical traps: (1) cron runs with a minimal environment — `PATH` is usually just `/usr/bin:/bin`, so the Python interpreter on your PATH isn't found unless you use the full path (`/home/app/.venv/bin/python`). (2) The working directory is not the project root, so relative file paths break — use `os.chdir` or `pathlib.Path(__file__).parent` to anchor paths. (3) stdout/stderr are emailed to the local user by default — in a container this is lost; redirect to a log file or a syslog pipe explicitly. (4) Environment variables (API keys, secrets) set in `.bashrc` or `.env` don't exist in cron's environment — pass them via `EnvironmentFile=` in a systemd timer (the preferred modern alternative) or source them explicitly. Prefer `systemd` timers over cron for modern deployments: they log to journald, support dependencies, and have proper `OnCalendar` syntax.",
+    "fj": "I just add `* * * * * python myscript.py` to the crontab.",
+    "fs": "That will silently fail — cron has no PATH to find your virtualenv python, no working directory context, and no environment variables. I use the absolute venv interpreter path, anchor paths from __file__, redirect stderr to a log, and prefer systemd timers for their journald integration.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "bug",
+        "lang": "python",
+        "label": "silent cron failure",
+        "lines": [
+          "# crontab entry:",
+          "# */5 * * * * python ingest.py",
+          "#",
+          "# Problems:",
+          "# - python not on cron PATH",
+          "# - relative paths break",
+          "# - secrets not in environment",
+          "# - stderr silently lost"
+        ]
+      },
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "robust cron entry",
+        "lines": [
+          "# crontab entry (robust):",
+          "# */5 * * * * /app/.venv/bin/python",
+          "#     /app/ingest.py",
+          "#     >> /var/log/ingest.log 2>&1",
+          "#",
+          "# In the script, anchor paths:",
+          "from pathlib import Path",
+          "ROOT = Path(__file__).parent",
+          "config = ROOT / 'config.yaml'"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why are systemd timers preferred over cron in 2026?",
+        "a": "Systemd timers integrate with journald for persistent, queryable logs (`journalctl -u my-timer`), support `OnCalendar` with timezone-aware schedules, can declare `After=` and `Requires=` dependencies, run as a specific user/group via the unit file, and support `EnvironmentFile=` for secrets injection without exposing them in the crontab. They also support monotonic timers (`OnBootSec`, `OnUnitActiveSec`) for relative scheduling, and `systemctl status` shows the last run and next trigger."
+      },
+      {
+        "q": "How do you prevent a cron job from overlapping with a still-running previous instance?",
+        "a": "Use `flock`: `*/5 * * * * flock -n /tmp/ingest.lock /app/.venv/bin/python /app/ingest.py`. `flock -n` exits immediately with code 1 if the lock is already held (non-blocking), so a second invocation skips silently rather than running two instances. In Python, do the same with `fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)` and catch `BlockingIOError` to detect overlap."
+      }
+    ]
+  },
+  {
+    "q": "How do you use Python's subprocess to build a shell-glue script that polls a command until it succeeds, with timeout and exponential backoff?",
+    "a": "The pattern is a `for attempt in range(max_attempts)` loop that calls `subprocess.run(...)` without `check=True`, inspects `result.returncode`, sleeps `base * 2**attempt + jitter` on failure, and raises after the last attempt. Never use `check=True` inside a retry loop — the exception would immediately abort the loop. Log the stderr on each failure so operators can diagnose transient vs persistent errors. Add a hard wall-clock timeout using `time.monotonic()` to bound the total wait regardless of attempt count — important for deployment scripts where a hung dependency should not block a release indefinitely. `shlex.split` safely converts a shell-style command string to a list when the command is read from config.",
+    "fj": "I'd put the command in a bash while loop with sleep.",
+    "fs": "A bash while loop has no structured error reporting or logging. In Python I get full control: exponential backoff with jitter, per-attempt stderr logging, a wall-clock timeout, and a CalledProcessError with context on final failure.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "poll with backoff + wall-clock timeout",
+        "lines": [
+          "import subprocess, time, random",
+          "",
+          "def poll_until_ok(cmd, max_sec=120, base=2):",
+          "    deadline = time.monotonic() + max_sec",
+          "    attempt  = 0",
+          "    while time.monotonic() < deadline:",
+          "        r = subprocess.run(",
+          "            cmd,",
+          "            capture_output=True,",
+          "            text=True",
+          "        )",
+          "        if r.returncode == 0:",
+          "            return r",
+          "        wait = base ** attempt + random.uniform(0, 1)",
+          "        attempt += 1",
+          "        time.sleep(min(wait,",
+          "            deadline - time.monotonic()))",
+          "    raise TimeoutError(f'{cmd} not ready')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is `shlex.split` and when do you need it for subprocess commands?",
+        "a": "`shlex.split` parses a shell-style command string — respecting quotes, escaping, and spaces — into a list suitable for `subprocess.run`. Use it when the command comes from a config file or environment variable as a string, and you need to safely convert it to list form without shell=True. Example: `shlex.split('grep \"foo bar\" log.txt')` → `['grep', 'foo bar', 'log.txt']`. Never use `str.split()` for this — it splits on all spaces and breaks quoted arguments."
+      },
+      {
+        "q": "How do you capture real-time stdout from a long-running subprocess instead of waiting for it to finish?",
+        "a": "Use `Popen` with `stdout=PIPE` and read line-by-line: `for line in proc.stdout: print(line, end='')`. This streams output as the subprocess writes it rather than buffering until completion. Useful for tailing progress from a spark-submit or dbt run. Be aware of buffering: many programs line-buffer to a terminal but block-buffer to a pipe — use `stdbuf -oL cmd` or `python -u` to force line buffering."
+      }
+    ]
+  },
+  {
+    "q": "How do you write a Python script that orchestrates a multi-step bash pipeline with cleanup on failure, analogous to bash's `trap ERR`?",
+    "a": "Python's `try/except/finally` and `contextlib.ExitStack` are the equivalent of bash's `trap ERR ... && cleanup`. Define each step as a function that calls `subprocess.run(..., check=True)`, then register cleanup callables onto an `ExitStack`. On any `CalledProcessError`, the stack unwinds in LIFO order — removing temp files, reverting partial writes, dropping staged tables — before the exception propagates. `finally` handles cleanup regardless of success or failure; `ExitStack.callback(fn)` is more composable than a flat `finally` block when cleanups depend on which steps succeeded. Log the failed command with its stderr so the cleanup reason is auditable. This pattern is the basis for safe multi-step deploy scripts and ETL migration operations.",
+    "fj": "I'd just let the script fail and clean up manually afterward.",
+    "fs": "Manual cleanup after a partial ETL run is risky — you can miss steps and leave corrupted state. I register cleanup functions in an ExitStack before each step so they always run in reverse order on failure, the same guarantee bash's trap ERR gives.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "ExitStack for cleanup on failure",
+        "lines": [
+          "from contextlib import ExitStack",
+          "import subprocess, tempfile, os",
+          "",
+          "with ExitStack() as stack:",
+          "    tmp = tempfile.mkdtemp()",
+          "    stack.callback(lambda: __import__(",
+          "        'shutil').rmtree(tmp, True))",
+          "",
+          "    subprocess.run(",
+          "        ['extract_data', '--out', tmp],",
+          "        check=True)",
+          "",
+          "    subprocess.run(",
+          "        ['validate', '--dir', tmp],",
+          "        check=True)",
+          "",
+          "    subprocess.run(",
+          "        ['load_to_db', '--dir', tmp],",
+          "        check=True)",
+          "# tmp removed whether or not we succeed"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you implement a 'dry run' mode in a Python orchestration script that shows what commands would run without executing them?",
+        "a": "Add a `dry_run: bool` parameter and wrap `subprocess.run` in a helper: if `dry_run`, log the command list with `shlex.join(cmd)` (Python 3.8+) and return a mock `CompletedProcess` with returncode=0; otherwise call the real subprocess. This gives operators a safe way to verify the command sequence before a destructive migration. `shlex.join` is the inverse of `shlex.split` and produces a properly shell-quoted string for readability."
+      },
+      {
+        "q": "How do you pass secrets to a subprocess without exposing them in process list output (ps aux)?",
+        "a": "Never put secrets in the command arguments — they appear in `/proc/pid/cmdline` and `ps aux` output. Pass them via the `env` parameter to `subprocess.run`: `env = {**os.environ, 'API_KEY': secret}`. The subprocess reads them from its environment rather than argv. For even tighter control, pass secrets via stdin or a temp file whose permissions are locked down (0600), deleting it in a finally block. Shell command history can also capture secrets, another reason to avoid shell=True with embedded secrets."
+      }
+    ]
+  },
+  {
+    "q": "How do you configure a pandas-profiling (ydata-profiling) ProfileReport with a YAML config file to enforce consistent EDA settings across a team?",
+    "a": "Pass `config_file='profile_config.yaml'` to `ProfileReport(df, config_file='profile_config.yaml')`. The YAML maps directly to the typed `Settings` Pydantic model — keys like `title`, `correlations.pearson.calculate`, `missing_diagrams.heatmap`, and `vars.num.chi_squared_threshold` can all be set there. Storing the config in version control means every team member and CI job runs the exact same profiling logic. You can also layer overrides: `ProfileReport(df, config_file='base.yaml', title='Sprint-23 EDA')` — kwargs override the file. This makes pandas-profiling reproducible across local, staging, and production EDA runs.",
+    "fj": "I just pass kwargs every time — the config file seems like extra work.",
+    "fs": "Without a config file, each engineer has different settings and reports aren't comparable. I commit a YAML to the repo so CI and every developer produce identical pandas-profiling reports — drift between runs means a data change, not a config change.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "YAML-driven pandas-profiling",
+        "lines": [
+          "# profile_config.yaml (committed to repo)",
+          "# title: 'Team EDA Report'",
+          "# correlations:",
+          "#   pearson: {calculate: true}",
+          "#   spearman: {calculate: false}",
+          "# missing_diagrams:",
+          "#   heatmap: true",
+          "",
+          "from ydata_profiling import ProfileReport",
+          "import pandas as pd",
+          "",
+          "df = pd.read_parquet('data.parquet')",
+          "report = ProfileReport(",
+          "    df,",
+          "    config_file='profile_config.yaml',",
+          "    title='Sprint-23 EDA'  # override single key",
+          ")",
+          "report.to_file('eda.html')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you generate a pandas-profiling Settings object programmatically instead of from a YAML file?",
+        "a": "Import `ProfileReport` and pass a `Settings` instance: `from ydata_profiling.config import Settings; cfg = Settings(); cfg.title = 'My Report'; cfg.correlations['pearson'].calculate = False; report = ProfileReport(df, config=cfg)`. This is useful when config values are computed at runtime (e.g. title derived from a run date) or when you want to keep config in Python rather than a separate file."
+      },
+      {
+        "q": "What happens if you run pandas-profiling on two different datasets with the same YAML config — are the reports comparable?",
+        "a": "Yes — identical config means identical computation choices (same correlation methods, same bin counts, same alert thresholds), so the HTML structure and JSON keys are stable across datasets. This makes automated diffing possible: you can parse `get_description()['variables']` from both reports and compute delta statistics column by column without worrying about config-induced differences."
+      }
+    ]
+  },
+  {
+    "q": "Explain how pandas-profiling computes correlations and what the difference is between Pearson, Spearman, and Cramér's V outputs in the report.",
+    "a": "pandas-profiling (ydata-profiling) computes a matrix for each correlation type separately and renders each as a heatmap tab. Pearson measures linear correlation between numeric columns (assumes normality, sensitive to outliers). Spearman is rank-based — it detects monotonic relationships and is robust to outliers and non-normal distributions. Cramér's V measures association between categorical columns using the chi-squared statistic normalized to [0,1]. Phik (φk) is a newer method that handles both numeric and categorical pairs uniformly. pandas-profiling exposes toggle flags in config: `correlations.pearson.calculate`, `correlations.spearman.calculate`, `correlations.cramers.calculate`, `correlations.phi_k.calculate`. In a feature-engineering context, HIGH_CORRELATION alerts from pandas-profiling between numeric features flag collinearity, while high Cramér's V between categoricals flags redundant encodings.",
+    "fj": "I just look at the Pearson matrix — it covers correlations.",
+    "fs": "Pearson only covers linear numeric relationships. pandas-profiling surfaces Cramér's V for categoricals and Phik for mixed types — those catch non-linear dependencies and redundant encodings that Pearson misses entirely.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "selective correlation config",
+        "lines": [
+          "from ydata_profiling import ProfileReport",
+          "",
+          "report = ProfileReport(",
+          "    df,",
+          "    correlations={",
+          "        'pearson':  {'calculate': True},",
+          "        'spearman': {'calculate': True},",
+          "        'cramers':  {'calculate': True},",
+          "        'phi_k':    {'calculate': False},  # skip for speed",
+          "    },",
+          "    title='Correlation Audit'",
+          ")",
+          "desc = report.get_description()",
+          "pearson_matrix = desc['correlations']['pearson']"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does pandas-profiling detect target leakage via its correlation output?",
+        "a": "After running pandas-profiling, parse `desc['correlations']['pearson']` (a DataFrame) and check the row or column corresponding to your target variable. Any feature with |Pearson| > 0.95 against the target is a leakage candidate. pandas-profiling raises a HIGH_CORRELATION alert for these automatically. Combine with Cramér's V for categorical targets — Cramér's V > 0.8 between a categorical feature and the target label is the same signal for classification tasks."
+      }
+    ]
+  },
+  {
+    "q": "How do you compare two datasets with pandas-profiling to detect data drift between training and serving distributions?",
+    "a": "Use `ProfileReport.compare()`: create two reports — one for the baseline (training) DataFrame and one for the current (serving) DataFrame — then call `comparison = baseline_report.compare(serving_report)` and write `comparison.to_file('drift.html')`. The output renders each variable's statistics side-by-side with a column per dataset. In the JSON form, parse `desc['variables'][col]['mean']` from each description object and compute percentage delta. pandas-profiling surfaces distributional shift visually (histogram overlays) and structurally (value count changes, alert changes). For production monitoring, run this comparison daily against a rolling training snapshot and assert that no numeric column's mean shifted by more than a configured threshold before serving new predictions.",
+    "fj": "I'd just look at recent logs and see if the model performance drops.",
+    "fs": "Performance drops are a lagging signal. pandas-profiling compare() gives leading signal — I can see distributional shift before it degrades model accuracy, then decide whether to retrain or alert the upstream team.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "drift detection with pandas-profiling compare",
+        "lines": [
+          "from ydata_profiling import ProfileReport",
+          "",
+          "train_report  = ProfileReport(train_df,  minimal=True, title='Train')",
+          "serve_report  = ProfileReport(serve_df,  minimal=True, title='Serving')",
+          "",
+          "comparison = train_report.compare(serve_report)",
+          "comparison.to_file('drift_report.html')",
+          "",
+          "# Programmatic drift gate",
+          "t_desc = train_report.get_description()",
+          "s_desc = serve_report.get_description()",
+          "for col in t_desc['variables']:",
+          "    t_mean = t_desc['variables'][col].get('mean', 0)",
+          "    s_mean = s_desc['variables'][col].get('mean', 0)",
+          "    if t_mean and abs(s_mean - t_mean) / abs(t_mean) > 0.20:",
+          "        raise ValueError(f'Drift on {col}: {t_mean:.2f} → {s_mean:.2f}')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What are the limits of pandas-profiling compare() for high-cardinality categorical drift?",
+        "a": "pandas-profiling compare() shows value_count distributions, but for high-cardinality columns (e.g. product IDs with millions of unique values) the overlap visualization is not meaningful — most values appear in one dataset only. For those, use Population Stability Index (PSI) on bucketed frequency distributions computed from `get_description()['variables'][col]['value_counts_without_nan']`. pandas-profiling surfaces the alert HIGH_CARDINALITY which is a signal to use a custom PSI check rather than the built-in histograms."
+      },
+      {
+        "q": "Can pandas-profiling compare more than two DataFrames at once?",
+        "a": "Yes — `ProfileReport.compare()` accepts a list of ProfileReport objects, not just one. Pass a list to compare training, validation, and test splits simultaneously. The rendered HTML adds one column per report. This is useful for detecting split leakage (validation distribution unexpectedly matching training exactly) as well as cross-environment drift."
+      }
+    ]
+  },
+  {
+    "q": "How do you integrate pandas-profiling into a CI/CD pipeline to enforce data-quality checks on every pull request?",
+    "a": "In CI (GitHub Actions, GitLab CI, or Airflow), run pandas-profiling on the pipeline's input data sample and parse `report.get_description()['alerts']` in a quality gate script. Assert that no MISSING alert appears on not-null columns, no CONSTANT alert on feature columns, and no HIGH_CARDINALITY alert on columns expected to be enums. Exit with code 1 on violation. Because `ProfileReport(df.sample(n=50_000), minimal=True)` runs in under a minute, this fits inside a standard CI job. Store the JSON description as a CI artifact and diff it against the previous run's artifact to detect schema drift. For data pipeline PRs, the gate prevents merging when a schema change breaks downstream assumptions. pandas-profiling's JSON output is stable across versions when using a pinned config, making it suitable for artifact diffing.",
+    "fj": "CI is for code tests, not data checks — data validation is an ops concern.",
+    "fs": "Data contracts break code. I run pandas-profiling as a CI step against a representative sample — under a minute — and the alert-gate catches schema drift, nullability violations, and constant columns before they reach production.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "CI quality gate with pandas-profiling",
+        "lines": [
+          "# ci_quality_gate.py",
+          "import json, sys",
+          "import pandas as pd",
+          "from ydata_profiling import ProfileReport",
+          "from ydata_profiling.model.alerts import AlertType",
+          "",
+          "NOT_NULL = {'user_id', 'event_ts', 'revenue'}",
+          "NOT_CONSTANT = {'feature_a', 'feature_b', 'segment'}",
+          "",
+          "df     = pd.read_parquet('input_sample.parquet')",
+          "report = ProfileReport(df, minimal=True, title='CI Gate')",
+          "alerts = report.get_description()['alerts']",
+          "",
+          "failures = []",
+          "for alert in alerts:",
+          "    col = alert.column_name",
+          "    if alert.alert_type == AlertType.MISSING and col in NOT_NULL:",
+          "        failures.append(f'MISSING on {col}')",
+          "    if alert.alert_type == AlertType.CONSTANT and col in NOT_CONSTANT:",
+          "        failures.append(f'CONSTANT on {col}')",
+          "",
+          "if failures:",
+          "    print('pandas-profiling CI gate FAILED:', failures)",
+          "    sys.exit(1)",
+          "print('pandas-profiling CI gate passed')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you cache the pandas-profiling description between CI runs to speed up the diff?",
+        "a": "After `report.get_description()`, serialize with `json.dump(desc['variables'], open('profile_cache.json','w'))`. In CI, store this as a build artifact keyed by branch and dataset hash. On the next run, load the prior cache and compute column-level delta before regenerating the full report — skip re-profiling columns whose source parquet partition hash hasn't changed. This avoids recomputing expensive correlation matrices for unchanged partitions."
+      }
+    ]
+  },
+  {
+    "q": "How does pandas-profiling's minimal mode differ from full mode, and when should you choose each in a data engineering workflow?",
+    "a": "In pandas-profiling, `minimal=True` disables the most computationally expensive steps: all correlation matrices (Pearson, Spearman, Cramér's V, Phik), interaction plots, and sample rendering. The result is a lean report that still includes per-variable distributions, missing-value counts, cardinality, and the alert list. Full mode (default `minimal=False`) computes every correlation matrix and interaction plot, which can add minutes or even hours on DataFrames with many columns. The rule: use minimal mode in CI gates (speed matters, alerts are enough), in Spark or Dask contexts (correlations require full-frame materialization), and for a first-pass on any unfamiliar dataset over 500k rows. Use full mode interactively when investigating a specific correlation hypothesis or preparing a report for stakeholders. pandas-profiling's alert list is identical between modes for non-correlation alerts, so you don't lose quality-gate coverage by using minimal.",
+    "fj": "I always use full mode — I want the complete picture.",
+    "fs": "Full mode on a 5M-row, 100-column DataFrame can run for 10+ minutes. I use minimal=True in CI and for first-pass EDA, then switch to full mode only when I need to investigate a specific correlation — pandas-profiling computes the same alerts either way.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Does minimal=True in pandas-profiling affect the per-variable histogram output?",
+        "a": "No — histograms and value-count distributions are always computed regardless of minimal mode. Only the cross-column computation (correlations and interactions) is disabled. This means you still get full univariate EDA in minimal mode — it's only the multivariate analysis that's skipped."
+      },
+      {
+        "q": "How do you enable only specific correlation methods in pandas-profiling instead of all-or-nothing?",
+        "a": "Set each correlation method individually in the config: `correlations={'pearson': {'calculate': True}, 'spearman': {'calculate': False}, 'cramers': {'calculate': False}, 'phi_k': {'calculate': False}}`. This gives you Pearson-only mode, which is much faster than full mode while still surfacing numeric collinearity. For a dataset with many categoricals, enable Cramér's V and disable Pearson instead."
+      }
+    ]
+  },
+  {
+    "q": "How do you profile a large Spark DataFrame using pandas-profiling without hitting driver OOM?",
+    "a": "pandas-profiling works on pandas DataFrames, so the pattern is: compute distributed aggregations in Spark, collect only summary statistics to the driver, and feed those to pandas-profiling via a sampled or aggregated pandas DataFrame. Use `spark_df.sample(fraction=0.01, seed=42).toPandas()` to draw a 1% sample — for a 10B-row table this gives a 100M-row sample which is still too large; chain with `.limit(200_000)` first. Alternatively, compute per-column statistics in Spark (mean, stddev, quantiles via `approxQuantile`, null count, distinct count) and assemble a fake pandas DataFrame of summary rows for pandas-profiling to profile — this gives you alert detection without materializing raw data on the driver. As of early 2026, ydata-profiling also ships experimental Spark support via `ydata_profiling.profile_report.ProfileReport` with a SparkDataFrame argument, which computes statistics in-cluster and only collects the description dict to the driver.",
+    "fj": "I'd just collect the whole Spark DataFrame to the driver and run pandas-profiling on it.",
+    "fs": "Collecting a billion rows to the driver crashes it. I sample to 100–200k rows or compute distributed aggregates in Spark and feed summaries to pandas-profiling. ydata-profiling 4.x also has native Spark integration that keeps computation in-cluster.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Spark sample → pandas-profiling",
+        "lines": [
+          "from ydata_profiling import ProfileReport",
+          "",
+          "# safe sample: cap before .toPandas()",
+          "sample_df = (",
+          "    spark_df",
+          "    .sample(fraction=0.001, seed=42)",
+          "    .limit(150_000)",
+          "    .toPandas()",
+          ")",
+          "",
+          "report = ProfileReport(",
+          "    sample_df,",
+          "    minimal=True,",
+          "    title='Spark Table EDA (1% sample)'",
+          ")",
+          "report.to_file('spark_eda.html')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What Spark aggregations should you pre-compute before calling pandas-profiling to get representative statistics without sampling?",
+        "a": "Use `df.agg(F.mean(col), F.stddev(col), F.min(col), F.max(col), F.count(F.when(F.col(col).isNull(), 1)).alias('null_count'), F.approxCountDistinct(col).alias('distinct_count'))` for numeric columns, and `F.approxCountDistinct` for categoricals. Collect these to a pandas summary DataFrame and run pandas-profiling on it — the alerts for MISSING, CONSTANT, and SKEWED can still fire from the aggregated statistics without needing raw rows."
+      }
+    ]
+  },
+  {
+    "q": "How do you embed a pandas-profiling report as a Jupyter widget and what are the limitations compared to the standalone HTML output?",
+    "a": "Call `report.to_widgets()` inside a Jupyter cell — this renders an interactive ipywidgets panel with tabs for Overview, Variables, Correlations, Missing values, Sample, and Duplicates. The widget is fully interactive: you can filter variable types and click through individual column detail pages. Limitations: widgets only work in environments with ipywidgets installed and a live kernel (not in JupyterBook static exports or GitHub preview). The widget output is not serializable to a standalone artifact for CI or sharing — use `to_file()` for portability. For a team notebook where the report is generated fresh on each run, widgets are ideal; for sharing a snapshot, use `to_file('report.html')`. pandas-profiling also supports `to_notebook_iframe()` which embeds the full HTML report in an iframe in the cell output — this is more portable than widgets but still requires a running Jupyter server to display.",
+    "fj": "I always use to_file() — the HTML is the most complete output.",
+    "fs": "to_file() is best for sharing. For interactive exploration in a notebook, I use to_widgets() so I can filter variables and drill into specific columns without regenerating the pandas-profiling report each time.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "pandas-profiling widget in Jupyter",
+        "lines": [
+          "from ydata_profiling import ProfileReport",
+          "",
+          "report = ProfileReport(df, title='Notebook EDA', explorative=True)",
+          "",
+          "# Interactive widget (requires ipywidgets)",
+          "report.to_widgets()",
+          "",
+          "# Or: inline iframe (more portable)",
+          "# report.to_notebook_iframe()"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does pandas-profiling handle duplicate row detection and what does the Duplicates tab show?",
+        "a": "pandas-profiling checks for exact row duplicates using `df.duplicated()` and reports the count and percentage in the Overview section. The Duplicates tab shows the actual duplicate rows (up to the configured `duplicates.head` limit, default 10). It flags a DUPLICATES alert if the ratio exceeds the `duplicates.head` threshold. This catches ETL fan-out bugs (joins that unintentionally multiply rows) before they propagate into aggregates."
+      }
+    ]
+  },
+  {
+    "q": "How do you suppress or configure specific alert types in pandas-profiling so they don't fail your pipeline gate on known acceptable conditions?",
+    "a": "pandas-profiling alert thresholds are configurable via the typed settings. For example: `vars.num.skewness_threshold` (default 20) controls when SKEWED fires — raise it for datasets where high skew is expected. `vars.cat.imbalance_threshold` (default 0.5) controls IMBALANCE for categoricals. `vars.num.low_categorical_threshold` (default 5) controls when a numeric column is treated as categorical. To suppress HIGH_CARDINALITY for known ID columns, post-process the alert list rather than raising the threshold globally — filter `[a for a in alerts if not (a.alert_type == AlertType.HIGH_CARDINALITY and a.column_name in KNOWN_ID_COLS)]`. This scoped suppression keeps the gate strict for unknown columns while acknowledging known exceptions. Document suppressions in code comments so future engineers understand why the alert is intentionally ignored. pandas-profiling does not have a per-column alert suppression config natively in 4.x — suppression must be applied in the post-processing layer.",
+    "fj": "I'd just lower the threshold or ignore all alerts of that type.",
+    "fs": "Global threshold changes mask real issues. I filter the alert list in code with a named KNOWN_EXCEPTIONS set — that way pandas-profiling still checks everything but I explicitly acknowledge the expected alerts, and any new HIGH_CARDINALITY on an unknown column still fails the gate.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "scoped alert suppression",
+        "lines": [
+          "from ydata_profiling import ProfileReport",
+          "from ydata_profiling.model.alerts import AlertType",
+          "",
+          "KNOWN_ID_COLS = {'user_id', 'session_id', 'event_id'}",
+          "",
+          "report = ProfileReport(df, minimal=True)",
+          "all_alerts = report.get_description()['alerts']",
+          "",
+          "# suppress HIGH_CARDINALITY only for known ID columns",
+          "actionable = [",
+          "    a for a in all_alerts",
+          "    if not (a.alert_type == AlertType.HIGH_CARDINALITY",
+          "            and a.column_name in KNOWN_ID_COLS)",
+          "]",
+          "",
+          "if actionable:",
+          "    raise ValueError(f'pandas-profiling gate failed: {actionable}')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you configure pandas-profiling to skip specific columns entirely from profiling?",
+        "a": "Pass a filtered DataFrame: `ProfileReport(df.drop(columns=SKIP_COLS, errors='ignore'), ...)`. There is no per-column skip config in ydata-profiling 4.x — the cleanest approach is to exclude columns before constructing the report. This also prevents those columns from appearing in the HTML, which is useful for PII or internal system columns that should not be in any shared artifact."
+      }
+    ]
+  },
+  {
+    "q": "How do you use pandas-profiling's JSON output to track data-quality metrics over time in a monitoring dashboard?",
+    "a": "After each pipeline run, call `report.get_description()` and extract the scalar metrics you care about from `desc['variables'][col]`: `p_missing` (null rate), `mean`, `std`, `p_zeros`, `n_distinct`, and `p_distinct`. Write these to a time-series store (PostgreSQL table, InfluxDB, or a partitioned parquet on S3 with a run_date column). Query the store in a BI tool (Looker, Superset) to render trend lines per column. Alert when a metric drifts beyond a rolling-window threshold. This approach turns pandas-profiling from a one-shot EDA tool into a continuous data observability layer — cheaper than Montecarlo or Great Expectations for teams already running pandas-profiling in pipelines. Correlate metric anomalies with pipeline run IDs to trace the root cause partition.",
+    "fj": "I'd just re-run the HTML report when something looks wrong.",
+    "fs": "HTML is for humans and point-in-time analysis. I serialize pandas-profiling's JSON description into a time-series table on every run — then I can query 'when did null rate on revenue first exceed 5%?' and correlate it with a specific pipeline run.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "pandas-profiling metrics → time-series table",
+        "lines": [
+          "import json, datetime",
+          "import pandas as pd",
+          "from ydata_profiling import ProfileReport",
+          "",
+          "run_date = datetime.date.today().isoformat()",
+          "report   = ProfileReport(df, minimal=True)",
+          "desc     = report.get_description()",
+          "",
+          "rows = []",
+          "for col, stats in desc['variables'].items():",
+          "    rows.append({",
+          "        'run_date':  run_date,",
+          "        'column':    col,",
+          "        'p_missing': stats.get('p_missing', 0),",
+          "        'mean':      stats.get('mean'),",
+          "        'n_distinct':stats.get('n_distinct'),",
+          "    })",
+          "",
+          "metrics_df = pd.DataFrame(rows)",
+          "# append to partitioned parquet or postgres table",
+          "metrics_df.to_parquet(f'metrics/{run_date}.parquet', index=False)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What pandas-profiling metric is the best early-warning signal for an upstream ETL join gone wrong?",
+        "a": "`n_distinct` (unique value count) on key columns spiking upward signals a fan-out — a join that produced duplicate rows inflates cardinality on columns that should be stable. Combined with `n_duplicates` from the overview section, a sudden increase in either metric on a historically stable column is the strongest early warning that a join condition changed. pandas-profiling surfaces both in `get_description()`."
+      }
+    ]
+  },
+  {
+    "q": "How does pandas-profiling handle datetime columns and what can you learn from its temporal analysis output?",
+    "a": "pandas-profiling auto-detects columns with pandas dtype `datetime64` or infers datetime from object columns when `infer_dtypes=True`. For datetime variables it computes: range (min/max timestamps), number of unique dates, null rate, and a histogram of counts by time bucket (day/month/year depending on range). It also generates a line chart of record counts over time. In the alert system, a UNIFORM alert on a datetime column means records are evenly distributed — expected for synthetic data but suspicious for real event logs (real events cluster). A SKEWED alert means records concentrate in a narrow time window — useful for catching backfill artifacts or incorrect timezone conversions. For a data engineer, checking the datetime histogram is the fastest way to verify that a new data source covers the expected date range and doesn't have gaps. pandas-profiling exposes these stats in `desc['variables'][col]['min']`, `['max']`, and the histogram bins in `['histogram']`.",
+    "fj": "I just check min and max of the date column manually.",
+    "fs": "Min/max misses gaps and concentration patterns. pandas-profiling's datetime histogram shows me the record distribution across time — I can spot backfill artifacts (sudden spike at a past date) and timezone bugs (records clustering at UTC midnight) immediately.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "datetime profiling with pandas-profiling",
+        "lines": [
+          "import pandas as pd",
+          "from ydata_profiling import ProfileReport",
+          "",
+          "df['event_ts'] = pd.to_datetime(df['event_ts'], utc=True)",
+          "",
+          "report = ProfileReport(",
+          "    df,",
+          "    infer_dtypes=False,   # already parsed",
+          "    title='Temporal EDA'",
+          ")",
+          "",
+          "desc = report.get_description()",
+          "ts_stats = desc['variables']['event_ts']",
+          "print('Range:', ts_stats['min'], '→', ts_stats['max'])",
+          "print('Nulls:', ts_stats['p_missing'])"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does pandas-profiling detect timezone issues in datetime columns?",
+        "a": "pandas-profiling computes the min/max range and histogram of the datetime column. If records cluster suspiciously at round-hour boundaries (e.g. 80% of events at exactly midnight UTC) the histogram reveals this pattern — a sign that timestamps were cast to date losing the time component, or that a timezone offset was applied twice. The UNIFORM or SKEWED alerts on datetime columns are starting points; the histogram bins in `get_description()['variables'][col]` give the full distributional picture for a targeted investigation."
+      }
+    ]
+  },
+  {
+    "q": "When should you use Shell Scripting instead of Python for a data pipeline glue layer, and where does each break down?",
+    "a": "Shell Scripting wins when you're wiring together existing CLI tools (aws s3 cp, dbt run, spark-submit) with simple sequencing — no data transformation, just plumbing. Bash launches faster than a Python process and every admin on the team can read it. Python wins when you need error handling with rich context, retries with backoff, structured logging, unit tests, or any data manipulation. The break-even is roughly: if the script has more than one conditional branch or you need to parse command output, reach for Python and use subprocess to call the shell commands. In practice, a senior data engineer writes a thin Bash harness (set -euo pipefail, trap cleanup ERR) and delegates all logic to Python modules — Shell Scripting handles orchestration, Python handles computation.",
+    "fj": "I just use Python for everything, bash is too hard to debug.",
+    "fs": "I use Shell Scripting as pure glue — set -euo pipefail, trap on ERR, call Python for any logic. That keeps bash short enough to audit and Python testable.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Shell Scripting harness calling Python worker",
+        "lines": [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          "",
+          "cleanup() { echo 'ERR on line $LINENO' >&2; }",
+          "trap cleanup ERR",
+          "",
+          "python3 extract.py --date \"$1\"",
+          "python3 transform.py --date \"$1\"",
+          "python3 load.py     --date \"$1\""
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the main reason Shell Scripting pipelines silently eat errors by default?",
+        "a": "In bash, a failed command in a pipeline only sets the exit code of the last command in the pipe, not the intermediate ones. Without `set -o pipefail`, `false | true` returns 0. `set -euo pipefail` makes the whole pipeline fail on any non-zero exit and also errors on unset variables (`-u`), catching two of the most common silent-failure bugs."
+      }
+    ]
+  },
+  {
+    "q": "How do you invoke Shell Scripting commands from Python via subprocess.run and safely capture both stdout and stderr for downstream processing?",
+    "a": "Use `subprocess.run(['cmd', 'arg'], capture_output=True, text=True, check=True)`. `capture_output=True` is shorthand for `stdout=PIPE, stderr=PIPE`. `text=True` decodes bytes to str using the system locale. `check=True` raises `CalledProcessError` on non-zero exit, so failures surface immediately rather than being silently swallowed. Access `.stdout` and `.stderr` on the result. Never use `shell=True` with user-supplied data — it passes the string to `/bin/sh -c` and enables shell injection. For Shell Scripting idioms like glob expansion or piping, invoke bash explicitly: `subprocess.run(['bash', '-c', 'ls *.parquet | wc -l'], capture_output=True, text=True, check=True)`.",
+    "fj": "I use os.system() and check the return code manually.",
+    "fs": "subprocess.run with check=True raises immediately on failure and capture_output gives me both streams. I avoid shell=True and pass a list of arguments so the shell never interprets special characters.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Safe Shell Scripting invocation from Python",
+        "lines": [
+          "import subprocess",
+          "",
+          "result = subprocess.run(",
+          "    ['dbt', 'run', '--select', 'staging+'],",
+          "    capture_output=True,",
+          "    text=True,",
+          "    check=True,   # raises CalledProcessError on non-zero",
+          ")",
+          "print(result.stdout)",
+          "if result.returncode != 0:",
+          "    raise RuntimeError(result.stderr)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you stream Shell Scripting command output in real time from Python instead of buffering it?",
+        "a": "Use `subprocess.Popen` with `stdout=PIPE, text=True` and iterate over `proc.stdout` line by line. This avoids buffering the full output in memory, which matters for long-running Shell Scripting commands like spark-submit logs. Call `proc.wait()` after the loop and raise on non-zero `returncode`."
+      }
+    ]
+  },
+  {
+    "q": "Explain `set -euo pipefail` in Shell Scripting and how you enforce equivalent guarantees when calling bash from a Python subprocess wrapper.",
+    "a": "`set -e` exits the script immediately on any command failure. `set -u` treats unset variables as errors, preventing silent empty-string substitution bugs. `set -o pipefail` makes the exit code of a pipeline the exit code of the rightmost failed command rather than the last command. Together they convert Shell Scripting's default permissive behavior into fail-fast behavior. When calling bash from Python, pass the flags inline: `subprocess.run(['bash', '-euo', 'pipefail', '-c', script], check=True)`. For production Shell Scripting wrappers, add `trap 'echo ERR on line $LINENO' ERR` to log where the failure occurred. In Python, wrap the `subprocess.run` call in a try/except catching `CalledProcessError` and re-raise with the stderr text as context — this mirrors what `set -e` would do in pure Shell Scripting.",
+    "fj": "I just run the bash script and check the exit code at the end.",
+    "fs": "set -euo pipefail makes Shell Scripting fail fast on any step. I also pass -euo pipefail when invoking bash from Python so the script can't silently succeed while a pipeline step failed.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Enforcing Shell Scripting fail-fast from Python",
+        "lines": [
+          "import subprocess, textwrap",
+          "",
+          "script = textwrap.dedent(\"\"\"",
+          "    set -euo pipefail",
+          "    trap 'echo ERR line $LINENO' ERR",
+          "    aws s3 cp s3://bucket/raw/ /tmp/raw/ --recursive",
+          "    python3 transform.py",
+          "\"\"\")",
+          "",
+          "try:",
+          "    subprocess.run(['bash', '-c', script],",
+          "                   check=True, capture_output=True, text=True)",
+          "except subprocess.CalledProcessError as e:",
+          "    raise RuntimeError(f'Shell Scripting step failed:\\n{e.stderr}') from e"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does `set -e` not catch failures inside subshells or command substitutions?",
+        "a": "`set -e` only applies to the current shell context. A command substitution like `VAR=$(failing_cmd)` swallows the non-zero exit of `failing_cmd` when used in an assignment. To catch this, assign on a separate line and let the substitution run standalone, or use `set -e` inside the subshell explicitly. This is a well-known bash gotcha that catches even experienced Shell Scripting authors."
+      }
+    ]
+  },
+  {
+    "q": "How do you handle exit codes and error propagation when Python orchestrates a multi-step Shell Scripting pipeline, so that failures don't silently continue?",
+    "a": "The pattern is: each Shell Scripting step is a separate `subprocess.run` call with `check=True`. On failure, `CalledProcessError` is raised immediately, stopping the pipeline. Wrap the whole sequence in a try/except that logs `e.returncode`, `e.stdout`, and `e.stderr`, then re-raises or sys.exit(1). For cleanup on failure, use a Python context manager or try/finally — this is the Python equivalent of bash's `trap cleanup ERR`. Use `sys.exit(e.returncode)` at the top level so the caller (cron, CI, Airflow) sees a non-zero exit code and marks the task failed. Never suppress `CalledProcessError` unless you explicitly handle partial failure — silent swallowing is the most common bug in Shell Scripting glue code.",
+    "fj": "I check `result.returncode != 0` after each step manually.",
+    "fs": "check=True on every subprocess.run raises immediately, try/finally handles cleanup, and sys.exit propagates the non-zero code to the caller — the same contract as Shell Scripting's set -e.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Shell Scripting exit code propagation pattern",
+        "lines": [
+          "import subprocess, sys, logging",
+          "",
+          "steps = [",
+          "    ['bash', '-c', 'aws s3 sync s3://bucket/in /tmp/in'],",
+          "    ['python3', 'transform.py'],",
+          "    ['bash', '-c', 'aws s3 sync /tmp/out s3://bucket/out'],",
+          "]",
+          "",
+          "try:",
+          "    for step in steps:",
+          "        subprocess.run(step, check=True, capture_output=True, text=True)",
+          "except subprocess.CalledProcessError as e:",
+          "    logging.error('Shell Scripting step failed rc=%d\\n%s', e.returncode, e.stderr)",
+          "    sys.exit(e.returncode)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "When should you use sys.exit(1) vs raising an exception in a Python script called from Shell Scripting?",
+        "a": "Use sys.exit(non-zero) at the outermost main() handler so the Shell Scripting caller sees a proper exit code — bash if/else and set -e both inspect $?. Raise exceptions internally for control flow and testability. Converting exceptions to exit codes at the boundary is the clean interface between Python's exception model and Shell Scripting's exit-code convention."
+      }
+    ]
+  },
+  {
+    "q": "How do you use Python's subprocess to build a Shell Scripting-style pipe — passing stdout of one process as stdin of the next — without writing intermediate files?",
+    "a": "Use `subprocess.Popen` with `stdout=PIPE` on the producer and `stdin=producer.stdout` on the consumer. This connects the file descriptors directly in the OS, so data streams between processes without Python reading it. Call `producer.stdout.close()` after creating the consumer so the producer gets SIGPIPE when the consumer exits. Then `consumer.communicate()` drives the pipeline to completion. This matches the Shell Scripting idiom `producer | consumer` but lets Python intercept errors on each end. For multi-stage Shell Scripting pipes (A | B | C), chain Popen objects in sequence. Avoid `shell=True` for the pipe — it spawns an extra shell process and makes error attribution harder.",
+    "fj": "I'd just use shell=True and write the pipe as a string command.",
+    "fs": "I chain Popen objects with stdout=PIPE and stdin=previous.stdout — same OS-level pipe as Shell Scripting but with individual process error handling and no shell injection surface.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Shell Scripting-style pipe via Popen chaining",
+        "lines": [
+          "import subprocess",
+          "",
+          "# equivalent: bzcat data.bz2 | python3 parse.py | gzip > out.gz",
+          "p1 = subprocess.Popen(['bzcat', 'data.bz2'], stdout=subprocess.PIPE)",
+          "p2 = subprocess.Popen(['python3', 'parse.py'],",
+          "                      stdin=p1.stdout, stdout=subprocess.PIPE)",
+          "p1.stdout.close()  # allow p1 to receive SIGPIPE if p2 exits",
+          "p3 = subprocess.Popen(['gzip'], stdin=p2.stdout,",
+          "                      stdout=open('out.gz', 'wb'))",
+          "p2.stdout.close()",
+          "p3.wait()",
+          "for p in (p1, p2, p3):",
+          "    if p.returncode:",
+          "        raise RuntimeError(f'Shell Scripting pipe step failed: rc={p.returncode}')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does closing producer.stdout in Python affect the Shell Scripting pipe behavior?",
+        "a": "After `p2 = Popen(stdin=p1.stdout)`, Python holds a reference to p1's stdout pipe. If p2 finishes early, p1 won't receive SIGPIPE unless Python releases its reference by calling `p1.stdout.close()`. Without this, the Shell Scripting pipe can deadlock — p1 keeps writing to a pipe no one is reading."
+      }
+    ]
+  },
+  {
+    "q": "Explain how xargs and Shell Scripting work together with Python-generated input to parallelize a file-processing task on a data lake.",
+    "a": "xargs reads newline-separated input from stdin and runs a command for each item, optionally in parallel with `-P N`. A common pattern is to have Python generate the list of S3 paths or file names (it has better S3/glob APIs than pure Shell Scripting), write them to stdout, and pipe to xargs: `python3 list_paths.py | xargs -P 8 -I{} aws s3 cp {} /tmp/`. The Shell Scripting pipe wires together Python's listing capability with xargs's parallelism, avoiding a Python multiprocessing pool for what is an I/O-bound download. Use `--null` / `-0` and `print(path, end='\u0000')` in Python when filenames may contain spaces — this is the robust Shell Scripting convention. Add `set -e` inside the xargs command or use `xargs -I{} bash -c 'set -euo pipefail; ...'` so individual failures propagate correctly in Shell Scripting.",
+    "fj": "I'd use a Python for loop to download files one at a time.",
+    "fs": "Python generates the list, xargs -P parallelizes the Shell Scripting command — best of both worlds. I use -0 / null-delimited to handle paths with spaces safely.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Python + xargs Shell Scripting parallel download",
+        "lines": [
+          "# list_paths.py — prints null-delimited S3 paths",
+          "import boto3, sys",
+          "",
+          "s3 = boto3.client('s3')",
+          "paginator = s3.get_paginator('list_objects_v2')",
+          "for page in paginator.paginate(Bucket='my-bucket', Prefix='raw/2026/'):",
+          "    for obj in page.get('Contents', []):",
+          "        sys.stdout.write(f\"s3://my-bucket/{obj['Key']}\\0\")",
+          "",
+          "# Shell Scripting invocation:",
+          "# python3 list_paths.py | xargs -0 -P 8 -I{} aws s3 cp {} /tmp/raw/"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why is null-delimited output (-0 / print with end='\\0') preferred over newline-delimited in Shell Scripting xargs pipelines?",
+        "a": "Filenames and S3 keys can legally contain spaces, tabs, and newlines. Newline delimiters break xargs parsing for such names, producing wrong split points. Null bytes (\\0) cannot appear in POSIX paths, so null-delimited output is unambiguous. `xargs -0` and Python's `sys.stdout.write(path + '\\0')` form the safe Shell Scripting convention for arbitrary filenames."
+      }
+    ]
+  },
+  {
+    "q": "How do you schedule a Python data pipeline using cron with Shell Scripting wrapper best practices, and what are the common failure modes?",
+    "a": "A cron entry runs a Shell Scripting wrapper script, not the Python file directly, for three reasons: the wrapper can activate the virtualenv, set environment variables, and redirect stdout/stderr to a log file. A typical pattern: `0 3 * * * /opt/pipelines/run_etl.sh >> /var/log/etl.log 2>&1`. The Shell Scripting wrapper should: (1) `set -euo pipefail` so any command failure stops it, (2) `source /opt/venv/bin/activate` to use the right Python, (3) export env vars for secrets (or read from AWS SSM), (4) exec the Python script so it inherits the wrapper's PID for process-manager visibility. Common cron + Shell Scripting failure modes: cron's minimal PATH omits /usr/local/bin so commands not found; no MAILTO set so errors disappear; overlapping runs because the previous job didn't finish; and timezone mismatch between cron's system TZ and the pipeline's expected TZ.",
+    "fj": "I just put the python3 command directly in crontab.",
+    "fs": "I cron a Shell Scripting wrapper with set -euo pipefail that activates the venv, exports secrets, and redirects logs. The wrapper also touches a lockfile so overlapping runs fail fast.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Shell Scripting cron wrapper for Python ETL",
+        "lines": [
+          "#!/usr/bin/env bash",
+          "# /opt/pipelines/run_etl.sh",
+          "set -euo pipefail",
+          "",
+          "LOCKFILE=/tmp/etl.lock",
+          "exec 9>\"$LOCKFILE\"",
+          "flock -n 9 || { echo 'already running' >&2; exit 1; }",
+          "",
+          "source /opt/venv/bin/activate",
+          "export DB_URL=$(aws ssm get-parameter --name /prod/db_url --with-decryption --query Parameter.Value --output text)",
+          "",
+          "exec python3 /opt/pipelines/etl.py --date \"$(date +%F)\""
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why does cron + Shell Scripting often fail with 'command not found' even when the same command works interactively?",
+        "a": "Cron runs with a minimal environment — PATH is typically `/usr/bin:/bin`. Interactive shells load ~/.bashrc and /etc/profile which add /usr/local/bin, ~/bin, conda/venv paths, etc. The Shell Scripting wrapper must explicitly set PATH or use full absolute paths for every command (python3, aws, dbt) to avoid this class of failure."
+      }
+    ]
+  },
+  {
+    "q": "How do you use Python's subprocess to call Shell Scripting commands that transform data with pipes — for example, using awk, sort, and uniq — and when is this better than pandas?",
+    "a": "For very large text files (tens of GB), Unix Shell Scripting tools like awk, sort, and uniq process data as a stream without loading it into memory, which pandas cannot do. Python's subprocess bridges this: use `subprocess.run(['bash', '-c', 'sort -t, -k2 big.csv | uniq -f1 | awk -F, \"{print $1,$3}\"'], capture_output=True, text=True, check=True)`. For Shell Scripting + Python hybrid processing, pipe the Shell Scripting output directly into pandas: `pd.read_csv(io.StringIO(result.stdout))`. This pattern is useful in data engineering when pre-filtering with Shell Scripting reduces the dataset from 50GB to 1GB before pandas sees it. The rule of thumb: use Shell Scripting tools for streaming text transforms (sort, grep, awk, cut, wc) and Python/pandas for anything that requires joins, aggregation logic, or structured output.",
+    "fj": "I'd just load the whole file into pandas and filter there.",
+    "fs": "Shell Scripting tools stream without loading into RAM — I'll sort/grep/awk to get the dataset down to a manageable size, then hand off to pandas. subprocess bridges the two worlds cleanly.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Shell Scripting pre-filter feeding pandas",
+        "lines": [
+          "import subprocess, io, pandas as pd",
+          "",
+          "# Stream-filter 50GB CSV to rows matching 2026 in Shell Scripting,",
+          "# then load the small result into pandas",
+          "result = subprocess.run(",
+          "    ['bash', '-c', \"grep ',2026-' /data/events.csv | head -1000000\"],",
+          "    capture_output=True, text=True, check=True",
+          ")",
+          "df = pd.read_csv(io.StringIO(result.stdout),",
+          "                 names=['id','ts','value'])",
+          "print(df.shape)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is a Shell Scripting technique for counting distinct values in a large CSV column without loading it into memory?",
+        "a": "`awk -F, '{print $2}' big.csv | sort | uniq -c | sort -rn | head -20` — awk extracts the column as a stream, sort groups duplicates, uniq -c counts them, and sort -rn ranks by frequency. This is pure Shell Scripting, needs no Python, and handles files larger than RAM because sort uses disk-based merge sort."
+      }
+    ]
+  },
+  {
+    "q": "How do you write a Python function that runs a Shell Scripting command with a timeout, retries with exponential backoff on transient failures, and surfaces a clean error on permanent failure?",
+    "a": "Use `subprocess.run` with `timeout=N` (raises `TimeoutExpired`) and wrap in a retry loop. Distinguish transient failures (returncode 1 with a known transient error string in stderr, or timeout) from permanent failures (returncode 2 or an assertion error in stderr). Use `time.sleep(2**attempt)` for exponential backoff. After max retries, re-raise as a domain exception so callers don't handle `CalledProcessError` directly. This pattern is essential for Shell Scripting-wrapped cloud commands like `aws s3 cp` which return transient 503 errors. Always log attempt number, returncode, and stderr at WARNING for observability. The Shell Scripting equivalent is a bash retry loop but Python gives you structured logging, unit-testable retry logic, and richer exception semantics.",
+    "fj": "I just re-run the script manually if it fails.",
+    "fs": "I wrap subprocess.run in a retry loop with exponential backoff, check returncode and stderr to distinguish transient vs permanent, and raise a named exception after max retries so the caller gets a clean error.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Shell Scripting retry with backoff from Python",
+        "lines": [
+          "import subprocess, time, logging",
+          "",
+          "def run_with_retry(cmd, max_attempts=4, timeout=120):",
+          "    for attempt in range(max_attempts):",
+          "        try:",
+          "            subprocess.run(cmd, check=True,",
+          "                           capture_output=True, text=True,",
+          "                           timeout=timeout)",
+          "            return",
+          "        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:",
+          "            logging.warning('Shell Scripting attempt %d failed: %s', attempt+1, e)",
+          "            if attempt < max_attempts - 1:",
+          "                time.sleep(2 ** attempt)",
+          "    raise RuntimeError(f'Shell Scripting command failed after {max_attempts} attempts')"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you tell apart a transient Shell Scripting failure from a permanent one when designing retry logic?",
+        "a": "Check returncode and stderr patterns: exit code 1 with 'ConnectionError', '503', or 'timeout' in stderr is typically transient; exit code 2 or messages like 'No such file', 'PermissionError', or 'invalid argument' are permanent. Maintaining an explicit allowlist of transient error strings avoids retrying permanent failures which wastes time and can have side effects in Shell Scripting pipelines that aren't idempotent."
+      }
+    ]
+  },
+  {
+    "q": "How do you use Shell Scripting and Python together to build a bash glue layer for a Spark/dbt/Airflow data pipeline that is idempotent and observable?",
+    "a": "The pattern has three layers. The Shell Scripting harness (`run.sh`) sets `set -euo pipefail`, sources env, acquires a lockfile, redirects logs to a dated file, and calls Python. The Python orchestrator uses subprocess to run dbt, spark-submit, or other CLI tools, checks exit codes, and emits structured JSON logs (so the Shell Scripting `>>` append lands in a structured log store). Idempotency: the Shell Scripting harness accepts a `--date` argument and passes it through to every step; each step uses the date as a partition key and writes to a date-stamped path, so re-running is safe. Observability: the Python layer emits a JSON line `{\"step\": \"transform\", \"rc\": 0, \"duration_s\": 12}` to stdout after each subprocess call; the Shell Scripting redirect captures it; a log parser indexes it. The combination gives you the simplicity of Shell Scripting orchestration with Python's rich error context and JSON-structured logging, which Datadog/CloudWatch can parse without an agent.",
+    "fj": "I just run dbt run and check if it passes.",
+    "fs": "Shell Scripting harness with set -euo pipefail for process control, Python for subprocess orchestration and JSON logging, idempotent date-partitioned paths — the whole thing is re-runnable and observable without an orchestrator agent.",
+    "level": "Sr",
+    "code": [
+      {
+        "accent": "fix",
+        "lang": "python",
+        "label": "Python orchestrator for Shell Scripting glue pipeline",
+        "lines": [
+          "import subprocess, json, time, sys, logging",
+          "",
+          "logging.basicConfig(format='%(message)s')",
+          "",
+          "def run_step(name, cmd):",
+          "    t0 = time.monotonic()",
+          "    try:",
+          "        subprocess.run(cmd, check=True, capture_output=True, text=True)",
+          "        rc = 0",
+          "    except subprocess.CalledProcessError as e:",
+          "        rc = e.returncode",
+          "        logging.error(e.stderr)",
+          "        raise",
+          "    finally:",
+          "        print(json.dumps({'step': name, 'rc': rc,",
+          "                          'duration_s': round(time.monotonic()-t0, 2)}))",
+          "",
+          "run_step('dbt_run',    ['dbt', 'run', '--select', 'staging+'])",
+          "run_step('dbt_test',   ['dbt', 'test'])",
+          "run_step('s3_export',  ['bash', '-c', 'aws s3 sync /tmp/out s3://bucket/out'])"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What makes a Shell Scripting + Python data pipeline idempotent, and why does idempotency matter for cron-scheduled jobs?",
+        "a": "Idempotency means running the pipeline twice for the same date produces the same result as running it once — no duplicate rows, no partial overwrites. You achieve this by writing to date-partitioned paths (overwriting, not appending), using INSERT OVERWRITE in SQL, and making each Shell Scripting step check if its output already exists and skip or overwrite consistently. Cron-scheduled jobs can overlap, retry on host reboot, or be re-run manually after failure — idempotency ensures re-runs are safe without manual cleanup."
+      }
+    ]
+  },
+  {
+    "q": "You own the Python packaging standard for a 50-engineer data org. How do you design the internal library strategy — monorepo vs poly-repo, shared wheels, and dependency governance?",
+    "a": "The axis is team autonomy vs coordination cost. A monorepo (single repo, uv or Poetry workspaces) gives a single lockfile across all internal packages so version conflicts surface immediately, makes cross-cutting refactors atomic, and lets you run one CI pipeline that tests everything together — the right default for a data org where 80% of teams share the same core libs. Poly-repo scales for genuinely independent domains (a data-platform team producing a wheel consumed by ML and analytics teams) but requires a private PyPI or Artifactory to publish and version those wheels, a release cadence process, and a cross-repo dependency upgrade chain that can lag. The governance decisions that actually hurt teams at scale: (1) who bumps transitive-dep versions and when — define a weekly dependabot merge day; (2) how internal shared code gets promoted from a notebook into a shared package — require a package proposal template; (3) how you handle breaking API changes in an internal library — semantic versioning enforced by CI checks on public imports. The Staff-level bet is monorepo for the org's first 100 engineers with a clear extracted-package playbook for genuine platform components.",
+    "fj": "I'd just have everyone use requirements.txt and share a Confluence page with the approved package list.",
+    "fs": "An approved-list Confluence page is a snapshot that rots immediately. I'd set up a uv workspace monorepo with a shared lockfile and a lint rule that blocks imports of unapproved packages — the governance is in code, not a wiki.",
+    "level": "Staff",
+    "code": [
+      {
+        "lang": "python",
+        "label": "uv workspace layout",
+        "accent": "fix",
+        "lines": [
+          "# pyproject.toml (root)",
+          "[tool.uv.workspace]",
+          "members = [",
+          "  'packages/datapipeline',",
+          "  'packages/featurestore',",
+          "  'packages/mlutils',",
+          "]",
+          "# one `uv.lock` governs all — cross-pkg",
+          "# conflicts surface in CI, not prod"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a shared internal library that ML engineers want to version pin while data engineers want the latest?",
+        "a": "Introduce a stable release branch with a semantic version and a `main`-tracking edge alias. ML engineers pin `mlutils==1.4.2` in their lockfile; data engineers use `mlutils>=1.4,<2` and accept minor bumps. The Staff-level discipline is to maintain a changelog and a deprecation policy (public symbol stays for 2 minor versions after deprecation) so consumers can migrate without urgency. A compatibility test suite run against pinned consumer lockfiles in CI catches breaking changes before they release."
+      },
+      {
+        "q": "What is the role of a private PyPI mirror in an enterprise data org and how do you set one up securely?",
+        "a": "A private mirror (Artifactory, AWS CodeArtifact, or devpi) serves two functions: it hosts internal wheels that must not be published to pypi.org, and it proxies the public PyPI so you control which external versions enter the org (blocking yanked or CVE-flagged versions). Set it as the sole index in `pyproject.toml` via `[[tool.uv.index]]` or `pip.conf`. Lock access with IAM or API tokens. Add a nightly job that audits new upstream releases for CVEs and opens auto-PRs to bump dependencies."
+      }
+    ]
+  },
+  {
+    "q": "Walk me through the full type-annotation strategy you would enforce across a 40-engineer Python data platform — mypy config, CI gates, Protocol-based interfaces, and rollout.",
+    "a": "Start with the tightest config that passes today and ratchet over quarters rather than dropping a breaking strict config on legacy code. In `mypy.ini`, set `warn_return_any = true`, `disallow_untyped_defs = true` in new packages only by scoping with `[[mypy-legacy.*]] ignore_errors = true`, then migrate one package per sprint. The platform-level wins: use `Protocol` for every internal interface that crosses package boundaries — this avoids hard inheritance coupling so any class matching the structural shape satisfies the type checker. Annotate all `TypedDict` shapes for JSON/config boundaries instead of `dict[str, Any]`, which is a type-erasure escape hatch. For dataframes, adopt `pandera` schemas so column-level type contracts are both statically checkable and runtime-validated. Gate CI with `mypy --strict` on new code, `pyright` as a second opinion for IDE integration, and `ruff` for fast lint including import ordering. The common rollout trap is enabling strict globally and drowning the team in errors — the phased approach (new packages strict, legacy annotated incrementally) keeps velocity while improving coverage.",
+    "fj": "I'd add type hints where it seems useful but not enforce it — it slows down development.",
+    "fs": "Unenforced type hints are documentation that drifts. I gate mypy --strict on new packages in CI from day one, use Protocol for cross-package interfaces to avoid coupling, and ratchet the legacy surface iteratively — not a big bang.",
+    "level": "Staff",
+    "code": [
+      {
+        "lang": "python",
+        "label": "mypy.ini phased strict rollout",
+        "accent": "fix",
+        "lines": [
+          "[mypy]",
+          "warn_return_any = true",
+          "disallow_untyped_defs = true",
+          "",
+          "[mypy-legacy.*]",
+          "ignore_errors = true   # old code quarantined",
+          "",
+          "# Protocol keeps packages decoupled",
+          "class DataSource(Protocol):",
+          "    def read_batch(self, n: int) -> list[Row]: ..."
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you use pandera to enforce DataFrame schemas as part of a typed pipeline?",
+        "a": "Define a `pandera.DataFrameSchema` (or a `pa.SchemaModel` for class-based declaration) specifying column names, dtypes, nullable flags, and value constraints. Decorate transform functions with `@pa.check_types` and annotate parameters as `DataFrame[MySchema]` — pandera validates at runtime on entry and exit. In CI, run the full pipeline against a fixture dataset so schema violations are caught before deploy. This bridges the gap between static type checking (which can't inspect DataFrame column names) and runtime safety."
+      },
+      {
+        "q": "What is `pyright`'s advantage over mypy for a large data platform team, and would you run both?",
+        "a": "Pyright (and Pylance in VS Code) is significantly faster on large codebases, has better inference for complex generics, and its type stubs are more aggressively maintained for popular libraries. The practical split: mypy in CI for the authoritative gate (broader ecosystem familiarity, stricter plugin support for dataclasses, attrs, pydantic), pyright configured in `pyrightconfig.json` for editor feedback so engineers see errors inline without running CI. Running both catches issues missed by each — the cost is occasional false-positive disagreements, which a `# type: ignore` with a comment resolves."
+      }
+    ]
+  },
+  {
+    "q": "You are the Staff engineer responsible for Python performance at scale in a data platform. Describe how you diagnose a CPU-bound bottleneck, then decide between Numba, Cython, and a Rust extension.",
+    "a": "The diagnosis workflow is: (1) profile with `py-spy top --pid` for a live view or `py-spy record -o flame.svg --pid` for a flamegraph — this shows which Python frame is eating CPU without modifying the code. (2) If the hot frame is in a pandas/NumPy operation, check for a vectorized alternative first — replacing a `df.apply` with a NumPy ufunc is the lowest-effort win and typically 10–100x. (3) If the bottleneck is a custom numeric algorithm with no vectorized equivalent, Numba's `@jit(nopython=True)` is the first escalation: zero build infrastructure, works on NumPy arrays, compiles on first call, and can be `@njit(parallel=True)` for loop-level parallelism. (4) If Numba can't express the logic (non-numeric types, complex control flow, CPython C-API calls), Cython with typed memoryviews is the next step — it produces a C extension and gives fine-grained control over GIL release. (5) Reach for Rust (via maturin + PyO3) when the extension needs to be maintained long-term by people comfortable with Rust, needs memory safety guarantees, or must be distributed as a wheel to external consumers — the build infrastructure is heavier but the result is the most maintainable. The Staff-level discipline is to never jump to Rust before exhausting the Python-ecosystem options, because Rust extensions are a hiring and onboarding cost.",
+    "fj": "I'd rewrite the slow function in C.",
+    "fs": "I profile with py-spy before touching the code. Then I escalate: vectorize first, Numba next (zero build cost), Cython for non-numeric logic, Rust extension only when the extension needs long-term maintenance and the team has Rust capacity.",
+    "level": "Staff",
+    "code": [
+      {
+        "lang": "python",
+        "label": "Numba: zero-infra JIT",
+        "accent": "fix",
+        "lines": [
+          "from numba import njit",
+          "",
+          "@njit(parallel=True)",
+          "def haversine_batch(lats, lons, lat0, lon0):",
+          "    # compiles to LLVM, runs parallel",
+          "    # on first call; subsequent calls cached",
+          "    out = np.empty(len(lats))",
+          "    for i in numba.prange(len(lats)):",
+          "        out[i] = _hav(lats[i], lons[i],",
+          "                       lat0, lon0)",
+          "    return out"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does `py-spy` differ from cProfile and when do you use each?",
+        "a": "cProfile instruments every function call with Python-level hooks, adding 2–10x overhead — safe for small inputs, useless for profiling a production process under real load. py-spy is a sampling profiler that attaches to a running PID via ptrace/proc maps without modifying the process — zero overhead, no code changes, and you can attach to a live Airflow task or Gunicorn worker. The trade-off: py-spy shows statistical call stacks, not exact call counts. Use cProfile for detailed per-function attribution during development; py-spy for production diagnosis or any scenario where code modification isn't safe."
+      },
+      {
+        "q": "What is the Numba compilation warm-up problem and how do you mitigate it in a production pipeline?",
+        "a": "Numba compiles on first call and caches the compiled artifact in `__pycache__` on disk. A cold start (first run on a new machine or after cache invalidation) adds seconds of JIT compilation time. In a batch pipeline, the warm-up is amortized over the full run. In a short-lived Lambda or containerized task with no persistent cache, the compilation overhead can exceed the benefit. Mitigate by persisting the Numba cache directory between runs (mount it as a volume), pre-compiling via `ahead_of_time` compilation (Numba AOT), or switching to Cython/Rust for latency-sensitive invocations where warm-up is unacceptable."
+      }
+    ]
+  },
+  {
+    "q": "How do you architect async-native Python services for a data platform — concurrency model, structured concurrency, backpressure, and observability — when you're setting the standard for a 20-team org?",
+    "a": "The Staff-level architecture decisions are: (1) Standardize on `asyncio.TaskGroup` (3.11+) as the primitive, not `gather`, because structured concurrency guarantees no orphan tasks and surfaces multi-error as ExceptionGroup — this is the pattern every team should copy. (2) Enforce `asyncio.timeout()` on every external call site — a hung database or S3 call must never block the event loop indefinitely; make timeouts a required constructor argument in your internal HTTP clients. (3) Model backpressure explicitly: ingestion pipelines use `asyncio.Queue(maxsize=N)` between producer and consumer coroutines so a slow consumer applies back-pressure to the producer rather than unbounded buffering. (4) For observability, async stack traces are fragmented — adopt `aiodebug` or a structured logger that captures the task name (`asyncio.current_task().get_name()`) on every log line so you can correlate distributed async context. (5) The org standard should be: async for I/O-bound services, multiprocessing for CPU-bound workers, never mix event loops in the same thread. Document this as an ADR and enforce it with `ruff` rules that flag `loop.run_until_complete` inside running loops.",
+    "fj": "I'd just use threading for services — async is too complex for most engineers.",
+    "fs": "Threading tops out at hundreds of connections and leaks resources on exception paths. I standardize on asyncio.TaskGroup for structured concurrency and asyncio.Queue for explicit backpressure — and I write the internal patterns so the rest of the org can copy them without understanding all the primitives.",
+    "level": "Staff",
+    "code": [
+      {
+        "lang": "python",
+        "label": "bounded TaskGroup + timeout + backpressure",
+        "accent": "fix",
+        "lines": [
+          "SEM = asyncio.Semaphore(50)  # max concurrent",
+          "QUEUE: asyncio.Queue = asyncio.Queue(maxsize=200)",
+          "",
+          "async def bounded_fetch(url: str) -> bytes:",
+          "    async with SEM:",
+          "        async with asyncio.timeout(10):",
+          "            return await _http_get(url)",
+          "",
+          "async def main(urls: list[str]) -> None:",
+          "    async with asyncio.TaskGroup() as tg:",
+          "        for url in urls:",
+          "            tg.create_task(bounded_fetch(url))",
+          "    # all tasks joined; any failure -> ExceptionGroup"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you propagate cancellation correctly through a chain of async tasks without leaking resources?",
+        "a": "Cancellation in asyncio raises `CancelledError` at the nearest `await` point. The critical discipline: always re-raise `CancelledError` — catch it for cleanup in a `finally` block, do minimal sync cleanup, then `raise`. Never `except CancelledError: pass`. With TaskGroup, cancelling the group cancels all children and waits for them to finish (they see CancelledError at their own awaits). Use `asyncio.shield(coro)` only for critical teardown work that must complete even if the parent is cancelled."
+      },
+      {
+        "q": "How do you set an org-wide standard for async context propagation — for example, passing a request ID through a chain of async calls?",
+        "a": "Use `contextvars.ContextVar` — it propagates automatically to tasks spawned from the current context (TaskGroup, asyncio.create_task copies the current context). Define a `REQUEST_ID: ContextVar[str] = ContextVar('request_id', default='')` at the app boundary, set it on ingress, and read it in any coroutine or logger. This avoids threading the ID through every function parameter. The org standard is a shared `ctx.py` module that defines the canonical ContextVars; internal frameworks integrate it so engineers get propagation for free."
+      }
+    ]
+  },
+  {
+    "q": "As Staff engineer, you are tasked with establishing Python code-quality tooling across 15 data teams. Design the ruff + pre-commit + CI pipeline and explain the cultural decisions behind each choice.",
+    "a": "The tooling stack in 2026: `ruff` as the single linter + formatter replacing flake8, isort, pyupgrade, and black — one binary, 10–100x faster, configured in `pyproject.toml`. `mypy` for static type checking. `pre-commit` for local enforcement so engineers get feedback before push (not just in CI). The CI pipeline runs `ruff check`, `ruff format --check`, and `mypy` in parallel as mandatory gates; slow tests run separately. The cultural decisions: (1) autocorrect on save in CI (`ruff --fix`) for style violations — never make humans manually fix trailing whitespace. (2) Make the linter config the source of truth, committed to the monorepo root and inherited by every package via `[tool.ruff]` in the root `pyproject.toml`. (3) Introduce `ruff` rules incrementally using `per-file-ignores` for legacy paths, with a quarterly 'rule adoption sprint'. (4) The pre-commit hook runs in `<2s` on the changed diff only (`ruff check --diff`); slow pre-commit hooks get ignored and removed. (5) Frame quality tooling as 'bike-shedding eliminator' — ruff removes the energy engineers waste arguing about import order and formatting in review, redirecting it to design discussions.",
+    "fj": "I'd let each team choose their own linter — forcing a standard kills autonomy.",
+    "fs": "Tooling autonomy means 15 conflicting configs and cross-team PRs that fail each other's linters. I pick one stack (ruff + mypy), configure it in the monorepo root, and give teams the escape hatch of per-file-ignores for migration — the standard is enforced, migration is gradual.",
+    "level": "Staff",
+    "code": [
+      {
+        "lang": "python",
+        "label": "monorepo pyproject.toml ruff config",
+        "accent": "fix",
+        "lines": [
+          "[tool.ruff]",
+          "line-length = 100",
+          "target-version = 'py312'",
+          "select = ['E','F','I','UP','B','C4','SIM']",
+          "# B = bugbear, UP = pyupgrade, SIM = simplify",
+          "",
+          "[tool.ruff.per-file-ignores]",
+          "'legacy/**' = ['E501','UP']   # quarantine old code",
+          "",
+          "# pre-commit: ruff check --fix + ruff format",
+          "# CI: ruff check (no --fix) + mypy --strict"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a ruff rule that triggers on valid existing code without suppressing it org-wide?",
+        "a": "Use `# noqa: RULE` inline with a mandatory comment explaining why, enforced by the `ruff-noqa-require-explanation` project setting. This means every suppression is self-documenting. For systematic false positives on a pattern, open a GitHub issue on ruff — the maintainers are responsive and rules get nuanced quickly. Never disable a whole rule category to avoid one false positive; quarantine at the narrowest scope (per-file, per-line) with a comment so it's findable for cleanup."
+      },
+      {
+        "q": "What is the right place to enforce import restrictions — ruff or mypy — and why?",
+        "a": "Ruff's `TID` (tidy-imports) rules block banned imports and enforce internal import boundaries (`from legacy.module import *` → error). This is the right place because it runs on every save and every CI commit, before mypy runs. Mypy can enforce type-level contracts (e.g. a Protocol must be satisfied) but is not the right tool for 'never import this module'. The `ruff` `module-boundaries` plugin or custom `flake8-tidy-imports` rules can express 'packages in ml/ must not import from legacy/'."
+      }
+    ]
+  },
+  {
+    "q": "You are Staff engineer for a platform that runs 200 Python data pipeline jobs daily. Design the dependency-injection and configuration strategy so that every job is testable in isolation without touching prod infrastructure.",
+    "a": "The core insight is that any function that constructs its own dependencies is untestable — testability requires that dependencies are injected, not instantiated. The pattern: define `Protocol`-typed interfaces for every external boundary (storage, database, secrets), have production code pass real implementations at the entry point, and tests pass fakes. For configuration, `pydantic-settings` is the standard: a `Settings(BaseSettings)` class reads from env vars, a `.env.test` file, or AWS SSM, with type validation on load. Never access `os.environ` or boto3 directly inside a transform function — always receive a `Settings` object or a typed client. For the 200-job org, establish: (1) a `JobContext` dataclass carrying `Settings`, `Logger`, and typed clients — passed as the first argument to every job's `run()` function; (2) a fixture factory in the shared test package that builds a `JobContext` with in-memory fakes; (3) a `make_context()` factory for production that wires real clients from environment. This means every job's `run()` can be called in a pytest unit test with zero infrastructure. The ratchet: CI runs jobs against the fake context in `<10s`; integration tests run against a staging context weekly.",
+    "fj": "I just mock os.environ in the test — that's standard practice.",
+    "fs": "Mocking os.environ is fragile and doesn't catch type errors in config. I inject a typed Settings object so the config is validated at construction, and pass a JobContext carrying all dependencies so the job's logic is testable without any mocking of globals.",
+    "level": "Staff",
+    "code": [
+      {
+        "lang": "python",
+        "label": "JobContext + Protocol-based DI",
+        "accent": "fix",
+        "lines": [
+          "from pydantic_settings import BaseSettings",
+          "from typing import Protocol",
+          "",
+          "class StorageClient(Protocol):",
+          "    def read(self, path: str) -> bytes: ...",
+          "    def write(self, path: str, data: bytes) -> None: ...",
+          "",
+          "class Settings(BaseSettings):",
+          "    bucket: str",
+          "    db_url: str",
+          "    model_config = {'env_file': '.env'}",
+          "",
+          "class JobContext:",
+          "    settings: Settings",
+          "    storage: StorageClient",
+          "    # test: pass InMemoryStorage()",
+          "    # prod: pass S3Client()",
+          "",
+          "def run(ctx: JobContext) -> None:",
+          "    data = ctx.storage.read(ctx.settings.bucket)"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you test a job that depends on the current date or a random seed without making tests non-deterministic?",
+        "a": "Inject the clock as a dependency — `get_today: Callable[[], date] = datetime.date.today` — and pass `lambda: date(2026, 1, 15)` in tests. Same for randomness: inject `rng: np.random.Generator` and pass `np.random.default_rng(seed=42)` in tests. The principle is that any function that calls `datetime.now()` or `random.random()` directly is non-deterministic and untestable; replace the source with an injected callable."
+      },
+      {
+        "q": "How does `pydantic-settings` handle secret rotation in a long-running process?",
+        "a": "By default, `BaseSettings` reads env vars once at construction. For secrets that rotate (AWS temporary credentials, Vault tokens), inject a `Callable[[], str]` (a secret-fetcher) rather than a plain `str` into the Settings, and call it per-request rather than at startup. Alternatively, reconstruct the Settings object on each job invocation from a fresh env snapshot — safe for batch jobs that aren't long-running. For daemon processes, use a background thread that re-reads the secret and swaps the client reference."
+      }
+    ]
+  },
+  {
+    "q": "As Principal engineer, you are evaluating CPython 3.13's no-GIL free-threaded build as the org's next runtime. What is your technical due-diligence framework and what does an org-wide rollout actually look like in 2026?",
+    "a": "The due-diligence framework has four axes: (1) Single-thread overhead — the free-threaded build costs 5–10% in CPython 3.14 (improved from 40% in 3.13 experimental) due to atomic reference counting. Profile your actual workload on both builds; for I/O-heavy pipelines the penalty is negligible, for pure-Python compute it matters. (2) Extension ecosystem readiness — check every C-extension dependency via `pip install <pkg> --pre --index-url https://pypi.org/simple/` on `python3.13t` and look for `Py_MOD_GIL_NOT_USED` declarations. NumPy ships free-threaded wheels as of 2.1; pandas is close but not fully there as of early 2026. Any extension that doesn't declare GIL-not-used re-enables the GIL silently with a warning — your parallelism disappears without a loud error. (3) Thread-safety correctness — CPython's built-in types are now thread-safe at the C level, but your application data races still exist. Run your test suite under ThreadSanitizer (`TSAN_OPTIONS=... python3.13t -X thread_sanitizer`) to catch races that the GIL was masking. (4) Rollout strategy — never org-wide first. Pilot on one CPU-bound pipeline where you have a clear benchmark, measure regression, fix, then expand. The org-level bet: free-threaded Python makes multiprocessing's pickling tax obsolete for CPU-parallel pipelines, which is a significant architecture simplification. Time the full rollout to CPython 3.15 when the extension ecosystem will be substantially more complete.",
+    "fj": "I'd upgrade the whole org to Python 3.13t now — free threading is the future.",
+    "fs": "The Principal move is to run a benchmark-driven pilot on one CPU-bound service, measure the single-thread overhead and extension compatibility, then publish a decision memo. Org-wide before the extension ecosystem settles is a reliability bet, not an engineering decision.",
+    "level": "Principal",
+    "code": [
+      {
+        "lang": "python",
+        "label": "detect GIL status at runtime",
+        "accent": "fix",
+        "lines": [
+          "import sys",
+          "",
+          "# Run: python3.13t script.py",
+          "if sys._is_gil_enabled():",
+          "    import warnings",
+          "    warnings.warn(",
+          "        'GIL re-enabled: an extension lacks',",
+          "        ' Py_MOD_GIL_NOT_USED. Parallelism lost.',",
+          "        RuntimeWarning, stacklevel=1",
+          "    )",
+          "",
+          "# Check per-extension in CI:",
+          "# python3.13t -W error::RuntimeWarning -c 'import numpy'"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the PEP 703 biased reference counting mechanism and why does it cause the single-thread overhead?",
+        "a": "PEP 703 replaces the single-threaded refcount increment (a non-atomic `++`) with a biased reference counting scheme: each object has a 'local' bias that the owning thread can increment cheaply, and a 'shared' count for cross-thread references that requires an atomic CAS. Objects that are only accessed from one thread pay near-zero overhead; objects passed between threads pay the atomic overhead on the shared count transitions. The single-thread overhead in CPython 3.14 comes from this mechanism being applied uniformly before the biased optimization kicks in — future versions are expected to reduce it further as the bias logic matures."
+      },
+      {
+        "q": "How do you make the case to leadership to fund a Python runtime migration when the GIL-free benefit is probabilistic?",
+        "a": "Frame it in terms of infrastructure cost and team velocity, not language features. A concrete model: if 10 CPU-bound batch jobs currently use ProcessPoolExecutor (each spawning 8 workers with pickle serialization overhead), migrating to free-threaded threading eliminates pickle round-trips estimated at X MB/job × Y jobs/day = Z GB of serialization avoided. Present a before/after benchmark on the pilot job with wall-clock time and p99 latency. Leadership responds to cost reduction and reliability — 'free-threaded Python lets us eliminate our multiprocessing complexity and reduce serialization overhead by 30%' is fundable; 'no-GIL is interesting' is not."
+      }
+    ]
+  },
+  {
+    "q": "You are Principal engineer setting the Python technical strategy for a 200-person data organization over a 3-year horizon. How do you govern language/runtime bets, manage multi-team tech debt, and decide when to introduce Rust extensions?",
+    "a": "The Principal role is to make the org's bets legible and reversible. Governance structure: a Python Platform Working Group with representatives from ML, data engineering, platform, and analytics meets quarterly to assess runtime and library changes; decisions are documented as ADRs with explicit 'trigger to revisit' conditions. Language/runtime bets follow a three-phase model: (1) Pilot — one team validates on a production workload with success metrics; (2) Incubate — tooling, documentation, and training are built; (3) Adopt — it's the org default. Proposals to adopt a new runtime (e.g. CPython 3.13t, Pyodide for WASM compute) or language extension must include a concrete benchmark, a migration cost estimate, and an exit strategy. For multi-team tech debt: categorize by blast radius (how many teams are blocked if this breaks), then staff a 'platform tax sprint' each quarter where platform engineers unblock the highest blast-radius items. Rust extensions policy: the bar is a demonstrated 10x performance improvement on a production bottleneck that cannot be addressed in Python, plus at least two engineers who can own the extension long-term. Never add a Rust extension for a function called once a day. Document Rust extensions as 'black-box wheels' with a pure-Python reference implementation for testing — this keeps the extension testable without a Rust toolchain.",
+    "fj": "I'd just let teams use whatever Python version they prefer and coordinate on Slack.",
+    "fs": "Slack-coordinated versioning across 200 people is operational chaos at incident time. I structure it as a Platform WG with quarterly ADRs, a three-phase adoption model, and a quarterly platform-tax sprint that systematically reduces the org's highest-blast-radius technical debt.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you deprecate and remove a widely-used internal Python library that 30 teams depend on?",
+        "a": "The Principal pattern: (1) announce the deprecation with a 6-month sunset date and a migration guide on the first day, not the last; (2) add a `DeprecationWarning` at import time in the next release; (3) provide an automated migration tool (a codemod via `libcst` or `rope`) that handles 80% of usages mechanically; (4) run the codemod against every consumer repo in CI to measure what's left; (5) staff one engineer to pair with each team on the remaining 20%. The common failure mode is announcing deprecation without a migration tool — 30 teams do nothing until the deadline and you either slip the deadline or break them. The codemod is the forcing function that makes migration tractable."
+      },
+      {
+        "q": "What is the '2-pizza team rule' equivalent for deciding when a Python library should become a shared platform service vs staying in-team?",
+        "a": "Promote to platform when: (a) three or more separate teams have independently implemented the same abstraction (duplication signal), (b) one team's implementation has become the de-facto reference and is imported by more than half the org (coordination cost), or (c) the capability has security/compliance implications that require org-wide consistency (risk signal). Don't promote because it's elegant — premature platformization creates maintenance burden and API lock-in. The ADR for promotion must name the three teams that will benefit, define the ownership model (who is on-call for the platform library), and set an SLA for issue response."
+      }
+    ]
+  },
+  {
+    "q": "As Principal engineer, how do you design Python's role in an org that also runs Rust services, Go microservices, and Scala/Spark jobs — where does Python start and stop, and how do you enforce the boundary?",
+    "a": "The architectural principle: Python is the coordination and experimentation layer; compiled languages own the performance-critical hot paths; boundaries are enforced by protocol, not by convention. Python's mandate: orchestration (Airflow, Prefect), ML/data-science exploration and model serving (via ONNX or TorchServe), configuration and CLI tooling, and glue code that calls fast services. Rust/Go own: real-time feature computation, sub-millisecond serving latency, high-throughput streaming processors. Scala/Spark own: large-scale batch joins and aggregations. The cross-language boundary protocol is Arrow IPC or Protobuf/gRPC — not ad-hoc CSV pipes or language-specific serialization. Enforce the boundary by: (1) requiring that any new service that processes more than 10k RPS go through a latency review before being written in Python; (2) mandating that Python services calling Rust/Go do so over gRPC with a Python-generated stub (not subprocess or shell out); (3) prohibiting Python-native Parquet writes in real-time serving paths (use the Arrow C++ library via PyArrow which delegates to native code). The Principal-level mistake to avoid: polyglot diversity for its own sake. If 90% of engineers are Python-first, introducing a Go service for a non-critical path incurs hiring, tooling, and on-call complexity disproportionate to the gain. Require a demonstrated 10x improvement or a compliance requirement before adding a new runtime to the org's portfolio.",
+    "fj": "I'd just pick one language for everything — polyglot orgs are too complex.",
+    "fs": "One-language orgs end up with Python in real-time serving paths where it doesn't belong. I define Python's mandate by what it's uniquely good at — coordination, exploration, ML — and enforce cross-language boundaries via Arrow IPC and gRPC stubs, not ad-hoc subprocess calls.",
+    "level": "Principal",
+    "code": [
+      {
+        "lang": "python",
+        "label": "Python → Rust service via gRPC stub",
+        "accent": "fix",
+        "lines": [
+          "# generated stub from feature_service.proto",
+          "from feature_service_pb2_grpc import FeatureServiceStub",
+          "from feature_service_pb2 import FeatureRequest",
+          "import grpc",
+          "",
+          "channel = grpc.secure_channel(",
+          "    'features.internal:443',",
+          "    grpc.ssl_channel_credentials()",
+          ")",
+          "stub = FeatureServiceStub(channel)",
+          "",
+          "# Python owns orchestration; Rust owns compute",
+          "resp = stub.GetFeatures(",
+          "    FeatureRequest(entity_ids=batch_ids),",
+          "    timeout=0.05   # 50ms budget enforced here",
+          ")"
+        ]
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a team that wants to rewrite a Python pipeline in Rust for performance, and your data suggests it isn't the bottleneck?",
+        "a": "Start with instrumentation, not opinion. Instrument the full pipeline with OpenTelemetry spans so the actual bottleneck is visible — if 80% of latency is in the Postgres query or the S3 read, rewriting the Python logic in Rust gives 20% improvement at most, not the 10x the team hopes for. Present the span data to the team and frame the rewrite as a hypothesis: 'we believe Python logic is the bottleneck; here is what the data shows.' If the data refutes the hypothesis, redirect the engineering effort to the actual bottleneck. Only approve the Rust rewrite if the profile data confirms Python CPU is genuinely the ceiling — then set clear success metrics (p99 latency improvement, infra cost reduction) to evaluate the rewrite post-deploy."
+      },
+      {
+        "q": "How do you use Apache Arrow as the universal interchange format between Python, Rust, and Spark in a polyglot data org?",
+        "a": "Arrow's C Data Interface allows zero-copy buffer sharing between runtimes in the same process via a pair of structs (`ArrowSchema` + `ArrowArray`) — PyArrow, the Arrow Rust crate, and DataFusion all implement it. Across process boundaries, Arrow IPC streams (a sequence of record batches with a schema header) are the standard: Python serializes with `pyarrow.ipc.new_stream`, Rust deserializes with `arrow::ipc::reader::StreamReader`. Spark's Arrow-based pandas UDFs use this same protocol to batch data across the JVM–Python boundary. The Principal-level decision is to mandate Arrow as the inter-service serialization standard for any analytical data contract, replacing CSV, custom JSON, and pickle — this gives you schema evolution (via field metadata), zero-copy in-process sharing, and language-agnostic tooling for debugging buffer contents."
+      }
+    ]
   }
 ]

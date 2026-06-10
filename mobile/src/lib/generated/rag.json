@@ -1073,5 +1073,465 @@
         "a": "Occasionally — if retrieval recall is already high, precision is fine, and the bottleneck is genuinely reasoning capacity (complex multi-step synthesis over correctly-retrieved evidence), a stronger model helps. And if the task needs more supporting evidence than current k provides and precision holds, more chunks help. The point isn't that the knobs never work — diagnose before turning them."
       }
     ]
+  },
+  {
+    "q": "How do you architect a Batch Ingestion pipeline for loading millions of documents into a RAG vector store without overwhelming the embedding API or the index?",
+    "a": "Batch Ingestion at scale needs three controls: rate limiting, parallel worker pools, and an idempotent checkpoint mechanism. You read source documents in configurable batches (typically 256–512 documents), chunk each document, then submit embedding requests in sub-batches sized to the provider's rate limit — OpenAI text-embedding-3 allows up to 2048 inputs per request in early 2026. Workers run in parallel threads or async coroutines, but a shared token-bucket throttler keeps the aggregate rate under the API quota. Each successfully embedded and upserted batch writes its document IDs to a checkpoint store (a simple file or Redis set); if the job dies mid-run, restart resumes from the last checkpoint rather than from scratch. Index writes should also be batched — most vector databases accept bulk upserts that are 5–10× faster than single-document writes.",
+    "fj": "I'd just loop through all documents, embed one at a time, and upsert.",
+    "fs": "Single-doc loops saturate API rate limits immediately and are 10× slower than bulk upserts. I batch at every layer — read, embed, upsert — with a token-bucket throttler, checkpointing so a crash resumes rather than replays the whole corpus.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Batch Ingestion with throttle + checkpoint",
+        "lang": "python",
+        "lines": [
+          "import asyncio, itertools",
+          "from tokenBucket import TokenBucket",
+          "",
+          "bucket = TokenBucket(rate=500_000, capacity=500_000)",
+          "",
+          "async def ingest_batch(docs, checkpoint):",
+          "    chunks = [chunk(d) for d in docs]",
+          "    flat = list(itertools.chain(*chunks))",
+          "    await bucket.consume(sum(len(c.split()) for c in flat))",
+          "    vecs = await embed_api(flat)  # bulk call",
+          "    index.upsert_batch(list(zip(flat, vecs)))",
+          "    checkpoint.mark_done([d.id for d in docs])",
+          "",
+          "# resume: skip already-checkpointed doc IDs"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you size the Batch Ingestion worker pool without hitting rate limits?",
+        "a": "Calculate: (API rate limit tokens/min) / (avg tokens per batch). For a 500K token/min limit and 4K-token batches, that's ~125 batches/min. Spread across N workers, each waits (60/125) seconds between calls. Add jitter to avoid synchronized bursts. Monitor actual 429 rates and back off exponentially when they occur."
+      },
+      {
+        "q": "What checkpoint granularity is fine enough without creating checkpoint overhead?",
+        "a": "Checkpoint at the document level, not the chunk level — re-embedding a 5-chunk document is negligible waste vs tracking thousands of chunk IDs. Store a set of completed document hashes in Redis or a file; each batch compares against it in O(1). The checkpoint overhead is amortized over many documents and is negligible compared to embedding cost."
+      },
+      {
+        "q": "How do you validate Batch Ingestion completed correctly?",
+        "a": "After the run, compare total chunks in the index against the expected count from source (chunk counts are deterministic for fixed chunking), spot-check 50 random documents with a test retrieval query per document to verify their chunks are retrievable, and assert that no source document ID is missing from the index manifest. Alert if the gap exceeds 0.1% of corpus size."
+      }
+    ]
+  },
+  {
+    "q": "In a Batch Ingestion pipeline, how do you design the chunking stage so it scales to terabytes of documents without becoming a CPU bottleneck?",
+    "a": "Chunking is CPU-bound text processing, not I/O-bound, so parallelizing with Python multiprocessing (not threading, due to the GIL) gives near-linear speedup per core. The design is a producer–consumer pipeline: a reader process streams documents from object storage in batches, a pool of chunker workers splits and tokenizes each document, and an embedding queue feeds the API workers. Chunking with tiktoken for token counting is ~10MB/s per core on typical hardware; a 16-core machine processes ~160MB/s, enough for several terabytes per few hours. Profile and confirm the bottleneck before scaling horizontally — on large Batch Ingestion runs the embedding API rate limit is usually tighter than chunking throughput. Cache the tokenizer vocabulary at worker startup to avoid repeated disk reads.",
+    "fj": "I'd run chunking in a single-threaded loop — it's just string splitting.",
+    "fs": "Chunking is CPU-bound; a single-threaded loop leaves 15 cores idle. I use multiprocessing worker pools so chunking keeps pace with the embedding queue, profile the actual bottleneck first, and cache the tokenizer at startup.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "parallel chunker pool",
+        "lang": "python",
+        "lines": [
+          "from concurrent.futures import ProcessPoolExecutor",
+          "import tiktoken",
+          "",
+          "enc = tiktoken.get_encoding('cl100k_base')",
+          "",
+          "def chunk_doc(doc, size=400, overlap=60):",
+          "    toks = enc.encode(doc.text)",
+          "    out, i = [], 0",
+          "    while i < len(toks):",
+          "        out.append(enc.decode(toks[i:i+size]))",
+          "        i += size - overlap",
+          "    return out",
+          "",
+          "with ProcessPoolExecutor(max_workers=16) as ex:",
+          "    all_chunks = list(ex.map(chunk_doc, docs))"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you avoid re-chunking unchanged documents on incremental Batch Ingestion runs?",
+        "a": "Hash each source document's content at read time. On incremental runs, compare the hash against a stored manifest; skip chunking entirely for unchanged documents. Only new or modified documents flow into the chunking pool. This reduces chunking work proportionally to the corpus churn rate, which is typically 1–10% per run on stable enterprise corpora."
+      },
+      {
+        "q": "Why use tiktoken for token counting during chunking rather than word splitting?",
+        "a": "Embedding APIs charge and enforce limits in tokens, not words — a word-count estimate can be 20–40% off, causing batch size violations. tiktoken matches the exact tokenization of OpenAI models so your batch stays within the 8192-token per-input limit and your token-bucket throttler uses accurate counts. Use the model's actual encoding (cl100k_base for text-embedding-3-* family)."
+      }
+    ]
+  },
+  {
+    "q": "Incremental re-indexing versus full Batch Ingestion re-index — when do you trigger each, and what are the failure modes unique to incremental?",
+    "a": "Full Batch Ingestion re-indexing is triggered by embedding-model upgrades (vectors are incompatible across models), major schema changes to chunk structure, or corruption of the index manifest. Incremental re-indexing runs continuously for corpus changes: new, updated, or deleted documents. Incremental has three unique failure modes. Zombie chunks: a document is deleted from source but its chunks remain in the index because the deletion signal was missed, so stale content keeps surfacing. Partial updates: a document update is partially processed (some chunks replaced, others not) after a crash, producing a hybrid of old and new chunks that can return contradictory answers. Index drift: over many incremental runs, documents chunked with slightly different parameters (e.g., after a chunker config change) coexist with old chunks, degrading retrieval consistency. Each requires explicit guards: tombstone-based deletion tracking, transactional chunk replacement per document, and a periodic reconciliation job that compares the index manifest to the source catalog.",
+    "fj": "I'd always do incremental updates — why rebuild when you can just update?",
+    "fs": "Incremental has zombie chunks, partial updates, and index drift as failure modes that a full Batch Ingestion re-index resets. I use incremental for routine changes but schedule a periodic full reconciliation and always trigger a full re-index on embedding-model upgrades.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you implement transactional chunk replacement per document in a vector database that lacks transactions?",
+        "a": "Use a two-phase approach: write new chunks with a 'pending' status tag, then atomically swap by deleting old chunks and promoting pending ones in a single bulk operation. If the job crashes between phases, a reconciliation job detects documents with only pending or only old chunks and re-runs that document. Effectively you implement optimistic concurrency at the document level using the status metadata field."
+      },
+      {
+        "q": "How often should you run a full Batch Ingestion re-index as a reconciliation sweep?",
+        "a": "Monthly for stable enterprise corpora, weekly for high-churn knowledge bases. The reconciliation sweep compares every document hash in the source catalog against the index manifest and re-processes mismatches. It catches zombie chunks, partial updates, and any silent data corruption. Budget it as a background job during low-traffic hours and alert if the mismatch rate exceeds 0.5%."
+      }
+    ]
+  },
+  {
+    "q": "How do you deduplicate documents during Batch Ingestion when the same content arrives from multiple source systems with different IDs?",
+    "a": "Content-level deduplication during Batch Ingestion requires two passes. First, compute a SimHash or MinHash fingerprint of each document's normalized text (lowercased, punctuation stripped) before chunking. Index fingerprints in a lightweight hash store (Redis sorted set or Bloom filter for memory efficiency). When a new document arrives, check its fingerprint against the store: exact duplicates (Hamming distance 0) are skipped entirely; near-duplicates (distance ≤ 3 for a 64-bit SimHash) are flagged for a secondary comparison or merged. Keep a canonical ID per fingerprint so all source IDs map to one indexed document, and store the provenance (all source IDs) in chunk metadata for audit. At scale, MinHash with LSH bands is more memory-efficient for large corpora — a 128-bit MinHash with 16 bands catches documents with ≥80% Jaccard similarity. Dedup before embedding, since embedding duplicates is wasted API cost.",
+    "fj": "I'd dedup by checking if the document ID already exists in the index.",
+    "fs": "ID-based dedup only catches exact re-ingestion of the same record. The real problem is semantically identical content with different IDs from different source systems. I use SimHash fingerprinting before chunking to catch both exact and near-duplicate content, keeping a canonical ID per fingerprint.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "SimHash dedup in Batch Ingestion",
+        "lang": "python",
+        "lines": [
+          "from simhash import Simhash",
+          "",
+          "seen: dict[int, str] = {}  # hash -> canonical_id",
+          "",
+          "def dedup_doc(doc):",
+          "    h = Simhash(doc.text.lower()).value",
+          "    for existing_h, cid in seen.items():",
+          "        dist = bin(h ^ existing_h).count('1')",
+          "        if dist <= 3:",
+          "            return cid  # near-duplicate, skip",
+          "    seen[h] = doc.id",
+          "    return None  # new, ingest it"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle near-duplicates that should be kept as separate documents despite high similarity?",
+        "a": "Store a 'dedup whitelist' of document-ID pairs that are intentionally similar but distinct (e.g., v1 and v2 of the same policy document, kept for audit). Check this whitelist before skipping near-duplicates. For version-controlled documents, use the document type and version number as a compound key for dedup scope — don't collapse different versions, only genuinely redundant copies."
+      },
+      {
+        "q": "When should you use a Bloom filter instead of a hash map for dedup during Batch Ingestion?",
+        "a": "When the corpus is large enough that storing all fingerprints in RAM is prohibitive. A Bloom filter with 1% false positive rate uses ~10 bits per element — 100M documents needs ~120MB, versus several GB for a hash map. The trade-off is false positives (a small fraction of unique documents incorrectly flagged as duplicates). Tune the false positive rate based on how costly a missed ingest is versus the memory budget."
+      }
+    ]
+  },
+  {
+    "q": "Your Batch Ingestion job hits embedding API rate limits mid-run and fails. How do you design for resilience so restarts are safe and fast?",
+    "a": "Resilience in Batch Ingestion requires three things: idempotent operations, durable checkpointing, and graceful rate-limit handling. Idempotency means that re-processing a document produces the same chunks and vectors as the first run — guaranteed by deterministic chunking and upsert-not-insert semantics so re-running a batch is a no-op for already-indexed chunks. Durable checkpointing persists the set of completed document IDs to a store that survives process crashes (a file, DynamoDB, or Redis with AOF); on restart, the pipeline filters out already-completed documents before queuing work. Graceful rate-limit handling means catching 429 responses, backing off with exponential backoff + jitter (don't retry immediately or you amplify the burst), and re-queuing the failed batch rather than failing the job. A dead-letter queue holds batches that fail after N retries for human inspection. Instrument the job with progress metrics (documents processed, rate limit hits, retry counts) so you can predict completion time and detect anomalies.",
+    "fj": "I'd retry failed batches immediately in a loop until they succeed.",
+    "fs": "Immediate retries amplify rate-limit bursts. I combine idempotent upserts + durable document-level checkpointing + exponential backoff with jitter, so a failed run restarts exactly where it left off without redundant work or API hammering.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "retry with backoff in Batch Ingestion",
+        "lang": "python",
+        "lines": [
+          "import time, random",
+          "",
+          "def embed_with_retry(texts, max_retries=5):",
+          "    for attempt in range(max_retries):",
+          "        try:",
+          "            return embed_api(texts)",
+          "        except RateLimitError:",
+          "            wait = (2 ** attempt) + random.random()",
+          "            time.sleep(wait)  # exp backoff + jitter",
+          "    raise Exception('Batch Ingestion: max retries exceeded')"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What's the difference between a checkpoint and a dead-letter queue in Batch Ingestion resilience?",
+        "a": "A checkpoint records success — 'these document IDs are fully indexed.' A dead-letter queue records persistent failures — 'these batches failed after N retries and need investigation.' Together they give complete accountability: everything either succeeds (checkpoint) or is explicitly captured for retry or escalation (DLQ). Without a DLQ, silent drops are invisible until a user reports a missing answer."
+      },
+      {
+        "q": "How do you surface Batch Ingestion progress and ETA to the team during a large initial load?",
+        "a": "Emit structured metrics: documents_processed, documents_total, chunks_upserted, api_errors, current_rate_docs_per_sec. From current_rate and documents_remaining you get ETA. Push these to a metrics store (Prometheus, CloudWatch) and build a simple dashboard. For very long jobs (days), send hourly Slack updates with percent complete and estimated finish. Visibility prevents silent stalls being missed for hours."
+      }
+    ]
+  },
+  {
+    "q": "How do you schedule and orchestrate a recurring Batch Ingestion pipeline for a knowledge base that receives daily document updates?",
+    "a": "A daily Batch Ingestion job should be scheduled via a workflow orchestrator (Airflow, Prefect, or a cloud-native scheduler like AWS EventBridge + Step Functions) rather than a cron script, because orchestrators provide retry logic, dependency tracking, alerting, and audit history. The DAG has four stages: extract new or modified documents from source systems (using a high-watermark timestamp or CDC feed), chunk and deduplicate, embed in batches with rate-limit throttling, and upsert into the vector store. Run the job during off-peak hours to avoid competing with query traffic for embedding API quota. Use an SLO on index freshness (e.g., documents indexed within 4 hours of source change) and alert if the daily run's lag metric exceeds it. For corpora with time-sensitive content, supplement daily Batch Ingestion with a real-time micro-batch stream for high-priority document types.",
+    "fj": "I'd run a cron job that calls the ingestion script every night.",
+    "fs": "A bare cron script has no retry, alerting, or audit trail. I orchestrate Batch Ingestion as a DAG with extract, chunk+dedup, embed, upsert stages, an index-freshness SLO, and a real-time micro-batch supplement for time-sensitive content.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you handle a Batch Ingestion run that starts while the previous run is still in progress?",
+        "a": "Use a distributed lock (e.g., a DynamoDB conditional write or Redis SETNX) that the job acquires at start and releases at end. If a new run can't acquire the lock, it either waits or skips with a warning. Without a lock, two concurrent runs can double-embed the same documents, produce duplicate chunks in the index, and degrade retrieval precision. Expose a 'previous run still running' alert so the team knows the schedule is falling behind."
+      },
+      {
+        "q": "How does a CDC feed differ from high-watermark polling for detecting changes in Batch Ingestion?",
+        "a": "High-watermark polling queries the source for records with updated_at > last_run_timestamp. It's simple but misses deletes and is subject to clock skew. Change Data Capture tails the database write-ahead log and captures every insert, update, and delete as an event stream. CDC catches deletions (critical for zombie chunk prevention), has lower latency, and is more reliable than timestamp polling on systems where updated_at isn't always maintained. CDC requires more infrastructure; high-watermark is the practical default for simpler sources."
+      }
+    ]
+  },
+  {
+    "q": "During Batch Ingestion, how do you handle documents that are too large to embed as a single chunk, and what happens if a document is repeatedly at the boundary of your chunk size?",
+    "a": "Documents too large for a single embedding are split into chunks during Batch Ingestion — this is the normal case. The edge case is documents that land exactly at the token limit boundary across many runs: with fixed-size chunking, a document that grows from 395 to 405 tokens across an update will chunk differently (one vs two chunks), so the old chunk must be deleted and new chunks inserted, not just updated in place. Guard against this by keying stored chunks on a (document_id, chunk_index) composite key and treating any change in chunk count as a full document re-process — delete all existing chunks for that document_id, then insert the new set. This is why Batch Ingestion upserts should be document-atomic: delete-then-insert-all per document, never patch individual chunks, to avoid stale orphan chunks from prior chunk counts.",
+    "fj": "I'd just upsert the chunks that changed and leave the rest alone.",
+    "fs": "If the chunk count changes (document grew past a chunk boundary), patching individual chunks leaves orphan chunks. I treat re-ingestion as document-atomic: delete all chunks for the document_id, then insert the new chunk set as one transaction.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "document-atomic chunk replacement",
+        "lang": "python",
+        "lines": [
+          "def reingest_document(doc_id, new_text, index):",
+          "    # Step 1: delete all old chunks atomically",
+          "    index.delete(filter={'doc_id': doc_id})",
+          "    # Step 2: chunk and embed fresh",
+          "    new_chunks = chunk(new_text)",
+          "    vecs = embed_api(new_chunks)",
+          "    # Step 3: bulk upsert new chunks",
+          "    index.upsert_batch([",
+          "        {'id': f'{doc_id}:{i}', 'vec': v,",
+          "         'text': c, 'doc_id': doc_id}",
+          "        for i, (c, v) in enumerate(zip(new_chunks, vecs))",
+          "    ])"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you prevent serving stale chunks during the delete-then-insert window in Batch Ingestion?",
+        "a": "For non-critical documents, accept eventual consistency — the window is typically milliseconds to seconds. For high-stakes documents, use a blue-green index pattern: write new chunks to a shadow namespace, then atomically redirect queries from the old namespace to the new one. This adds operational complexity but eliminates the stale-chunk window entirely. Most RAG corpora tolerate brief eventual consistency."
+      },
+      {
+        "q": "What metadata should you attach to each chunk during Batch Ingestion for maximum operational flexibility later?",
+        "a": "At minimum: doc_id, chunk_index, chunk_count (for validation), content_hash, ingested_at timestamp, source_system, doc_updated_at, and any access-control labels. Optionally: section title, document type, language, and the embedding model version. The embedding model version is critical — it lets you identify which chunks need re-embedding after a model upgrade without a full manifest scan."
+      }
+    ]
+  },
+  {
+    "q": "How do you handle embedding backfill during Batch Ingestion when you upgrade to a new embedding model mid-production?",
+    "a": "An embedding-model upgrade during Batch Ingestion is one of the few cases requiring a full corpus re-embed — you cannot mix vectors from different models in the same index because their geometric spaces are incompatible, and a query embedded by the new model will return garbage results against old-model vectors. The safe pattern is a parallel index cutover: provision a second index, run the full Batch Ingestion backfill into it using the new model (the old index keeps serving queries throughout), validate the new index with your recall@k harness on a labeled test set, and then atomically flip query routing from the old index to the new one. After a monitored bake-in period with no regressions, decommission the old index. Never merge the two indexes or serve from both simultaneously. Budget the backfill time carefully: at 500K tokens/minute API throughput, re-embedding a 10M-chunk corpus with an average 300 tokens per chunk takes roughly 100 hours of embedding time at full API quota, which means a multi-day job requiring careful scheduling.",
+    "fj": "I'd just update new documents with the new model and keep old ones as-is.",
+    "fs": "Mixing embedding models breaks retrieval — query vectors and document vectors must share the same space. I build a parallel index with a full Batch Ingestion backfill, validate recall@k, then atomically cut over queries, never mixing vector spaces mid-index.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "parallel index cutover for model upgrade",
+        "lang": "python",
+        "lines": [
+          "# Step 1: full Batch Ingestion into new index",
+          "new_index = VectorDB('index_v2_embeddings')",
+          "for batch in read_all_docs(batch_size=512):",
+          "    chunks = [chunk(d) for d in batch]",
+          "    flat = list(itertools.chain(*chunks))",
+          "    vecs = embed_api_v2(flat)  # NEW model",
+          "    new_index.upsert_batch(zip(flat, vecs))",
+          "# Step 2: validate",
+          "assert recall_at_k(new_index, test_set, k=5) >= 0.85",
+          "# Step 3: atomic query cutover",
+          "router.set_active_index('index_v2_embeddings')"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you estimate the Batch Ingestion backfill time before committing to a model upgrade?",
+        "a": "Measure: (total chunks in corpus) × (avg tokens per chunk) / (API tokens-per-minute quota) = hours of pure embedding time. Add 20% for overhead (rate limit backoffs, retries, I/O). For a 50M-chunk corpus at 300 tokens/chunk and 500K TPM quota: 50M × 300 / 500K = 30,000 minutes = ~21 days. That signals you need either higher API quota tier, a self-hosted model, or a phased rollout strategy."
+      },
+      {
+        "q": "Can you do a phased model upgrade instead of a full simultaneous backfill?",
+        "a": "Only if you shard the index by document type or corpus section and upgrade shards independently — within each shard, all vectors stay in one model's space. Never mix models within the same searchable shard. This lets you upgrade one corpus section per week on limited API quota. Queries route to the shard for the relevant domain. Operationally complex but feasible for very large corpora where a full simultaneous Batch Ingestion backfill would take weeks."
+      }
+    ]
+  },
+  {
+    "q": "What rate-limit strategies should you apply at the Batch Ingestion layer specifically, and how do they differ from runtime query-time rate limiting?",
+    "a": "Batch Ingestion and query-time traffic share the same embedding API quota, so Batch Ingestion must be a polite background consumer, not a quota hog. The strategies differ in priority and mechanism. At Batch Ingestion time, use a token-bucket that intentionally reserves 30–50% of quota headroom for query-time traffic — Batch Ingestion runs slower but never starves production queries. Use adaptive throttling: monitor the embedding API's real-time quota utilization and reduce Batch Ingestion throughput when query-time usage spikes (e.g., during business hours). Schedule large Batch Ingestion runs during off-peak windows (nights and weekends). Backpressure from a 429 should pause the entire Batch Ingestion pipeline for a longer window (30–60 seconds) rather than retrying one batch immediately, because 429s indicate sustained pressure, not a transient spike. At query time, the concern is opposite: latency-sensitive, must not be queued behind a slow Batch Ingestion batch. Use separate API keys or quota pools if the provider supports it, so Batch Ingestion quota exhaustion physically cannot impact query-time latency.",
+    "fj": "I'd just run Batch Ingestion at max throughput and let the 429s tell me when to slow down.",
+    "fs": "Max-throughput Batch Ingestion starves query-time embedding and creates 429 storms. I reserve quota headroom for queries, schedule Batch Ingestion off-peak, use adaptive throttling during business hours, and ideally separate API keys so Batch Ingestion can never impact query latency.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you monitor that Batch Ingestion is not impacting query-time embedding latency?",
+        "a": "Instrument query-time embedding P95 latency as a golden signal. During Batch Ingestion runs, watch for correlation: if P95 rises when Batch Ingestion throughput is high, you're sharing quota. Track the embedding API's quota utilization percentage as a metric. If it's above 70% during Batch Ingestion, reduce batch throughput or split quota pools. The goal is zero observable impact on query latency from background ingestion."
+      },
+      {
+        "q": "What's the difference between token-bucket and leaky-bucket throttling for Batch Ingestion?",
+        "a": "Token bucket allows bursting up to the bucket capacity, then enforces an average rate. This matches how most embedding APIs work — you can burst for a short window, then sustain the average. Leaky bucket outputs at a constant rate regardless of input bursts, smoothing traffic but preventing any burst absorption. For Batch Ingestion, token bucket is preferred: it lets you process a large batch quickly when quota is available, then pause, rather than artificially spreading at a constant drip rate."
+      }
+    ]
+  },
+  {
+    "q": "How do you structure Batch Ingestion for a multi-tenant RAG system where each tenant has a separate knowledge base with different update frequencies and volumes?",
+    "a": "Multi-tenant Batch Ingestion requires per-tenant isolation at three levels: data, scheduling, and quota. Data isolation means each tenant's chunks carry a tenant_id in metadata and are either physically separated (per-tenant index) or logically separated (single index with pre-filter enforcement). Scheduling isolation means tenants with high-frequency updates (say, hourly micro-batches) don't delay tenants with daily bulk loads — use a priority queue with per-tenant lanes and configurable concurrency limits per tenant. Quota isolation means a large tenant's Batch Ingestion run can't exhaust the API quota and starve small tenants; allocate a per-tenant token budget that scales with their tier (free, pro, enterprise). Track per-tenant ingestion metrics (documents indexed, lag, error rate) and expose them in a tenant dashboard. On failure, a tenant's Batch Ingestion job should fail in isolation without affecting other tenants' pipelines.",
+    "fj": "I'd run all tenant ingestion in one shared loop and just label the chunks by tenant_id.",
+    "fs": "A shared loop means one large tenant's Batch Ingestion run can starve all others. I use per-tenant priority lanes, per-tenant quota budgets, and isolated failure handling so one tenant's pipeline failure never affects others.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Should you use per-tenant indexes or a single shared index with tenant_id filters for multi-tenant RAG?",
+        "a": "Per-tenant indexes provide hard data isolation and simplify access control (no pre-filter can be bypassed), but multiply operational overhead with each new tenant. A shared index with tenant_id pre-filters is simpler to operate but requires that the pre-filter is enforced at every query point — a missing filter is a data-leak bug. The decision hinges on tenant count, compliance requirements, and whether tenants need SLA guarantees (per-tenant indexes give dedicated capacity). For enterprise compliance (HIPAA, SOC2), per-tenant isolation is usually required."
+      },
+      {
+        "q": "How do you handle a tenant's first-time Batch Ingestion load that is 100× larger than their typical daily updates?",
+        "a": "Treat it as a burst job with a separate high-capacity pipeline run, not a standard daily job. Provision temporary additional API quota (many providers support burst tier increases), schedule it during off-peak hours, and use a separate priority lane so it doesn't block other tenants' daily incremental Batch Ingestion. After the initial load completes, switch the tenant to the standard incremental pipeline. Alert when a tenant's first-load volume exceeds a threshold so you can proactively provision rather than discovering the constraint mid-run."
+      }
+    ]
+  },
+  {
+    "q": "You own a RAG platform serving 20 teams. How do you design the platform so teams can iterate on chunking, embedding models, and retrievers independently without breaking each other or the shared index?",
+    "a": "A shared monolithic index is a platform anti-pattern at this scale: one team changing chunk size or embedding models would invalidate every other team's vector space. The right architecture is a namespace-per-team index behind a shared platform API that abstracts the vector database, with a standardized schema for chunk metadata (doc_id, chunk_index, tenant_id, embedding_model_version, ingested_at). Teams declare their pipeline config (chunker, embedding model, retriever strategy) in a versioned config registry; the platform runs isolated ingestion pipelines per config version and enforces a compatibility contract: any config change triggers a full namespace re-index in a shadow namespace before the team can cut over. The platform provides a canonical eval harness (recall@k, RAGAS metrics) that any team can run against their namespace, with CI gates that block namespace promotion if recall@5 drops more than 5% from their baseline. Shared services -- rate-limit throttler, semantic cache, ingestion queue, cost accounting -- are provided as platform primitives. This separates platform stability from team experimentation.",
+    "fj": "I'd let each team manage their own index and embedding calls directly.",
+    "fs": "Uncoordinated direct index access means any team's config change breaks shared infrastructure and there is no cost or quality visibility. A platform API with namespace isolation, versioned config registry, and canonical eval gates lets teams iterate without cross-team blast radius.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle embedding model diversity across teams -- some on text-embedding-3-small, others on a self-hosted BGE -- without maintaining separate infrastructure per model?",
+        "a": "Abstract the embedding model behind a platform embedding service that accepts text and a model_id, and routes to the appropriate backend (hosted API or self-hosted inference endpoint). Each namespace tags its chunks with embedding_model_version. The platform service enforces that all writes to a namespace use the same model version, rejecting mismatches. When a team upgrades models, they provision a new namespace and the platform handles the full backfill via the shared ingestion pipeline. Teams never call embedding APIs directly; cost and quota are centrally metered."
+      },
+      {
+        "q": "How do you prevent a noisy-neighbor team from exhausting shared API quota and degrading other teams' retrieval latency?",
+        "a": "Per-team token budgets allocated from a shared pool, enforced by the platform's rate-limit throttler. Teams are assigned a baseline quota (scaled to their tier) and can burst up to a cap with back-pressure: when a team hits its burst cap, their ingestion queue pauses rather than taking quota from neighbors. Query-time embedding gets a protected reserved quota that ingestion traffic cannot touch -- physically separated API keys or quota pools if the provider supports it. Monitor per-team quota utilization as a platform SLO and alert before exhaustion."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a retrieval evaluation framework that works across 15 different RAG use cases on your platform -- from a customer-support bot to a code search engine to a regulatory document search -- each with different query distributions and quality definitions?",
+    "a": "A one-size-fits-all eval harness fails because \"quality\" is use-case-specific: a customer-support bot needs high faithfulness and low hallucination rate, code search needs exact-match precision on function signatures, and regulatory search needs zero missed relevant clauses (high recall). The platform provides a shared eval infrastructure -- a harness runner, metric library, and CI gate -- but each team owns their labeled test set and their quality contract. The harness has three layers: retrieval metrics (recall@k, precision@k, MRR) that are universal, generation metrics (faithfulness, answer relevancy via RAGAS) that are universal but judge-model-configurable, and use-case-specific metrics (e.g., exact-match rate for code search, no-hallucination rate for regulatory search) that teams plug in as custom scorers. The platform aggregates metric trends across all namespaces so platform-wide regressions from a shared infrastructure change (a vector database upgrade, a chunker library bump) are visible before they reach teams. Each team's CI gate is expressed as a set of metric thresholds in their config registry entry.",
+    "fj": "I'd use RAGAS faithfulness and answer relevancy for all use cases.",
+    "fs": "RAGAS covers generation quality universally but doesn't capture use-case-specific quality -- code search needs exact-match precision, regulatory search needs recall above a clause-coverage threshold. I layer universal metrics over use-case-specific custom scorers, with platform-level aggregation to catch shared infrastructure regressions.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you keep 15 teams' labeled test sets from becoming stale and misleading?",
+        "a": "Each test set has a freshness SLO: teams are required to refresh their labeled query-document pairs quarterly, or when their query cluster distribution shifts by more than a configurable threshold measured by embedding-space drift of the query log. The platform mines the team's production query logs, clusters them, and surfaces new clusters that are uncovered by the current test set, flagging them for the team to label. A stale test set masks real regressions -- if users are asking questions outside the test set's coverage, the CI gate gives false confidence."
+      }
+    ]
+  },
+  {
+    "q": "Your RAG platform ingests 50M documents across teams. Walk through how you architect ingestion cost control -- from API spend to compute to storage -- and how you make those costs legible to each team.",
+    "a": "Cost in a large RAG platform has three layers: embedding API spend (the dominant cost), compute for chunking and reranking, and vector storage at scale. Each must be metered per team and surfaced in a cost dashboard. Embedding API spend is controlled by: (1) per-team token budgets with hard caps, (2) aggressive dedup at ingestion so you never embed the same content twice, (3) incremental re-indexing with content hashing so unchanged chunks are never re-embedded, and (4) promoting smaller embedding models for teams whose eval shows no quality loss (text-embedding-3-small vs large is a 5x cost difference). Compute cost is controlled by right-sizing the chunker worker pool to actual corpus churn rate and scheduling ingestion off-peak. Storage cost is controlled by vector quantization (INT8 reduces storage 4x with typically <1% recall loss) and pruning zombie chunks via monthly reconciliation. Make costs legible by emitting per-team cost metrics (dollars/day by category) to a shared dashboard, with projections for planned corpus growth. Teams that consume disproportionate resources get flagged and work with platform engineers to optimize their pipeline.",
+    "fj": "I'd just optimize the most expensive parts when costs get too high.",
+    "fs": "Reactive optimization misses silent waste. I meter per-team by cost category, enforce dedup + incremental re-indexing to eliminate redundant embedding calls, right-size compute to churn rate, and use quantization to cut storage -- with proactive dashboards so teams self-govern before costs escalate.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "per-team cost accounting",
+        "lang": "python",
+        "lines": [
+          "def record_embed_cost(team_id, tokens, model):",
+          "    rate = MODEL_RATES[model]  # $/1K tokens",
+          "    cost = (tokens / 1000) * rate",
+          "    metrics.increment(",
+          "        embed_cost_usd,",
+          "        cost,",
+          "        tags={team: team_id, model: model})",
+          "# aggregated in dashboard per team/day"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you decide whether to push a team to switch embedding models purely on cost grounds?",
+        "a": "Never on cost grounds alone -- you need a quality gate. Run an A/B on the team's labeled eval set: if the smaller/cheaper model meets or exceeds their recall@k and faithfulness thresholds, recommend the switch with data. If it doesn't, the cost saving is not worth the retrieval regression. Platform engineers can run this eval automatically as part of an annual cost-optimization review for each namespace, flagging teams where a cheaper model is a free win."
+      },
+      {
+        "q": "How do zombie chunks accumulate at scale and what is their real cost?",
+        "a": "Zombie chunks come from three sources: deleted source documents whose deletion signals were dropped, incremental ingestion bugs that left old chunks when a document was re-chunked with different parameters, and schema migrations that left unreferenced chunks. Their cost is dual: storage cost (each zombie vector consumes RAM in the ANN index, raising the index size and slowing search) and retrieval quality cost (zombie chunks from deleted or superseded documents surface incorrect answers, raising hallucination rate). A monthly reconciliation sweep comparing the index manifest against the source catalog catches and deletes them."
+      }
+    ]
+  },
+  {
+    "q": "How do you design a build-vs-buy decision framework for RAG infrastructure at a company scaling from 5 to 50 data teams?",
+    "a": "At five teams, buying wins almost everywhere: managed vector databases (Pinecone, Weaviate Cloud, pgvector on RDS), hosted embedding APIs, and off-the-shelf RAG frameworks reduce time to value and eliminate operational toil. The inflection points for build vs buy are predictable: (1) cost -- at sufficient scale, self-hosted open-source models and vector databases cost a fraction of managed services; (2) data sovereignty -- regulated industries often cannot send document content to third-party embedding APIs and must self-host; (3) customization -- when your retrieval quality requirement exceeds what the off-the-shelf retriever supports (domain-specific rerankers, custom hybrid fusion); and (4) multi-tenancy -- when you need per-tenant isolation guarantees that managed services don't provide. The framework scores each component (embedding model, vector database, chunker, reranker, eval harness) on cost, lock-in, customization need, and ops burden. At 50 teams, the typical outcome is: self-hosted embedding inference for high-volume namespaces, a managed vector database for operational simplicity, an internal eval harness (because external tools don't cover custom use-case metrics), and a hybrid ingestion pipeline. Never build what you can buy if the buy option meets your requirements; never stay bought when self-hosting is a 5x cost reduction with acceptable ops overhead.",
+    "fj": "I'd build everything in-house to avoid vendor lock-in.",
+    "fs": "Building everything in-house at 5 teams is a trap -- the ops burden overwhelms the team before the product ships. I score each component on cost, lock-in, customization need, and ops burden, and build only where managed options fail a threshold -- typically embedding inference at scale and eval tooling for custom use cases.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you evaluate vector database vendor lock-in risk specifically?",
+        "a": "Assess portability along three axes: data export (can you export all vectors and metadata in a standard format?), query API portability (are queries expressed in a vendor-specific DSL that would need a rewrite?), and ecosystem fit (does the vendor support the hybrid search, metadata filtering, and namespace isolation your platform needs?). Mitigate lock-in by abstracting the vector database behind your platform's retrieval API so swapping the backend is a platform-layer change, not a 15-team migration. The abstraction layer is the most valuable lock-in insurance."
+      },
+      {
+        "q": "When does pgvector become a serious alternative to a dedicated vector database?",
+        "a": "pgvector on Postgres is a serious option when: the corpus fits comfortably in RAM for the HNSW index (typically under 50M 1536-dim vectors), you already operate Postgres and want to avoid a new operational dependency, and you need hybrid SQL + vector queries in a single transaction boundary. It underperforms dedicated ANN databases at 100M+ vectors without careful tuning. For most teams under 20M chunks, pgvector with HNSW is a strong default that eliminates a separate vector database entirely -- Supabase and RDS both offer it managed as of early 2026."
+      }
+    ]
+  },
+  {
+    "q": "Your RAG platform's ingestion pipeline must enforce freshness SLOs: documents indexed within 2 hours of source change for tier-1 teams, 24 hours for tier-2. How do you design the pipeline to meet both SLOs with a shared embedding API quota?",
+    "a": "SLO-aware ingestion requires priority-queue scheduling with quota partitioning. The ingestion pipeline has two lanes: a real-time lane (micro-batch, triggered by CDC events or webhooks) for tier-1 teams, and a bulk-batch lane (daily scheduled job) for tier-2 teams. The real-time lane holds a reserved 40% of API quota so tier-2 bulk runs can never starve it; tier-2 runs get the remaining quota during off-peak hours. Within the real-time lane, a priority queue orders work by SLO deadline proximity: a document whose 2-hour window is expiring in 30 minutes pre-empts a document just submitted. Each team has an index-freshness SLO metric (time from source change to indexed) tracked in the platform's monitoring system; an alert fires when p95 freshness for any tier-1 team exceeds 90 minutes. For burst scenarios -- a tier-1 team submitting 10,000 documents at once -- the real-time lane has a burst capacity (higher short-term quota draw) with auto-scaling ingestion workers that scale down after the burst drains. The tier-2 lane never gets pre-empted by tier-1 quota beyond the reserved partition; it finishes on its own budget.",
+    "fj": "I'd run all ingestion in one queue and increase throughput if we miss SLOs.",
+    "fs": "A single queue means tier-2 bulk runs crowd out tier-1 real-time updates. I partition quota into reserved real-time and bulk lanes, use SLO-deadline-aware prioritization within the real-time lane, and track p95 freshness per team as a monitored SLO with pre-failure alerting.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle a spike where a tier-1 team submits more documents than the reserved lane quota can process within the SLO window?",
+        "a": "Pre-agreed burst contract: tier-1 teams declare their max burst volume during onboarding; the platform provisions burst capacity (auto-scaled workers + temporary quota increase with the API provider) up to that declared ceiling. If the actual burst exceeds the declared ceiling, the SLO is considered a customer-caused breach and the platform notifies the team. This makes burst capacity an explicit contract rather than a surprise operational fire. Monitor declared vs actual burst volume and renegotiate contracts at quarterly reviews."
+      }
+    ]
+  },
+  {
+    "q": "Across your RAG platform's 20 teams, you notice that answer quality degrades for 3 teams after a vector database minor version upgrade. How do you investigate, roll back safely, and prevent this class of regression in the future?",
+    "a": "A vector database version upgrade can change ANN index behavior (HNSW parameter defaults, distance calculation precision, BM25 scorer version for hybrid search) in ways that shift recall without obvious error signals. Investigation: immediately compare recall@k on each affected team's labeled test set before and after the upgrade, inspect the vector database's changelog for ANN algorithm or scoring changes, and check whether the regression correlates with namespace size (large indexes are more sensitive to HNSW parameter changes). Safe rollback: because you never run the platform without a shadow-index validation step before any infrastructure change, you still have the old-version index live -- flip the query router back to the pre-upgrade namespace. This is the core platform design principle: infrastructure changes never cut over until a recall@k gate passes. Prevention: add a pre-upgrade integration test that runs the eval harness against all active namespaces on the candidate version in a staging environment, with a recall@k regression threshold (e.g., no namespace drops more than 2%) as a hard gate on the upgrade. Treat vector database version upgrades with the same rigor as embedding model upgrades.",
+    "fj": "I'd roll back the upgrade and open a ticket with the vector database vendor.",
+    "fs": "Rolling back without investigation leaves the root cause unknown and repeats on the next upgrade. I run recall@k against all namespaces on the candidate version in staging before any cutover -- the gate blocks the upgrade if any namespace regresses beyond threshold. Investigation isolates whether the change is ANN parameter defaults, scoring changes, or a namespace-size-dependent behavior.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you detect that a vector database upgrade is affecting only large namespaces and not small ones?",
+        "a": "Stratify the staging eval by namespace size (small: <1M chunks, medium: 1-10M, large: >10M). If recall@k regression appears only in the large stratum, the issue is almost certainly HNSW construction parameter sensitivity -- large indexes need higher ef_construction and m values to maintain recall. Check the upgrade changelog for any changes to HNSW defaults and test with the old parameter values explicitly set. Many vector databases changed HNSW defaults between versions in 2024-2025 and this is a common regression pattern."
+      }
+    ]
+  },
+  {
+    "q": "As principal architect, how do you set your organization's multi-year RAG strategy -- including the build-vs-buy posture, model vendor bets, and the boundary between RAG and other knowledge-access patterns like fine-tuning and agentic AI?",
+    "a": "A multi-year RAG strategy has four pillars. First, knowledge access architecture: RAG is the default for dynamic, private, auditable knowledge access; long-context LLMs are the alternative for small, stable corpora needing whole-document reasoning; fine-tuning is reserved for behavioral changes (output format, domain reasoning style), not knowledge; and agentic AI orchestrates multi-step retrieval for multi-hop and complex queries. These are not alternatives -- they compose. Second, model vendor posture: avoid single-vendor lock-in at the embedding and generation layers by abstracting behind an internal model router that can swap providers without changing application code. As of early 2026 the competitive landscape (Cohere, Voyage, OpenAI, Mistral, open-source BGE/E5) is volatile enough that a 12-month lock-in is a strategic risk. Third, platform investment: build a shared RAG platform for retrieval, eval, and ingestion infrastructure -- not per-team RAG stacks -- so quality improvements and cost optimizations propagate to all teams. Fourth, governance: define org-wide standards for chunk metadata schema, eval metric thresholds, data residency (which corpus classes can use hosted APIs vs must self-host), and access-control enforcement. Review the strategy annually against the model capability curve -- as long-context and agent capabilities advance, the optimal boundary between RAG, long-context, and agent patterns shifts.",
+    "fj": "I'd standardize the whole org on one RAG framework and one embedding model.",
+    "fs": "Standardizing on one vendor or framework without an abstraction layer creates a migration crisis when that vendor changes pricing or a better option emerges. I invest in an internal model router and platform API so the org can shift vendor bets without application-layer changes, and define the strategy along four pillars: knowledge architecture, vendor posture, platform investment, and governance.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you decide when the RAG platform should absorb agentic retrieval (multi-hop, CRAG loops) vs leaving it to individual team application layers?",
+        "a": "Absorb into the platform when the pattern is common across teams and the infrastructure is shared -- query decomposition, corrective retrieval loops, and CRAG-style grading are good platform candidates because every team building a multi-hop use case rediscovers them independently. Leave in the application layer when the agentic logic is deeply use-case-specific -- a domain-specific tool-calling loop for a code debugger is not a generalizable platform primitive. The boundary rule: if more than three teams need the same agentic pattern, build it into the platform. If it is one team's unique flow, it stays in their application."
+      },
+      {
+        "q": "How do you structure the annual review that decides whether to shift the boundary between RAG, long-context, and fine-tuning?",
+        "a": "Review four signals: (1) model capability -- what context lengths and retrieval-vs-parametric tradeoffs does the latest generation support? (2) cost curve -- long-context inference cost per query vs RAG pipeline cost per query at your volume; (3) quality evidence -- do teams running long-context experiments beat RAG on their eval metrics or not? (4) org adoption barriers -- what is the engineering cost of migrating a production RAG system to a long-context or fine-tuned approach? Combine these into a decision matrix for each use-case class (dynamic knowledge, stable reference, behavioral, multi-hop). The outcome is an updated strategy doc that adjusts which pattern is the recommended default for new projects vs incumbent."
+      }
+    ]
+  },
+  {
+    "q": "Your CISO requires that no customer document content ever leaves your data perimeter, but your product needs LLM-quality retrieval and generation at scale. How do you architect a sovereign RAG stack and what quality tradeoffs do you accept?",
+    "a": "A sovereign RAG stack runs every component inside the data perimeter: self-hosted embedding inference, a self-hosted vector database, and an on-premises or VPC-deployed LLM. As of early 2026, the self-hosted embedding options are strong -- BGE-M3, E5-Mistral-7B, and Jina Embeddings v3 are competitive with hosted APIs on most retrieval benchmarks. For generation, Llama 3.1 70B or Mistral Large self-hosted on A100/H100 clusters covers most enterprise use cases. The quality tradeoffs are real but bounded: self-hosted embedding models may trail the absolute frontier (Voyage-3, OpenAI text-embedding-3-large) by 2-5 NDCG points on general benchmarks, but with domain fine-tuning of the embedding model that gap often closes. The architecture must invest in MLOps for model serving: model version management, GPU autoscaling, inference latency SLOs, and a model upgrade cadence that keeps the stack within 1-2 generations of the frontier. The governance decision is: accept a small quality ceiling in exchange for absolute data sovereignty. Track the quality delta between sovereign and hosted stacks quarterly on your own domain eval set, and set a threshold (e.g., >10% recall@5 regression vs hosted) that would trigger a re-evaluation of the sovereignty requirement.",
+    "fj": "Self-hosted models are too far behind hosted APIs to be usable for enterprise RAG.",
+    "fs": "As of early 2026 self-hosted embedding and generation models are within a few NDCG points of frontier hosted APIs on most domain benchmarks, especially with domain fine-tuning. The quality gap is real but bounded; I track it quarterly on our own eval set and invest in MLOps to stay within 1-2 model generations of the frontier.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle embedding model upgrades in a sovereign stack where you can't rely on a managed service to do the rollout?",
+        "a": "Same parallel-index cutover pattern as managed stacks, but you own the model deployment pipeline. Build a model-serving layer (TorchServe, vLLM, or Triton) that supports multiple concurrent model versions; the new embedding model is deployed to a staging endpoint, the full corpus backfill runs against staging, the recall@k eval gate passes, and then query routing cuts over. The difference from managed is that you also own the GPU capacity planning for the backfill -- a 50M-chunk backfill at 300 tokens/chunk needs roughly 2,500 A100-hours at 1B tokens/hour throughput on a medium-sized self-hosted model. Plan the capacity window explicitly."
+      },
+      {
+        "q": "What is the sovereign stack governance model -- who approves adding a new LLM or embedding model?",
+        "a": "Establish a model review board with representation from security, privacy, legal, and ML engineering. Any new model must pass: security review (supply chain, license, export controls), privacy review (does the model's training data create memorization risks for similar content?), and quality review (eval gate on the org's canonical benchmark). The process should be streamlined -- target a 2-week review cycle -- so sovereignty does not mean lagging the frontier by years. Document approved models in a model registry that teams pull from; unapproved models cannot reach production infrastructure."
+      }
+    ]
+  },
+  {
+    "q": "How do you design org-wide RAG governance -- including data classification, access control standards, eval quality gates, and vendor risk -- so that 30 product teams can ship safely without central bottlenecks?",
+    "a": "Effective RAG governance is not a gate -- it is a paved road. Central bottlenecks fail at 30 teams; the goal is self-service within guardrails. Data classification: define four corpus tiers (public, internal, confidential, regulated) with automatic routing rules -- regulated data cannot use hosted embedding APIs, confidential data requires per-tenant index isolation. Teams self-classify their corpus against a decision tree; platform tooling enforces the routing rule automatically at ingestion. Access control standards: every RAG chunk must carry an access label; retrieval APIs enforce pre-filtering against the caller's identity context at the platform layer, never delegated to teams. Eval quality gates: teams must publish a labeled eval set and meet a recall@5 baseline before going to production; the platform CI runner enforces this gate and blocks deployments that regress beyond threshold. Vendor risk: the platform maintains an approved vendor registry (embedding APIs, vector databases, LLM providers) with assessed data-handling agreements; teams choose from the registry, not from the internet. Governance scales by making compliance the path of least resistance -- pre-built pipeline templates that are already compliant, a self-service corpus-classification tool, and a platform team that unblocks rather than reviews.",
+    "fj": "I'd have a central architecture review for every RAG deployment.",
+    "fs": "Central review at 30 teams means a 4-week queue and teams routing around it. I make compliance the default: pre-built compliant pipeline templates, automatic corpus-tier routing, platform-enforced access control, and a CI eval gate. The governance team unblocks, not reviews.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle a team that wants to use a new embedding API not yet on the approved vendor registry?",
+        "a": "Publish a vendor onboarding SLA (target 2 weeks): the team submits the vendor, security reviews the data-processing agreement, privacy reviews data residency and retention, and ML engineering reviews the API for lock-in and quality. If approved, the vendor is added to the registry and all 30 teams benefit. If denied, the team gets a written rationale and an alternative from the registry. The process must be fast enough that teams do not route around it -- a 6-week review is an invitation to shadow IT."
+      },
+      {
+        "q": "How do you measure whether the governance model is working vs becoming a bottleneck?",
+        "a": "Track three signals: time-to-production for new RAG deployments (target: under 4 weeks including the eval gate), shadow-IT rate (teams using non-registry vendors detected via network egress monitoring), and governance escalation rate (how often teams need a central architecture exception). If time-to-production exceeds 6 weeks or shadow-IT rate rises, governance is a bottleneck and the paved road needs widening -- more pre-built templates, faster vendor onboarding, or self-service classification tooling."
+      }
+    ]
   }
 ]

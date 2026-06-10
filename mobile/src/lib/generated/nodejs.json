@@ -1210,5 +1210,958 @@
         "a": "In CJS, `require()` returns a snapshot copy of `module.exports`. Replacing a property on the exports object from a mock updates what future `require` calls see, but modules that already hold a reference to the old export don't update. In ESM, exports are live bindings — if a module re-assigns an export, all importers of that binding immediately see the new value. This means test mocks for ESM must use `vi.spyOn` or import the module as a namespace and mutate the live binding."
       }
     ]
+  },
+  {
+    "q": "How does NestJS's module system enforce encapsulation and what must you export to share a provider between modules?",
+    "a": "Every NestJS application is a graph of `@Module()`-decorated classes. Each module defines `providers` (the DI container entries), `imports` (other modules whose exports it consumes), `exports` (the subset of its providers it makes visible to importing modules), and `controllers`. A provider that is listed in `providers` but NOT in `exports` is strictly private to that module — other modules cannot inject it even if they import the module. To share a service across modules you must add it to `exports`; the importing module lists it in `imports`; then its controllers and providers can inject it via the constructor. `forwardRef()` breaks circular module imports.",
+    "fj": "I'd just add all services to a global providers array in the app module.",
+    "fs": "Encapsulation keeps the DI graph explicit. I treat each module as a mini-library with a deliberate public API (exports). Putting everything in the app module is the monolith trap — it prevents lazy loading and testing in isolation.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Exporting a shared service",
+        "lang": "ts",
+        "lines": [
+          "@Module({",
+          "  providers: [OrdersService, InternalHelper],",
+          "  exports: [OrdersService], // InternalHelper stays private",
+          "})",
+          "export class OrdersModule {}",
+          "",
+          "@Module({ imports: [OrdersModule] })",
+          "export class ShippingModule {",
+          "  constructor(private orders: OrdersService) {}",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does `@Global()` do and when is it appropriate?",
+        "a": "`@Global()` on a module means its exports are available to every other module in the application without needing to import it explicitly. It is appropriate for truly application-wide singletons like a `ConfigService`, `LoggerService`, or database connection — things that would otherwise need to be imported in every module. Overusing it defeats the purpose of encapsulation."
+      },
+      {
+        "q": "How do you create a NestJS module that is configured dynamically at runtime (e.g., `ConfigModule.forRoot()`)?",
+        "a": "Use the static `forRoot(options)` / `register(options)` pattern: define a static method on the module class that returns a `DynamicModule` object with `module`, `providers`, `exports`, etc. The options are provided as a factory or value provider. `forRootAsync()` accepts `useFactory` with `inject` for async configuration (reading from a remote store at startup)."
+      }
+    ]
+  },
+  {
+    "q": "Explain NestJS's dependency injection lifecycle — what are the scopes (DEFAULT, REQUEST, TRANSIENT) and when does each hurt you?",
+    "a": "NestJS providers have three scopes. **DEFAULT (singleton)**: one instance per application lifetime, shared by all consumers — the correct choice for stateless services, DB connections, and caches. **REQUEST**: a new instance per HTTP request; the entire dependency subtree must also be REQUEST-scoped, otherwise NestJS throws. This is expensive: NestJS rebuilds the DI subtree on every request and disables caching — p99 latency increases measurably under load. **TRANSIENT**: a new instance for every injection point — the most expensive. Use TRANSIENT only when each consumer genuinely needs isolated mutable state (a per-consumer logger instance). Mixing scopes incorrectly — e.g., injecting a REQUEST-scoped provider into a singleton — results in a runtime error.",
+    "fj": "I'd make everything REQUEST-scoped so each request gets fresh instances.",
+    "fs": "REQUEST scope is a performance trap. I've seen services where every provider was marked REQUEST-scoped 'to be safe' — p99 went from 10 ms to 80 ms. Unless you need per-request isolation (tenant ID stored on the provider), DEFAULT is always the right scope.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "REQUEST scope — beware the subtree cost",
+        "lang": "ts",
+        "lines": [
+          "@Injectable({ scope: Scope.REQUEST })",
+          "export class TenantService {",
+          "  // NestJS rebuilds this + all dependencies",
+          "  // on EVERY HTTP request",
+          "  constructor(@Inject(REQUEST) private req: Request) {}",
+          "  getTenantId() { return this.req.headers['x-tenant-id']; }",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Can you inject a singleton provider into a REQUEST-scoped provider?",
+        "a": "Yes — a REQUEST-scoped provider can depend on a singleton. The singleton is already instantiated and NestJS injects the existing instance. The restriction is the reverse: a singleton cannot depend on a REQUEST-scoped provider, because the singleton is created once at startup before any request exists."
+      }
+    ]
+  },
+  {
+    "q": "How do NestJS Guards, Interceptors, and Pipes differ in their position in the request lifecycle, and which runs first?",
+    "a": "The NestJS request lifecycle order is: **Middleware** → **Guards** → **Interceptors** (pre-handler) → **Pipes** → **Handler** → **Interceptors** (post-handler) → **Exception Filters**. Guards evaluate whether a request is authorized — they return `true/false` and throw `ForbiddenException` on failure. Interceptors wrap the handler call with `Observable` and `next.handle()` — they can modify the request, the response, or add timing/logging around the handler. Pipes transform and validate incoming data (route params, body, query) before the handler receives them — they throw `BadRequestException` on validation failure. Exception Filters catch any unhandled exceptions from any of the above layers.",
+    "fj": "Guards and middleware are the same thing — they both block requests.",
+    "fs": "The ordering is what interviewers test. Guards come before interceptors — if auth fails, interceptors never run, so don't put auth logic in an interceptor. Pipes only see transformed data, so don't validate auth claims in a pipe.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Guard returns bool — interceptor wraps response",
+        "lang": "ts",
+        "lines": [
+          "@Injectable()",
+          "export class JwtGuard implements CanActivate {",
+          "  canActivate(ctx: ExecutionContext): boolean {",
+          "    const req = ctx.switchToHttp().getRequest();",
+          "    return this.jwt.verify(req.headers.authorization);",
+          "  }",
+          "}",
+          "",
+          "@Injectable()",
+          "export class TimingInterceptor implements NestInterceptor {",
+          "  intercept(_: ExecutionContext, next: CallHandler) {",
+          "    const t0 = Date.now();",
+          "    return next.handle().pipe(",
+          "      tap(() => console.log(Date.now() - t0, 'ms')),",
+          "    );",
+          "  }",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you apply a Guard globally vs to a single controller vs to a single route?",
+        "a": "Global: `app.useGlobalGuards(new JwtGuard())` in `main.ts`, or register via `APP_GUARD` provider token so it participates in DI. Controller-level: `@UseGuards(JwtGuard)` on the class. Route-level: `@UseGuards(JwtGuard)` on the method. Narrower scope overrides broader for order, but all applicable guards run from broadest to narrowest scope."
+      },
+      {
+        "q": "What is the `Reflector` and how do Guards use it to read custom metadata?",
+        "a": "`Reflector` is NestJS's metadata reader. You define a custom decorator with `SetMetadata('roles', ['admin'])`, and in the guard you inject `Reflector` and call `reflector.getAllAndOverride<string[]>('roles', [context.getHandler(), context.getClass()])` to read the roles from the handler or class, with method-level taking precedence. This is the standard pattern for role-based access control in NestJS."
+      }
+    ]
+  },
+  {
+    "q": "How does NestJS's microservices transport layer work and what are the tradeoffs between TCP, Redis, and Kafka transports?",
+    "a": "NestJS microservices decouple service-to-service communication behind a `ClientProxy` abstraction. **TCP** (built-in): direct socket connection, low latency, no broker, but point-to-point — service A must know service B's address; no fan-out, no persistence. **Redis**: uses pub/sub; the broker decouples producers and consumers; messages are not persisted — if the consumer is down, messages are lost; suitable for fire-and-forget events. **Kafka**: durable, partitioned, ordered log; consumers can replay; handles high throughput and fan-out; operationally heavier. Pattern-matching: `@MessagePattern('cmd')` handles request-response (uses `send()`); `@EventPattern('evt')` handles one-way fire-and-forget (uses `emit()`). Mixing transports in one app is supported by instantiating multiple `ClientProxy` instances.",
+    "fj": "I'd use HTTP between microservices — it's simpler than all this.",
+    "fs": "Transport choice is about durability and coupling. In prod I default to Kafka for event-driven flows (audit trail, replay) and Redis for ephemeral broadcast (invalidation, notifications). Pure TCP only for internal, latency-critical RPC with stable service topology.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Kafka event pattern in NestJS",
+        "lang": "ts",
+        "lines": [
+          "@Controller()",
+          "export class OrdersController {",
+          "  @EventPattern('order.placed')",
+          "  async handleOrder(",
+          "    @Payload() data: OrderDto,",
+          "    @Ctx() ctx: KafkaContext,",
+          "  ) {",
+          "    await this.ordersService.process(data);",
+          "    ctx.getMessage().offset; // manual ack",
+          "  }",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What does `ClientProxy.send()` return and how do you handle timeouts?",
+        "a": "`send()` returns an `Observable` that emits the response. You typically convert it with `firstValueFrom()` (from `rxjs`). If no response arrives within the default timeout (5 s), the Observable errors. Set `timeout` in the `ClientsModule.register` options or pipe `.pipe(timeout(3000))` on the Observable. Missing timeout handling is a common source of request pile-ups in production."
+      }
+    ]
+  },
+  {
+    "q": "How do you structure a NestJS application for testability — what does a unit test look like vs an e2e test?",
+    "a": "**Unit test**: use `Test.createTestingModule({ providers: [ServiceUnderTest, { provide: DepService, useValue: mockDep }] })` to create an isolated DI container. NestJS compiles only the declared providers — no HTTP server, no DB. Call `module.get(ServiceUnderTest)` to get the instance and test its methods directly. **E2E test**: use `Test.createTestingModule({ imports: [AppModule] })` then `app.init()` — the full application boots. Use `supertest` to fire HTTP requests against `app.getHttpServer()`. The critical difference: unit tests mock all dependencies and are fast; e2e tests exercise the full request lifecycle (middleware, guards, interceptors, pipes) and catch integration bugs. For e2e with a real DB, use a dedicated test schema and truncate tables in `beforeEach`.",
+    "fj": "I'd just write integration tests against the running server — unit tests with mocks don't test real behavior.",
+    "fs": "I use a pyramid: many unit tests for business logic (service layer), a smaller set of e2e tests for each controller's happy path and critical error paths. Unit tests are the fast feedback loop; e2e tests catch the guard/pipe/interceptor wiring that unit tests miss.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "NestJS unit test with mock provider",
+        "lang": "ts",
+        "lines": [
+          "describe('OrdersService', () => {",
+          "  let svc: OrdersService;",
+          "  beforeEach(async () => {",
+          "    const mod = await Test.createTestingModule({",
+          "      providers: [",
+          "        OrdersService,",
+          "        { provide: getRepositoryToken(Order),",
+          "          useValue: { findOne: jest.fn() } },",
+          "      ],",
+          "    }).compile();",
+          "    svc = mod.get(OrdersService);",
+          "  });",
+          "  it('throws on missing order', async () => {",
+          "    jest.spyOn(svc['repo'], 'findOne')",
+          "      .mockResolvedValue(null);",
+          "    await expect(svc.findById(1))",
+          "      .rejects.toThrow(NotFoundException);",
+          "  });",
+          "});"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you mock a NestJS ConfigService in a unit test?",
+        "a": "Provide it as a custom value: `{ provide: ConfigService, useValue: { get: jest.fn().mockReturnValue('test-value') } }`. Alternatively use `ConfigModule.forRoot({ load: [() => ({ db: { url: 'sqlite::memory:' } })] })` in a test module so the real `ConfigService` is initialized with test values."
+      }
+    ]
+  },
+  {
+    "q": "How do you define a TypeORM entity with a composite primary key and what pitfalls arise with `findOne`?",
+    "a": "Use `@PrimaryColumn()` on each part of the composite key and omit `@PrimaryGeneratedColumn()`. TypeORM represents composite keys as an object of `{ col1, col2 }` in the `id` shorthand — `repo.findOne({ where: { tenantId, orderId } })`. The major pitfall: in TypeORM v0.3+, `findOne` without a full primary key spec performs a full-table scan because TypeORM constructs a `WHERE` clause from all provided fields. Passing only one column of a composite key returns an arbitrary row matching that single column rather than a 404 — a silent data-correctness bug. Always pass all columns of the composite key, or use `findOneByOrFail({ tenantId, orderId })` which throws `EntityNotFoundError` on a miss.",
+    "fj": "I'd add a surrogate UUID primary key to every table to avoid composite key complexity.",
+    "fs": "Composite keys are unavoidable in multi-tenant and join tables. The findOne partial-key bug has burned teams — I always add a runtime assertion that all key columns are defined before calling findOne.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Composite PK entity",
+        "lang": "ts",
+        "lines": [
+          "@Entity()",
+          "export class OrderItem {",
+          "  @PrimaryColumn() orderId: number;",
+          "  @PrimaryColumn() productId: number;",
+          "  @Column() quantity: number;",
+          "}",
+          "",
+          "// Correct lookup — both PK columns provided",
+          "await repo.findOneByOrFail({ orderId, productId });"
+        ],
+        "accent": "fix"
+      },
+      {
+        "label": "Partial PK lookup — silent bug",
+        "lang": "ts",
+        "lines": [
+          "// WRONG: only orderId provided",
+          "// returns first row with that orderId",
+          "await repo.findOneBy({ orderId });"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you model a many-to-many join table with extra columns in TypeORM?",
+        "a": "Use an explicit join entity (not `@ManyToMany` with `@JoinTable`). Create a separate `@Entity()` with `@PrimaryColumn()` for both foreign keys plus `@Column()` for the extra data. Add `@ManyToOne` to each parent entity and `@OneToMany` back to the join entity. `@ManyToMany` with `@JoinTable` only works for pure join tables with no additional columns."
+      }
+    ]
+  },
+  {
+    "q": "Explain TypeORM migrations — how do you generate, run, and revert them, and what is the danger of `synchronize: true` in production?",
+    "a": "`synchronize: true` in the DataSource config makes TypeORM diff your entity definitions against the live schema on every application startup and runs `ALTER TABLE` / `CREATE TABLE` statements automatically. In production this is catastrophic: a renamed column becomes DROP + ADD (data loss), a typo in entity metadata can drop a production column on deploy. The safe workflow: (1) `typeorm migration:generate -n AddOrderStatus` — TypeORM diffs entities against the last migration and generates a TypeScript migration file with `up()` and `down()` methods; (2) review the generated SQL; (3) `typeorm migration:run` applies all pending migrations; (4) `typeorm migration:revert` rolls back the last one. Migrations are tracked in the `migrations` table. Always set `synchronize: false` and `migrationsRun: false` (run explicitly in CI) in production.",
+    "fj": "synchronize:true is fine — it keeps the schema in sync automatically.",
+    "fs": "synchronize:true is a data-loss landmine. I had a teammate rename a TypeORM column property, push to prod, and watch TypeORM drop and recreate the column — losing a week of user data. I enforce `synchronize: false` via env config and run migrations as a separate deploy step.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Generated migration — safe to review",
+        "lang": "ts",
+        "lines": [
+          "export class AddOrderStatus1700000000000 {",
+          "  async up(q: QueryRunner) {",
+          "    await q.addColumn('order',",
+          "      new TableColumn({",
+          "        name: 'status',",
+          "        type: 'varchar',",
+          "        default: \"'pending'\",",
+          "      }));",
+          "  }",
+          "  async down(q: QueryRunner) {",
+          "    await q.dropColumn('order', 'status');",
+          "  }",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you handle a migration that must backfill data for an existing column?",
+        "a": "Write the migration in three phases in a single file: (1) `addColumn` with `isNullable: true`; (2) `await q.query('UPDATE ...')` to backfill; (3) `alterColumn` to set `isNullable: false`. Never add a NOT NULL column without a default or backfill — it fails instantly on tables with existing rows."
+      },
+      {
+        "q": "What is the difference between `migration:generate` and `migration:create`?",
+        "a": "`migration:generate` diffs the current entity definitions against the last migration state and writes SQL automatically. `migration:create` generates an empty migration file with blank `up()` and `down()` methods — you write the SQL manually. Use `create` for data migrations, seed operations, or changes that TypeORM's differ cannot express (e.g., creating a partial index or a stored procedure)."
+      }
+    ]
+  },
+  {
+    "q": "How does TypeORM's QueryBuilder work and when should you use it over `find` options?",
+    "a": "QueryBuilder constructs SQL programmatically via a fluent API: `repo.createQueryBuilder('order').leftJoinAndSelect('order.items', 'item').where('order.status = :status', { status }).orderBy('order.createdAt', 'DESC').take(20).getMany()`. Use it when: (1) you need JOINs with conditions on the joined table, (2) you need `GROUP BY` / `HAVING` / subqueries, (3) you need partial column selection (`select(['order.id', 'order.total'])`), or (4) performance requires avoiding the N+1 generated by eager relations. The `find` API with `relations` is more readable for simple cases but performs multiple round-trips or a single wide join — use QueryBuilder's `leftJoinAndSelect` when you need both parent and child data in a single query with a WHERE on the child.",
+    "fj": "I'd use find() with the relations option — it's simpler.",
+    "fs": "find({ relations: ['items'] }) is fine for small datasets. For paginated lists with thousands of rows and child relations I always use QueryBuilder with explicit column selection — it avoids fetching columns I don't use and lets me push filtering to SQL rather than JS.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "QueryBuilder: join + filter + paginate",
+        "lang": "ts",
+        "lines": [
+          "const orders = await repo",
+          "  .createQueryBuilder('o')",
+          "  .leftJoinAndSelect('o.items', 'i')",
+          "  .where('o.userId = :uid', { uid })",
+          "  .andWhere('i.quantity > :qty', { qty: 0 })",
+          "  .orderBy('o.createdAt', 'DESC')",
+          "  .skip(offset).take(limit)",
+          "  .getMany();"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you prevent SQL injection in TypeORM QueryBuilder?",
+        "a": "Always use named parameters (`:paramName`) or positional parameters (`?`). TypeORM escapes them via the underlying driver's parameterized query mechanism. Never interpolate user input directly into the query string. `WHERE 'o.name = ' + userInput` is an injection vector; `WHERE 'o.name = :name'` with `{ name: userInput }` is safe."
+      }
+    ]
+  },
+  {
+    "q": "What is the TypeORM N+1 problem and what are the three ways to eliminate it?",
+    "a": "N+1 occurs when you load N parent records and then issue one additional query per parent to fetch its children — total N+1 queries instead of 1 or 2. TypeORM triggers this when you access a lazy-loaded relation (`@OneToMany({ lazy: true })`) in a loop, or when you use `find({ relations: ['items'] })` which performs one query per parent row (or an unparameterized `IN` clause depending on version). Three fixes: (1) **QueryBuilder `leftJoinAndSelect`** — single SQL JOIN, all data in one round-trip; (2) **DataLoader pattern** — batch all child IDs from a resolver cycle and issue a single `WHERE id IN (...)` query; (3) **eager: true** with selectAll — TypeORM performs a single query with a JOIN for every load, but cannot be conditional. QueryBuilder is the most control-rich option for production APIs.",
+    "fj": "I'd set eager: true on all relations to avoid lazy loading.",
+    "fs": "eager: true on all relations is itself an N+1 fix but can over-fetch. The DataLoader pattern is what I use in GraphQL resolvers — batch and cache per request. For REST APIs I always use QueryBuilder with explicit joins rather than letting TypeORM decide the strategy.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "N+1 via lazy relation loop",
+        "lang": "ts",
+        "lines": [
+          "// 1 query for orders + N queries for items",
+          "const orders = await orderRepo.find();",
+          "for (const o of orders) {",
+          "  const items = await o.items; // lazy load",
+          "  console.log(items.length);",
+          "}"
+        ],
+        "accent": "fix"
+      },
+      {
+        "label": "Fix: single JOIN query",
+        "lang": "ts",
+        "lines": [
+          "const orders = await orderRepo",
+          "  .createQueryBuilder('o')",
+          "  .leftJoinAndSelect('o.items', 'i')",
+          "  .getMany();",
+          "// 1 query total"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does the DataLoader pattern batch TypeORM queries in a GraphQL resolver context?",
+        "a": "Create a `DataLoader<parentId, Child[]>` per request. In each resolver that needs children, call `loader.load(parentId)`. DataLoader collects all `load()` calls within the same event-loop tick, then fires a single batch function with all IDs: `repo.find({ where: { parentId: In(ids) } })`. Group by `parentId` and return arrays in the same order as the input IDs. Result: one SQL query per resolver cycle instead of N."
+      }
+    ]
+  },
+  {
+    "q": "How do TypeORM transactions work and what is the difference between `QueryRunner` and the `transaction` helper?",
+    "a": "TypeORM provides two transaction APIs. The **`transaction` helper** (`dataSource.transaction(async manager => { ... })`) creates a `QueryRunner` internally, begins the transaction, runs your callback with a transactional `EntityManager`, and commits on success or rolls back on exception — concise but you can't use the global repository inside the callback (you must use `manager.getRepository(Entity)`). The **`QueryRunner` API** gives explicit control: `qr.connect() → qr.startTransaction() → qr.commitTransaction() / qr.rollbackTransaction() → qr.release()` — use it when you need to perform multiple phases, use savepoints (`qr.query('SAVEPOINT sp1')`), or integrate with code that doesn't propagate the manager naturally. Both must always `release()` the QueryRunner in a `finally` block to return the connection to the pool.",
+    "fj": "I'd wrap the whole service method in a try/catch and rollback manually.",
+    "fs": "I use the `transaction` helper for 90% of cases — it handles commit/rollback automatically. QueryRunner is for complex multi-step operations where I need savepoints or need to pass the same connection across multiple services without threading the EntityManager.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "QueryRunner — explicit control",
+        "lang": "ts",
+        "lines": [
+          "const qr = dataSource.createQueryRunner();",
+          "await qr.connect();",
+          "await qr.startTransaction();",
+          "try {",
+          "  await qr.manager.save(Order, order);",
+          "  await qr.manager.save(Payment, payment);",
+          "  await qr.commitTransaction();",
+          "} catch (e) {",
+          "  await qr.rollbackTransaction();",
+          "  throw e;",
+          "} finally {",
+          "  await qr.release(); // always release",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What happens if you forget to call `qr.release()` inside `finally`?",
+        "a": "The connection is leaked back to the pool — it's checked out but never returned. Under sustained traffic the pool runs dry and new requests queue waiting for a connection, eventually timing out. The symptom is a spike in `ConnectionTimeoutError` appearing minutes after a high-traffic event, with no obvious correlation to the root cause."
+      },
+      {
+        "q": "How do you propagate a TypeORM transaction across multiple services in NestJS?",
+        "a": "Pass the `EntityManager` (from the `transaction` callback) or the `QueryRunner` as a parameter to sub-services. Alternatively use the `cls-hooked` / `AsyncLocalStorage` pattern: store the current QueryRunner in ALS at the start of the transaction and retrieve it in repositories via a custom `TransactionRepository` wrapper. The latter avoids threading the manager through every method signature."
+      }
+    ]
+  },
+  {
+    "q": "How do you model TypeORM entity relations with `@OneToMany` / `@ManyToOne` and what is the cascade pitfall?",
+    "a": "`@ManyToOne` lives on the owning side (the entity with the FK column) and `@OneToMany` is the inverse side — TypeORM requires both if you want bidirectional navigation. The FK column is on the `@ManyToOne` entity. Cascade options (`cascade: ['insert', 'update', 'remove']`) tell TypeORM to propagate operations to related entities. The most dangerous cascade is `remove`: with `cascade: ['remove']` on a `@OneToMany`, saving a parent with an empty `children` array will delete all orphaned children — sometimes desired, often catastrophic. Use `orphanedRowAction: 'delete'` only intentionally and always test with real data. For inserts, `cascade: ['insert']` on `@OneToMany` lets you save a parent with new children in one call — very convenient but it means TypeORM issues one INSERT per child in a loop, not a bulk INSERT.",
+    "fj": "I'd set cascade: true on all relations for convenience.",
+    "fs": "cascade: true is shorthand for all cascade options including remove. I've seen it delete half a production table when a parent was saved with a partial children array. I always specify cascades explicitly and test delete paths in staging.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Bidirectional relation with explicit cascade",
+        "lang": "ts",
+        "lines": [
+          "@Entity()",
+          "export class Order {",
+          "  @PrimaryGeneratedColumn() id: number;",
+          "  @OneToMany(() => OrderItem, i => i.order,",
+          "    { cascade: ['insert'] }) // only insert",
+          "  items: OrderItem[];",
+          "}",
+          "",
+          "@Entity()",
+          "export class OrderItem {",
+          "  @PrimaryGeneratedColumn() id: number;",
+          "  @ManyToOne(() => Order, o => o.items)",
+          "  @JoinColumn({ name: 'order_id' })",
+          "  order: Order;",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is `@RelationId` and when is it useful?",
+        "a": "`@RelationId(() => order => order.items)` (or `@Column() orderId: number` with the `@ManyToOne`) exposes the FK value as a plain column on the entity without loading the relation. It is useful when you only need the FK integer (e.g. for an API response DTO) and want to avoid the round-trip that `order.items` would trigger. Always prefer `@Column() orderId` over `@RelationId` for query performance clarity."
+      }
+    ]
+  },
+  {
+    "q": "How does NestJS's exception filter pipeline work and how do you write a domain-specific filter that maps TypeORM errors to HTTP responses?",
+    "a": "When any layer (guard, pipe, interceptor, handler) throws, NestJS routes the exception to the nearest applicable **exception filter** — checked in order: method-level, controller-level, global. The built-in `HttpExceptionFilter` handles `HttpException` subclasses. For TypeORM's `QueryFailedError` (e.g. unique-constraint violation) you create a class implementing `ExceptionFilter<QueryFailedError>`, decorate it with `@Catch(QueryFailedError)`, and inspect `exception.driverError.code` (Postgres: `'23505'` for unique, `'23503'` for FK violation) to return a `409` or `400`. Register globally via `APP_FILTER` token so it participates in DI and can inject `ConfigService` or loggers.",
+    "fj": "I'd wrap every service method in try/catch and return the right HTTP status manually.",
+    "fs": "Exception filters are the single place to canonicalize DB error codes into HTTP semantics. One filter registered globally keeps every service clean of HTTP-layer concerns.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "TypeORM unique-violation → 409",
+        "lang": "ts",
+        "lines": [
+          "@Catch(QueryFailedError)",
+          "export class DbExceptionFilter",
+          "    implements ExceptionFilter<QueryFailedError> {",
+          "  catch(ex: QueryFailedError, host: ArgumentsHost) {",
+          "    const res = host.switchToHttp().getResponse();",
+          "    const pg = (ex as any).driverError;",
+          "    const status =",
+          "      pg?.code === '23505' ? 409 :",
+          "      pg?.code === '23503' ? 400 : 500;",
+          "    res.status(status).json({",
+          "      statusCode: status,",
+          "      message: ex.message,",
+          "    });",
+          "  }",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the difference between `@Catch()` with no arguments and `@Catch(HttpException)`?",
+        "a": "`@Catch()` with no arguments catches every unhandled exception — it is the catch-all filter. `@Catch(HttpException)` only intercepts `HttpException` instances (and subclasses). If you combine multiple filters, the most specific `@Catch` wins over the general one for matching exception types."
+      },
+      {
+        "q": "How do you ensure a globally registered exception filter still has access to NestJS DI?",
+        "a": "Register it as an `APP_FILTER` provider in a module rather than calling `app.useGlobalFilters(new MyFilter())`. The `APP_FILTER` token tells NestJS to instantiate the filter inside the DI container, so constructor injection of services like `ConfigService` or `LoggerService` works. Manual instantiation bypasses the DI container and cannot inject providers."
+      }
+    ]
+  },
+  {
+    "q": "How does NestJS's `ConfigModule` work and what is the safest pattern for strongly-typed, validated configuration at startup?",
+    "a": "`ConfigModule.forRoot()` reads `process.env` (and optional `.env` files via `envFilePath`) and makes values available through `ConfigService.get<T>('KEY')`. For strong typing and early-fail validation, pair it with `joi` or `class-validator` schemas: pass `validationSchema: Joi.object({ DB_URL: Joi.string().uri().required() })` to the `forRoot` options — NestJS validates at startup and throws a descriptive error before the app binds to a port. The safer pattern is `validate: (config) => plainToInstance(AppConfig, config, { enableImplicitConversion: true })` combined with `validateSync` from `class-validator` — you get a typed class with getters instead of stringly-typed `get('KEY')` calls.",
+    "fj": "I'd access process.env directly in each service — ConfigModule adds unnecessary complexity.",
+    "fs": "process.env direct access scatters config reads everywhere and makes testing fragile. ConfigModule centralises validation at startup so misconfigured deploys fail before serving any traffic — much better than silent runtime errors.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Joi-validated ConfigModule",
+        "lang": "ts",
+        "lines": [
+          "ConfigModule.forRoot({",
+          "  isGlobal: true,",
+          "  validationSchema: Joi.object({",
+          "    DATABASE_URL: Joi.string().uri().required(),",
+          "    JWT_SECRET: Joi.string().min(32).required(),",
+          "    PORT: Joi.number().default(3000),",
+          "  }),",
+          "  validationOptions: { abortEarly: false },",
+          "})"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you use `ConfigService` in a TypeORM `DataSource` factory registered in a NestJS module?",
+        "a": "Use `TypeOrmModule.forRootAsync({ useFactory: (cfg: ConfigService) => ({ url: cfg.get('DATABASE_URL'), ... }), inject: [ConfigService] })`. The `useFactory` pattern defers DataSource creation until the DI container can inject `ConfigService`, so the database URL is always read from the validated config, never from raw `process.env`."
+      }
+    ]
+  },
+  {
+    "q": "What is NestJS's `Interceptor` RxJS pipeline and how do you implement response transformation and timeout handling in one interceptor?",
+    "a": "A NestJS interceptor's `intercept(ctx, next)` method returns an `Observable`. Calling `next.handle()` gives you an Observable of the handler's return value. You compose RxJS operators on it: `map(data => ({ data }))` wraps every response in an envelope; `timeout(5000)` errors if the handler takes longer than 5 s; `catchError(err => throwError(() => new GatewayTimeoutException()))` converts the RxJS `TimeoutError` to a NestJS HTTP exception. The power is composability — one interceptor can chain `tap` (logging), `map` (transform), `timeout` (SLA enforcement), and `catchError` (error mapping) as a single declarative pipeline that wraps every route it is applied to.",
+    "fj": "I'd add a timeout middleware and a separate transform interceptor — keep them separate.",
+    "fs": "Composing timeout + transform in one interceptor is both DRY and testable. In prod I apply a global timeout interceptor so no handler can silently stall indefinitely.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Timeout + envelope interceptor",
+        "lang": "ts",
+        "lines": [
+          "@Injectable()",
+          "export class GlobalInterceptor implements NestInterceptor {",
+          "  intercept(_: ExecutionContext, next: CallHandler) {",
+          "    return next.handle().pipe(",
+          "      timeout(5000),",
+          "      map(data => ({ data, ts: Date.now() })),",
+          "      catchError(err => throwError(() =>",
+          "        err.name === 'TimeoutError'",
+          "          ? new GatewayTimeoutException()",
+          "          : err)),",
+          "    );",
+          "  }",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "Why must `next.handle()` only be called once inside an interceptor?",
+        "a": "Each call to `next.handle()` creates a new execution of the handler. Calling it twice would run the handler twice — sending two DB writes or two responses. The canonical pattern is to call it once, then compose operators on the returned Observable. Never subscribe manually inside an interceptor."
+      }
+    ]
+  },
+  {
+    "q": "How does NestJS's `ValidationPipe` work with `class-validator` and `class-transformer`, and what are the security-critical options?",
+    "a": "`ValidationPipe` transforms raw JSON bodies into typed DTO instances using `class-transformer`'s `plainToInstance`, then runs `class-validator`'s `validate()`. Key options: **`whitelist: true`** — strips any property not declared in the DTO class, preventing mass-assignment attacks where a client sends `isAdmin: true`. **`forbidNonWhitelisted: true`** — rejects the request entirely if extra properties are present (stricter than whitelist which silently strips). **`transform: true`** — coerces string query params to numbers/booleans based on TS type hints. **`transformOptions.enableImplicitConversion: true`** further automates type coercion. Missing `whitelist: true` in a CRUD API is the most common NestJS security oversight.",
+    "fj": "I validate manually in the controller — pipes are an extra layer I don't need.",
+    "fs": "whitelist: true is mandatory for any production API. I've reviewed NestJS codebases where it was missing and an attacker could override internal flags by adding arbitrary fields to the request body.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Secure global ValidationPipe",
+        "lang": "ts",
+        "lines": [
+          "app.useGlobalPipes(new ValidationPipe({",
+          "  whitelist: true,           // strip unknown props",
+          "  forbidNonWhitelisted: true,// or reject request",
+          "  transform: true,           // coerce types",
+          "  transformOptions: {",
+          "    enableImplicitConversion: true,",
+          "  },",
+          "}));"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you validate nested DTO objects with `class-validator`?",
+        "a": "Decorate the nested property with `@ValidateNested()` and `@Type(() => AddressDto)`. Without `@Type`, `class-transformer` treats the nested object as a plain object and `class-validator` skips inner validation. Both decorators together are required for deep validation."
+      },
+      {
+        "q": "How do you return structured validation errors instead of the default 400 message?",
+        "a": "Pass `exceptionFactory: (errors) => new BadRequestException(errors.map(e => Object.values(e.constraints).join(', ')))` to `ValidationPipe`. This transforms the `ValidationError[]` array into a readable error list. You can also return the full structured `errors` array for client-side field-level highlighting."
+      }
+    ]
+  },
+  {
+    "q": "How does NestJS handle WebSockets with the `@WebSocketGateway` decorator and how does the lifecycle compare to HTTP controllers?",
+    "a": "A `@WebSocketGateway(port?, options?)` class is a NestJS provider that wraps a WebSocket server (default adapter: `socket.io`, or swap to native `ws` with `WsAdapter`). Lifecycle hooks: `OnGatewayInit` fires after the server binds; `OnGatewayConnection` / `OnGatewayDisconnect` fire per client. `@SubscribeMessage('event')` decorates handlers for named socket events — equivalent to `@Get` on a controller. Guards, Interceptors, and Pipes all apply to gateway handlers using the same decorators. Key difference from HTTP: the NestJS context is `WsContext` not `HttpContext` — call `ctx.switchToWs()` in guards and interceptors. DI, modules, and request-lifecycle scopes work identically to HTTP.",
+    "fj": "I'd use a separate socket.io server outside NestJS and connect it to the same port.",
+    "fs": "Running the WebSocket gateway inside NestJS shares the DI container, so the gateway can inject the same OrdersService or AuthService as HTTP controllers — no code duplication and consistent auth logic.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "WebSocket gateway with auth guard",
+        "lang": "ts",
+        "lines": [
+          "@WebSocketGateway({ cors: { origin: '*' } })",
+          "@UseGuards(WsJwtGuard)",
+          "export class EventsGateway {",
+          "  @WebSocketServer() server: Server;",
+          "",
+          "  @SubscribeMessage('message')",
+          "  handleMessage(",
+          "    @MessageBody() data: MessageDto,",
+          "    @ConnectedSocket() client: Socket,",
+          "  ) {",
+          "    this.server.emit('broadcast', data);",
+          "  }",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you broadcast a message from an HTTP controller to all connected WebSocket clients?",
+        "a": "Inject the gateway class (or a shared event emitter) into the HTTP controller. Call `this.gateway.server.emit('event', data)`. Because both the gateway and the controller are NestJS providers in the same DI container, you can inject the gateway directly — the `server` property is populated after `OnGatewayInit` fires."
+      }
+    ]
+  },
+  {
+    "q": "How do you use TypeORM's `@Column` transformer option to transparently encrypt a column value at the ORM layer?",
+    "a": "TypeORM's `@Column({ transformer: { to, from } })` accepts an object with `to(value)` (called before writing to the DB) and `from(value)` (called after reading from the DB). You can embed AES-GCM encryption in `to` and decryption in `from`, making the encryption completely transparent to the rest of the application. The column stores ciphertext; the entity property exposes plaintext. Caveats: you cannot run `WHERE` queries on encrypted columns (ciphertext is not deterministic with GCM); for searchable encrypted fields use deterministic encryption (AES-SIV) or store a HMAC of the plaintext alongside it. Key management must be external (AWS KMS, Vault) — never hardcode the key.",
+    "fj": "I'd encrypt in the service layer before calling save() — the ORM shouldn't know about encryption.",
+    "fs": "The transformer keeps encryption cross-cutting without polluting service methods. The WHERE limitation is the real constraint to design around — I document which columns are GCM-encrypted and enforce a ban on direct WHERE filters on those columns via a code-review checklist.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "TypeORM column transformer for AES encryption",
+        "lang": "ts",
+        "lines": [
+          "const encryptTransformer = {",
+          "  to: (v: string) => encrypt(v, KEY),",
+          "  from: (v: string) => decrypt(v, KEY),",
+          "};",
+          "",
+          "@Entity()",
+          "export class User {",
+          "  @Column({ transformer: encryptTransformer })",
+          "  ssn: string; // plaintext in app, ciphertext in DB",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is the TypeORM `@Column` `select: false` option and when do you combine it with a transformer?",
+        "a": "`select: false` prevents the column from being included in `SELECT *` queries unless explicitly listed with `addSelect('entity.column')`. Combine it with an encryption transformer on a sensitive column (like an SSN) so the field is never accidentally returned in broad queries — you must explicitly opt in to loading it, reducing inadvertent exposure in API responses."
+      }
+    ]
+  },
+  {
+    "q": "How does TypeORM's soft-delete feature work and what are the query implications you must account for?",
+    "a": "Enable soft-delete by adding `@DeleteDateColumn() deletedAt: Date | null` to an entity. Call `repo.softDelete(id)` or `repo.softRemove(entity)` to set `deletedAt` to `NOW()` instead of issuing `DELETE`. All subsequent `find`, `findOne`, and QueryBuilder queries automatically append `WHERE entity.deletedAt IS NULL` — so soft-deleted rows are invisible by default. To include them use `repo.find({ withDeleted: true })` or `.withDeleted()` on a QueryBuilder. To restore: `repo.restore(id)` sets `deletedAt` back to `NULL`. Pitfalls: (1) unique constraints on live rows must account for the soft-deleted duplicates — add a partial index `WHERE deleted_at IS NULL`; (2) TypeORM's `count()` also excludes soft-deleted rows, which can misalign analytics if you forget `withDeleted`.",
+    "fj": "I'd add an `isDeleted: boolean` column and filter manually in every query.",
+    "fs": "The automatic WHERE injection is the whole value — you can't forget the filter. The unique constraint and analytics pitfalls are the parts teams hit in production; I add partial indexes at migration time and document the withDeleted caveat for the analytics team.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Soft-delete entity + partial unique index",
+        "lang": "ts",
+        "lines": [
+          "@Entity()",
+          "@Index(['email'], {",
+          "  unique: true,",
+          "  where: '\"deleted_at\" IS NULL', // partial",
+          "})",
+          "export class User {",
+          "  @PrimaryGeneratedColumn() id: number;",
+          "  @Column() email: string;",
+          "  @DeleteDateColumn() deletedAt: Date | null;",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you cascade soft-delete to child entities in TypeORM?",
+        "a": "TypeORM does not cascade soft-deletes automatically. You must either: (1) call `softDelete` on each child repository in a transaction; (2) use a database trigger; or (3) override `softRemove` in a subscriber (`@EventSubscriber`) that listens to `afterSoftRemove` and cascades to children. The subscriber approach keeps the cascade logic in one place without polluting the service layer."
+      }
+    ]
+  },
+  {
+    "q": "How does TypeORM handle optimistic locking with `@VersionColumn` and what happens when two concurrent updates collide?",
+    "a": "`@VersionColumn()` adds an integer `version` column to an entity that TypeORM auto-increments on every `save()`. When you load an entity (version = 3), modify it, and call `save()`, TypeORM issues `UPDATE ... WHERE id = ? AND version = 3`. If a concurrent transaction has already incremented it to 4, the update affects 0 rows and TypeORM throws `OptimisticLockVersionMismatchError`. You catch this and retry or return a `409 Conflict` to the client. Compared to pessimistic locking (`repo.findOne({ lock: { mode: 'pessimistic_write' } })` which issues `SELECT ... FOR UPDATE`), optimistic locking has zero DB blocking overhead — it is the right choice for low-collision workloads (typical CRUD). Pessimistic locking is necessary only for high-collision workflows like inventory reservation.",
+    "fj": "I'd use transactions to prevent conflicts — optimistic locking adds complexity.",
+    "fs": "Transactions prevent dirty reads but don't stop two transactions both reading version 3 and both trying to write version 4 — that's a lost update. Optimistic locking catches the second write and surfaces the conflict explicitly.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Optimistic lock: catch collision, retry",
+        "lang": "ts",
+        "lines": [
+          "@Entity()",
+          "export class Product {",
+          "  @PrimaryGeneratedColumn() id: number;",
+          "  @Column() stock: number;",
+          "  @VersionColumn() version: number;",
+          "}",
+          "",
+          "try {",
+          "  product.stock -= qty;",
+          "  await repo.save(product);",
+          "} catch (e) {",
+          "  if (e instanceof OptimisticLockVersionMismatchError)",
+          "    throw new ConflictException('Retry');",
+          "  throw e;",
+          "}"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "When would you choose `pessimistic_write` lock over `@VersionColumn` in TypeORM?",
+        "a": "Use `pessimistic_write` (`SELECT ... FOR UPDATE`) when the collision rate is high enough that optimistic retries become expensive — for example, decrementing a shared inventory counter under heavy concurrent load. The row-level lock serializes writers at the DB level, eliminating wasted work from conflicting transactions. The tradeoff is higher lock contention and deadlock risk."
+      }
+    ]
+  },
+  {
+    "q": "How do you configure TypeORM's connection pool correctly for a NestJS app running in Kubernetes and what metrics indicate pool exhaustion?",
+    "a": "TypeORM delegates pooling to the underlying driver (e.g. `pg` for Postgres, `mysql2` for MySQL). Key options: `extra.max` (max connections, default 10 for pg), `extra.min` (min kept alive, default 0), `extra.idleTimeoutMillis` (close idle connections after N ms), `extra.connectionTimeoutMillis` (throw if pool can't acquire in N ms). In Kubernetes with N replicas, total DB connections = N × `extra.max` — easy to exhaust Postgres's `max_connections` (default 100). Set `extra.max` to `floor(max_connections * 0.8 / replicas)`. Metrics: `pg_stat_activity` rows grouped by state (`idle`, `active`, `idle in transaction`) show live pool usage; a spike in `idle in transaction` means code is holding open transactions. Application-side: `ConnectionTimeoutError` in logs indicates exhaustion.",
+    "fj": "I'd use the default pool size — TypeORM picks a reasonable default.",
+    "fs": "The default pool size of 10 across 20 replicas = 200 connections, which exceeds most Postgres defaults. I always calculate the per-pod pool size from the DB max_connections and set it explicitly. I also alert on idle-in-transaction connection count.",
+    "level": "Sr",
+    "code": [
+      {
+        "label": "Pool config for K8s multi-replica",
+        "lang": "ts",
+        "lines": [
+          "TypeOrmModule.forRoot({",
+          "  type: 'postgres',",
+          "  url: process.env.DATABASE_URL,",
+          "  extra: {",
+          "    // 80 conn total / 10 pods = 8 per pod",
+          "    max: 8,",
+          "    min: 2,",
+          "    idleTimeoutMillis: 30000,",
+          "    connectionTimeoutMillis: 3000,",
+          "  },",
+          "})"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "What is PgBouncer and why would you add it in front of TypeORM's native pool?",
+        "a": "PgBouncer is a connection pooler that sits between the application and Postgres. In `transaction` mode it multiplexes many application connections onto far fewer real Postgres connections — a single PgBouncer can serve hundreds of TypeORM connections while holding only 20 real Postgres server connections open. This is essential when running many microservice replicas or serverless functions where each instance needs a pool but the total replica count makes native pooling impractical."
+      }
+    ]
+  },
+  {
+    "q": "How do you diagnose and eliminate event-loop saturation in a high-throughput Node.js service handling 20k RPS?",
+    "a": "Start with `perf_hooks.monitorEventLoopDelay({ resolution: 10 })` — if p99 exceeds ~10 ms under load, the loop is being blocked. Use `clinic flame` during a load test to generate a V8 CPU flamegraph; the widest synchronous frames are the culprits. Common sources at scale: synchronous `JSON.parse` of large bodies (move to streaming JSON parsers like `clarinet`), regex backtracking in hot request paths, `dns.lookup` starvation (switch to `dns.resolve4` with a TTL cache), and synchronous logging in the hot path (buffer logs and flush async). After identifying blocking work, offload it to `worker_threads` with a thread pool managed by `piscina` — it handles worker lifecycle, queue backpressure, and statistics. Instrument workers with `perf_hooks.performance.mark` to measure offload latency. Gate deploys on event-loop p99 staying below threshold in CI load tests.",
+    "fj": "I'd add more cluster workers — more processes means less per-process load.",
+    "fs": "Cluster doubles throughput for I/O-bound work but doesn't fix CPU blocking — every worker still saturates its own loop. I profile first, classify the work as I/O-bound vs CPU-bound, then choose cluster vs worker_threads accordingly.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "piscina worker pool for CPU-bound parse",
+        "lang": "ts",
+        "lines": [
+          "import Piscina from 'piscina';",
+          "const pool = new Piscina({",
+          "  filename: './parse-worker.js',",
+          "  maxThreads: os.cpus().length - 1,",
+          "  maxQueue: 500,",
+          "});",
+          "",
+          "app.post('/ingest', async (req, res) => {",
+          "  // offload heavy JSON transform to worker",
+          "  const result = await pool.run(req.body);",
+          "  res.json(result);",
+          "});"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does piscina handle backpressure when all workers are busy?",
+        "a": "When the internal task queue exceeds `maxQueue`, `pool.run()` rejects with a `Error: queue is full`. You catch this and return a 503 to the caller, shedding load rather than queueing indefinitely and OOM-ing. The `queueSize` statistic is a key metric to alert on."
+      },
+      {
+        "q": "What is the tradeoff between having many small worker_threads vs few large ones?",
+        "a": "Many small threads increase OS context-switch overhead and memory footprint (each thread has its own V8 isolate and stack). Few large threads may under-utilize CPU cores. A good starting point is `cpus().length - 1` threads (leave one for the main loop) and tune from there using flamegraphs of worker utilization."
+      }
+    ]
+  },
+  {
+    "q": "Walk through how you would design an org-wide observability baseline for a fleet of 50+ Node.js microservices.",
+    "a": "Three pillars — logs, metrics, traces — each with a Node-specific pattern. **Logs**: structured JSON via `pino` (lowest overhead logger; avoids `winston`'s sync transport in hot paths), sent to a log aggregator (Datadog, Loki). Every log line carries `service`, `version`, `traceId`, `reqId` injected via `AsyncLocalStorage`. **Metrics**: `prom-client` exposes a `/metrics` endpoint; mandatory gauges are event-loop lag (p50/p99 via `monitorEventLoopDelay`), GC pause time (PerformanceObserver `gc` entries), active DB connections vs pool max, and request rate/latency histograms. **Traces**: OpenTelemetry Node.js SDK with auto-instrumentation for http, express/fastify, pg, ioredis — zero manual spans for baseline coverage. All three share a `traceId` propagated via W3C Trace Context headers. Enforce via an internal `@company/node-base` package that bootstraps all three in one `initTelemetry()` call — teams opt out by overriding, not by missing it.",
+    "fj": "I'd add Datadog APM to each service — it handles everything automatically.",
+    "fs": "APM agents are good but black-box. I layer OTel auto-instrumentation for traces, prom-client for business metrics that APM doesn't model, and pino for structured logs. The internal base package ensures no service skips the baseline.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "pino + ALS request-scoped logger",
+        "lang": "ts",
+        "lines": [
+          "const als = new AsyncLocalStorage<{ reqId: string; traceId: string }>();",
+          "const base = pino({ level: 'info' });",
+          "",
+          "export const log = {",
+          "  info: (msg: string, extra?: object) =>",
+          "    base.info({ ...als.getStore(), ...extra }, msg),",
+          "  error: (msg: string, err: Error) =>",
+          "    base.error({ ...als.getStore(), err }, msg),",
+          "};",
+          "",
+          "app.use((req, res, next) => {",
+          "  als.run({ reqId: req.id, traceId: req.headers['traceparent'] ?? '' }, next);",
+          "});"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you prevent log volume from exploding as the fleet scales?",
+        "a": "Apply sampling at the trace level (OTel `TraceIdRatioBased` sampler at 10% for healthy traffic, 100% for errors), and log only at `warn`+ in the hot path — debug logs behind an env flag. Use pino's `redact` option to strip PII before logs leave the process. Route high-cardinality data (full request bodies) to a separate debug sink gated by feature flag."
+      },
+      {
+        "q": "What is the single Node.js metric most predictive of an imminent incident?",
+        "a": "Event-loop p99 lag. It is a leading indicator: when CPU work starts exceeding what the loop can drain, lag climbs before request latency visibly degrades and before error rates spike. An alert at 50 ms p99 gives the on-call team minutes to react before user-facing impact."
+      }
+    ]
+  },
+  {
+    "q": "How do you enforce consistent framework and dependency standards across 30+ Node.js services in a monorepo?",
+    "a": "Layer three enforcement mechanisms. **Build-time**: a shared `eslint-config-company` and `tsconfig-company/base.json` published as internal packages; CI fails on lint errors. An ESLint custom rule (or `eslint-plugin-import` `no-restricted-imports`) bans deprecated patterns (e.g. `require('crypto').createHash` instead of `webcrypto.subtle`). **Dependency governance**: use Renovate or Dependabot with a shared preset that pins major versions across services; a custom Renovate `groupRule` upgrades NestJS across all services in one PR. **Runtime contracts**: an internal `@company/node-base` package (see observability question) that each service imports in `main.ts` — it enforces the minimum NestJS version, bootstraps telemetry, and registers the global ValidationPipe/ExceptionFilter baseline. Gate adoption via a `package.json` engine field (`\"engines\": {\"node\": \">=22\"}`). Monthly automated PRs that bump the base package force services to stay current or explicitly opt out with a comment.",
+    "fj": "I'd write a wiki page with the standards and trust teams to follow it.",
+    "fs": "Wiki pages rot. The enforcement has to be in code — lint rules, CI gates, and package contracts. The key insight is that standards must be easy to comply with; if the base package does the right thing by default, teams don't need to remember.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle a service that cannot upgrade immediately when you bump the base package major version?",
+        "a": "Publish both the old and new major versions in parallel for a migration window (e.g. 60 days). Automated PRs open against all services; services that cannot migrate file an exception tracked in a decision log. After the window, CI blocks builds that still use the old major. Never let exceptions be permanent without a documented reason."
+      },
+      {
+        "q": "What is the role of Nx or Turborepo task orchestration in a Node.js monorepo?",
+        "a": "They provide affected-file-based task scheduling — `nx affected --target=test` only runs tests for packages changed since the last commit, reducing CI time from O(all services) to O(changed services). They cache task outputs (including Docker build layers via remote cache) so unchanged packages are never rebuilt. Turborepo's `pipeline` config defines task dependency graphs so `build` always runs before `test`."
+      }
+    ]
+  },
+  {
+    "q": "How do you implement zero-downtime, rolling deploys for a stateful Node.js service that holds WebSocket connections in a Kubernetes cluster?",
+    "a": "WebSocket connections are long-lived and stateful — a pod restart terminates them. The rolling deploy strategy: (1) **Connection draining**: on `SIGTERM`, set a `draining` flag; stop accepting new WebSocket upgrades (return 503 on the HTTP health probe so the load balancer routes new connections elsewhere); let existing connections finish or negotiate a graceful close. (2) **Client-side reconnect**: the client library should reconnect with exponential backoff + jitter — the server close is expected. (3) **Shared state**: any connection-specific state (subscriptions, session) must live in Redis or a persistent store, not in-process — so reconnecting to a different pod is transparent. (4) **preStop hook + terminationGracePeriodSeconds**: add a K8s `preStop: exec sleep 5` to give the load balancer time to de-register the pod before SIGTERM arrives. Set `terminationGracePeriodSeconds` to match your p99 connection drain time. (5) **PodDisruptionBudget**: ensure at least N-1 pods are always available during the rollout.",
+    "fj": "I'd use sticky sessions so users always hit the same pod and the reconnect problem goes away.",
+    "fs": "Sticky sessions make the connection stateful at the LB layer — one pod restart loses all those users simultaneously. Shared state in Redis + client reconnect is the only horizontally scalable design.",
+    "level": "Staff",
+    "code": [
+      {
+        "label": "Graceful WS drain on SIGTERM",
+        "lang": "ts",
+        "lines": [
+          "let draining = false;",
+          "",
+          "process.on('SIGTERM', () => {",
+          "  draining = true;",
+          "  // signal LB health probe → unhealthy",
+          "  httpServer.close();",
+          "  // give clients 20s to drain",
+          "  setTimeout(() => {",
+          "    wsServer.clients.forEach(c => c.close(1001, 'shutdown'));",
+          "    process.exit(0);",
+          "  }, 20_000);",
+          "});",
+          "",
+          "app.get('/health', (_, res) =>",
+          "  res.status(draining ? 503 : 200).end());"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How do you route WebSocket messages across pods when a client reconnects to a different pod than the one that sent an event?",
+        "a": "Use Redis Pub/Sub as an event bus. Each pod subscribes to a channel; when pod A needs to send an event to a client connected to pod B, it publishes to Redis. Pod B's subscriber receives it and forwards to the connected socket. socket.io's `@socket.io/redis-adapter` implements this pattern out of the box."
+      }
+    ]
+  },
+  {
+    "q": "How do you evaluate build-vs-buy for Node.js HTTP framework selection (Fastify vs Express vs bare http) at Staff level and what are the production tradeoffs?",
+    "a": "Framework choice is an architectural bet with long amortization — evaluate on four dimensions. **Throughput**: Fastify benchmarks at 3–4x Express throughput (70k+ RPS vs 20k on typical hello-world; the gap narrows to 30–50% with real middleware). The delta comes from Fastify's schema-based JSON serialization (`fast-json-stringify` compiles schemas to optimized serializers) and its hook system (avoids Express's linear middleware chain). **Ecosystem**: Express has 10+ years of battle-tested middleware; Fastify's plugin system (`fastify-plugin`) enforces encapsulation but has fewer community plugins — teams must often write their own. **TypeScript**: Fastify has first-class TS types; Express types are community-maintained and lag. **Maintainability**: Fastify's DI-via-decorators and scoped plugin context make large codebases easier to reason about; Express's flat global-middleware model becomes spaghetti at scale. My heuristic: choose Fastify for new greenfield services where throughput matters or the team is TypeScript-first; keep Express for services with deep middleware ecosystems. Bare `node:http` only for protocol-specific work (WebSocket proxy, HTTP/2 push).",
+    "fj": "I'd use Express — everyone knows it and there are plugins for everything.",
+    "fs": "I run a short benchmark of the real middleware stack (not hello-world) before committing. The framework decision is a 3-year bet — ecosystem, hiring, and debugging muscle memory all lock in.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What is Fastify's schema compilation model and why does it outperform Express JSON serialization?",
+        "a": "Fastify uses `fast-json-stringify` to compile a JSON Schema into a JavaScript function at registration time. At request time, the serializer function runs without property iteration or type checking — it knows the exact shape. Express's `res.json()` calls `JSON.stringify` on every response, which must discover the shape dynamically. The compiled serializer also strips unknown properties, which is both a security benefit (response data leakage prevention) and a performance one."
+      },
+      {
+        "q": "When would you choose NestJS over raw Fastify for a new service?",
+        "a": "NestJS (which can use Fastify as its adapter) adds a structured DI system, decorators for guards/pipes/interceptors, and a module graph. Choose NestJS when the service has complex business logic requiring testable, separated concerns, or when the team is already on NestJS and consistency matters. Choose raw Fastify when the service is a thin gateway/proxy where the framework overhead and abstraction cost of NestJS is not worth the structure."
+      }
+    ]
+  },
+  {
+    "q": "How do you architect a Node.js service to handle 1 million concurrent idle WebSocket connections efficiently?",
+    "a": "A million concurrent connections is a network and memory problem, not a throughput problem — most connections are idle. Key levers: (1) **Socket memory**: each idle TCP socket in Node costs ~4–8 KB kernel buffer + ~1–2 KB V8 object overhead. 1M connections = 5–8 GB kernel buffers + ~2 GB V8 overhead — requires a dedicated pod with 12–16 GB RAM. (2) **File descriptors**: raise `ulimit -n` to 1.5M+ and set `fs.file-max` in the kernel. (3) **Single Node.js process handles ~500k idle sockets** before GC pressure becomes prohibitive — use cluster with 2 workers for the target. (4) **Heartbeat + pruning**: detect zombie connections with a ping/pong cycle (WebSocket protocol level); prune dead sockets every 30s to prevent memory growth. (5) **Message fan-out**: 1M sockets × 1KB message = 1 GB serialization work per broadcast — batch-encode once with `Buffer.from` and `socket.send(sharedBuffer)` (transferable) rather than re-encoding per socket. (6) **Protocol**: consider MQTT over raw WebSocket for idle-optimized keep-alive semantics at this scale.",
+    "fj": "I'd run many small Node.js pods and load-balance connections across them.",
+    "fs": "Horizontal scaling helps but each pod still needs to handle its share. The engineering is in minimizing per-socket memory and avoiding per-message serialization — those two levers determine whether you need 5 pods or 50.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does the `ws` library's `perMessageDeflate` option affect memory at this scale?",
+        "a": "`perMessageDeflate` enables per-message compression (zlib). At 1M connections, each compressed socket context holds ~300 KB of zlib state — that's 300 GB total, which is catastrophically prohibitive. Disable `perMessageDeflate` or use `clientNoContextTakeover: true` and `serverNoContextTakeover: true` to reset context per message, reducing memory to near zero at the cost of worse compression ratios."
+      },
+      {
+        "q": "What is the role of a connection gateway service in a 1M-connection architecture?",
+        "a": "A connection gateway (e.g. built on uWebSockets.js or a purpose-built C++ server) fronts all WebSocket connections and handles only the socket lifecycle — accepting, heartbeating, routing messages via Redis Pub/Sub to business-logic services. This separates the connection scaling concern from business logic. uWebSockets.js handles 1M connections in ~512 MB vs Node.js's 2–4 GB, but it is a C++ addon with a more limited API surface."
+      }
+    ]
+  },
+  {
+    "q": "How do you set the multi-year Node.js runtime upgrade strategy for an organization, and what governance processes minimize disruption?",
+    "a": "Node.js follows a predictable LTS lifecycle: odd releases are non-LTS; even releases enter Active LTS at 12 months and Maintenance LTS at 30 months, then EOL at 42 months. A Principal-level runtime strategy has three components. **Target**: always run the current Active LTS (e.g. Node 22 through 2026, Node 24 from 2025). Never run EOL versions in production — they receive no security patches. **Upgrade cadence**: begin migration 6 months before EOL to absorb the long tail of dependency upgrades. **Governance**: (1) maintain a `supported-node.json` central registry listing each service's current runtime version; (2) automated PRs via Renovate's `node` manager bump `.nvmrc` and `engines.node` in `package.json`; (3) a Node upgrade working group reviews breaking changes (V8 API changes, `--openssl-legacy-provider` removal, ESM loader changes) and maintains an org-wide migration guide; (4) SLA: services must be on the current Active LTS within 90 days of release, on pain of blocking new feature deployments. Early adopters test Current releases in staging to surface issues before they become LTS.",
+    "fj": "I'd upgrade when a security vulnerability forces it — upgrades carry risk.",
+    "fs": "Reactive-only upgrades leave you sprinting to patch a CVE on EOL Node while the security team watches. The LTS calendar is known years in advance — make it a planned, boring event, not an emergency.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you handle a native C++ addon that has not been updated for a new Node.js ABI version?",
+        "a": "Native addons bind to a specific Node ABI (Node API / NAPI version). Pre-N-API addons must be recompiled for each Node major — file a GitHub issue, fork and rebuild if the maintainer is inactive, or replace with a pure-JS alternative. N-API addons are ABI-stable across Node majors, so they rarely need recompilation. This is a key reason to prefer N-API addons and audit native dependencies before every major Node upgrade."
+      },
+      {
+        "q": "What changed in Node.js 22 that affects production services migrating from Node 20?",
+        "a": "Node 22 (LTS Oct 2024): `require(esm)` for synchronous ESM modules is stable (no flag needed for CJS→ESM interop of non-TLA modules); `fs.glob` / `fs.globSync` are added (no more `glob` npm dependency); `WebSocket` client is available globally; `vm.Script` context isolation improvements affect Jest's module isolation. Breaking: V8 12.4 raises some compile-time type coercion strictness. Test with `node --pending-deprecation` to surface deprecated API usage before upgrading."
+      }
+    ]
+  },
+  {
+    "q": "How do you govern the ESM vs CommonJS migration strategy across a large Node.js codebase and what are the long-term implications of delaying it?",
+    "a": "The ESM ecosystem shift is irreversible: major packages (chalk 5+, got 12+, p-queue 7+, node-fetch 3+) are ESM-only. Delaying means pinning those packages at old versions — accumulating security debt and missing features. Principal-level strategy: (1) **Inventory**: classify all internal packages as CJS-only, dual (CJS+ESM), or ESM-only using a script that checks `package.json` `type` and `exports`. (2) **New packages**: all new internal packages publish as ESM-only or dual, with the CJS build generated by `tsup` or `unbuild`. (3) **Service migration order**: start with leaf services (fewest downstream dependents), migrate to `\"type\": \"module\"` in `package.json`, replace `__dirname`/`require.resolve` with `import.meta.url`, switch Jest to `--experimental-vm-modules` or migrate to Vitest. (4) **Interop bridge**: for services that cannot migrate yet, use `import()` dynamic import to consume ESM-only packages — this is the 2–3 year bridge. (5) **Exit criteria**: all internal packages dual or ESM-only, all services on `\"type\": \"module\"`, CI with `--input-type=module` lint rule. The delay cost compounds: every new CJS internal package is another migration unit to tackle later.",
+    "fj": "I'd stay on CJS — ESM adds complexity and the ecosystem still mostly works.",
+    "fs": "Staying on CJS means pinning ecosystem packages. I've seen teams running chalk 4, got 11, and node-fetch 2 simultaneously — that's three security-sensitive packages at EOL versions. The migration cost is real but fixed; the delay cost compounds indefinitely.",
+    "level": "Principal",
+    "code": [
+      {
+        "label": "dual-package tsup config (CJS + ESM output)",
+        "lang": "ts",
+        "lines": [
+          "// tsup.config.ts",
+          "import { defineConfig } from 'tsup';",
+          "export default defineConfig({",
+          "  entry: ['src/index.ts'],",
+          "  format: ['cjs', 'esm'],",
+          "  dts: true,",
+          "  splitting: false,",
+          "  clean: true,",
+          "});",
+          "// package.json exports field:",
+          "// \".\": {",
+          "//   \"import\": \"./dist/index.mjs\",",
+          "//   \"require\": \"./dist/index.cjs\"",
+          "// }"
+        ],
+        "accent": "fix"
+      }
+    ],
+    "followups": [
+      {
+        "q": "How does Vitest improve the ESM testing story compared to Jest?",
+        "a": "Vitest is built on Vite which uses native ESM. It runs tests in native ES module mode without requiring `--experimental-vm-modules` or Babel transforms. Mock semantics correctly respect ESM live bindings. It is also significantly faster for TypeScript projects because Vite's esbuild-based transform is faster than ts-jest's `tsc`. For teams migrating to ESM, Vitest removes the largest testing friction point."
+      }
+    ]
+  },
+  {
+    "q": "How do you design and enforce architectural boundaries in a large Node.js/TypeScript monorepo to prevent codebase entropy over 3+ years?",
+    "a": "Entropy in a monorepo manifests as circular dependencies, business logic leaking into transport layers, and shared mutable state. Principal-level tools: (1) **Dependency constraints with Nx**: `nx.json` `depConstraints` rules enforce that `ui` packages may not import `data-access`, `feature` packages may not import each other directly, and `data-access` packages may not import `feature`. CI fails on violations. (2) **Module boundary lint rules**: `eslint-plugin-boundaries` or NestJS `eslint-plugin-import` `no-restricted-paths` enforces that HTTP controllers import only service layer, service layer imports only repository layer. (3) **Interface segregation via published types**: internal packages export TypeScript interfaces, not implementations — consumers depend on the interface contract, not the concrete class, keeping them decoupled. (4) **ADR process**: architectural decision records (Markdown in the repo) document why a boundary exists — future engineers understand the constraint rather than routing around it. (5) **Fitness functions**: automated tests that assert the dependency graph shape (e.g. `dependency-cruiser` reports) run in CI — if a new import violates a boundary, CI fails with a clear message pointing to the ADR.",
+    "fj": "I'd use code review to catch bad imports — lint rules can be overly restrictive.",
+    "fs": "Code review doesn't scale to 50 engineers and 200 packages. Lint rules with clear error messages that link to the ADR explaining the boundary are faster feedback and more consistent than review. The goal is to make the right architecture the path of least resistance.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How does `dependency-cruiser` differ from Nx's dependency graph enforcement?",
+        "a": "`dependency-cruiser` is a general-purpose dependency analysis tool that works on any JS/TS project — it reads actual `import`/`require` statements and validates them against declarative rules (forbidden cycles, allowed paths, severity levels). Nx's constraints are higher-level (tag-based project categories) and integrate with its build graph. They are complementary: Nx for project-level constraints, `dependency-cruiser` for file-level import rules within a package."
+      },
+      {
+        "q": "How do you handle a legitimate need to break a declared architectural boundary without abandoning the governance model?",
+        "a": "File an RFC (request for comment) document describing the use case, the proposed boundary violation, and the long-term plan to fix the underlying design. If approved, add a targeted ESLint `// eslint-disable-next-line` with a comment linking to the RFC ticket. The RFC serves as the ADR for the exception and creates a paper trail. Automated scripts that grep for disable comments and verify they have linked tickets keep the exception count visible."
+      }
+    ]
   }
 ]

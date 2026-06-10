@@ -80,7 +80,7 @@ export interface GeneratedCard {
   a: string;
   fj: string;
   fs: string;
-  level: 'Jr' | 'Mid' | 'Sr';
+  level: 'Jr' | 'Mid' | 'Sr' | 'Staff' | 'Principal';
   asked?: number;
   /** Optional real code examples shown under the answer (bug/fix or single snippet). */
   code?: {
