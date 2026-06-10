@@ -4,6 +4,7 @@ import { Pressable, ScrollView, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { SKILL_CATEGORY_ORDER, skillCategory, TRACKS, Track } from '../../lib/content';
+import { confirmAsync } from '../../lib/dialog';
 import { ROLES } from '../../lib/roles';
 import { useStore } from '../../lib/store';
 import { radius, space, useTheme } from '../../lib/theme';
@@ -29,9 +30,23 @@ export default function Library() {
   const roleHits = ROLES.filter((r) => !query || r.name.toLowerCase().includes(query)).length;
 
   // Tap a track (role) → make it active and jump to the Learn path built for it.
+  // Switching is app-wide (it re-ranks Learn, mock, weak-spots…), so confirm before swapping
+  // someone's prep context out from under them.
   const openRole = (key: string) => {
-    setRole(key);
-    router.push('/');
+    if (key === role) {
+      router.push('/');
+      return;
+    }
+    const name = ROLES.find((r) => r.key === key)?.name ?? key;
+    void confirmAsync(
+      'Switch your prep?',
+      `This changes your whole Learn path to “${name}”. Your progress is kept — switch back anytime.`,
+      'Switch'
+    ).then((ok) => {
+      if (!ok) return;
+      setRole(key);
+      router.push('/');
+    });
   };
 
   return (

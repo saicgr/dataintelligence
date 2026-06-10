@@ -127,10 +127,12 @@ export default function MockInterview() {
           </Card>
         </CardEnter>
         {deck.length === 0 ? (
-          <Card style={{ padding: 16 }}>
+          <Card style={{ padding: 16, gap: 12 }}>
             <T muted size={13} style={{ textAlign: 'center' }}>
               No quiz-ready questions for this role yet. Drill a few topics first, then come back.
             </T>
+            {/* Never dead-end: hand the user the path the copy describes. */}
+            <Btn label="Drill topics →" variant="navy" onPress={() => router.replace('/(tabs)/practice')} />
           </Card>
         ) : (
           <Btn

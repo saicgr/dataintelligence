@@ -225,31 +225,37 @@ function LearnPath() {
             scrollSV.value = e.nativeEvent.contentOffset.y;
           }}>
           <View style={{ padding: space.md, gap: space.sm, paddingBottom: 130, paddingRight: 26 }}>
-            <RoleHeader role={role} onPress={() => setShowSettings(true)} />
-            <InterviewPlanCard dateIso={interviewDate} onStart={startDaily} />
-            <CardEnter>
-              <ContinueHero action={action} />
-            </CardEnter>
-            <CardEnter delay={50}>
-              <DailyStrip heroKind={action.kind} />
-            </CardEnter>
-            <CardEnter delay={75}>
-              {/* Each quest opens the session that actually advances it: fresh stream for "review a
-                  fresh card", a diagnostic deck for "finish a diagnostic", else the daily review queue. */}
-              <QuestStrip
-                onPressQuest={(qq) => {
-                  if (qq.id === 'review-fresh') startFresh();
-                  else if (qq.id === 'finish-diagnostic') startDiagnostic();
-                  else startDaily();
-                }}
-              />
-            </CardEnter>
-            <CardEnter delay={85}>
-              <PlanList />
-            </CardEnter>
-            <CardEnter delay={90}>
-              <ContestBanner />
-            </CardEnter>
+            {/* While searching, results REPLACE the home content (like Library search) — the
+                hero/quests/plan sections hide so matches aren't buried under the default page. */}
+            {!query && (
+              <Fragment>
+                <RoleHeader role={role} onPress={() => setShowSettings(true)} />
+                <InterviewPlanCard dateIso={interviewDate} onStart={startDaily} />
+                <CardEnter>
+                  <ContinueHero action={action} />
+                </CardEnter>
+                <CardEnter>
+                  <DailyStrip heroKind={action.kind} />
+                </CardEnter>
+                <CardEnter delay={50}>
+                  {/* Each quest opens the session that actually advances it: fresh stream for "review a
+                      fresh card", a diagnostic deck for "finish a diagnostic", else the daily review queue. */}
+                  <QuestStrip
+                    onPressQuest={(qq) => {
+                      if (qq.id === 'review-fresh') startFresh();
+                      else if (qq.id === 'finish-diagnostic') startDiagnostic();
+                      else startDaily();
+                    }}
+                  />
+                </CardEnter>
+                <CardEnter delay={50}>
+                  <PlanList />
+                </CardEnter>
+                <CardEnter delay={50}>
+                  <ContestBanner />
+                </CardEnter>
+              </Fragment>
+            )}
             {/* Pinned "Your path": the role's headline tracks, in its registry priority order. */}
             {coreTracks.length > 0 && (
               <Fragment>
@@ -514,7 +520,8 @@ function Header({
             <Row style={{ gap: 3 }}>
               <T weight="800" size={13} color={goalMet ? c.success : c.muted}>🎯</T>
               <T weight="800" size={13} color={goalMet ? c.success : c.muted}>
-                {goalMet ? 'Done' : `${cardsToday}/${dailyGoal}`}
+                {/* "cards" disambiguates this from the Daily Quests 0/3 counter below. */}
+                {goalMet ? 'Done' : `${cardsToday}/${dailyGoal} cards`}
               </T>
             </Row>
           </Row>

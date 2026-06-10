@@ -1,7 +1,9 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { safeBack } from '../lib/nav';
 import { useRef } from 'react';
-import { Alert, Pressable, View } from 'react-native';
+import { Pressable, View } from 'react-native';
+
+import { alertInfo } from '../lib/dialog';
 import { captureRef } from 'react-native-view-shot';
 import * as Sharing from 'expo-sharing';
 
@@ -37,10 +39,10 @@ export default function Certificate() {
       if (await Sharing.isAvailableAsync()) {
         await Sharing.shareAsync(uri, { mimeType: 'image/png', UTI: 'public.png', dialogTitle: 'Share your certificate' });
       } else {
-        Alert.alert('Sharing unavailable', 'This device can’t open the share sheet.');
+        alertInfo('Sharing unavailable', 'This device can’t open the share sheet.');
       }
     } catch (e) {
-      Alert.alert('Couldn’t share', String((e as Error).message));
+      alertInfo('Couldn’t share', String((e as Error).message));
     }
   }
 

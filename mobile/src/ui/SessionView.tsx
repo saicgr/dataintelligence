@@ -99,6 +99,15 @@ function CardView() {
   useEffect(() => () => {
     if (revealTimer.current) clearTimeout(revealTimer.current);
   }, []);
+  // Auto-reveal after a recall-check pick. Effect-driven (not a timer set inside onPress) so a
+  // re-render between pick and fire can't strand the user on an answered-but-unrevealed card.
+  useEffect(() => {
+    if (checkPick == null || reveal) return;
+    revealTimer.current = setTimeout(doReveal, 550);
+    return () => {
+      if (revealTimer.current) clearTimeout(revealTimer.current);
+    };
+  }, [checkPick, reveal, doReveal]);
   const flipPoints = card && card.kind === 'flip' ? extractKeyPoints(card, 5) : [];
   useEffect(() => {
     if (reveal && jot.trim().length > 0 && flipPoints.length >= 2 && jotTicks == null) {
@@ -345,7 +354,7 @@ function CardView() {
                                 setCheckOk(o.ok);
                                 noteCheck(o.ok);
                                 answerFeedback(o.ok);
-                                revealTimer.current = setTimeout(doReveal, 550);
+                                // Reveal is scheduled by the checkPick effect above.
                               }}
                               style={{
                                 borderWidth: 2,

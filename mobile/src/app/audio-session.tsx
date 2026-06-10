@@ -39,7 +39,9 @@ type Phase = 'idle' | 'question' | 'thinking' | 'answer' | 'grade' | 'done';
 
 /** Render any card kind down to a plain question + answer string for speech. */
 function speakable(card: SessionCard): { q: string; a: string } {
-  const q = card.framing ? `${card.framing}. ${card.q}` : card.q;
+  // Strip trailing punctuation off the framing before joining — authored framings often end
+  // with "." already, which produced "…end to end.. Explain why…" on screen and in speech.
+  const q = card.framing ? `${card.framing.replace(/[.!?\s]+$/, '')}. ${card.q}` : card.q;
   let a = card.a ?? '';
   if (!a && card.opts?.length) {
     const correct = card.opts.find((o) => o.ok);

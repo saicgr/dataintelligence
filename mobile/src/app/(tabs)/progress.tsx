@@ -1,14 +1,17 @@
 import { type Href, useRouter } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
-import { View } from 'react-native';
+import { Pressable, View } from 'react-native';
 
 import { computeBadges } from '../../lib/badges';
+import { buildCheatSheet } from '../../lib/cheatsheet';
 import { tracksForRole } from '../../lib/content';
+import { alertInfo, confirmAsync } from '../../lib/dialog';
+import { exportSheet } from '../../lib/exportPdf';
 import { daysLeftInWeek, fetchLeaderboard, type Leaderboard, tierForRank, weekKey } from '../../lib/leagues';
 import { mostAskedAtCompany, type MostAskedTopic } from '../../lib/peerAnswers';
 import { readinessAxes, readinessForRole, readinessLabel } from '../../lib/readiness';
 import { ROLES } from '../../lib/roles';
-import { level, useStore, xpInLevel } from '../../lib/store';
+import { isProActive, level, useStore, xpInLevel } from '../../lib/store';
 import { useTheme } from '../../lib/theme';
 import { AnimatedProgressBar } from '../../ui/anim';
 import { Btn, Card, Chip, H2, Row, Screen, T } from '../../ui/kit';
@@ -26,6 +29,26 @@ export default function Progress() {
   const voiceTried = useStore((s) => s.voiceTried);
   const markBadgesSeen = useStore((s) => s.markBadgesSeen);
   const company = useStore((s) => s.targetCompany);
+  const proActive = useStore(isProActive);
+
+  // Pro cheat-sheet export: seen cards only (key points + tells, never the full Q&A).
+  const exportTrack = (slug: string, name: string) => {
+    if (!proActive) {
+      void confirmAsync(
+        'Cheat-sheet export is Pro',
+        `Export your studied ${name} cards as a one-page PDF recap — key points + senior tells.`,
+        'See plans'
+      ).then((go) => {
+        if (go) router.push('/paywall');
+      });
+      return;
+    }
+    const sheet = buildCheatSheet(slug, progress);
+    if (!sheet) return alertInfo('Nothing to export yet', `Drill a few ${name} cards first — the sheet covers what you've studied.`);
+    void exportSheet(sheet.html).then((r) => {
+      if (!r.ok && r.error) alertInfo('Couldn’t export', r.error);
+    });
+  };
   const [asked, setAsked] = useState<MostAskedTopic[]>([]);
   useEffect(() => {
     mostAskedAtCompany(company).then(setAsked).catch(() => {});
@@ -112,12 +135,28 @@ export default function Progress() {
         )}
       </Card>
 
-      <H2>Your coverage · {covTracks.length} tracks for this role</H2>
+      {/* "tracks with questions in your prep", not "skills" — the Library's Skills count is the
+          full catalog (incl. empty tracks), so the two numbers are different metrics by design. */}
+      <H2>Your coverage · {covTracks.length} tracks with questions in your prep</H2>
+      <T muted size={11.5} style={{ lineHeight: 16 }}>
+        Tap 📄 on a studied track to export a cheat-sheet PDF — key points &amp; senior tells from the
+        cards you&apos;ve covered (Pro).
+      </T>
       {covTracks.map((t) => {
         const total = t.q;
         const seen = seenByTrack(t.slug);
         const pct = total ? Math.min(100, Math.round((seen / total) * 100)) : 0;
-        return <CoverageRow key={t.slug} name={t.name} color={t.color} pct={pct} seen={seen} total={total} />;
+        return (
+          <CoverageRow
+            key={t.slug}
+            name={t.name}
+            color={t.color}
+            pct={pct}
+            seen={seen}
+            total={total}
+            onExport={seen > 0 ? () => exportTrack(t.slug, t.name) : undefined}
+          />
+        );
       })}
     </Screen>
   );
@@ -240,19 +279,32 @@ function CoverageRow({
   pct,
   seen,
   total,
+  onExport,
 }: {
   name: string;
   color: string;
   pct: number;
   seen: number;
   total: number;
+  /** Present once the track has ≥1 studied card — exports the cheat-sheet recap (Pro). */
+  onExport?: () => void;
 }) {
   const { c, track } = useTheme();
+  const complete = pct >= 100;
   return (
     <View style={{ marginBottom: 4 }}>
       <Row style={{ justifyContent: 'space-between' }}>
         <T size={12.5} weight="700">{name}</T>
-        <T muted size={12.5}>{seen}/{total} · {pct}%</T>
+        <Row style={{ gap: 8 }}>
+          {onExport && (
+            <Pressable onPress={onExport} hitSlop={8} accessibilityRole="button" accessibilityLabel={`Export ${name} cheat sheet as PDF`}>
+              <T size={11.5} weight="800" color={complete ? c.success : c.muted}>
+                {complete ? '📄 Cheat sheet ↗' : '📄 ↗'}
+              </T>
+            </Pressable>
+          )}
+          <T muted size={12.5}>{seen}/{total} · {pct}%</T>
+        </Row>
       </Row>
       <View style={{ height: 10, borderRadius: 999, backgroundColor: c.border, overflow: 'hidden', marginTop: 5 }}>
         <View style={{ width: `${pct}%`, height: '100%', backgroundColor: track(color) }} />

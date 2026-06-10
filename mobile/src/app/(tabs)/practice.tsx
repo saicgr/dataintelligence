@@ -29,9 +29,13 @@ export default function Practice() {
     router.push('/');
   };
   // Distinct from the scheduled daily queue: an off-schedule random topic from your prep.
+  // Capped at 12 cards — it promises "quick reps", not a full track drill.
   const surprise = () => {
     if (tracks.length === 0) return;
-    drill(tracks[Math.floor(Math.random() * tracks.length)].slug);
+    haptic.light();
+    sfx.tap();
+    startTrack(tracks[Math.floor(Math.random() * tracks.length)].slug, undefined, 12);
+    router.push('/');
   };
   const drillCompany = (key: string) => {
     haptic.light();

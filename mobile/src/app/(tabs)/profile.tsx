@@ -1,8 +1,9 @@
 import { useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { Alert, Pressable, Switch, TextInput, View } from 'react-native';
+import { Pressable, Switch, TextInput, View } from 'react-native';
 
 import { appleAvailable, signInWithApple, signInWithEmail, signInWithGoogle, signOut } from '../../lib/auth';
+import { alertInfo, confirmAsync } from '../../lib/dialog';
 import { hasSupabase } from '../../lib/env';
 import { haptic } from '../../lib/feedback';
 import { PACKS, SUB_YEARLY_PER_MONTH, SUB_YEARLY_PRICE } from '../../lib/products';
@@ -41,19 +42,19 @@ export default function Profile() {
   const signedIn = Boolean(userId);
 
   async function magicLink() {
-    if (!hasSupabase) return Alert.alert('Not configured', 'Add your Supabase keys to .env (see SETUP.md).');
+    if (!hasSupabase) return alertInfo('Not configured', 'Add your Supabase keys to .env (see SETUP.md).');
     try {
       await signInWithEmail(email);
-      Alert.alert('Check your email', `We sent a magic link to ${email}.`);
+      alertInfo('Check your email', `We sent a magic link to ${email}.`);
     } catch (e) {
-      Alert.alert('Sign-in failed', String((e as Error).message));
+      alertInfo('Sign-in failed', String((e as Error).message));
     }
   }
   const wrap = (fn: () => Promise<void>) => async () => {
     try {
       await fn();
     } catch (e) {
-      Alert.alert('Sign-in failed', String((e as Error).message));
+      alertInfo('Sign-in failed', String((e as Error).message));
     }
   };
 
@@ -195,7 +196,7 @@ export default function Profile() {
         />
         <RestDaysRow value={restDays} onChange={setRestDays} />
         <NavRow icon="♻️" label="Restore purchase" onPress={() => void restore()} />
-        <SettingRow icon="◐" label="Theme" right="System" />
+        <ThemeRow />
         <SettingRow icon="ℹ️" label="About" right="v1.0" />
         {__DEV__ && (
           <ToggleRow
@@ -211,8 +212,15 @@ export default function Profile() {
             icon="🔁"
             label="Restart onboarding"
             onPress={() => {
-              restartOnboarding();
-              router.replace('/onboarding');
+              void confirmAsync(
+                'Restart onboarding?',
+                'You’ll re-pick your role and prep setup. Your progress and streak are kept.',
+                'Restart'
+              ).then((ok) => {
+                if (!ok) return;
+                restartOnboarding();
+                router.replace('/onboarding');
+              });
             }}
           />
         )}
@@ -240,16 +248,17 @@ function AccentSection() {
   function pick(key: AccentKey) {
     const opt = ACCENTS[key];
     if (opt.pro && !entitled) {
-      Alert.alert(
+      // confirmAsync, not Alert.alert — Alert is a silent no-op on web, which made locked
+      // swatches feel broken instead of locked.
+      void confirmAsync(
         'Pro accent themes',
         signedIn
           ? 'Unlock every accent color with FieldNotes Pro.'
           : 'Accent themes need FieldNotes Pro and a signed-in account.',
-        [
-          { text: 'Not now', style: 'cancel' },
-          { text: 'See plans', onPress: () => router.push('/paywall') },
-        ]
-      );
+        'See plans'
+      ).then((go) => {
+        if (go) router.push('/paywall');
+      });
       return;
     }
     haptic.selection();
@@ -385,6 +394,32 @@ function NavRow({ icon, label, onPress }: { icon: string; label: string; onPress
         <IconBox icon={icon} />
         <T size={13.5} weight="600" style={{ flex: 1 }}>{label}</T>
         <T muted size={12.5} weight="700">›</T>
+      </Row>
+    </Pressable>
+  );
+}
+
+/** Theme row — taps cycle System → Light → Dark (the row used to be inert, a reported bug). */
+function ThemeRow() {
+  const { c } = useTheme();
+  const themePref = useStore((s) => s.themePref);
+  const cycleTheme = useStore((s) => s.cycleTheme);
+  const label = themePref === 'system' ? 'System' : themePref === 'light' ? 'Light' : 'Dark';
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Theme: ${label}. Tap to change.`}
+      onPress={() => {
+        haptic.selection();
+        cycleTheme();
+      }}>
+      <Row style={{ paddingVertical: 13, paddingHorizontal: 15, borderTopWidth: 1, borderTopColor: c.border }}>
+        <IconBox icon="◐" />
+        <View style={{ flex: 1 }}>
+          <T size={13.5} weight="600">Theme</T>
+          <T muted size={11} style={{ lineHeight: 15 }}>Tap to switch · System / Light / Dark</T>
+        </View>
+        <T muted size={12.5} weight="700">{label} ›</T>
       </Row>
     </Pressable>
   );

@@ -114,7 +114,7 @@ export function EvidenceView({ card }: { card: SessionCard }) {
       ) : (
         <View style={{ marginTop: 14 }}>
           <T weight="800" size={13} color={tellHit ? c.success : c.danger} style={{ marginBottom: 8 }}>
-            {tellHit ? '🎯 That’s the tell' : '✗ That one’s fine — the real tell is highlighted'}
+            {tellHit ? '🎯 That’s the tell' : '✗ Not that one — the real tell is highlighted in green'}
           </T>
           <T weight="800" size={12} color={c.muted} style={{ letterSpacing: 0.4, marginBottom: 4 }}>
             WHAT DOES IT TELL YOU?
@@ -125,8 +125,14 @@ export function EvidenceView({ card }: { card: SessionCard }) {
 
       {phase === 'revealed' ? (
         <View style={{ marginTop: 13 }}>
-          <T weight="800" size={15} color={good ? c.success : c.danger} style={{ marginBottom: 7 }}>
-            {good ? '🎉 Read it right' : '✗ Re-read the panel'}
+          {/* Three states, not two — "right cause but missed the tell" used to render a flat ✗
+              next to a green-highlighted correct option, which read as a contradiction. */}
+          <T weight="800" size={15} color={good ? c.success : causeOk ? c.warn : c.danger} style={{ marginBottom: 7 }}>
+            {good
+              ? '🎉 Read it right'
+              : causeOk
+                ? '△ Right cause — but you tapped the wrong tell. Scheduling a rep.'
+                : '✗ Wrong cause — re-read the panel'}
           </T>
           <T size={13} style={{ lineHeight: 20 }}>
             {ev.why}

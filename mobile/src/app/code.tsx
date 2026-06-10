@@ -111,7 +111,8 @@ function Editor({
     try {
       let r: JudgeResult;
       if (problem.lang === 'sql') {
-        r = judgeSql(problem, code);
+        // Sync on native, async on web (sql.web.ts) — await is a no-op for the sync judge.
+        r = await judgeSql(problem, code);
       } else {
         const res = (await hostRef.current?.run(buildProgram(problem, code))) ?? { error: 'Runtime not ready — check your connection.' };
         r = judgeFromStdout(problem, res);
@@ -152,7 +153,11 @@ function Editor({
         <T muted size={11} weight="800" style={{ letterSpacing: 0.4 }}>YOUR CODE</T>
         <TextInput
           value={code}
-          onChangeText={setCode}
+          onChangeText={(t) => {
+            setCode(t);
+            // A stale pass/fail/error belongs to the previous run — clear it as soon as the code changes.
+            if (result) setResult(null);
+          }}
           multiline
           autoCapitalize="none"
           autoCorrect={false}

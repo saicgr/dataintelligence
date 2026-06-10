@@ -2,7 +2,7 @@ import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from 'expo-router';
 import Head from 'expo-router/head';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
-import { Platform, useColorScheme, View } from 'react-native';
+import { Platform, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { identify, initAnalytics, track } from '../lib/analytics';
@@ -13,6 +13,7 @@ import { initFeedback } from '../lib/feedback';
 import { initIAP } from '../lib/iap';
 import { setDailyReminder } from '../lib/reminders';
 import { useStore } from '../lib/store';
+import { useResolvedScheme } from '../lib/theme';
 
 function useBootstrap() {
   const setUserId = useStore((s) => s.setUserId);
@@ -56,7 +57,8 @@ function useBootstrap() {
 const isWeb = Platform.OS === 'web';
 
 export default function RootLayout() {
-  const scheme = useColorScheme();
+  // Honor the user's theme preference (Profile → Theme), not just the OS scheme.
+  const scheme = useResolvedScheme();
   useBootstrap();
   return (
     <GestureHandlerRootView style={[{ flex: 1 }, isWeb && { backgroundColor: '#0b0f15', alignItems: 'center' }]}>
@@ -100,7 +102,7 @@ export default function RootLayout() {
             <Stack.Screen name="audio-session" />
             <Stack.Screen name="incidents" />
           </Stack>
-          <StatusBar style="auto" />
+          <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
         </ThemeProvider>
       </View>
     </GestureHandlerRootView>

@@ -1,8 +1,10 @@
 /**
  * On-device code judge — shared contract (plan GAP 1). Grading is deterministic output-match
  * (NOT AI), so it honors the "no runtime AI" moat. Each language has its own runner:
- *   - sql.ts     → expo-sqlite (offline, synchronous)
- *   - pyodide.tsx → Pyodide-in-WebView for python + pyspark (needs the runner mounted)
+ *   - sql.ts      → expo-sqlite, offline & synchronous (sql.web.ts: async API — the sync
+ *                   web path needs SharedArrayBuffer/cross-origin isolation, async doesn't)
+ *   - pyodide.tsx → Pyodide-in-WebView for python + pyspark (pyodide.web.tsx: Pyodide
+ *                   on the page — no WebView on web); needs the runner mounted
  */
 import type { Rating } from '../srs';
 

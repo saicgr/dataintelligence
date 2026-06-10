@@ -19,10 +19,14 @@ export default function Debrief() {
 
   const [company, setCompany] = useState(company0.split(',')[0]?.trim() ?? '');
   const [level, setLevel] = useState('Senior');
-  const [outcome, setOutcome] = useState('Solid');
+  // Outcome starts UNPICKED — a pre-selected "Solid" silently misreported interviews when
+  // users didn't notice the default. One explicit tap is cheap; wrong data is not.
+  const [outcome, setOutcome] = useState<string | null>(null);
   const [topics, setTopics] = useState<string[]>([]);
   const [notes, setNotes] = useState('');
   const [done, setDone] = useState(false);
+  // Company is required — the whole feature aggregates into "most-asked at <company>".
+  const canSave = company.trim().length > 0 && outcome != null;
 
   const toggle = (t: string) =>
     setTopics((cur) => (cur.includes(t) ? cur.filter((x) => x !== t) : [...cur, t]));
@@ -75,6 +79,9 @@ export default function Debrief() {
         autoCapitalize="words"
         style={{ borderWidth: 2, borderColor: c.border, borderRadius: radius.md, padding: 12, color: c.fg, backgroundColor: c.surface }}
       />
+      {company.trim().length === 0 && (
+        <T muted size={11.5}>Required — debriefs power the “most-asked at &lt;company&gt;” list.</T>
+      )}
 
       <H2>Level</H2>
       <Row style={{ flexWrap: 'wrap' }}>
@@ -117,9 +124,11 @@ export default function Debrief() {
       />
 
       <Btn
-        label="Save debrief & re-rank my deck"
+        label={canSave ? 'Save debrief & re-rank my deck' : 'Add company & outcome to save'}
+        style={{ opacity: canSave ? 1 : 0.5 }}
         onPress={async () => {
-          await submitDebrief({ company, level, outcome, topics, notes });
+          if (!canSave) return;
+          await submitDebrief({ company: company.trim(), level, outcome: outcome!, topics, notes });
           setDone(true);
         }}
       />

@@ -1,8 +1,9 @@
 import { useRouter } from 'expo-router';
 import { safeBack } from '../lib/nav';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, Share, TextInput, View } from 'react-native';
+import { ActivityIndicator, Pressable, Share, TextInput, View } from 'react-native';
 
+import { alertInfo, confirmAsync } from '../lib/dialog';
 import { acceptInvite, Friend, inviteCodeFor, listFriends, removeFriend } from '../lib/friends';
 import { hasSupabase } from '../lib/env';
 import { haptic } from '../lib/feedback';
@@ -62,22 +63,20 @@ export default function Friends() {
       setCode('');
       await refresh();
     } else {
-      Alert.alert('Couldn’t add friend', REASON_COPY[res.reason] ?? REASON_COPY.error);
+      alertInfo('Couldn’t add friend', REASON_COPY[res.reason] ?? REASON_COPY.error);
     }
   }
 
   function confirmRemove(f: Friend) {
-    Alert.alert('Remove friend?', `This ends your ${f.friendStreak}-day shared streak with ${f.name}.`, [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Remove',
-        style: 'destructive',
-        onPress: async () => {
-          await removeFriend(userId, f.friendId);
-          await refresh();
-        },
-      },
-    ]);
+    void confirmAsync(
+      'Remove friend?',
+      `This ends your ${f.friendStreak}-day shared streak with ${f.name}.`,
+      'Remove'
+    ).then(async (ok) => {
+      if (!ok) return;
+      await removeFriend(userId, f.friendId);
+      await refresh();
+    });
   }
 
   return (
@@ -98,9 +97,9 @@ export default function Friends() {
           </T>
           <T muted size={12.5} style={{ textAlign: 'center', lineHeight: 18 }}>
             Sign in to swap invite codes and grow a shared streak — you both keep it alive by
-            studying on the same day.
+            studying on the same day. Sign-in lives in the Account section of your Profile.
           </T>
-          <Btn label="Go to Profile to sign in" onPress={() => router.push('/profile')} style={{ alignSelf: 'stretch' }} />
+          <Btn label="Open Account settings →" onPress={() => router.push('/profile')} style={{ alignSelf: 'stretch' }} />
         </Card>
       ) : (
         <>

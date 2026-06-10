@@ -83,7 +83,9 @@ const PRODUCTION_KINDS = new Set(['scenario', 'diag', 'querybuild', 'match', 'ev
 export const FREE_CODE_RUNS = 3;
 const xpFor = (kind: string | undefined, rating: Rating): number => {
   const prod = kind ? PRODUCTION_KINDS.has(kind) : false;
-  if (rating === 'again') return prod ? 8 : 5;
+  // Deliberate (founder decision 2026-06): a wrong/"Again" answer earns NOTHING — XP is a
+  // progress signal, not an effort reward. Streaks and quest counters still advance.
+  if (rating === 'again') return 0;
   return prod ? 20 : 10; // good / easy
 };
 
@@ -139,6 +141,8 @@ interface State {
   haptics: boolean;
   // Accent theme (Pro + account gated for non-default swatches; see resolveAccent in theme.ts)
   accentKey: AccentKey;
+  // Theme preference — 'system' follows the OS; the Profile row cycles System → Light → Dark.
+  themePref: 'system' | 'light' | 'dark';
   // Scheduled rest days (UTC weekday 0=Sun..6=Sat) — skipped rest days don't break the streak.
   restDays: number[];
   // Weekly league XP (resets each ISO week) — feeds the leaderboard.
@@ -187,6 +191,7 @@ interface State {
   singleId: string | null; // a single card opened directly from search
   lessonIdx: number | null;
   sessionLevel: Level | null; // optional difficulty filter for a track session (track screen selector)
+  sessionCap: number | null; // optional deck-size cap for "quick reps" entries (Surprise me) — null = normal sizing
   userLevel: Level | null; // PERSISTED default level (Junior/Senior/Pro) chosen at onboarding → filters daily/role sessions
   sessionDeck: SessionCard[];
   sessionMeta: { due: number; fresh: number };
@@ -210,6 +215,7 @@ interface State {
   setSound: (v: boolean) => void;
   setHaptics: (v: boolean) => void;
   setAccent: (k: AccentKey) => void;
+  cycleTheme: () => void;
   setRestDays: (days: number[]) => void;
   setInterviewDate: (iso: string | null) => void;
   bumpQuest: (metric: 'diag' | 'fresh' | 'lesson', n?: number) => void;
@@ -234,7 +240,7 @@ interface State {
   setDailyGoal: (n: number) => void;
   applyHintCost: (n: number) => void;
   startDaily: () => void;
-  startTrack: (slug: string, level?: Level) => void;
+  startTrack: (slug: string, level?: Level, cap?: number) => void;
   startFresh: () => void;
   startSaved: () => void;
   startWeakspot: () => void;
@@ -270,7 +276,7 @@ interface State {
 
 type DeckInputs = Pick<
   State,
-  'sessionKind' | 'trackSlug' | 'companyKey' | 'incidentId' | 'singleId' | 'lessonIdx' | 'sessionLevel' | 'userLevel' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
+  'sessionKind' | 'trackSlug' | 'companyKey' | 'incidentId' | 'singleId' | 'lessonIdx' | 'sessionLevel' | 'sessionCap' | 'userLevel' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
 >;
 
 /** Ids the user disliked — buildSessionDeck pushes these to the back so they surface less (never hidden). */
@@ -286,9 +292,10 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
   let deck: SessionCard[];
   if (s.sessionKind === 'weakspot') {
     deck = weakSpotDeck(dailyPoolForRole(s.role, now), s.progress, now, unlockAll ? 30 : 10);
-    // Brand-new user has no weak cards yet → don't show an empty session; fall back to a normal one.
+    // Brand-new user has no weak cards yet → don't show an empty session; fall back to a SHORT
+    // warm-up (12 cards), not a full daily-size session — "weakest first" promised quick reps.
     if (deck.length === 0) {
-      deck = buildSessionDeck(dailyPoolForRole(s.role, now), s.progress, now, unlockAll ? 40 : 15, adaptive, down);
+      deck = buildSessionDeck(dailyPoolForRole(s.role, now), s.progress, now, 12, adaptive, down);
     }
   } else if (s.sessionKind === 'lesson' && s.trackSlug && s.lessonIdx != null) {
     deck = lessonDeck(s.trackSlug, s.lessonIdx);
@@ -301,7 +308,7 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
       scoped.length ? scoped : pool,
       s.progress,
       now,
-      unlockAll ? Infinity : 50,
+      s.sessionCap ?? (unlockAll ? Infinity : 50),
       adaptive,
       down,
       s.sessionLevel ? null : s.userLevel,
@@ -360,6 +367,7 @@ const FRESH_SESSION = {
   sessionXp: 0,
   sessionHits: 0,
   sessionMisses: 0,
+  sessionCap: null,
 } as const;
 
 const initial = buildDeck({
@@ -370,6 +378,7 @@ const initial = buildDeck({
   singleId: null,
   lessonIdx: null,
   sessionLevel: null,
+  sessionCap: null,
   userLevel: null,
   role: 'de',
   unlocked: false,
@@ -398,6 +407,7 @@ export const useStore = create<State>()(
       sound: true,
       haptics: true,
       accentKey: 'classic',
+      themePref: 'system' as const,
       restDays: [],
       weeklyXp: 0,
       weeklyXpWeek: null,
@@ -434,6 +444,7 @@ export const useStore = create<State>()(
       singleId: null,
       lessonIdx: null,
       sessionLevel: null,
+      sessionCap: null,
       userLevel: null,
       sessionDeck: initial.deck,
       sessionMeta: initial.meta,
@@ -466,6 +477,10 @@ export const useStore = create<State>()(
       setSound: (sound) => set({ sound }),
       setHaptics: (haptics) => set({ haptics }),
       setAccent: (accentKey) => set({ accentKey }),
+      cycleTheme: () =>
+        set((s) => ({
+          themePref: s.themePref === 'system' ? 'light' : s.themePref === 'light' ? 'dark' : 'system',
+        })),
       setRestDays: (restDays) => set({ restDays }),
       setInterviewDate: (interviewDate) => set({ interviewDate }),
       bumpQuest: (metric, n = 1) => {
@@ -527,9 +542,9 @@ export const useStore = create<State>()(
         set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
-      startTrack: (slug, level) => {
+      startTrack: (slug, level, cap) => {
         track('session_started', { kind: 'track', track: slug, level: level ?? 'all' });
-        set({ sessionKind: 'track', trackSlug: slug, sessionLevel: level ?? null, lessonIdx: null, ...FRESH_SESSION });
+        set({ sessionKind: 'track', trackSlug: slug, sessionLevel: level ?? null, lessonIdx: null, ...FRESH_SESSION, sessionCap: cap ?? null });
         get().rebuildSession();
       },
       startFresh: () => {
@@ -826,7 +841,7 @@ export const useStore = create<State>()(
     }),
     {
       name: 'fieldnotes-v1',
-      version: 12,
+      version: 13,
       storage: createJSONStorage(() => AsyncStorage),
       partialize: (s) => ({
         role: s.role,
@@ -844,6 +859,7 @@ export const useStore = create<State>()(
         sound: s.sound,
         haptics: s.haptics,
         accentKey: s.accentKey,
+        themePref: s.themePref,
         restDays: s.restDays,
         userLevel: s.userLevel,
         weeklyXp: s.weeklyXp,
@@ -937,6 +953,10 @@ export const useStore = create<State>()(
           if (typeof p.leagueResultShownWeek !== 'string') p.leagueResultShownWeek = null;
           if (typeof p.reports !== 'object' || p.reports === null) p.reports = {};
           if (!Array.isArray(p.pendingReports)) p.pendingReports = [];
+        }
+        if (from < 13) {
+          // v13 added the theme preference (Profile row: System → Light → Dark).
+          if (p.themePref !== 'light' && p.themePref !== 'dark') p.themePref = 'system';
         }
         return p;
       },

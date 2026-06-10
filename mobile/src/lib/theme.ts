@@ -150,8 +150,15 @@ export type Theme = {
   track: (key: string) => string;
 };
 
+/** The scheme actually in effect: the user's Profile preference, falling back to the OS. */
+export function useResolvedScheme(): 'light' | 'dark' {
+  const sys = useColorScheme() === 'dark' ? 'dark' : 'light';
+  const pref = useStore((s) => s.themePref);
+  return pref === 'system' ? sys : pref;
+}
+
 export function useTheme(): Theme {
-  const scheme = useColorScheme() === 'dark' ? 'dark' : 'light';
+  const scheme = useResolvedScheme();
   const tc = trackColors[scheme] as Record<string, string>;
   // Accent picker: a Pro swatch only applies when the user is entitled (live Pro + signed-in account).
   const accentKey = useStore((s) => s.accentKey);
