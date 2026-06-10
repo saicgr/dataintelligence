@@ -1,0 +1,59 @@
+{
+  "_draft": true,
+  "_track": "databricks",
+  "_action": "append to mobile/src/lib/generated/databricks.json",
+  "q": "A revenue metric has been wrong in your gold layer for 3 weeks. Root cause: a currency conversion column was silently NULL because EXPECT didn't FAIL. What architecture changes prevent this class of issue?",
+  "a": "EXPECT in DLT logs violations and keeps moving — it is a monitoring signal, not a gate. On a metric column that feeds financial reporting, that is the wrong default. Three architectural changes: (1) Replace EXPECT with EXPECT OR FAIL on any column that is load-bearing for aggregations. EXPECT OR FAIL stops the pipeline and rolls back the update atomically — a failed run is noisy but a silent wrong number is worse; (2) Add Databricks Lakehouse Monitoring on the gold table. Lakehouse Monitoring tracks percent_null per column across time windows and can alert via Databricks SQL alerts when null fraction for fx_rate exceeds a threshold; (3) Write unit tests for your transformation notebooks using pytest or Databricks' test utilities — assert that the output of your currency conversion logic has zero NULLs on a representative fixture. The root-cause lesson: the issue propagated for 3 weeks because there was no fail-fast at the point of transformation, and no downstream anomaly detection. Defense-in-depth: EXPECT OR FAIL at pipeline time + Lakehouse Monitoring alert + transformation unit tests.",
+  "fj": "I'd add a NOT NULL constraint on the currency column and re-run the pipeline.",
+  "fs": "A NOT NULL constraint raises an error at write time but doesn't help if the column IS being written (with NULLs). The correct fix is EXPECT OR FAIL to block the pipeline if the invariant is violated — plus Lakehouse Monitoring to catch statistical drift (e.g., 10% null rate) before it compounds for weeks.",
+  "level": "Staff",
+  "asked": 0,
+  "code": [
+    {
+      "lang": "sql",
+      "label": "Silent failure: EXPECT logs but lets NULLs through",
+      "accent": "bug",
+      "lines": [
+        "-- DLT silver table — EXPECT only warns:",
+        "CREATE OR REFRESH STREAMING TABLE silver_txns",
+        "  CONSTRAINT valid_fx_rate",
+        "    EXPECT (fx_rate IS NOT NULL)",
+        "  -- violated rows still written to silver!"
+      ]
+    },
+    {
+      "lang": "sql",
+      "label": "Fail-fast: EXPECT OR FAIL blocks the run",
+      "accent": "fix",
+      "lines": [
+        "-- Block the pipeline on NULL fx_rate:",
+        "CREATE OR REFRESH STREAMING TABLE silver_txns",
+        "  CONSTRAINT valid_fx_rate",
+        "    EXPECT (fx_rate IS NOT NULL)",
+        "    ON VIOLATION FAIL UPDATE;",
+        "",
+        "-- Lakehouse Monitoring alert on gold:",
+        "-- percent_null(fx_rate) > 0.01 OVER last 1h"
+      ]
+    },
+    {
+      "lang": "pyspark",
+      "label": "Lakehouse Monitoring: check null fraction on gold",
+      "lines": [
+        "# Query the LHM profile metrics table",
+        "# after enabling monitoring on gold.revenue:",
+        "spark.sql('''",
+        "  SELECT window, column_name, percent_null",
+        "  FROM   gold.revenue_profile_metrics",
+        "  WHERE  column_name = 'fx_rate'",
+        "    AND  window.start >= current_date() - 7",
+        "  ORDER  BY window.start DESC",
+        "''').show()"
+      ]
+    }
+  ],
+  "followups": [
+    "When should you use EXPECT vs EXPECT_OR_DROP vs EXPECT_OR_FAIL in a medallion pipeline?",
+    "What does Databricks Lakehouse Monitoring's drift metrics table tell you that simple row counts don't?"
+  ]
+}

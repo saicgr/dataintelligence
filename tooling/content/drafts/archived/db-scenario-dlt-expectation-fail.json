@@ -1,0 +1,59 @@
+{
+  "_draft": true,
+  "_track": "databricks",
+  "_action": "append to mobile/src/lib/generated/databricks.json",
+  "q": "You're on-call. Your DLT pipeline failed on a silver expectation. The pipeline email says 12,000 rows were dropped in the last run. How do you investigate and decide whether to reprocess?",
+  "a": "Start by querying the pipeline's event log — it contains per-expectation pass/fail counts for every run. Create the event_log_raw view from your pipeline's event log location, then query flow_progress events to extract which expectation fired and how many records failed. Once you know the expectation name, query the source (bronze) table filtered to the last run window and pull sample rows that would fail the predicate — this tells you whether the data is genuinely bad or the rule is wrong. Decision tree: if the source data is malformed (e.g., corrupt upstream feed), fix upstream and trigger a full-refresh pipeline run to reprocess the window; if the expectation rule is too strict (e.g., a new merchant type not yet in your allowlist), update the expectation logic and re-run. Reprocessing is safe in DLT because Delta's transaction log makes reruns idempotent. Never adjust EXPECT to EXPECT_OR_DROP without understanding the business impact — dropping rows silently in silver means gold aggregates are silently wrong.",
+  "fj": "I'd check the pipeline UI to see which expectation fired, then re-run the pipeline.",
+  "fs": "The UI shows counts, not causes. The diagnostic move is querying event_log to get the exact expectation and failed_records, then pulling the actual bad rows from bronze to determine if it's a data bug or a rule bug — then deciding reprocess vs expectation update.",
+  "level": "Sr",
+  "asked": 0,
+  "code": [
+    {
+      "lang": "sql",
+      "label": "Query DLT event_log for expectation failures",
+      "lines": [
+        "-- Run from within your Unity Catalog schema",
+        "CREATE OR REPLACE TEMP VIEW event_log_raw AS",
+        "  SELECT * FROM event_log(",
+        "    '<pipeline_id>'  -- your pipeline ID",
+        "  );",
+        "",
+        "SELECT",
+        "  row_exp.dataset    AS dataset,",
+        "  row_exp.name       AS expectation,",
+        "  SUM(row_exp.passed_records)  AS passed,",
+        "  SUM(row_exp.failed_records)  AS failed",
+        "FROM (",
+        "  SELECT EXPLODE(FROM_JSON(",
+        "    details:flow_progress:data_quality:expectations,",
+        "    'array<struct<name:string,dataset:string,",
+        "     passed_records:long,failed_records:long>>'",
+        "  )) AS row_exp",
+        "  FROM event_log_raw",
+        "  WHERE event_type = 'flow_progress'",
+        ")",
+        "GROUP BY 1, 2",
+        "ORDER BY failed DESC;"
+      ]
+    },
+    {
+      "lang": "sql",
+      "label": "Pull sample failing rows from bronze",
+      "lines": [
+        "-- After identifying the expectation predicate,",
+        "-- pull bad rows to see the actual data:",
+        "SELECT *",
+        "FROM bronze.transactions",
+        "WHERE event_date = current_date() - 1",
+        "  AND NOT (amount > 0          -- example predicate",
+        "           AND merchant_id IS NOT NULL)",
+        "LIMIT 50;"
+      ]
+    }
+  ],
+  "followups": [
+    "What is the difference between EXPECT, EXPECT_OR_DROP, and EXPECT_OR_FAIL in DLT?",
+    "How do you trigger a full-refresh DLT pipeline run safely without losing downstream gold tables?"
+  ]
+}

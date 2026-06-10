@@ -1,0 +1,57 @@
+{
+  "_draft": true,
+  "_track": "databricks",
+  "_action": "append to mobile/src/lib/generated/databricks.json",
+  "q": "How do you refresh the static side of a Spark stream-static join when the lookup table changes, without restarting the whole streaming query?",
+  "a": "The answer depends entirely on what backs the static side. With Delta Lake you get automatic refresh for free: TahoeFileIndex calls DeltaLog.update() on every micro-batch so the join always sees the latest committed snapshot. No code change needed. With non-Delta file formats (Parquet, JSON, CSV) the file index is resolved once and cached in memory — there is no built-in refresh. Your options in that case are: (1) restart the streaming query — the cleanest guarantee but causes a brief gap; (2) call .cache() on the static DataFrame and, from a separate thread or foreachBatch call, invoke DataFrame.unpersist() followed by re-calling spark.read to rebuild it — this works but introduces a race window where two micro-batches could see different versions; (3) store the lookup data in Delta and use Delta as the static source so you get automatic refresh without any of this complexity. The foreachBatch path is sometimes suggested as a workaround — call REFRESH TABLE inside foreachBatch — but this only refreshes the Hive metastore's file list, not the in-memory index used by the streaming plan, and can still produce missing-file errors during concurrent writes. The operationally safe trade-off: use Delta for any lookup table that must stay current; fall back to a query restart with a bounded checkpoint for everything else.",
+  "fj": "I'd call REFRESH TABLE inside foreachBatch so the static side picks up changes without a restart.",
+  "fs": "REFRESH TABLE refreshes the metastore file list but not the in-memory FileIndex baked into the streaming plan — new files can still be missed and concurrent writes can produce missing-file errors. Delta's TahoeFileIndex is the only mechanism that reliably refreshes per micro-batch without a restart.",
+  "level": "Sr",
+  "asked": 0,
+  "code": [
+    {
+      "lang": "pyspark",
+      "label": "Delta static side — automatic per-micro-batch refresh",
+      "lines": [
+        "# Delta: TahoeFileIndex.update() called each micro-batch — no extra code needed",
+        "dim_product = spark.read.format('delta').table('prod.dim_product')",
+        "",
+        "enriched = (events_stream",
+        "  .join(dim_product, on='product_id', how='left_outer'))",
+        "",
+        "query = (enriched.writeStream",
+        "  .format('delta')",
+        "  .option('checkpointLocation', '/ckpt/enriched')",
+        "  .outputMode('append')",
+        "  .start('prod.enriched_events'))"
+      ]
+    },
+    {
+      "lang": "pyspark",
+      "label": "Non-Delta fallback: unpersist + re-read in foreachBatch (race-aware)",
+      "lines": [
+        "# WARNING: race window between unpersist and re-read; prefer Delta instead",
+        "dim_ref = spark.read.parquet('/mnt/lookup/dim_product').cache()",
+        "",
+        "def refresh_and_write(batch_df, batch_id):",
+        "    global dim_ref",
+        "    # every N batches, rebuild the static side",
+        "    if batch_id % 100 == 0:",
+        "        dim_ref.unpersist()",
+        "        dim_ref = spark.read.parquet('/mnt/lookup/dim_product').cache()",
+        "    enriched = batch_df.join(dim_ref, on='product_id', how='left_outer')",
+        "    enriched.write.format('delta').mode('append').save('/delta/enriched')",
+        "",
+        "query = (raw_stream.writeStream",
+        "  .foreachBatch(refresh_and_write)",
+        "  .option('checkpointLocation', '/ckpt/enriched')",
+        "  .start())"
+      ]
+    }
+  ],
+  "followups": [
+    "What is the risk of calling .cache() on the static DataFrame in a long-running streaming query?",
+    "If the lookup table is updated via a daily batch job, how do you coordinate the refresh with the stream?",
+    "Can you use a streaming join (stream-stream) instead to avoid the refresh problem entirely?"
+  ]
+}
