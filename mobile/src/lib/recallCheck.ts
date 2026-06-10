@@ -13,8 +13,9 @@ export interface RecallCheck {
   opts: { t: string; ok: boolean }[];
 }
 
-/** Options longer than this read as paragraphs, not pills — skip the check. */
-const MAX_LEN = 160;
+/** Options longer than this read as paragraphs, not pills — skip the check.
+ *  240 covers ~81% of the banks (avg senior tell ≈ 193 chars); 160 covered only 29%. */
+const MAX_LEN = 240;
 
 /** FNV-1a 32-bit — deterministic per-card seed (same pattern as quests.ts). */
 function hashSeed(seed: string): number {

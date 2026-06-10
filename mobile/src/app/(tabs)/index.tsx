@@ -624,7 +624,9 @@ function nextAction(role: string, progress: Record<string, CardState>, due: numb
     const statuses = Array.from({ length: count }, (_, i) => lessonStatus(t.slug, i, progress));
     const doneCount = statuses.filter((s) => s.done).length;
     if (doneCount > 0 && doneCount < count) {
-      const idx = statuses.findIndex((s) => !s.done);
+      // Resume AT THE USER'S LEVEL too (#10) — a Principal who just did lesson 12 shouldn't be
+      // steered back to "Fundamentals · Lesson 1". No level set → first incomplete (unchanged).
+      const idx = firstLessonAtLevel(t.slug, userLevel, progress);
       return {
         kind: 'lesson', eyebrow: 'Continue',
         title: `${t.name} · ${lessonTitle(t.slug, idx)}`,
