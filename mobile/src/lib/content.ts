@@ -1021,13 +1021,23 @@ export function dailyPoolForRole(roleKey: string, now: number): SessionCard[] {
 /** Production ("do") formats — biased forward in a session so it's not mostly flip/MCQ recognition. */
 const PRODUCTION_KINDS = new Set<string>(['scenario', 'diag', 'querybuild', 'match', 'evidence', 'order', 'classify']);
 
+/** 0..4 position of a level on the Jr→Principal ladder. */
+export const levelIndex = (l: Level): number => LEVELS.indexOf(l);
+/** How far a card sits from the user's level (level-less cards count as Mid). */
+export const levelDistance = (card: SessionCard, target: Level): number =>
+  Math.abs(levelIndex(card.level ?? 'Mid') - levelIndex(target));
+/** Staff/Principal sessions lean harder on production formats ("judgment, not trivia"). */
+export const isStaffPlus = (l: Level | null): boolean => l === 'Staff' || l === 'Principal';
+
 export function buildSessionDeck(
   pool: SessionCard[],
   progress: Record<string, CardState>,
   now: number,
   limit: number,
   adaptive = false,
-  deprioritize?: Set<string>
+  deprioritize?: Set<string>,
+  targetLevel: Level | null = null,
+  prodRatio = 1
 ): SessionCard[] {
   const seen = new Set<string>();
   const uniq: SessionCard[] = [];
@@ -1037,6 +1047,8 @@ export function buildSessionDeck(
       uniq.push(c);
     }
   }
+  // Due cards ALWAYS come first, regardless of level — a due card is a commitment the user
+  // already made; skipping it breaks the retention math.
   const due = uniq.filter((c) => {
     const st = progress[c.id];
     return st && st.reps > 0 && st.due <= now;
@@ -1047,17 +1059,23 @@ export function buildSessionDeck(
       : (a, b) => progress[a.id].due - progress[b.id].due
   );
   // "new" includes never-seen cards AND lapsed ('again' resets reps to 0) so they resurface
-  const newCards = uniq.filter((c) => {
+  let newCards = uniq.filter((c) => {
     const st = progress[c.id];
     return !st || st.reps === 0;
   });
+  // Level personalization (#10): rank new cards by distance from the user's level (stable, so
+  // pool order breaks ties). Nothing is hidden — fundamentals just stop leading a Staff session.
+  if (targetLevel) {
+    newCards = [...newCards].sort((a, b) => levelDistance(a, targetLevel) - levelDistance(b, targetLevel));
+  }
   // Pedagogy (plan #9): bias sessions toward "do" formats — interleave production cards (scenario,
   // diag, build, evidence, order, match, classify) with recognition (flip/MCQ) so they aren't buried.
+  // `prodRatio` production cards per recognition card (Staff+ runs 3:1 — judgment over trivia).
   const prodNew = newCards.filter((c) => PRODUCTION_KINDS.has(c.kind));
   const recNew = newCards.filter((c) => !PRODUCTION_KINDS.has(c.kind));
   const mixedNew: SessionCard[] = [];
   for (let i = 0, j = 0; i < prodNew.length || j < recNew.length; ) {
-    if (i < prodNew.length) mixedNew.push(prodNew[i++]);
+    for (let k = 0; k < prodRatio && i < prodNew.length; k++) mixedNew.push(prodNew[i++]);
     if (j < recNew.length) mixedNew.push(recNew[j++]);
   }
   let ordered = [...due, ...mixedNew];
@@ -1093,6 +1111,35 @@ export function lessonDeck(slug: string, lessonIdx: number, size = LESSON_SIZE):
 /** Number of lesson nodes in a track (for the Path) — derived from the live bank. */
 export function lessonCount(slug: string, size = LESSON_SIZE): number {
   return Math.ceil(bankForTrack(slug).length / size);
+}
+
+/**
+ * Level-aware track entry (#10): the first lesson holding an UNSEEN card at (or above) the
+ * user's level — so a Senior doesn't start at "What is X?". Falls back to the first
+ * incomplete lesson when the track has nothing at that level. Earlier lessons stay open.
+ */
+export function firstLessonAtLevel(
+  slug: string,
+  level: Level | null,
+  progress: Record<string, CardState>,
+  size = LESSON_SIZE
+): number {
+  const bank = bankForTrack(slug);
+  const lessons = Math.ceil(bank.length / size);
+  let firstIncomplete = 0;
+  let foundIncomplete = false;
+  for (let i = 0; i < lessons; i++) {
+    const slice = bank.slice(i * size, i * size + size);
+    const unseen = slice.filter((c) => (progress[c.id]?.reps ?? 0) === 0);
+    if (unseen.length === 0) continue;
+    if (!foundIncomplete) {
+      firstIncomplete = i;
+      foundIncomplete = true;
+    }
+    if (!level) return i;
+    if (unseen.some((c) => c.level && levelIndex(c.level) >= levelIndex(level))) return i;
+  }
+  return firstIncomplete;
 }
 
 /** Lessons per chapter — a "boss" checkpoint test caps each chapter (plan #25). */

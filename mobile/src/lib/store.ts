@@ -10,6 +10,7 @@ import {
   deckCounts,
   findCardById,
   freshSessionCards,
+  isStaffPlus,
   type Level,
   lessonDeck,
   roleDomain,
@@ -285,8 +286,19 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
     deck = lessonDeck(s.trackSlug, s.lessonIdx);
   } else if (s.sessionKind === 'track' && s.trackSlug) {
     const pool = bankForTrack(s.trackSlug);
+    // An explicit level chip on the track screen stays a HARD filter (the user asked for it);
+    // otherwise the user's default level soft-ranks the deck (closest level first).
     const scoped = s.sessionLevel ? pool.filter((cd) => cd.level === s.sessionLevel) : pool;
-    deck = buildSessionDeck(scoped.length ? scoped : pool, s.progress, now, unlockAll ? Infinity : 50, adaptive, down);
+    deck = buildSessionDeck(
+      scoped.length ? scoped : pool,
+      s.progress,
+      now,
+      unlockAll ? Infinity : 50,
+      adaptive,
+      down,
+      s.sessionLevel ? null : s.userLevel,
+      isStaffPlus(s.sessionLevel ?? s.userLevel) ? 3 : 1
+    );
   } else if (s.sessionKind === 'company' && s.companyKey) {
     deck = buildSessionDeck(companyBank(s.companyKey), s.progress, now, unlockAll ? Infinity : 50, adaptive, down);
   } else if (s.sessionKind === 'incident' && s.incidentId) {
@@ -313,11 +325,20 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
   } else if (s.sessionKind === 'basics') {
     deck = buildSessionDeck(basicsForRole(s.role), s.progress, now, Infinity, false, down);
   } else {
-    // Daily: respect the user's chosen level (Junior/Senior/Pro → Jr/Mid/Sr). Fall back to the
-    // full pool if filtering leaves too little (never starve the daily queue).
+    // Daily: the user's level soft-RANKS the pool (closest level first) instead of hard-filtering.
+    // The old filter + ≥5 fallback silently dumped thin levels (e.g. Principal) back into the full
+    // unranked pool — which is exactly how a Principal ended up on Stage-0 fundamentals (#10).
     const pool = dailyPoolForRole(s.role, now);
-    const scoped = s.userLevel ? pool.filter((cd) => cd.level === s.userLevel) : pool;
-    deck = buildSessionDeck(scoped.length >= 5 ? scoped : pool, s.progress, now, unlockAll ? 40 : 15, adaptive, down);
+    deck = buildSessionDeck(
+      pool,
+      s.progress,
+      now,
+      unlockAll ? 40 : 15,
+      adaptive,
+      down,
+      s.userLevel,
+      isStaffPlus(s.userLevel) ? 3 : 1
+    );
   }
   return { deck, meta: deckCounts(deck, s.progress, now) };
 }

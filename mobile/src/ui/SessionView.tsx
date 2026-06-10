@@ -5,6 +5,7 @@ import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 
 import { answerFeedback, haptic, sfx } from '../lib/feedback';
+import { levelIndex } from '../lib/content';
 import { requestPermission } from '../lib/notifications';
 import { buildRecallCheck } from '../lib/recallCheck';
 import { dueLabel, dueWithin } from '../lib/srs';
@@ -190,6 +191,7 @@ function CardView() {
             <Row style={{ marginBottom: 11, flexWrap: 'wrap' }}>
               <TrackBadge label={card.tool} color={col} />
               <Chip label={card.tag} />
+              <LevelChip cardLevel={card.level} />
             </Row>
             <T size={17} weight="700" style={{ lineHeight: 24 }}>
               {card.q}
@@ -625,6 +627,23 @@ function SourceRow({ url, label, publishedAt }: { url: string; label?: string; p
       </T>
       <T size={11.5} weight="800" color={link}>open ↗</T>
     </Pressable>
+  );
+}
+
+/** #6 — tells a Senior+ user the card IS at their level (or a stretch / a fundamentals refresher). */
+function LevelChip({ cardLevel }: { cardLevel?: import('../lib/content').Level }) {
+  const { c } = useTheme();
+  const userLevel = useStore((s) => s.userLevel);
+  if (!cardLevel || !userLevel) return null;
+  const diff = levelIndex(cardLevel) - levelIndex(userLevel);
+  // -1/0 reads as "at level" noise-free; only call out the meaningful gaps.
+  const label = diff > 0 ? '⤴ Stretch' : diff <= -2 ? '🌱 Fundamentals' : diff === 0 ? '🎯 Your level' : null;
+  if (!label) return null;
+  const color = diff > 0 ? '#7048e8' : diff === 0 ? c.success : c.muted;
+  return (
+    <View style={{ borderWidth: 1, borderColor: color, borderRadius: 999, paddingVertical: 2, paddingHorizontal: 8 }}>
+      <T size={10} weight="800" color={color}>{label}</T>
+    </View>
   );
 }
 

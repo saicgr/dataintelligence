@@ -20,11 +20,14 @@ import {
   CHAPTER_SIZE,
   checkpointCount,
   checkpointKey,
+  firstLessonAtLevel,
   freshSessionCards,
   lessonDeck,
   lessonCount,
   lessonTitle,
+  type Level,
   LEVEL_OPTIONS,
+  levelIndex,
   levelLabel,
   roleDomain,
   searchCards,
@@ -104,7 +107,7 @@ function LearnPath() {
   const [searchOpen, setSearchOpen] = useState(true);
   const [q, setQ] = useState('');
   const [manual, setManual] = useState<Record<string, boolean>>({});
-  const action = nextAction(role, progress, due);
+  const action = nextAction(role, progress, due, userLevel);
   const scrollRef = useRef<ScrollView>(null);
   const trackY = useRef<Record<string, number>>({});
   const sectionY = useRef<Record<string, number>>({});
@@ -603,9 +606,12 @@ type NextAction = {
   idx?: number;
 };
 
-/** Pick the highest-priority next step: resume → review → fundamentals → begin. */
-function nextAction(role: string, progress: Record<string, CardState>, due: number): NextAction {
+/** Pick the highest-priority next step: resume → review → fundamentals → begin.
+ *  For Senior+ users the fundamentals primer DEMOTES below starting a real track (#6/#10) —
+ *  "Start here · Fundamentals" stops being the dominant hero for people past it. */
+function nextAction(role: string, progress: Record<string, CardState>, due: number, userLevel: Level | null): NextAction {
   const tracks = tracksForRole(role);
+  const seniorPlus = userLevel != null && levelIndex(userLevel) >= 2; // Sr / Staff / Principal
   // 1. Resume the first in-progress track at its next incomplete lesson.
   for (const t of tracks) {
     const count = lessonCount(t.slug);
@@ -626,19 +632,30 @@ function nextAction(role: string, progress: Record<string, CardState>, due: numb
   if (due > 0) {
     return { kind: 'review', eyebrow: 'Due today', title: "Today's review", sub: `${due} card${due === 1 ? '' : 's'} due`, icon: '📚', frac: 0, colorKind: 'navy' };
   }
-  // 3. Fundamentals primer, if not finished.
+  // 3. Fundamentals primer (Jr/Mid only here — Senior+ gets it as optional review after a real start).
   const basics = basicsForRole(role);
-  if (basics.length > 0) {
-    const seen = basics.filter((cd) => (progress[cd.id]?.reps ?? 0) > 0).length;
-    if (seen < basics.length) {
-      return { kind: 'basics', eyebrow: 'Start here', title: 'Fundamentals', sub: `The basics first · ${seen}/${basics.length}`, icon: '🌱', frac: seen / basics.length, colorKind: 'success' };
-    }
+  const basicsSeen = basics.filter((cd) => (progress[cd.id]?.reps ?? 0) > 0).length;
+  const basicsLeft = basics.length > 0 && basicsSeen < basics.length;
+  if (basicsLeft && !seniorPlus) {
+    return { kind: 'basics', eyebrow: 'Start here', title: 'Fundamentals', sub: `The basics first · ${basicsSeen}/${basics.length}`, icon: '🌱', frac: basicsSeen / basics.length, colorKind: 'success' };
   }
-  // 4. Nothing in progress, nothing due → begin the role's first track.
+  // 4. Nothing in progress, nothing due → begin the role's first track AT THE USER'S LEVEL (#10).
   const first = tracks[0];
   if (first) {
     const count = lessonCount(first.slug);
-    return { kind: 'lesson', eyebrow: 'Start', title: `${first.name} · ${lessonTitle(first.slug, 0)}`, sub: `Lesson 1 of ${count}`, icon: first.icon, frac: 0, colorKind: 'track', colorKey: first.color, slug: first.slug, idx: 0 };
+    const idx = firstLessonAtLevel(first.slug, userLevel, progress);
+    const levelled = userLevel != null && idx > 0;
+    return {
+      kind: 'lesson',
+      eyebrow: 'Start',
+      title: `${first.name} · ${lessonTitle(first.slug, idx)}`,
+      sub: levelled ? `Starts at ${levelLabel(userLevel)} · earlier lessons stay open` : `Lesson ${idx + 1} of ${count}`,
+      icon: first.icon, frac: 0, colorKind: 'track', colorKey: first.color, slug: first.slug, idx,
+    };
+  }
+  // 5. Senior+ fallback: nothing real to start → fundamentals as optional review.
+  if (basicsLeft) {
+    return { kind: 'basics', eyebrow: 'Optional review', title: 'Review fundamentals', sub: `Skim the basics · ${basicsSeen}/${basics.length}`, icon: '🌱', frac: basicsSeen / basics.length, colorKind: 'success' };
   }
   // Fallback (role with no tracks) → review.
   return { kind: 'review', eyebrow: 'Practice', title: "Today's review", sub: 'A quick session', icon: '📚', frac: 0, colorKind: 'navy' };

@@ -326,6 +326,14 @@ function Tailor({ c, role, setRole, mode, setMode, level, setLevel }: { c: C; ro
           value={level}
           onChange={setLevel}
         />
+        {/* #11 — Staff/Principal is a different PROMISE, not just harder trivia. Say so up front. */}
+        {(level === 'Staff' || level === 'Principal') && (
+          <T muted size={11.5} style={{ lineHeight: 16 }}>
+            {level === 'Principal'
+              ? 'Principal prep leans on scenarios, diagnostics and tradeoff calls — judgment practice, not trivia. We pull Staff-level depth where Principal cards are still landing.'
+              : 'Staff sessions lean on scenarios, diagnostics and tradeoff calls — fewer flashcards, more judgment.'}
+          </T>
+        )}
       </View>
 
       <View style={{ gap: 9 }}>
