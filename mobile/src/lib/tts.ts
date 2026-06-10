@@ -109,11 +109,14 @@ export function stop(): void {
   }
 }
 
-/** Strip markdown/code noise so the spoken stream stays clean. */
-function sanitize(text: string): string {
+/** Strip markdown/code noise so the spoken stream stays clean. Exported so callers
+ *  (Review Mode eligibility) can test "is there anything left to say" with the same rules. */
+export function sanitize(text: string): string {
   return (text ?? '')
     .replace(/```[\s\S]*?```/g, ' (code block) ') // don't read code fences character-by-character
     .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') // [link text](url) → link text
+    .replace(/^\s*(?:[-*+]|\d+\.)\s+/gm, ' ') // leading list markers
     .replace(/[*_#>|]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();

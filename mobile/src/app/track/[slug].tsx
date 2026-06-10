@@ -3,10 +3,13 @@ import { safeBack } from '../../lib/nav';
 import { useState } from 'react';
 import { Pressable, View } from 'react-native';
 
-import { LEVELS, type Level, levelLabel, lessonTitle, lessonsForTrack, QRow, questionsFor, trackBySlug } from '../../lib/content';
+import { bankForTrack, LEVELS, type Level, levelLabel, lessonTitle, lessonsForTrack, QRow, questionsFor, trackBySlug } from '../../lib/content';
+import { alertInfo } from '../../lib/dialog';
+import { audioEligible } from '../../lib/reviewAudio';
 import { isProActive, useStore } from '../../lib/store';
 import { radius, useTheme } from '../../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
+import { ReviewPlayer } from '../../ui/ReviewPlayer';
 
 export default function TrackDetail() {
   const { slug } = useLocalSearchParams<{ slug: string }>();
@@ -15,11 +18,25 @@ export default function TrackDetail() {
   const startTrack = useStore((s) => s.startTrack);
   const unlocked = useStore(isProActive);
   const [lvl, setLvl] = useState<Level | 'All'>('All');
+  const [playerOpen, setPlayerOpen] = useState(false);
 
   const t = trackBySlug(slug ?? '');
   if (!t) return null;
   const col = track(t.color);
   const rows = questionsFor(t.slug);
+  // Review Mode (Pro): the speakable subset — non-code, non-interactive cards with real answers.
+  const listenable = audioEligible(bankForTrack(t.slug));
+  const openPlayer = () => {
+    if (!unlocked) {
+      router.push('/paywall');
+      return;
+    }
+    if (listenable.length === 0) {
+      alertInfo('No audio-eligible cards', 'This track is code/interactive-only — nothing to read aloud.');
+      return;
+    }
+    setPlayerOpen(true);
+  };
 
   // Coding-practice / on-call / craft units are interactive LESSONS, not flip-card Q&A — they
   // have no GENERATED rows. Render their lesson trail instead of an empty question list.
@@ -45,11 +62,31 @@ export default function TrackDetail() {
           }}>
           <T size={22}>{t.icon}</T>
         </View>
-        <View>
+        <View style={{ flex: 1 }}>
           <T size={20} weight="900">{t.name}</T>
           <T muted size={12.5}>{t.q} questions · all levels</T>
         </View>
+        <Pressable
+          onPress={openPlayer}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel="Listen — review this track hands-free"
+          style={{
+            width: 42,
+            height: 42,
+            borderRadius: 21,
+            borderWidth: 1.5,
+            borderColor: c.border,
+            backgroundColor: c.card,
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}>
+          <T size={19}>🎧</T>
+        </Pressable>
       </Row>
+      {playerOpen && (
+        <ReviewPlayer track={t} cards={listenable} onClose={() => setPlayerOpen(false)} />
+      )}
 
       <H2>Levels · tap to drill that level</H2>
       <Row style={{ gap: 9, flexWrap: 'wrap' }}>
