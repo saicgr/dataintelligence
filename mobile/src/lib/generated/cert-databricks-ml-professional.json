@@ -1,0 +1,1364 @@
+[
+  {
+    "q": "How do you construct an ML pipeline in SparkML using Pipeline, stages, Estimators, and Transformers? Walk through a concrete classification example.",
+    "a": "A SparkML Pipeline chains a sequence of stages, where each stage is either a Transformer (transforms a DataFrame without fitting) or an Estimator (fits a model on data and produces a Transformer). When you call Pipeline.fit(), Spark iterates through the stages: Transformers call transform(), Estimators call fit() and return a fitted model. A typical classification pipeline includes: (1) StringIndexer to encode label column, (2) VectorAssembler to combine feature columns into a single feature vector, (3) StandardScaler to normalize features, and (4) a classifier like RandomForestClassifier. After calling pipeline.fit(train_df) you get a PipelineModel, which you can then call .transform(test_df) on for predictions. The PipelineModel can be saved to disk and reloaded, making it production-safe. Pipelines prevent data leakage because the Estimators inside are fit only on training data and the resulting Transformers are applied consistently to any future data.",
+    "fj": "You can use a Pipeline for feature transformation but the model itself must be trained outside the pipeline separately.",
+    "fs": "This is wrong — Estimators like classifiers and regressors are valid Pipeline stages. Pipeline.fit() triggers the full chain including model training, and the resulting PipelineModel encapsulates all stages for unified inference.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "SparkML Pipeline for classification",
+        "lines": [
+          "from pyspark.ml import Pipeline",
+          "from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler",
+          "from pyspark.ml.classification import RandomForestClassifier",
+          "",
+          "indexer = StringIndexer(inputCol='label', outputCol='label_idx')",
+          "assembler = VectorAssembler(inputCols=['age','salary','tenure'], outputCol='raw_features')",
+          "scaler = StandardScaler(inputCol='raw_features', outputCol='features')",
+          "rf = RandomForestClassifier(featuresCol='features', labelCol='label_idx', numTrees=100)",
+          "",
+          "pipeline = Pipeline(stages=[indexer, assembler, scaler, rf])",
+          "model = pipeline.fit(train_df)          # fit all stages on training data",
+          "predictions = model.transform(test_df)  # apply fitted pipeline to test data",
+          "model.save('/mnt/models/rf_pipeline')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "What are the key transformers and estimators in SparkML and when should you select each one? Give examples for feature encoding, scaling, and dimensionality reduction.",
+    "a": "SparkML provides two categories of feature processing components. Transformers include: VectorAssembler (combines multiple columns into a feature vector), Tokenizer and RegexTokenizer (NLP tokenization), Binarizer (threshold-based binary encoding), PCA (dimensionality reduction — technically an Estimator that produces a PCAModel Transformer), Normalizer, and StandardScalerModel. Estimators include: StringIndexer (learns label-to-index mapping from data), OneHotEncoder (must be fit to determine cardinality), Word2Vec (learns word embeddings), MinMaxScaler, and StandardScaler. Selection guidance: use StringIndexer + OneHotEncoder for nominal categoricals; use VectorAssembler last before the model to assemble all numeric features; use StandardScaler when your algorithm is distance-sensitive (SVM, k-means, logistic regression); use PCA when you have >50 features and want to reduce noise. For text, chain Tokenizer → HashingTF → IDF. Never apply StringIndexer fit on test data — always fit on training data and transform both.",
+    "fj": "VectorAssembler is an Estimator that learns the feature schema from training data before it can transform.",
+    "fs": "VectorAssembler is a pure Transformer — it requires no fitting and simply concatenates specified columns into a vector column. The confusion arises because some transformers (like StandardScaler, PCA) do have an Estimator phase, but VectorAssembler does not.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "When should you choose SparkML over a single-node ML library like scikit-learn or XGBoost on Databricks? What factors drive the decision?",
+    "a": "Use SparkML when: (1) your dataset exceeds memory of a single driver node (typically >10-50 GB), (2) you need distributed feature engineering as part of the same pipeline, (3) you want native batch or streaming inference on Spark DataFrames at scale, or (4) your use case involves iterative algorithms that benefit from in-memory distributed computation. Prefer single-node models (scikit-learn, XGBoost, LightGBM, PyTorch) when: (1) data fits in memory — single-node XGBoost is significantly faster than SparkML for tabular data on same hardware, (2) you need algorithms not in MLlib (SHAP, advanced ensembles), (3) you need a GPU-accelerated model, or (4) you need real-time online inference at <10ms latency via a REST endpoint. For inference specifically: SparkML is ideal for batch scoring millions of rows with spark_udf; single-node models loaded as MLflow pyfunc endpoints are better for real-time REST serving. The boundary is not hard — Databricks supports both patterns and you can train single-node models and deploy them at Spark scale via mlflow.pyfunc.spark_udf.",
+    "fj": "SparkML should always be used on Databricks because it's the native framework and will always be faster than scikit-learn.",
+    "fs": "SparkML has significant overhead per task due to JVM serialization, scheduling, and shuffle operations. For datasets that fit in memory, scikit-learn or XGBoost on a single node (even a large driver) is often 5-10x faster and produces better models. SparkML's strength is distributed scale, not raw speed on small data.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you tune SparkML models using CrossValidator and ParamGridBuilder? What metrics are available and how does MLflow autologging capture these runs?",
+    "a": "CrossValidator wraps an Estimator (your pipeline or model), a ParamGridBuilder-produced parameter grid, and an Evaluator, then performs k-fold cross-validation across all parameter combinations. ParamGridBuilder lets you specify discrete or continuous ranges: .addGrid(rf.numTrees, [50, 100, 200]).addGrid(rf.maxDepth, [5, 10]).build(). CrossValidator returns a CrossValidatorModel with the best parameters selected by the Evaluator metric. Available Evaluators include BinaryClassificationEvaluator (areaUnderROC, areaUnderPR), MulticlassClassificationEvaluator (accuracy, f1, weightedPrecision), RegressionEvaluator (rmse, mse, r2, mae). With Databricks Autologging enabled (mlflow.pyspark.ml.autolog() is on by default in DBR 10.2+ ML), CrossValidator automatically creates nested MLflow runs: a parent run for the overall CV experiment and child runs for each parameter combination, logging hyperparameters and the corresponding cross-validation metric for easy comparison.",
+    "fj": "CrossValidator uses TrainValidationSplit internally — they are the same thing.",
+    "fs": "CrossValidator and TrainValidationSplit are distinct classes. CrossValidator does k-fold CV (all data is used for both training and validation across k folds). TrainValidationSplit does a single train/validation split, is faster but produces higher variance estimates. They are both hyperparameter tuning wrappers but with different evaluation strategies.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "CrossValidator with ParamGridBuilder",
+        "lines": [
+          "from pyspark.ml.tuning import CrossValidator, ParamGridBuilder",
+          "from pyspark.ml.evaluation import BinaryClassificationEvaluator",
+          "from pyspark.ml.classification import GBTClassifier",
+          "",
+          "gbt = GBTClassifier(featuresCol='features', labelCol='label')",
+          "paramGrid = (ParamGridBuilder()",
+          "    .addGrid(gbt.maxDepth, [5, 10])",
+          "    .addGrid(gbt.maxIter, [20, 50])",
+          "    .build())",
+          "",
+          "evaluator = BinaryClassificationEvaluator(metricName='areaUnderROC')",
+          "cv = CrossValidator(estimator=gbt, estimatorParamMaps=paramGrid,",
+          "                    evaluator=evaluator, numFolds=5, parallelism=4)",
+          "",
+          "import mlflow",
+          "mlflow.pyspark.ml.autolog()  # default on in DBR 10.2+ ML",
+          "with mlflow.start_run():",
+          "    cv_model = cv.fit(train_df)   # nested runs logged automatically"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you score SparkML models for batch versus streaming inference? What are the key differences in pipeline application?",
+    "a": "For batch inference, you call pipelineModel.transform(input_df) on a Spark DataFrame loaded from Delta or another source — this runs distributed scoring across all partitions. Alternatively, use mlflow.pyfunc.spark_udf(spark, model_uri) to load any MLflow-registered model as a Spark UDF and apply it with df.withColumn('prediction', model_udf(*feature_cols)). For streaming inference, Spark Structured Streaming treats the streaming DataFrame like a static DataFrame — you can call pipelineModel.transform(streaming_df) directly because SparkML PipelineModels are stateless Transformers compatible with streaming. The key difference: batch scoring processes bounded data and can repartition for parallelism; streaming scoring must process each micro-batch incrementally, so avoid any stateful aggregation inside the pipeline. When using mlflow.pyfunc.spark_udf for streaming, ensure the UDF is registered and the model artifact is on accessible storage. For Delta Live Tables (Lakeflow Declarative Pipelines), you can apply a pipelineModel.transform inside a @dlt.table decorated function.",
+    "fj": "SparkML pipelines can only be used for batch inference; streaming requires rebuilding models in a streaming-native framework.",
+    "fs": "SparkML PipelineModels are pure Transformers — they have no state and simply apply learned transformations. Spark Structured Streaming supports calling .transform() on a streaming DataFrame with a PipelineModel, making real-time streaming inference straightforward without any framework changes.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Batch vs streaming scoring with SparkML",
+        "lines": [
+          "# --- Batch inference ---",
+          "batch_df = spark.read.format('delta').load('/mnt/data/input')",
+          "predictions = pipeline_model.transform(batch_df)",
+          "",
+          "# --- spark_udf for any MLflow model ---",
+          "import mlflow.pyfunc",
+          "model_udf = mlflow.pyfunc.spark_udf(spark, 'models:/my_model/Production')",
+          "scored = batch_df.withColumn('pred', model_udf('feat1','feat2','feat3'))",
+          "",
+          "# --- Streaming inference ---",
+          "stream_df = (spark.readStream.format('delta')",
+          "             .load('/mnt/data/stream_input'))",
+          "stream_preds = pipeline_model.transform(stream_df)  # works directly",
+          "query = (stream_preds.writeStream.format('delta')",
+          "         .outputMode('append')",
+          "         .option('checkpointLocation', '/mnt/checkpoints/model')",
+          "         .start('/mnt/data/stream_output'))"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you perform distributed hyperparameter tuning using Optuna on Databricks with MLflow tracking? What classes enable parallelism?",
+    "a": "Optuna on Databricks leverages two MLflow 3.0 integration classes: MlflowStorage (uses the MLflow Tracking Server as Optuna's storage backend, enabling persistence and resume of studies) and MlflowSparkStudy (launches parallel Optuna trials across PySpark executors). The pattern is: (1) define an objective function that trains your model and returns a validation metric, (2) create an Optuna study via optuna.create_study() with MlflowStorage, (3) run MlflowSparkStudy.optimize(objective, n_trials=100) which fans out trials across Spark workers. MLflow 3.0 is pre-installed on DBR 17.0 ML and above. Each trial is logged as a child MLflow run under a parent run, giving you a visual comparison grid in the Databricks Experiments UI. Optuna's TPE (Tree-structured Parzen Estimator) sampler is more sample-efficient than grid search because it models the distribution of good hyperparameters and focuses trials there. Unlike CrossValidator, Optuna supports pruning (stopping poor trials early) via Hyperband-style pruners, which can cut tuning cost significantly.",
+    "fj": "Optuna on Databricks only runs on the driver node — it cannot be parallelized across a Spark cluster.",
+    "fs": "MlflowSparkStudy is specifically designed to distribute Optuna trials across PySpark executors. Each executor runs an independent trial and results are coordinated through MlflowStorage on the tracking server, enabling true horizontal parallelism across the cluster.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Distributed Optuna tuning with MLflow on Databricks",
+        "lines": [
+          "import optuna",
+          "import mlflow",
+          "from mlflow.optuna import MlflowStorage, MlflowSparkStudy",
+          "",
+          "def objective(trial):",
+          "    lr = trial.suggest_float('lr', 1e-4, 1e-1, log=True)",
+          "    depth = trial.suggest_int('max_depth', 3, 12)",
+          "    # train model, return validation metric",
+          "    return val_rmse",
+          "",
+          "storage = MlflowStorage(experiment_name='/Shared/optuna-study')",
+          "study = MlflowSparkStudy(study_name='churn_model_v3', storage=storage)",
+          "",
+          "with mlflow.start_run(run_name='optuna-parent'):",
+          "    study.optimize(objective, n_trials=200)  # distributed across Spark workers",
+          "",
+          "best_params = study.best_params"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you perform distributed hyperparameter tuning using Ray Tune on Databricks? Describe the cluster setup and MLflow integration.",
+    "a": "Ray is included in Databricks Runtime 15.0 ML and above as a first-class offering — no extra installation is required. To use Ray Tune: (1) initialize a Ray cluster on the Databricks workers using ray.init() or the Databricks Ray utility, (2) define a trainable function that accepts a config dict and reports metrics, (3) wrap MLflow tracking inside the trainable using mlflow.start_run(nested=True), (4) call tune.run(trainable, config=search_space, num_samples=100) with a search algorithm like OptunaSearch or BayesOptSearch. Ray Tune supports advanced features unavailable in SparkML CrossValidator: early stopping via Hyperband/ASHA schedulers, population-based training, and resume from checkpoint. Ray also integrates directly with Ray Train for distributed model training within each trial (useful for PyTorch/TensorFlow). Since Ray 2.x, tune.run is deprecated in favor of the Tuner API: tuner = Tuner(trainable, param_space=config, run_config=RunConfig()); results = tuner.fit(). Results can be logged as MLflow child runs for unified experiment tracking.",
+    "fj": "Ray Tune requires a separate Ray cluster outside of Databricks — it cannot run on the same cluster as Spark.",
+    "fs": "Since DBR 15.0 ML, Ray is bundled and runs alongside Spark on the same Databricks cluster. Databricks handles the Ray cluster initialization, and both Spark and Ray can access the same Delta tables and Unity Catalog, enabling hybrid workflows without separate infrastructure.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Ray Tune with MLflow on Databricks",
+        "lines": [
+          "import ray",
+          "from ray import tune",
+          "from ray.tune.search.optuna import OptunaSearch",
+          "from ray.tune.schedulers import ASHAScheduler",
+          "import mlflow",
+          "",
+          "ray.init()  # auto-configures on Databricks DBR 15.0+ ML",
+          "",
+          "def trainable(config):",
+          "    with mlflow.start_run(nested=True):",
+          "        mlflow.log_params(config)",
+          "        # train model with config['lr'], config['depth']",
+          "        val_loss = train_and_eval(config)",
+          "        mlflow.log_metric('val_loss', val_loss)",
+          "        tune.report(val_loss=val_loss)",
+          "",
+          "tuner = tune.Tuner(",
+          "    trainable,",
+          "    param_space={'lr': tune.loguniform(1e-4, 0.1), 'depth': tune.randint(3, 12)},",
+          "    tune_config=tune.TuneConfig(num_samples=100,",
+          "                                search_alg=OptunaSearch(),",
+          "                                scheduler=ASHAScheduler()),",
+          ")",
+          "results = tuner.fit()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "Compare Ray and Spark for distributing ML workloads on Databricks. When should you choose each, and how do vertical vs. horizontal scaling trade-offs apply?",
+    "a": "Ray and Spark are complementary frameworks on Databricks. Spark excels at data parallelism: large-scale ETL, SQL, feature engineering on structured/semi-structured datasets, and batch inference via spark_udf. Ray excels at task parallelism and compute-intensive ML: distributed deep learning (PyTorch, TensorFlow), hyperparameter search, reinforcement learning, and serving arbitrary Python workloads. Key trade-off dimensions: (1) Data access — Spark DataFrames are the native format; Ray can read from Spark in-memory without write-read cycles via the Ray-on-Spark integration but has overhead. (2) Scaling strategy — Spark scales horizontally by adding more worker nodes and is designed for TB-scale data; Ray can scale both horizontally (more actors) and vertically (large GPU nodes). (3) Statefulness — Ray Actors support stateful services (model servers, reinforcement learning rollouts); Spark tasks are stateless by design. (4) Operator overhead — Spark requires Catalyst optimizer, JVM serialization; Ray is pure Python, lower overhead per task for small compute. On Databricks, vertical scaling (single large node with many GPUs) is preferred for deep learning single-node training; horizontal Ray is preferred for hyperparameter sweeps; Spark horizontal is preferred for feature computation and batch inference.",
+    "fj": "You should always use Ray instead of Spark for ML because Ray is the newer framework and handles all ML use cases better.",
+    "fs": "Spark's data parallelism is still superior for large-scale feature engineering, ETL, and batch inference on structured data. Ray cannot replace Spark's query optimizer, Delta Lake integration, or SQL capabilities. The right answer is a hybrid: Spark for data prep, Ray for compute-intensive ML training and tuning.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do pandas Function APIs (applyInPandas / mapInPandas) enable distributed model training and inference per group on Databricks?",
+    "a": "The Pandas Function API lets you run arbitrary pandas/sklearn/XGBoost code on each partition or group of a Spark DataFrame, combining Spark's data distribution with Python ML libraries. applyInPandas is used with groupBy: for each group (e.g., each store_id or customer_segment), Spark sends the group's rows as a pandas DataFrame to an executor, your function trains a scikit-learn or XGBoost model on that group, and returns predictions or model artifacts as a pandas DataFrame. mapInPandas operates partition-by-partition without a groupBy key, useful for parallel batch inference. The function signature for applyInPandas is fn(key, pdf: pd.DataFrame) -> pd.DataFrame. A typical pattern for 'train one model per store': (1) define a train_and_predict function that fits an sklearn model on the group and returns predictions, (2) call df.groupBy('store_id').applyInPandas(train_and_predict, schema=output_schema). For logging each group's model, use mlflow.sklearn.log_model() inside the function — this creates nested runs automatically. This pattern is the recommended Databricks approach for the 'many models' problem at scale.",
+    "fj": "applyInPandas and mapInPandas are only for inference — you cannot train models inside these functions because executors don't have access to MLflow.",
+    "fs": "Executors on Databricks do have access to MLflow tracking, and you can call mlflow.start_run() with nested=True inside an applyInPandas function to train and log one model per group. This is the standard Databricks pattern for the many-models use case (e.g., one model per retail store, region, or product category).",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "applyInPandas for per-group model training",
+        "lines": [
+          "from pyspark.sql.types import StructType, StructField, StringType, DoubleType",
+          "import pandas as pd",
+          "from sklearn.linear_model import Ridge",
+          "import mlflow",
+          "",
+          "output_schema = StructType([",
+          "    StructField('store_id', StringType()),",
+          "    StructField('prediction', DoubleType())",
+          "])",
+          "",
+          "def train_per_store(key, pdf: pd.DataFrame) -> pd.DataFrame:",
+          "    store_id = key[0]",
+          "    X = pdf[['feat1','feat2','feat3']].values",
+          "    y = pdf['sales'].values",
+          "    model = Ridge().fit(X, y)",
+          "    preds = model.predict(X)",
+          "    with mlflow.start_run(nested=True, run_name=f'store_{store_id}'):",
+          "        mlflow.log_param('store_id', store_id)",
+          "        mlflow.sklearn.log_model(model, 'model')",
+          "    return pd.DataFrame({'store_id': store_id, 'prediction': preds})",
+          "",
+          "result = df.groupBy('store_id').applyInPandas(train_per_store, schema=output_schema)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "Explain model parallelism vs. data parallelism in the Databricks ML context. When does each apply and how does SparkML implement data parallelism?",
+    "a": "Data parallelism splits the training dataset across multiple workers; each worker computes gradients or statistics on its shard and results are aggregated. SparkML implements data parallelism natively — DataFrames are partitioned across executors, and algorithms like gradient-boosted trees or k-means iterate in a distributed fashion using Spark's RDD operations. Data parallelism is the right choice when: your dataset is too large for one machine, your algorithm can be expressed as distributed aggregations, and updates can be batched and synchronized (as in distributed SGD). Model parallelism splits a single large model across multiple devices/nodes — layers or parameter shards are on different GPUs. This is required when the model itself exceeds GPU memory (LLMs with billions of parameters). SparkML does not implement model parallelism — for that you use Horovod, PyTorch FSDP, or DeepSpeed via Ray Train on Databricks. In practice on Databricks: data parallelism via SparkML or Ray Data is used for classical ML and feature engineering; model parallelism is used for large neural networks via Ray Train with PyTorch distributed backends (NCCL). Most exam questions focus on data parallelism via SparkML and applyInPandas.",
+    "fj": "Model parallelism is the default strategy in SparkML and is automatically applied to all large models.",
+    "fs": "SparkML exclusively uses data parallelism by partitioning data across executors. SparkML does not support model parallelism. For model parallelism (required for large neural networks), you must use Ray Train with PyTorch FSDP, Fully Sharded Data Parallelism, or DeepSpeed — frameworks outside of SparkML.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you structure nested MLflow runs for hyperparameter sweeps and multi-stage experiments? What APIs create parent/child run relationships?",
+    "a": "Nested MLflow runs organize complex experiments into a hierarchical structure: a parent run represents the overall experiment (e.g., a full hyperparameter sweep or a multi-stage pipeline), and child runs represent individual trials, folds, or stages. To create a nested run, start a parent run with mlflow.start_run() and inside that context, start a child run with mlflow.start_run(nested=True). The child run's run_id is separate, and it appears indented under the parent in the Databricks Experiments UI. For CrossValidator/TrainValidationSplit with mlflow.pyspark.ml.autolog() enabled, nesting is automatic. For manual sweeps (Optuna, custom loops), you must explicitly use nested=True. Useful metadata patterns: tag the parent run with experiment-level metadata (dataset version, git commit); tag each child run with trial-specific metadata (hyperparameter values, fold index). You can retrieve the best child run using mlflow.search_runs() with a filter_string on the tags.mlflow.parentRunId tag and order by a metric to find the best trial programmatically.",
+    "fj": "Nested runs are purely visual — parent and child runs share the same run_id and metrics are merged together.",
+    "fs": "Parent and child runs have distinct run IDs and separate metric/parameter namespaces. Child runs are linked to the parent via a tag (mlflow.parentRunId). They are independent objects in the tracking server — you can search, compare, and promote child runs independently of the parent.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Manual nested MLflow runs for hyperparameter sweep",
+        "lines": [
+          "import mlflow",
+          "",
+          "configs = [{'lr': 0.01, 'depth': 5}, {'lr': 0.1, 'depth': 8}]",
+          "",
+          "with mlflow.start_run(run_name='sweep-parent') as parent_run:",
+          "    mlflow.set_tag('dataset_version', 'v2.3')",
+          "    mlflow.set_tag('git_sha', '3fa2c1d')",
+          "",
+          "    for cfg in configs:",
+          "        with mlflow.start_run(nested=True, run_name=f\"trial_lr{cfg['lr']}\"):",
+          "            mlflow.log_params(cfg)",
+          "            val_rmse = train_model(**cfg)  # your training function",
+          "            mlflow.log_metric('val_rmse', val_rmse)",
+          "",
+          "# Query best child run",
+          "runs = mlflow.search_runs(",
+          "    filter_string=f'tags.mlflow.parentRunId = \"{parent_run.info.run_id}\"',",
+          "    order_by=['metrics.val_rmse ASC']",
+          ")",
+          "best_run_id = runs.iloc[0].run_id"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you programmatically log custom metrics, parameters, and artifacts with MLflow? When should you log each type?",
+    "a": "MLflow provides three primary logging APIs: mlflow.log_param(key, value) for scalar configuration values that describe the experiment setup (hyperparameters, dataset version, feature list — logged once per run); mlflow.log_metric(key, value, step=None) for numeric evaluation values that can be plotted over time (loss curves, accuracy, RMSE — can be called multiple times with incrementing step); mlflow.log_artifact(local_path) to upload files to the run's artifact store (feature importance plots, confusion matrices, requirements.txt, serialized models). Additional APIs: mlflow.log_dict() for JSON-serializable objects, mlflow.log_figure() for matplotlib/plotly figures, mlflow.log_table() for DataFrames as JSON. Best practices: log params before training starts (enables filtering before runs complete), log metrics inside training loops with the step argument to enable loss curves, log artifacts after training completes. For large artifacts (model weights), prefer mlflow.[framework].log_model() over log_artifact to preserve the MLflow model format with signature and input example. Use mlflow.set_tag() for categorical labels (environment, team, pipeline_version) that you want to filter on but aren't numeric metrics.",
+    "fj": "mlflow.log_metric and mlflow.log_param are interchangeable — they both store key-value pairs in the run.",
+    "fs": "They serve distinct purposes and have different UI behaviors. Parameters are configuration values shown in a params table (step-less, typically logged once). Metrics are numeric time-series values that can be plotted against step — the Experiments UI shows metric trends charts only for metrics. Mixing them causes broken charts and incorrect comparisons.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Structured MLflow logging: params, metrics, artifacts",
+        "lines": [
+          "import mlflow",
+          "import matplotlib.pyplot as plt",
+          "",
+          "with mlflow.start_run(run_name='xgb-training-v3'):",
+          "    # Log params once — configuration",
+          "    mlflow.log_params({'n_estimators': 300, 'max_depth': 6, 'eta': 0.05})",
+          "    mlflow.set_tag('team', 'demand-forecasting')",
+          "",
+          "    for epoch, (train_loss, val_loss) in enumerate(train_loop()):",
+          "        mlflow.log_metric('train_loss', train_loss, step=epoch)",
+          "        mlflow.log_metric('val_loss', val_loss, step=epoch)",
+          "",
+          "    # Artifacts — files uploaded to artifact store",
+          "    fig = plot_feature_importance(model)",
+          "    mlflow.log_figure(fig, 'feature_importance.png')",
+          "    mlflow.log_artifact('/local/path/requirements.txt')",
+          "    mlflow.xgboost.log_model(model, 'model',",
+          "                             input_example=X_val[:5])"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you build a custom MLflow pyfunc model that performs real-time feature engineering at inference time? Why is this pattern important?",
+    "a": "A custom pyfunc model subclasses mlflow.pyfunc.PythonModel and overrides two methods: load_context(context) to load heavy artifacts (model weights, lookup tables, scalers) once at startup from context.artifacts, and predict(context, model_input) to execute the full inference logic including real-time feature computation. This is important because it bundles preprocessing, feature transformation, and model scoring into a single deployable artifact, ensuring training-serving consistency — the same feature computation code runs during both training and real-time inference. A common pattern: in predict(), compute on-demand features (session-level aggregations, geo-distance, time-since-last-event) from the raw request payload before passing to the underlying model. Log the custom model with mlflow.pyfunc.log_model(artifact_path, python_model=MyModel(), artifacts={'model_path': '/path/to/model', 'scaler_path': '/path/to/scaler'}). The registered pyfunc model can be deployed to Mosaic AI Model Serving as a REST endpoint — the endpoint container loads the model once via load_context and calls predict() for each request.",
+    "fj": "pyfunc models are only for wrapping existing sklearn or XGBoost models — you cannot add custom Python logic to the predict method.",
+    "fs": "The entire purpose of pyfunc is to wrap arbitrary Python logic. You can include API calls, database lookups, custom feature engineering, ensemble logic, or post-processing in predict(). This is the primary mechanism for deploying non-standard models and custom inference pipelines on Databricks Model Serving.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Custom pyfunc model with real-time feature engineering",
+        "lines": [
+          "import mlflow",
+          "import pandas as pd",
+          "import joblib",
+          "",
+          "class FeatureEngineeringModel(mlflow.pyfunc.PythonModel):",
+          "    def load_context(self, context):",
+          "        # Load once at endpoint startup",
+          "        self.model = joblib.load(context.artifacts['model_path'])",
+          "        self.scaler = joblib.load(context.artifacts['scaler_path'])",
+          "",
+          "    def predict(self, context, model_input: pd.DataFrame):",
+          "        # Real-time feature computation",
+          "        model_input['days_since_signup'] = (",
+          "            pd.Timestamp.now() - pd.to_datetime(model_input['signup_date'])",
+          "        ).dt.days",
+          "        model_input['price_ratio'] = model_input['price'] / model_input['avg_price']",
+          "        features = self.scaler.transform(",
+          "            model_input[['days_since_signup', 'price_ratio', 'tenure']]",
+          "        )",
+          "        return self.model.predict(features)",
+          "",
+          "with mlflow.start_run():",
+          "    mlflow.pyfunc.log_model(",
+          "        artifact_path='model',",
+          "        python_model=FeatureEngineeringModel(),",
+          "        artifacts={'model_path': '/tmp/model.pkl', 'scaler_path': '/tmp/scaler.pkl'},",
+          "        input_example=pd.DataFrame({'signup_date': ['2024-01-01'], 'price': [9.99], 'avg_price': [12.0], 'tenure': [180]})",
+          "    )"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How does Databricks Feature Store enforce point-in-time correctness to prevent data leakage? What role does FeatureEngineeringClient play?",
+    "a": "Point-in-time correctness ensures that when you join features to your training labels, you use only feature values that existed at or before the label's event timestamp — preventing future data leakage. Databricks Feature Engineering achieves this by designating a column as the timeseries_columns parameter when creating a feature table, which marks it as the time axis. When you call FeatureEngineeringClient.create_training_set() with a label DataFrame containing an event_timestamp column and feature lookups, the client performs an AS OF join: for each label row's timestamp, it finds the most recent feature values that were available at that exact time. This prevents the classic leakage bug where you accidentally include features computed after the label event. FeatureEngineeringClient also automates feature computation pipelines by packaging feature lookups with model training — when you log a model via fe.log_model(), the feature lookup metadata is embedded in the model artifact, enabling automatic feature retrieval at inference time. SlidingWindow and TumblingWindow classes enable windowed aggregation features with point-in-time semantics. This is especially critical for financial fraud detection, demand forecasting, and recommendation systems where feature values change frequently.",
+    "fj": "Point-in-time correctness is handled automatically by Delta Lake versioning — you do not need any special Feature Store APIs.",
+    "fs": "Delta Lake time travel provides access to historical table states by version or timestamp, but it cannot perform AS OF joins where each row's lookup timestamp is different. FeatureEngineeringClient's create_training_set() performs a row-level AS OF join matching each label's timestamp to the correct historical feature value — this is impossible to achieve with a simple Delta Lake time travel query.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Point-in-time correct training set creation",
+        "lines": [
+          "from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup",
+          "",
+          "fe = FeatureEngineeringClient()",
+          "",
+          "# Labels with event timestamps (no future feature leakage)",
+          "label_df = spark.table('ml.churn.labels')  # has: user_id, event_ts, label",
+          "",
+          "feature_lookups = [",
+          "    FeatureLookup(",
+          "        table_name='ml.features.user_activity',",
+          "        feature_names=['session_count_7d', 'avg_session_length'],",
+          "        lookup_key='user_id',",
+          "        timestamp_lookup_key='event_ts'  # AS OF join on this column",
+          "    ),",
+          "]",
+          "",
+          "training_set = fe.create_training_set(",
+          "    df=label_df,",
+          "    feature_lookups=feature_lookups,",
+          "    label='label',",
+          "    exclude_columns=['event_ts']",
+          ")",
+          "training_df = training_set.load_df()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you configure Databricks online tables for low-latency feature serving? What are the key configuration options?",
+    "a": "Databricks Online Tables (backed by Lakebase Autoscaling for all stores created after March 2026) provide millisecond-latency feature retrieval for real-time inference. To configure: (1) create a feature table in Unity Catalog with a primary key constraint and non-nullable primary keys, (2) enable Change Data Feed on the Delta table (ALTER TABLE ... SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')), (3) create the online table via the UI or REST API specifying the source Delta table and sync mode. Sync modes: TRIGGERED (scheduled batch sync — lower cost, acceptable staleness), CONTINUOUS (near-real-time streaming sync — higher freshness for fast-changing features). The online table is served via the Databricks Online Store, accessible through the Feature Engineering Client at inference time. When you register a model with fe.log_model() and include the online table in FeatureLookups, Mosaic AI Model Serving automatically retrieves features from the online table during prediction — eliminating manual feature fetching code in your serving logic. Key limitations: primary key lookups only (no range scans), maximum row size constraints, and cost scales with read volume.",
+    "fj": "Databricks online tables are just cached Delta tables — they query the underlying Parquet files directly to return features.",
+    "fs": "Online tables use a separate low-latency key-value store (Lakebase), not Delta Parquet files. The Delta table is the source of truth that syncs to the online store. Direct Delta reads have second-to-minute latency (file listing, Parquet scan) — online tables deliver sub-10ms lookups required for real-time serving.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Creating an online table for feature serving",
+        "lines": [
+          "# Enable Change Data Feed on source table",
+          "spark.sql(\"\"\"",
+          "  ALTER TABLE ml.features.user_activity",
+          "  SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')",
+          "\"\"\")",
+          "",
+          "# Create online table via Databricks REST API or SDK",
+          "from databricks.sdk import WorkspaceClient",
+          "from databricks.sdk.service.catalog import OnlineTableSpec, OnlineTableSpecContinuousSchedulingPolicy",
+          "",
+          "w = WorkspaceClient()",
+          "online_table_spec = OnlineTableSpec(",
+          "    source_table_full_name='ml.features.user_activity',",
+          "    primary_key_columns=['user_id'],",
+          "    run_triggered={}  # or run_continuously={} for CONTINUOUS mode",
+          ")",
+          "w.online_tables.create(name='ml.features.user_activity_online',",
+          "                       spec=online_table_spec)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How do you design a streaming feature pipeline for real-time feature ingestion and on-demand feature generation? What ensures training-serving consistency?",
+    "a": "A streaming feature pipeline has three components: (1) Ingestion: Structured Streaming reads from a source (Kafka, Kinesis, Delta CDC) and computes aggregated features in a streaming manner using watermarks and windows, writing results to a Feature Store table with CONTINUOUS publish mode. (2) On-demand features: computed at inference time from request payload data (e.g., distance between user location and target) — these are defined inside the pyfunc model's predict() method and never stored in the feature table. (3) Pre-computed features: stored in the feature table and looked up at inference time. Training-serving consistency is enforced by: (a) using the same Feature Engineering Client for both training (create_training_set) and serving (fe.log_model with FeatureLookups), so the same join logic applies in both contexts; (b) on-demand features must be expressed as Python functions included in the pyfunc model, not as ad-hoc notebook code. A common bug is computing a feature differently in the training notebook versus the serving function — Feature Store's model packaging eliminates this risk by embedding the lookup specification in the model artifact. Lakebase online tables bridge the gap between the streaming write path and the low-latency read path for serving.",
+    "fj": "On-demand features should be precomputed and stored in the feature table to ensure consistency — computing them at inference time introduces inconsistency.",
+    "fs": "On-demand features are defined as features that cannot be precomputed because they depend on request-time context (e.g., user's current location, real-time cart contents). They must be computed at inference time. Consistency is guaranteed not by precomputing but by using the same Python function in both training and serving — which MLflow pyfunc packaging enforces.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "Describe the end-to-end ML model lifecycle pipeline architecture on Databricks. How do platform features map to each lifecycle stage?",
+    "a": "The Databricks ML lifecycle has five stages: (1) Data preparation — Delta Lake + Lakeflow Declarative Pipelines + Feature Engineering for curated feature tables with governance via Unity Catalog. (2) Experimentation — MLflow Experiments for tracking runs, parameters, metrics, and artifacts; Databricks Notebooks for interactive development. (3) Training and tuning — SparkML, Ray Train, or single-node frameworks; CrossValidator / Optuna / Ray Tune for hyperparameter search; mlflow.autolog() for automatic tracking. (4) Model registration and governance — MLflow Model Registry in Unity Catalog for versioning, aliasing (Champion/Challenger), and access control; model signatures and input examples for contract enforcement. (5) Deployment and monitoring — Mosaic AI Model Serving for REST endpoints; batch inference via spark_udf; Lakehouse Monitoring for drift and performance tracking; automated retraining via Lakeflow Jobs. The Databricks platform unifies all stages under Unity Catalog governance: features, models, experiments, and endpoints all respect the same permission model, enabling lineage tracking from raw data to deployed model predictions.",
+    "fj": "The MLflow Model Registry and Unity Catalog are separate systems — models registered in MLflow are not visible or governed by Unity Catalog.",
+    "fs": "Since Databricks Runtime 13.2, the MLflow Model Registry is natively integrated into Unity Catalog. Models are registered as three-level namespace objects (catalog.schema.model_name) and inherit Unity Catalog's RBAC, lineage, and auditing. The legacy Workspace Model Registry is still supported but new deployments should use Unity Catalog for full governance.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you define and deploy Databricks ML assets — model serving endpoints and MLflow experiments — as infrastructure-as-code using Databricks Asset Bundles (DABs)?",
+    "a": "Databricks Asset Bundles (DABs) are the IaC framework for managing all Databricks resources as YAML-defined bundles versioned in Git. For ML assets, a bundle YAML can declare: MLflow experiments (with workspace path, permissions, and tags), model serving endpoints (with endpoint_name, config block specifying served_models with model_name, model_version, workload_size, and scale_to_zero_enabled), and Lakeflow Jobs that orchestrate training pipelines. The bundle structure supports multi-environment targets (dev, staging, prod) with per-environment variable overrides. Deployment: databricks bundle validate checks syntax; databricks bundle deploy -t prod provisions or updates all declared resources. Benefits: model serving endpoint configuration is version-controlled alongside the training code, enabling PR review of endpoint changes; CI/CD pipelines (GitHub Actions, Azure DevOps) can run databricks bundle deploy automatically on merge to main. DABs also support parameterized notebooks and jobs, so a single bundle can train different model variants by varying the run parameters per environment.",
+    "fj": "Databricks Asset Bundles can only define Lakeflow Jobs and Pipelines — model serving endpoints must be created manually through the UI or separate REST API calls.",
+    "fs": "DABs support model serving endpoints as a first-class resource type in the bundle YAML. You can define the full endpoint configuration — served models, traffic splits, environment variables, and compute settings — as code, enabling version-controlled and reviewable endpoint deployments alongside training pipelines.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "DABs YAML: model serving endpoint definition (databricks.yml)",
+        "lines": [
+          "# databricks.yml",
+          "bundle:",
+          "  name: churn-model-bundle",
+          "",
+          "resources:",
+          "  experiments:",
+          "    churn_experiment:",
+          "      name: /Shared/churn-model-v3",
+          "",
+          "  model_serving_endpoints:",
+          "    churn_endpoint:",
+          "      name: churn-prediction-prod",
+          "      config:",
+          "        served_models:",
+          "          - model_name: ml.prod.churn_model",
+          "            model_version: '3'",
+          "            workload_size: Small",
+          "            scale_to_zero_enabled: true",
+          "            traffic_percentage: 100",
+          "",
+          "targets:",
+          "  prod:",
+          "    workspace:",
+          "      host: https://my-prod-workspace.azuredatabricks.net",
+          "    variables:",
+          "      model_version: '3'"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you implement unit tests for notebook functions and ML pipeline components on Databricks? What frameworks and patterns are used?",
+    "a": "Unit testing ML pipeline components on Databricks uses pytest as the primary framework, with notebooks converted to Python modules or tested via %run in test notebooks. Patterns: (1) Refactor notebook logic into importable Python functions in a src/ or lib/ directory — test these with standard pytest. (2) Use pytest-mock or unittest.mock to mock Spark sessions and DataFrames in unit tests to avoid needing a live cluster for fast CI. (3) For SparkML pipeline components, test individual transformers: create a small synthetic DataFrame, apply the transformer, assert the output schema and values. (4) For MLflow logging, mock mlflow.start_run() or use a local file-based tracking URI to avoid writing to the real tracking server. (5) Databricks Asset Bundles support running pytest as a task in a Lakeflow Job, enabling CI integration. Test pyramid guidance: unit tests (fast, no Spark needed, test individual functions) at base; integration tests (small Spark cluster, real Delta tables, end-to-end pipeline smoke test) in the middle; system tests (full prod-like environment, data quality assertions, model performance thresholds) at top.",
+    "fj": "You cannot write unit tests for Databricks notebooks — the entire notebook must be run as an integration test on a cluster.",
+    "fs": "Notebooks can be refactored so business logic lives in Python modules that are independently testable with pytest. You can also use dbutils.notebook.run() for notebook-level testing in DABs pipelines. The key is separating pure Python logic (testable offline) from Spark operations (tested with a small integration cluster).",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "pytest unit test for SparkML transformer",
+        "lines": [
+          "# tests/test_feature_pipeline.py",
+          "import pytest",
+          "from pyspark.sql import SparkSession",
+          "from pyspark.ml.feature import VectorAssembler",
+          "from src.feature_pipeline import build_assembler",
+          "",
+          "@pytest.fixture(scope='session')",
+          "def spark():",
+          "    return SparkSession.builder.master('local[2]').appName('test').getOrCreate()",
+          "",
+          "def test_vector_assembler_output_schema(spark):",
+          "    df = spark.createDataFrame([(1.0, 2.0, 3.0)], ['a', 'b', 'c'])",
+          "    assembler = build_assembler(input_cols=['a', 'b', 'c'], output_col='features')",
+          "    result = assembler.transform(df)",
+          "    assert 'features' in result.columns",
+          "    assert result.count() == 1",
+          "    vec = result.collect()[0]['features']",
+          "    assert list(vec) == [1.0, 2.0, 3.0]"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you design integration tests for end-to-end ML pipelines on Databricks? What types of tests should exist at dev, staging, and prod?",
+    "a": "Integration tests for ML pipelines verify that components work together correctly on real infrastructure. Layer structure: Dev environment tests — run against small sample data (<1% of prod volume) on an interactive cluster; verify schema correctness, pipeline execution completes without errors, MLflow run is created with expected parameters and metrics above a floor threshold, model is registered in Unity Catalog. Staging environment tests — use a full pipeline run with a representative dataset (recent 30-day sample); validate data quality (null rates, distribution checks), model performance above a validation threshold (e.g., AUC > 0.75), feature store lookups succeed, endpoint can serve a test request within latency SLA. Prod environment tests — smoke test via canary request to the serving endpoint, performance regression test comparing new model metrics to champion metrics, data drift check against baseline. Test organization approaches: monolithic (all tests in one notebook — easy but slow CI), modular (separate test files per component — faster, more targeted), and notebook-per-stage (each pipeline stage has its own validation step — self-documenting). Databricks Asset Bundles support defining test jobs that run before deployment as part of the CI/CD pipeline.",
+    "fj": "Integration tests should only run in production after deployment to validate that the model is working correctly.",
+    "fs": "Running tests only in production means failures affect live users. Integration tests should be run in staging first — a production-like environment with real data samples but isolated from user traffic. Production-only testing is a deployment anti-pattern; staging catches issues like schema mismatches and performance regressions before they reach users.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you design scalable ML environments on Databricks using workspace topology, cluster policies, and environment separation best practices?",
+    "a": "A production-grade Databricks ML environment uses separate workspaces per environment tier: Dev (interactive exploration, permissive cluster configs, personal MLflow experiments), Staging (CI/CD runs, shared experiments, production-like data access patterns), and Prod (locked-down policies, audit logging, automated jobs only — no interactive notebooks in prod data). Cluster policies enforce cost and security guardrails: policy configs restrict max_workers, allowed instance types, required autotermination, and mandatory tags for cost attribution. ML-specific cluster configurations: use single-node clusters or small shared clusters for development; use autoscaling job clusters (min_workers=0, max_workers=16) for batch training; use GPU clusters with spot instances for deep learning. Unity Catalog provides the cross-workspace governance layer — the same catalog grants, lineage, and model registry are accessible from all environment workspaces, so a model trained in dev and registered in Unity Catalog can be deployed in prod without data copying. Secret scopes (backed by Azure Key Vault or Databricks secrets) should store credentials — never hardcode in notebooks. Databricks Asset Bundles define all resources per target environment, enabling promotion workflows via PR merges.",
+    "fj": "The best practice is to use a single shared Databricks workspace with separate folders for dev, staging, and prod to avoid managing multiple workspaces.",
+    "fs": "A single workspace creates blast radius risk — a misconfigured job or permissive policy in dev can impact prod resources. Workspace separation provides hard isolation boundaries, independent cluster policies, and separate audit logs. Unity Catalog enables cross-workspace data sharing without sacrificing the isolation benefits of separate workspaces.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you implement automated model retraining workflows on Databricks triggered by data drift or performance degradation alerts?",
+    "a": "The automated retraining pattern on Databricks combines Lakehouse Monitoring, SQL Alerts, and Lakeflow Jobs into a trigger chain. Architecture: (1) Lakehouse Monitoring continuously evaluates model inference tables and publishes drift metrics and performance metrics to Delta metric tables. (2) A Databricks SQL Alert queries the metric table for threshold violations (e.g., PSI > 0.25 or accuracy drop > 5%) on a scheduled interval. (3) The alert's webhook notification triggers a Lakeflow Jobs run via the REST API or a webhook integration. (4) The Lakeflow Job executes the retraining pipeline: data validation, feature refresh, model training with the latest data window, model evaluation, and conditional registration if the new model outperforms the current champion. To avoid retraining on noise, implement a stabilization check: require the drift condition to persist for N consecutive monitoring windows before triggering retraining. Version the retraining pipeline as a Databricks Asset Bundle task, tagging the resulting MLflow run with the trigger reason (drift_type, metric_name, threshold_violated) for observability.",
+    "fj": "Automated retraining should be scheduled on a fixed calendar cadence (weekly/monthly) — event-driven triggers based on drift are too complex to implement reliably.",
+    "fs": "Fixed-schedule retraining is wasteful (retrains even when the model is still performing well) and reactive (waits for the next scheduled run even when drift has caused immediate performance degradation). Event-driven retraining using Lakehouse Monitoring alerts is more efficient and responsive, and Databricks provides all the components needed to implement it robustly.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Retraining trigger via SQL Alert webhook",
+        "lines": [
+          "# SQL Alert query — runs every hour",
+          "-- alert_query.sql",
+          "SELECT monitor_time, psi_score, accuracy_drop",
+          "FROM ml.monitoring.churn_model_metrics",
+          "WHERE monitor_time >= CURRENT_TIMESTAMP - INTERVAL 1 HOUR",
+          "  AND (psi_score > 0.25 OR accuracy_drop > 0.05)",
+          "",
+          "# Alert action: webhook POST to Lakeflow Jobs API",
+          "# POST https://<workspace>/api/2.1/jobs/run-now",
+          "# Body: {\"job_id\": 12345, \"python_params\": [\"--trigger\", \"drift_alert\"]}",
+          "",
+          "# Retraining job — validates before promoting",
+          "import mlflow",
+          "from databricks.sdk import WorkspaceClient",
+          "",
+          "new_model_uri = run_training_pipeline()",
+          "new_metrics = mlflow.get_run(new_run_id).data.metrics",
+          "",
+          "if new_metrics['val_auc'] > champion_metrics['val_auc'] + 0.01:",
+          "    client = mlflow.tracking.MlflowClient()",
+          "    client.set_registered_model_alias(",
+          "        'ml.prod.churn_model', 'Champion', new_version)",
+          "    print('New champion promoted')",
+          "else:",
+          "    print('Challenger did not beat champion — keeping current model')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you select the top-performing model during automated retraining cycles? Describe champion-challenger patterns on Databricks.",
+    "a": "The champion-challenger pattern uses MLflow Model Registry aliases to manage promotion without changing endpoint URLs. The Champion alias points to the currently deployed best model; the Challenger alias points to the newly trained candidate. Validation gate logic: after the retraining job completes, retrieve both models, compute evaluation metrics on a held-out validation set (not used during training), and compare on primary metric (e.g., AUC) and secondary metrics (precision at threshold, calibration). Promotion criteria should include: primary metric improvement above a minimum threshold (avoid noise), no regression on secondary metrics (a new model that improves AUC but worsens calibration may be worse for a pricing system), data quality checks (predictions are well-distributed, no degenerate outputs). Implementation: use mlflow.MlflowClient.set_registered_model_alias() to promote Challenger to Champion atomically. The Model Serving endpoint references the Champion alias — no endpoint reconfiguration needed. For shadow testing: deploy the Challenger behind a traffic split (e.g., 5%) using Model Serving endpoint traffic routing, log predictions to separate inference tables, and compare outcomes offline before full promotion.",
+    "fj": "To promote a new model version, you must update the model serving endpoint configuration to point to the new version number directly.",
+    "fs": "Using model aliases (Champion/Challenger) decouples endpoint configuration from specific version numbers. The endpoint is configured to serve the 'Champion' alias — when you update the alias to point to a new version, the endpoint automatically serves it without any endpoint reconfiguration. This enables atomic, zero-downtime model promotions.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "Which statistical tests detect drift in categorical features? Compare Chi-squared, Jensen-Shannon divergence, and PSI — when should you use each?",
+    "a": "Chi-squared test: a hypothesis test that compares observed vs. expected category frequencies. Use when you have a baseline reference distribution and want a p-value-based decision (reject null = drift detected). Sensitive to sample size — with millions of rows, even tiny irrelevant shifts will be flagged as significant. Best for: production monitoring where you want a binary drift decision with statistical rigor. Jensen-Shannon (JS) divergence: a symmetric, bounded (0-1) measure of the divergence between two probability distributions. Unlike KL divergence, JS is always finite even when distributions have non-overlapping support. Use when you want a continuous score to track drift magnitude over time and compare across features. Best for: dashboard-style monitoring where you want to rank features by drift severity. PSI (Population Stability Index): bins the categorical distribution and computes a weighted sum of (actual% - expected%) * ln(actual%/expected%). Thresholds: PSI < 0.1 = no change, 0.1-0.25 = moderate change, >0.25 = significant shift. PSI is not a proper statistical test (no p-value) but is widely used in financial services (credit scoring, fraud) for regulatory reporting. Best for: compliance reporting and intuitive operational thresholds. Databricks Lakehouse Monitoring computes Chi-squared and PSI out-of-the-box for categorical columns in inference and snapshot profiles.",
+    "fj": "PSI and Chi-squared are equivalent tests for categorical drift — you can use either interchangeably.",
+    "fs": "PSI is not a statistical hypothesis test and provides no p-value. It is a stability index with rule-of-thumb thresholds. Chi-squared is a proper hypothesis test. They measure related but different things: Chi-squared tests whether a distribution difference is statistically significant; PSI quantifies the magnitude of shift in a way that's interpretable for business stakeholders. Use both in production: Chi-squared for alerting, PSI for reporting.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "Which statistical tests detect drift in numerical features? When do you use Wasserstein distance vs. Mann-Whitney test vs. KS test?",
+    "a": "Kolmogorov-Smirnov (KS) test: measures the maximum difference between two empirical CDFs. It is sensitive to differences anywhere in the distribution but is most sensitive to the median region. Use for: symmetric drift detection when you care about any distributional shift. Wasserstein distance (Earth Mover's Distance): measures the minimum 'work' needed to transform one distribution into another. It is a true metric on the space of distributions and is sensitive to the magnitude of shift, not just whether shift occurred. Use when: you want a continuous score that captures how far distributions have moved (useful for dashboard trending) and you care about the practical significance of the shift, not just statistical significance. Mann-Whitney U test: a non-parametric hypothesis test for whether two distributions have the same median/rank-sum. Use when: you specifically care about location shift (mean/median change) rather than distributional shape change. Best for: detecting mean-shift in skewed distributions where a t-test's normality assumption doesn't hold. Databricks Lakehouse Monitoring uses Wasserstein distance by default for numerical columns in monitoring profiles. In practice: use KS for quick sensitivity, Wasserstein for magnitude-aware drift scoring, Mann-Whitney when median shift is the primary concern (e.g., transaction amounts, income features).",
+    "fj": "KS test is always preferred over Wasserstein distance because it provides a p-value and KS is more statistically rigorous.",
+    "fs": "KS test's p-value is affected by sample size — with billions of rows, trivial shifts will always be significant. Wasserstein distance measures practical significance independent of sample size, making it more meaningful for production monitoring where you have large datasets. The 'more rigorous' label applies to different dimensions: KS for binary significance decisions, Wasserstein for operational drift magnitude tracking.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "What are the three table types in Databricks Lakehouse Monitoring — snapshot, time series, and inference — and what monitoring features apply to each?",
+    "a": "Snapshot tables: contain a point-in-time snapshot of data (e.g., current customer attributes, daily batch output). Monitoring computes data quality metrics (null rates, distinct counts, distribution statistics) and compares to a baseline snapshot. No temporal windowing — good for catching schema changes and distribution shifts in static or slowly-changing datasets. Time series tables: contain timestamped rows with a designated timestamp column. Monitoring computes windowed metrics (hourly, daily) and tracks trends over time using the timestamp axis. Ideal for: event logs, sensor readings, streaming data. Supports drift detection comparing each time window to a baseline or to the previous window. Inference tables: contain model input features, predictions, and optionally ground-truth labels and model version identifiers. Monitoring tracks: prediction drift (how prediction distribution shifts over time), feature drift (input feature distribution changes), and when labels are available, model performance metrics (accuracy, RMSE, AUC). Inference tables are the primary type for ML model monitoring. Key difference: snapshot = data quality only; time series = temporal data quality trends; inference = data quality + model quality + prediction drift. Lakehouse Monitoring creates two output Delta tables: a profile metrics table (per-window statistics) and a drift metrics table (per-window drift scores vs. baseline or previous window).",
+    "fj": "Time series tables and inference tables are the same in Lakehouse Monitoring — any table with a timestamp column is treated as an inference table.",
+    "fs": "They are distinct profile types requiring different creation parameters. Inference tables require a model_id_col and prediction_col (and optionally label_col) and track model-specific metrics. Time series tables require only a timestamp column and track data quality over time. The inference profile unlocks model performance monitoring, which time series profiles cannot provide.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you create a Lakehouse Monitor for an inference table using the Python SDK? What are the key components of the resulting monitoring pipeline?",
+    "a": "To create a Lakehouse Monitor: import databricks.lakehouse_monitoring as lm, then call lm.create_monitor(table_name=..., profile_type=lm.InferenceLog(...), output_schema_name=..., baseline_table_name=..., slicing_exprs=[...]). The InferenceLog profile requires specifying: timestamp_col (when the prediction was made), model_id_col (which model version served this row), prediction_col (model output), label_col (ground truth, optional), and problem_type ('classification' or 'regression'). The monitoring pipeline creates two output Delta tables in output_schema_name: (1) profile_metrics — per-window statistics for each monitored column (mean, std, nulls, histogram, drift score vs. baseline), and (2) drift_metrics — per-window drift scores comparing the current window to the baseline or previous window. Monitoring runs on a configurable schedule (TRIGGERED or CONTINUOUS). The baseline_table_name specifies the reference distribution (typically training data) against which drift is measured. Slicing expressions allow computing metrics by data subgroup (e.g., WHERE region='west'), revealing demographic or segment-level performance divergence. Refresh the monitor manually with lm.run_refreshes(table_name=...) for on-demand metric computation.",
+    "fj": "Lakehouse Monitoring requires you to write custom SQL queries to compute drift metrics — there are no built-in statistical tests.",
+    "fs": "Lakehouse Monitoring computes built-in statistical drift tests (Chi-squared for categoricals, Wasserstein and KS for numericals) automatically based on the profile type, without requiring custom SQL. You can additionally define custom metrics using Python or SQL expressions, but the out-of-the-box metrics already cover standard drift detection scenarios.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Creating a Lakehouse Monitor for an inference table",
+        "lines": [
+          "import databricks.lakehouse_monitoring as lm",
+          "",
+          "lm.create_monitor(",
+          "    table_name='ml.prod.churn_predictions',",
+          "    profile_type=lm.InferenceLog(",
+          "        timestamp_col='prediction_ts',",
+          "        model_id_col='model_version',",
+          "        prediction_col='predicted_churn_prob',",
+          "        label_col='actual_churned',  # optional — enables performance metrics",
+          "        problem_type='classification',",
+          "    ),",
+          "    output_schema_name='ml.monitoring',",
+          "    baseline_table_name='ml.train.churn_training_features',",
+          "    slicing_exprs=['region', 'product_tier', 'tenure_bucket'],",
+          "    schedule=lm.MonitorCronSchedule(quartz_cron_expression='0 0 * * * ?')  # hourly",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you configure SQL alerts and webhooks to create an automated alerting chain for drift threshold violations in Databricks?",
+    "a": "The alerting chain for drift violations has three components: (1) Databricks SQL Query: query the Lakehouse Monitoring profile_metrics or drift_metrics table to compute an alert condition. Example: SELECT COUNT(*) as violation_count FROM ml.monitoring.churn_predictions_drift_metrics WHERE window_end >= CURRENT_TIMESTAMP - INTERVAL 2 HOURS AND drift_type = 'wasserstein_distance' AND drift_value > 0.15. (2) Databricks SQL Alert: create an alert on this query with condition 'value > 0' and a refresh schedule. The alert evaluates the query on the schedule and triggers if the condition is met. (3) Alert destination: configure a webhook destination (POST to Lakeflow Jobs REST API, PagerDuty, Slack, or email) that fires when the alert is triggered. Webhook for Lakeflow Jobs retraining: POST to /api/2.1/jobs/run-now with the job_id and optional parameters. The full chain: Lakehouse Monitoring refreshes metrics → SQL Alert evaluates threshold → Alert fires webhook → Lakeflow Job runs retraining pipeline → New model evaluated → Champion updated if better. Best practice: include alert suppression logic (e.g., require 3 consecutive violations before triggering) to prevent alert storms from transient data anomalies.",
+    "fj": "You need a separate monitoring tool outside Databricks (like Grafana or PagerDuty directly querying the table) to implement production ML alerts.",
+    "fs": "Databricks SQL Alerts natively query Delta tables and can trigger webhook notifications to any HTTP endpoint, including the Lakeflow Jobs API. The complete alerting and automation chain is achievable within the Databricks platform without external tools, though integrations with PagerDuty/Slack are supported as secondary notification channels.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "SQL Alert query for drift threshold violation",
+        "lines": [
+          "-- Query underlying the Databricks SQL Alert",
+          "SELECT",
+          "  column_name,",
+          "  drift_type,",
+          "  drift_value,",
+          "  window_end",
+          "FROM ml.monitoring.churn_predictions_drift_metrics",
+          "WHERE",
+          "  window_end >= CURRENT_TIMESTAMP - INTERVAL 2 HOURS",
+          "  AND drift_type IN ('wasserstein_distance', 'chi_squared_test')",
+          "  AND (",
+          "    (drift_type = 'wasserstein_distance' AND drift_value > 0.15)",
+          "    OR (drift_type = 'chi_squared_test' AND drift_value > 0.05)",
+          "  )",
+          "  AND column_name IN ('age', 'income', 'product_category')  -- key features",
+          "-- Alert condition: COUNT > 0 triggers webhook"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you use Lakehouse Monitoring to detect data drift by comparing feature distributions to a baseline reference window?",
+    "a": "Baseline comparison in Lakehouse Monitoring works by specifying a baseline_table_name when creating the monitor — typically the training dataset or a validated production snapshot from a known-good period. The monitor computes drift metrics by comparing each monitoring window's feature distributions to the baseline using the appropriate statistical test per feature type (Chi-squared/PSI for categoricals, Wasserstein/KS for numericals). The drift_metrics output table contains columns: column_name, drift_type, drift_value, window_start, window_end, and optionally slice_value for sliced metrics. Drift_value represents the test statistic — you interpret it by the test's natural scale (PSI: >0.25 critical; Wasserstein: domain-specific; Chi-squared p-value: <0.05 significant). For time-series profiles, you can alternatively compare each window to the preceding window (relative drift) rather than an absolute baseline — useful for detecting gradual drift. The profile_metrics table provides the underlying distribution statistics (histogram bins, percentiles, null rates) per window that you can use for custom drift visualizations in Databricks dashboards. Key pattern: always set a meaningful baseline; comparing to an empty or small baseline produces unreliable drift scores.",
+    "fj": "Lakehouse Monitoring automatically selects an appropriate baseline by sampling recent production data — you do not need to specify a baseline table.",
+    "fs": "There is no automatic baseline selection — you must explicitly provide a baseline_table_name or configure a reference window. Without a baseline, the monitor uses previous windows for relative comparison but cannot flag absolute distributional drift from the training distribution. An explicit training-data baseline is strongly recommended for meaningful model monitoring.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you evaluate model performance trends using inference tables in Lakehouse Monitoring? What metrics are available when ground truth is delayed?",
+    "a": "When a label_col is specified in the InferenceLog profile, Lakehouse Monitoring automatically computes model performance metrics per window: for classification — accuracy, precision, recall, F1, AUC-ROC; for regression — RMSE, MAE, R2. These are written to the profile_metrics table with metric_type = 'model_quality'. Performance trend analysis: query the profile_metrics table ordered by window_end to visualize metric degradation over time. A drop in AUC across consecutive windows signals model decay and should trigger a retraining alert. Delayed label problem: in many production systems, ground truth labels arrive days or weeks after predictions (e.g., loan default 30 days later). Strategies: (1) Monitor proxy metrics that are available immediately (prediction distribution, confidence scores, input feature drift) as early warning indicators. (2) Use prediction drift (wasserstein on the predicted_churn_prob column) as a leading indicator before labels arrive. (3) Implement a label join pipeline that backfills the label_col in the inference table when ground truth becomes available and re-triggers monitoring refreshes on the backfilled data. The inference table schema should include a label_available_ts column to track when labels were joined.",
+    "fj": "If ground truth labels are not available in real time, you cannot use Lakehouse Monitoring for model performance tracking.",
+    "fs": "Lakehouse Monitoring supports delayed labels by monitoring the inference table as a Delta table — when you backfill label_col rows using a merge operation, the next monitoring refresh computes performance metrics for those newly labeled rows. In the meantime, prediction drift and feature drift serve as proxy indicators of model health.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you define custom metrics in Lakehouse Monitoring? When would you use custom metrics over built-in ones?",
+    "a": "Custom metrics in Lakehouse Monitoring are defined as Python functions or SQL expressions that compute additional statistics beyond the built-in drift and quality metrics. Use cases: business-specific metrics (e.g., expected profit under the model's predictions, fairness metrics across demographic slices), custom drift measures (e.g., domain-specific PSI with non-uniform bins), or composite scores that combine multiple features. API: pass a list of MonitorMetric objects to the custom_metrics parameter of lm.create_monitor(). Each MonitorMetric specifies a name, input_columns list, type (AGGREGATE for window-level stats, DERIVED for computed from other metrics), and definition (SQL expression or Python function). Example: a business value metric that computes avg(predicted_prob * deal_value) per window to track expected revenue. Granularity: custom metrics support the same slicing_exprs as built-in metrics, so you can compute them per region or per model version. When to use: built-in metrics cover standard statistical drift detection comprehensively — use custom metrics when your business has specific performance thresholds (e.g., false positive rate < 2% for a specific high-value segment) that the built-in metrics don't capture.",
+    "fj": "Custom metrics in Lakehouse Monitoring replace the built-in metrics — you cannot have both running simultaneously on the same table.",
+    "fs": "Custom metrics are additive — they are computed in addition to built-in metrics and written to the same profile_metrics output table with the custom metric name. There is no trade-off between using built-in and custom metrics; they coexist in the same monitoring pipeline.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Custom metric definition in Lakehouse Monitoring",
+        "lines": [
+          "import databricks.lakehouse_monitoring as lm",
+          "",
+          "expected_revenue_metric = lm.Metric(",
+          "    type=lm.MetricType.AGGREGATE,",
+          "    name='expected_revenue_per_prediction',",
+          "    input_columns=['predicted_prob', 'deal_value'],",
+          "    definition='avg(predicted_prob * deal_value)',",
+          "    output_data_type='DOUBLE'",
+          ")",
+          "",
+          "high_value_fp_rate = lm.Metric(",
+          "    type=lm.MetricType.AGGREGATE,",
+          "    name='false_positive_rate_high_value',",
+          "    input_columns=['predicted_label', 'actual_label', 'deal_value'],",
+          "    definition=\"\"\"",
+          "      sum(CASE WHEN predicted_label=1 AND actual_label=0 AND deal_value>1000 THEN 1 ELSE 0 END)",
+          "      / NULLIF(sum(CASE WHEN actual_label=0 AND deal_value>1000 THEN 1 ELSE 0 END), 0)",
+          "    \"\"\",",
+          "    output_data_type='DOUBLE'",
+          ")",
+          "",
+          "lm.create_monitor(",
+          "    table_name='ml.prod.churn_predictions',",
+          "    profile_type=lm.InferenceLog(...),",
+          "    custom_metrics=[expected_revenue_metric, high_value_fp_rate]",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you monitor endpoint health and infrastructure metrics for Databricks Model Serving endpoints? What metrics are available and where are they surfaced?",
+    "a": "Databricks Model Serving endpoints expose infrastructure metrics that can be monitored via: (1) Built-in endpoint metrics in the Serving UI: request rate (requests/second), latency percentiles (p50, p90, p99 in milliseconds), error rate (4xx and 5xx), and token throughput for LLM endpoints. These are available in the endpoint's monitoring tab with time-series charts. (2) System-level metrics via the /metrics endpoint or Databricks REST API: cpu_usage, memory_usage, and replica count per endpoint. (3) External monitoring integration: configure a Databricks Job to periodically query the endpoint REST metrics API and write results to a Delta table, then apply Lakehouse Monitoring or custom SQL alerts on that table. Key SLOs to track: p99 latency (should stay below your contract SLA, typically <200ms for real-time endpoints), error_rate (alert if >0.1% for a sustained period), and throughput saturation (if requests/sec approaches endpoint capacity, scale the workload_size or increase max_provisioned_throughput). For GPU endpoints: monitor GPU utilization — if consistently <50%, you may be over-provisioned; if >90%, consider scaling up. Mosaic AI Model Serving supports scale-to-zero for cost efficiency when traffic is intermittent.",
+    "fj": "Infrastructure metrics for Model Serving endpoints are only available via third-party APM tools like Datadog — Databricks does not provide built-in endpoint monitoring.",
+    "fs": "Databricks Model Serving has a built-in monitoring tab in the workspace UI that shows latency, error rate, and request throughput over configurable time windows without any external tools. REST API access to these metrics also enables programmatic alerting and integration with external dashboards.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "Compare blue-green, canary, and shadow deployment strategies for high-traffic production ML applications on Databricks. When is each appropriate?",
+    "a": "Blue-green deployment: maintain two identical endpoint configurations (blue = current production, green = new model). Switch 100% of traffic atomically by updating the alias or endpoint config. Pros: zero downtime, instant rollback by switching alias back. Cons: requires 2x infrastructure cost during cutover, no gradual validation. Best for: strict uptime requirements, simple A/B comparison where you have high confidence in the new model from offline evaluation. Canary deployment: route a small percentage of traffic (1-10%) to the new model version while the majority continues to hit the current model. Monitor the canary's metrics (latency, error rate, prediction quality) before expanding traffic. Built-in support on Databricks via endpoint traffic_percentage configuration. Best for: medium to high traffic environments where gradual validation reduces blast radius. Shadow deployment: the new model receives the same requests as the current model but its responses are not returned to users — predictions are logged to an inference table for offline analysis. Best for: validating a new model without any user exposure risk, particularly for high-stakes domains (fraud, healthcare). Databricks supports shadow mode by deploying a second endpoint and routing a copy of requests via a proxy or Lakeflow Job. The shadow model's inference table can be monitored with Lakehouse Monitoring to compare prediction distributions before any traffic is shifted.",
+    "fj": "Canary and A/B testing are the same deployment pattern — canary is just the term used when traffic percentage is less than 50%.",
+    "fs": "Canary and A/B testing serve different purposes. Canary is a risk-management strategy: start small, verify stability, then increase traffic. A/B testing is an experiment: split traffic to measure which model produces better business outcomes (e.g., click-through rate). A/B tests require proper statistical power analysis and run for a fixed duration; canary deployments run until confidence is reached and then shift all traffic.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "model-deployment"
+  },
+  {
+    "q": "How do you implement a canary rollout using Databricks Model Serving endpoint traffic routing percentages? Show the configuration pattern.",
+    "a": "Databricks Model Serving endpoints support traffic splitting natively: a single endpoint can serve multiple model versions simultaneously with configurable traffic_percentage weights that must sum to 100. Canary rollout pattern: (1) Baseline: 100% traffic to Champion (version 3). (2) Canary start: update endpoint config to 95% Champion + 5% Challenger (version 4). (3) Monitor: watch latency, error rate, and prediction distribution for both served models in the monitoring tab. (4) Expand: if metrics are healthy, progressively increase Challenger to 20%, 50%, 100%. (5) Cutover: remove Champion from the config when Challenger reaches 100%. Configuration can be done via the UI, REST API, or Databricks SDK. For automated rollout, a Lakeflow Job evaluates metrics after each traffic increment and either advances to the next stage or rolls back to 100% Champion. The endpoint URL remains constant throughout — callers are unaware of the traffic split. Both models must be registered in Unity Catalog and available in the same serving endpoint config.",
+    "fj": "Traffic splitting requires two separate endpoints — you cannot route different percentages to different model versions on a single Databricks Model Serving endpoint.",
+    "fs": "A single Databricks Model Serving endpoint supports up to 10 served entities with configurable traffic_percentage weights. This is the recommended approach — it preserves a single endpoint URL for callers while enabling internal traffic splitting, A/B testing, and canary rollouts without URL changes.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Canary rollout via endpoint traffic split",
+        "lines": [
+          "from databricks.sdk import WorkspaceClient",
+          "from databricks.sdk.service.serving import EndpointCoreConfigInput, ServedModelInput",
+          "",
+          "w = WorkspaceClient()",
+          "",
+          "# Start canary: 5% to new model, 95% to current champion",
+          "w.serving_endpoints.update_config(",
+          "    name='churn-prediction-prod',",
+          "    served_models=[",
+          "        ServedModelInput(",
+          "            model_name='ml.prod.churn_model',",
+          "            model_version='3',",
+          "            workload_size='Small',",
+          "            traffic_percentage=95,",
+          "            scale_to_zero_enabled=True",
+          "        ),",
+          "        ServedModelInput(",
+          "            model_name='ml.prod.churn_model',",
+          "            model_version='4',",
+          "            workload_size='Small',",
+          "            traffic_percentage=5,",
+          "            scale_to_zero_enabled=True",
+          "        )",
+          "    ]",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-deployment"
+  },
+  {
+    "q": "How do you register a custom PyFunc model and its artifacts in Unity Catalog and deploy it to Mosaic AI Model Serving? Include how to query via REST API.",
+    "a": "Registration flow: (1) During training, call mlflow.pyfunc.log_model() with python_model=, artifacts={}, and registered_model_name='catalog.schema.model_name' (three-part Unity Catalog name). MLflow automatically creates a new model version in Unity Catalog. (2) Add model signature (input/output schema) and input_example for contract enforcement and UI documentation. (3) Assign an alias with mlflow.MlflowClient().set_registered_model_alias(name, alias='Champion', version=N). Deployment: create or update a Model Serving endpoint via the SDK or UI referencing the UC model. Querying via REST API: the endpoint exposes a standard REST endpoint at https://<workspace>/serving-endpoints/<endpoint-name>/invocations. The request body uses MLflow scoring format: {\"dataframe_split\": {\"columns\": [\"col1\", \"col2\"], \"data\": [[val1, val2]]}} or {\"inputs\": [...]} for tensor inputs. Authentication uses a Databricks personal access token (PAT) or OAuth token in the Authorization header. Response: {\"predictions\": [output_value]}. For batch REST calls, send up to 256 rows per request. Use the MLflow Deployments SDK (mlflow.deployments.get_deploy_client) for programmatic invocation without raw HTTP.",
+    "fj": "Unity Catalog model registration requires a separate registration step after mlflow logging — you must first log the model and then run a separate mlflow.register_model() call.",
+    "fs": "Setting registered_model_name in mlflow.pyfunc.log_model() (or any mlflow.[flavor].log_model()) automatically registers the model in Unity Catalog in a single step. The separate mlflow.register_model() call is an older pattern used when the log and register steps were separate; the combined approach is the current best practice.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Register PyFunc in Unity Catalog and query endpoint",
+        "lines": [
+          "import mlflow",
+          "import requests",
+          "",
+          "# Register in Unity Catalog during training",
+          "with mlflow.start_run():",
+          "    mlflow.pyfunc.log_model(",
+          "        artifact_path='model',",
+          "        python_model=MyCustomModel(),",
+          "        artifacts={'model_pkl': '/tmp/model.pkl'},",
+          "        registered_model_name='ml.prod.churn_model',  # UC 3-part name",
+          "        input_example=sample_df,",
+          "        signature=mlflow.models.infer_signature(sample_df, predictions)",
+          "    )",
+          "",
+          "# Query endpoint via REST",
+          "ENDPOINT_URL = 'https://<workspace>/serving-endpoints/churn-prediction-prod/invocations'",
+          "TOKEN = '<databricks-pat>'",
+          "",
+          "payload = {",
+          "    'dataframe_split': {",
+          "        'columns': ['age', 'tenure', 'product_tier'],",
+          "        'data': [[35, 180, 'premium']]",
+          "    }",
+          "}",
+          "response = requests.post(",
+          "    ENDPOINT_URL,",
+          "    headers={'Authorization': f'Bearer {TOKEN}'},",
+          "    json=payload",
+          ")",
+          "print(response.json())  # {'predictions': [0.73]}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-deployment"
+  },
+  {
+    "q": "How do you score batch predictions using spark_udf and mlflow.pyfunc.load_model patterns? When should you use each?",
+    "a": "Two primary patterns for batch scoring: (1) mlflow.pyfunc.spark_udf(): loads an MLflow model as a Spark UDF that can be applied column-wise on a DataFrame. The UDF is broadcast to all executors. Best for: applying non-SparkML models (XGBoost, scikit-learn, PyTorch) to Spark DataFrames at scale; the env_manager='conda' or 'virtualenv' parameter ensures dependencies are installed on each executor. Use df.withColumn('prediction', model_udf(*feature_cols)) or the result_type parameter to control the return type. (2) mlflow.pyfunc.load_model(): loads the model as a Python object on the driver only. Call model.predict(pandas_df). Best for: small batch scoring where data fits in driver memory, or when you need to preprocess with driver-side logic before scoring. Comparison: spark_udf parallelizes prediction across executors and scales to billions of rows; pyfunc.load_model is single-threaded but has lower overhead for small datasets. For SparkML PipelineModels, use pipelineModel.transform(spark_df) directly — no need for spark_udf. Use spark_udf when integrating non-Spark models into a Spark scoring job. Specify result_type (e.g., DoubleType() or ArrayType(DoubleType())) explicitly to avoid type inference overhead.",
+    "fj": "mlflow.pyfunc.load_model must be called on each worker node — calling it only on the driver means workers cannot access the model during distributed scoring.",
+    "fs": "mlflow.pyfunc.load_model loads the model on the driver for single-node prediction. For distributed scoring, mlflow.pyfunc.spark_udf() handles model distribution to workers internally — it serializes the model reference (not the model itself) and each executor independently loads the model from the MLflow artifact store. You do not need to manually distribute the model object.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Batch scoring: spark_udf vs. load_model",
+        "lines": [
+          "import mlflow.pyfunc",
+          "from pyspark.sql.types import DoubleType",
+          "",
+          "MODEL_URI = 'models:/ml.prod.churn_model/Champion'",
+          "",
+          "# Pattern 1: spark_udf — distributed scoring on large DataFrames",
+          "predict_udf = mlflow.pyfunc.spark_udf(",
+          "    spark,",
+          "    model_uri=MODEL_URI,",
+          "    result_type=DoubleType(),",
+          "    env_manager='virtualenv'  # restores deps on each executor",
+          ")",
+          "scored_df = input_df.withColumn('churn_prob', predict_udf('age', 'tenure', 'product_tier'))",
+          "scored_df.write.format('delta').mode('overwrite').saveAsTable('ml.prod.batch_scores')",
+          "",
+          "# Pattern 2: load_model — driver-side scoring for small data",
+          "model = mlflow.pyfunc.load_model(MODEL_URI)",
+          "pandas_input = input_df.limit(10000).toPandas()",
+          "predictions = model.predict(pandas_input)",
+          "print(predictions)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-deployment"
+  },
+  {
+    "q": "How do you implement a streaming inference pipeline using Structured Streaming with MLflow model integration on Databricks?",
+    "a": "Streaming inference with MLflow models on Databricks uses Structured Streaming's ability to process streaming DataFrames with arbitrary Python transformations. Pattern: (1) Read a streaming source (Delta table with readStream, Kafka, Kinesis). (2) Load the MLflow model as a spark_udf using mlflow.pyfunc.spark_udf() — this is evaluated once at job startup, not per micro-batch. (3) Apply the UDF to the streaming DataFrame with withColumn() — Structured Streaming applies the UDF to each micro-batch. (4) Write results with writeStream to a Delta sink with append output mode and a checkpoint location. The checkpoint persists the streaming state for fault tolerance and exactly-once processing guarantees. For SparkML PipelineModels, call pipelineModel.transform(streaming_df) directly — SparkML models are natively streaming-compatible. Latency tuning: set spark.sql.streaming.statefulOperator.checkCorrectness.enabled=false for stateless UDF pipelines; use trigger(processingTime='30 seconds') for micro-batch or trigger(availableNow=True) for incremental batch. A common pattern for feature engineering: use foreachBatch to apply complex per-batch logic (feature computation + model scoring + writing to multiple sinks) with full control over the micro-batch processing.",
+    "fj": "You must use a different model loading mechanism for streaming inference — mlflow.pyfunc.spark_udf() only works for batch DataFrames.",
+    "fs": "mlflow.pyfunc.spark_udf() returns a Spark UDF that is fully compatible with streaming DataFrames. Spark treats the streaming DataFrame like a regular DataFrame for transformation operations — the UDF is applied to each micro-batch's data. Structured Streaming does not distinguish between batch and streaming DataFrames at the transformation API level.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Streaming inference with MLflow model",
+        "lines": [
+          "import mlflow.pyfunc",
+          "from pyspark.sql.types import DoubleType",
+          "",
+          "# Load model as UDF once (not per micro-batch)",
+          "predict_udf = mlflow.pyfunc.spark_udf(",
+          "    spark,",
+          "    model_uri='models:/ml.prod.churn_model/Champion',",
+          "    result_type=DoubleType()",
+          ")",
+          "",
+          "# Read streaming source",
+          "stream_df = (",
+          "    spark.readStream",
+          "    .format('delta')",
+          "    .option('readChangeFeed', 'true')",
+          "    .table('ml.features.user_events')",
+          ")",
+          "",
+          "# Apply model",
+          "scored_stream = stream_df.withColumn(",
+          "    'churn_prob',",
+          "    predict_udf('age', 'tenure', 'product_tier')",
+          ")",
+          "",
+          "# Write to Delta sink",
+          "query = (",
+          "    scored_stream.writeStream",
+          "    .format('delta')",
+          "    .outputMode('append')",
+          "    .option('checkpointLocation', '/mnt/checkpoints/churn_stream')",
+          "    .trigger(processingTime='30 seconds')",
+          "    .toTable('ml.prod.churn_stream_scores')",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-deployment"
+  },
+  {
+    "q": "How do you configure A/B testing and shadow deployments using Databricks Model Serving endpoint traffic splitting? What distinguishes A/B from shadow mode?",
+    "a": "A/B testing via traffic splitting: configure a single endpoint with two served models each with non-zero traffic_percentage (e.g., 50/50 split). Both models return responses to callers — the experiment compares business outcomes (conversion, click-through) between the two model variants. Requires a mechanism to log which model version served each request (the response includes the model_name and model_version in the response metadata, or you can log to an inference table). Statistical analysis: collect sufficient samples (compute required N based on expected effect size and desired power), then compare outcome metrics using a two-sample test. Shadow deployment: the primary model handles all user-facing traffic; a secondary 'shadow' model receives identical copies of requests but its responses are discarded (not returned to callers). Shadow mode validates the new model against real traffic without any user exposure. Implementation on Databricks: native shadow mode is not a single-endpoint config — implement via a Lakeflow Job or proxy that forwards each request to both endpoints in parallel, logging the shadow model's predictions to an inference table for offline analysis. Lakehouse Monitoring on the shadow inference table reveals whether the shadow model's predictions align with the primary model before traffic is shifted. Key difference: A/B testing affects real users and measures business outcomes; shadow testing has no user impact and only validates model technical correctness.",
+    "fj": "Shadow deployment means deploying a copy of the production model with identical weights — it is used for redundancy, not model comparison.",
+    "fs": "Shadow deployment in the ML context means routing real production traffic to a new candidate model that runs in parallel but whose outputs are hidden from users. The purpose is to evaluate the new model's predictions against real data without risk. It has nothing to do with redundancy — it is specifically a model validation strategy for safe releases.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "model-deployment"
+  },
+  {
+    "q": "How does Databricks Feature Store integrate with Model Serving for online feature retrieval at inference time? What makes this architecture important?",
+    "a": "When you train a model using FeatureEngineeringClient.create_training_set() and log it with fe.log_model(), the feature lookup specifications (which online tables to query, which keys to use) are embedded in the MLflow model artifact as metadata. When this model is deployed to Mosaic AI Model Serving, the endpoint automatically retrieves features from the configured online tables at inference time — callers only need to provide the lookup keys (e.g., user_id, item_id), not the full feature vector. Architecture: (1) Caller sends {\"user_id\": 12345, \"item_id\": 67890} to the endpoint. (2) Model Serving looks up features for user 12345 from the user_activity online table and for item 67890 from the item_features online table (millisecond latency via Lakebase). (3) Features are joined with the request payload. (4) The pyfunc predict() method receives the full feature vector and returns the prediction. Importance: this pattern eliminates the 'feature pipeline duplication' anti-pattern where teams maintain separate feature computation code for training and serving, which leads to training-serving skew. The feature definitions are authoritative in the Feature Store catalog — any update to the feature computation logic automatically applies to both training and serving.",
+    "fj": "To use Feature Store at inference time, callers must provide all feature values in the request payload — the endpoint cannot look up features automatically.",
+    "fs": "When a model is logged with fe.log_model() and the endpoint is configured with Feature Store integration, the serving endpoint performs automatic feature lookups using the embedded FeatureLookup specifications. Callers provide only the lookup keys. This is a fundamental benefit of the Feature Store architecture — it removes the burden of feature computation from the caller and ensures consistency.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Logging a Feature Store-integrated model for serving",
+        "lines": [
+          "from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup",
+          "import mlflow",
+          "",
+          "fe = FeatureEngineeringClient()",
+          "",
+          "feature_lookups = [",
+          "    FeatureLookup(",
+          "        table_name='ml.features.user_activity',          # backed by online table",
+          "        feature_names=['session_count_7d', 'avg_session_length'],",
+          "        lookup_key='user_id'",
+          "    ),",
+          "    FeatureLookup(",
+          "        table_name='ml.features.item_features',",
+          "        feature_names=['item_popularity', 'avg_rating'],",
+          "        lookup_key='item_id'",
+          "    )",
+          "]",
+          "",
+          "# Log model with embedded feature lookup specs",
+          "fe.log_model(",
+          "    model=trained_model,",
+          "    artifact_path='model',",
+          "    flavor=mlflow.sklearn,",
+          "    training_set=training_set,",
+          "    registered_model_name='ml.prod.recommendation_model'",
+          ")",
+          "",
+          "# At inference time, caller sends only keys:",
+          "# POST /invocations  {\"dataframe_split\": {\"columns\": [\"user_id\",\"item_id\"], \"data\": [[12345, 67890]]}}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-deployment"
+  },
+  {
+    "q": "What MLlib evaluation metrics should you use for binary classification, multiclass classification, and regression in SparkML? How do you compute them post-training?",
+    "a": "SparkML Evaluators wrap the appropriate metric computation and integrate cleanly with CrossValidator. For binary classification, use BinaryClassificationEvaluator with metricName='areaUnderROC' (AUC-ROC, default) or 'areaUnderPR' (AUC-PR, better for imbalanced classes). For multiclass, use MulticlassClassificationEvaluator with metricName options: 'accuracy', 'f1' (macro-F1), 'weightedPrecision', 'weightedRecall', 'logLoss'. For regression, use RegressionEvaluator with 'rmse' (root mean squared error, default), 'mse', 'mae', 'r2', or 'var' (explained variance). You can also compute metrics directly post-prediction using pyspark.ml.evaluation classes — instantiate the evaluator, set labelCol and predictionCol, then call evaluator.evaluate(predictions_df). For probability-based metrics (AUC, logLoss), set rawPredictionCol or probabilityCol on the evaluator. Best practice: always evaluate on a hold-out test set not used in cross-validation to get an unbiased estimate. For imbalanced classification, prefer AUC-PR over AUC-ROC — AUC-ROC can be misleadingly high when negatives greatly outnumber positives.",
+    "fj": "You must implement custom Spark aggregation functions to compute evaluation metrics — there are no built-in evaluators for production use.",
+    "fs": "SparkML provides BinaryClassificationEvaluator, MulticlassClassificationEvaluator, and RegressionEvaluator as production-ready built-in classes. They integrate with CrossValidator for hyperparameter tuning and can be used standalone with predictions_df.evaluate(). Custom aggregation is only needed for exotic metrics not covered by the built-in set.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "SparkML evaluation metrics",
+        "lines": [
+          "from pyspark.ml.evaluation import (",
+          "    BinaryClassificationEvaluator,",
+          "    MulticlassClassificationEvaluator,",
+          "    RegressionEvaluator",
+          ")",
+          "",
+          "# Binary classification",
+          "binary_eval = BinaryClassificationEvaluator(",
+          "    labelCol='label', rawPredictionCol='rawPrediction',",
+          "    metricName='areaUnderROC'",
+          ")",
+          "auc = binary_eval.evaluate(predictions_df)",
+          "",
+          "# Multiclass",
+          "multi_eval = MulticlassClassificationEvaluator(",
+          "    labelCol='label', predictionCol='prediction',",
+          "    metricName='f1'",
+          ")",
+          "f1 = multi_eval.evaluate(predictions_df)",
+          "",
+          "# Regression",
+          "reg_eval = RegressionEvaluator(",
+          "    labelCol='label', predictionCol='prediction',",
+          "    metricName='rmse'",
+          ")",
+          "rmse = reg_eval.evaluate(predictions_df)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How does mlflow.pyspark.ml.autolog() work on Databricks? What is logged automatically and what are the key version requirements?",
+    "a": "mlflow.pyspark.ml.autolog() is the current recommended autologging mechanism for SparkML on Databricks Runtime 10.2 ML and above (the legacy mllib-mlflow integration is deprecated on DBR 10.1+). When enabled (it is on by default via Databricks Autologging), it automatically logs: all parameters from the fitted Estimator or Pipeline, evaluation metrics from the Evaluator, and the fitted model as an MLflow artifact. For CrossValidator and TrainValidationSplit, it creates nested runs: a parent run for the CV job and child runs for each hyperparameter combination. It also logs the best model, best parameters, and cross-validation metric scores. You can configure it with log_models=True/False (control whether the model artifact is saved — disable to reduce storage cost when only metrics matter), log_post_training_metrics=True (compute and log test metrics after fitting), and exclusive=False (allow other autologgers to coexist). To enable explicitly: call mlflow.pyspark.ml.autolog() before fitting. To disable autologging globally: call mlflow.autolog(disable=True). The integration is aware of Databricks Autologging — if Databricks Autologging is enabled in cluster settings, pyspark.ml autologging is active even without an explicit call.",
+    "fj": "Autologging for SparkML logs parameters and metrics but never saves the model artifact — you must call mlflow.spark.log_model() manually to save the model.",
+    "fs": "By default, log_models=True in mlflow.pyspark.ml.autolog(), which causes the fitted PipelineModel or Estimator model to be logged as an MLflow artifact automatically. You can set log_models=False to suppress model logging, but the default behavior includes model saving.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Configuring pyspark.ml autologging",
+        "lines": [
+          "import mlflow",
+          "",
+          "# Explicit configuration (often not needed — on by default in Databricks)",
+          "mlflow.pyspark.ml.autolog(",
+          "    log_models=True,              # save fitted model as artifact",
+          "    log_post_training_metrics=True, # evaluate on test data after fit",
+          "    log_input_examples=True,      # save sample inputs with the model",
+          "    exclusive=False               # coexist with other autologgers",
+          ")",
+          "",
+          "# Fitting will now auto-log everything",
+          "with mlflow.start_run(run_name='pipeline-autolog'):",
+          "    model = pipeline.fit(train_df)",
+          "    # Parameters, metrics, and model are all logged automatically",
+          "    # For CrossValidator: nested child runs per hyperparameter combo"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "What is the Databricks Declarative Automation Bundle (DAB) CI/CD workflow for ML pipelines? Describe the full promote-to-prod pattern.",
+    "a": "A complete DAB CI/CD workflow for ML pipelines: (1) Development — data scientists work in the dev workspace, define training pipelines as Lakeflow Jobs in databricks.yml, commit changes to a feature branch. (2) Pull Request / CI — a CI pipeline (GitHub Actions, Azure DevOps) runs databricks bundle validate to check YAML syntax, then databricks bundle deploy -t staging followed by databricks bundle run -t staging to execute integration tests. (3) Staging validation — the bundle deploys all resources to staging workspace (experiments, jobs, endpoints) and runs the full training pipeline against a sample dataset; results are validated against thresholds. (4) Merge to main — after PR approval, the main branch triggers a CD pipeline that runs databricks bundle deploy -t prod, which provisions or updates all prod resources declared in the bundle. (5) Model promotion — the CD job invokes the training Lakeflow Job in prod; after training, a model validation task compares the new model to the Champion and promotes via MlflowClient.set_registered_model_alias() if quality gates pass. Key benefit: all infrastructure changes (endpoint config, cluster policies, experiment paths) are code-reviewed in PRs before reaching production, eliminating manual UI-based changes that are hard to audit.",
+    "fj": "Model promotion from staging to production requires manual intervention in the Databricks UI — it cannot be automated through CI/CD pipelines.",
+    "fs": "Model promotion is fully automatable: the Databricks SDK's MlflowClient.set_registered_model_alias() call can be executed from a Lakeflow Job task in the CI/CD pipeline, which promotes the model alias to Champion if quality gates pass. The entire flow — deploy, train, evaluate, promote — can run without human intervention.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you use pandas UDFs (Scalar and Iterator variants) for batch feature engineering and inference at Spark scale? How do they differ from applyInPandas?",
+    "a": "Pandas UDFs (also called vectorized UDFs) use Apache Arrow for efficient columnar data transfer between JVM and Python, making them significantly faster than row-level Python UDFs. Three variants: (1) Scalar pandas UDF (SCALAR type): takes one or more pandas Series as input, returns a pandas Series. Applied column-by-column via withColumn(). Best for: per-row transformations using pandas/numpy/sklearn (feature scaling, text encoding). (2) Iterator of Series pandas UDF (SCALAR_ITER): wraps the SCALAR pattern but receives an iterator of pandas Series batches — allows loading a model once per partition rather than per row. Critical pattern for ML inference: load the model in the iterator function body before the loop, then apply it to each batch. (3) applyInPandas: groupBy().applyInPandas() processes a complete group as a pandas DataFrame — input and output are DataFrames, not Series. Use for: group-level computations that need access to all rows in a group simultaneously (group-level model training, cross-validation per group). Key difference from pandas UDFs: pandas UDFs operate row-by-row or batch-by-batch on individual columns; applyInPandas operates on a complete grouped DataFrame with full row context. For ML inference, prefer Iterator pandas UDF to amortize model loading cost across a partition.",
+    "fj": "Pandas UDFs and applyInPandas are the same API — applyInPandas is just the newer name for pandas UDFs.",
+    "fs": "They are distinct APIs with different input/output contracts. Pandas UDFs operate on Series (columns) and are applied via withColumn() or select(). applyInPandas requires a groupBy() and operates on a full grouped DataFrame. They serve different use cases: pandas UDFs for per-row or per-batch column transformations, applyInPandas for group-level computations requiring full row context.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Iterator pandas UDF for efficient batch ML inference",
+        "lines": [
+          "import pandas as pd",
+          "from pyspark.sql.functions import pandas_udf",
+          "from pyspark.sql.types import DoubleType",
+          "from typing import Iterator",
+          "import mlflow",
+          "",
+          "@pandas_udf(DoubleType())",
+          "def predict_udf(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.Series]:",
+          "    # Model loaded ONCE per partition — not per row",
+          "    model = mlflow.sklearn.load_model('models:/ml.prod.churn_model/Champion')",
+          "    for batch_df in iterator:",
+          "        yield pd.Series(model.predict_proba(batch_df)[:, 1])",
+          "",
+          "# Apply to Spark DataFrame",
+          "result = df.withColumn(",
+          "    'churn_prob',",
+          "    predict_udf(df['age'], df['tenure'], df['product_tier'])",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-development"
+  },
+  {
+    "q": "How does Databricks Lakehouse Monitoring handle snapshot tables? What use cases and monitoring features apply?",
+    "a": "Snapshot profile in Lakehouse Monitoring is designed for tables that represent a point-in-time state — not append-only event streams, but the current snapshot of a dataset (e.g., current customer attributes, a daily batch ML output table, feature table values at a given time). When you create a snapshot monitor, Databricks computes data quality metrics for the entire table at each refresh: null rates, distinct counts, mean, standard deviation, and histogram distributions per column. There is no temporal windowing — the full table is treated as a single snapshot to compare against the baseline. Drift detection: on each refresh, the snapshot's distributions are compared to the baseline reference table using Chi-squared (categorical) and Wasserstein/KS (numerical) tests, with results written to the drift_metrics output table. Use cases: (1) monitoring a daily feature engineering output for unexpected distribution shifts before it is used for training; (2) tracking changes in a scoring table between weekly runs; (3) detecting schema changes (new nulls, unexpected values) in a silver-layer Delta table. The key limitation versus time series profiles: snapshot monitors cannot compute windowed trends — they only provide 'latest snapshot vs. baseline' comparison, not temporal trend analysis.",
+    "fj": "Snapshot monitors in Lakehouse Monitoring are used for real-time streaming tables — they continuously monitor each arriving micro-batch.",
+    "fs": "Snapshot profiles are for bounded, non-streaming tables evaluated at refresh time. They compute metrics on the table's current state at each scheduled refresh, not on streaming micro-batches. For streaming or timestamped data, use the time series profile which supports window-based temporal analysis.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you implement a champion-challenger A/B test at the model serving layer and measure statistical significance of outcome differences?",
+    "a": "A champion-challenger A/B test via Model Serving traffic splitting: (1) Deploy both Champion (alias v3) and Challenger (alias v4) to the same endpoint with a 50/50 or 80/20 split. (2) Ensure the response includes model_version metadata so each prediction is tagged with which model served it. (3) Log all predictions to an inference table (input features, model_version, prediction, and optionally user_id for later outcome join). (4) After a defined collection period, join outcomes (conversions, actual labels) to the inference table. (5) Statistical test: for conversion rate differences, use a two-proportion z-test or chi-squared test; for continuous outcomes (revenue, RMSE), use Mann-Whitney U or Welch's t-test. Minimum detectable effect size: compute required sample N before starting the test using power analysis (scipy.stats.power or statsmodels). Stop criteria: either reach N samples or reach a pre-defined evaluation period — avoid peeking at results early (multiple comparison inflation). In Databricks: run the statistical analysis as a SQL query on the inference table joined with outcomes, or as a PySpark notebook. If the Challenger is statistically significantly better (p < 0.05) and practically significant (effect > threshold), promote Challenger to Champion via MlflowClient.set_registered_model_alias().",
+    "fj": "You can determine which model is better by comparing their offline validation metrics from the training run — there is no need to run a live A/B test.",
+    "fs": "Offline validation metrics compute performance on historical held-out data, which may not reflect live production behavior (different user cohorts, feature drift, or serving latency effects). A/B tests measure real business outcomes on live traffic, which is the ground truth for production model quality. Models that look identical offline can differ significantly in live performance.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Statistical significance test for A/B model comparison",
+        "lines": [
+          "from scipy import stats",
+          "import pandas as pd",
+          "",
+          "# Load joined inference + outcome data",
+          "results_df = spark.sql(\"\"\"",
+          "  SELECT model_version,",
+          "         COUNT(*) as n,",
+          "         SUM(converted) as conversions,",
+          "         AVG(converted) as conv_rate",
+          "  FROM ml.prod.churn_predictions p",
+          "  JOIN ml.prod.outcomes o ON p.user_id = o.user_id",
+          "  GROUP BY model_version",
+          "\"\"\").toPandas()",
+          "",
+          "champion = results_df[results_df.model_version == 'v3'].iloc[0]",
+          "challenger = results_df[results_df.model_version == 'v4'].iloc[0]",
+          "",
+          "# Two-proportion z-test",
+          "z_stat, p_value = stats.proportions_ztest(",
+          "    count=[champion.conversions, challenger.conversions],",
+          "    nobs=[champion.n, challenger.n]",
+          ")",
+          "print(f'p-value: {p_value:.4f}')",
+          "if p_value < 0.05 and challenger.conv_rate > champion.conv_rate:",
+          "    print('Challenger wins — promote to Champion')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-deployment"
+  },
+  {
+    "q": "How does Databricks MLflow model versioning and aliasing work in Unity Catalog? What replaces the old Staging/Production stage workflow?",
+    "a": "In the Unity Catalog Model Registry, model versions no longer have fixed lifecycle stages (None/Staging/Production/Archived) as in the legacy Workspace Model Registry. Instead, aliases provide a flexible, user-defined naming system for referencing specific versions. An alias is a mutable named pointer to a specific version: you might define Champion (production model), Challenger (candidate under evaluation), and Baseline (minimum performance benchmark). Setting an alias: MlflowClient().set_registered_model_alias(name='ml.prod.churn_model', alias='Champion', version='5'). Retrieving by alias: mlflow.pyfunc.load_model('models:/ml.prod.churn_model@Champion'). Model Serving endpoints can reference a specific version number or a registered model alias. Benefits of aliases over stages: (1) you can have multiple simultaneously valid aliases (Champion, Challenger, Baseline all active at once), (2) aliases are arbitrary strings — not limited to a fixed stage enum, (3) promotion is atomic — reassigning Champion alias to a new version is a single API call. Migration from legacy: replace references to stage='Production' with alias='Champion' in your codebase. The legacy Workspace Model Registry still supports stages, but all new models registered in Unity Catalog should use the alias pattern.",
+    "fj": "In Unity Catalog, you transition model versions between Staging and Production stages just like in the legacy Workspace Model Registry.",
+    "fs": "Unity Catalog Model Registry removed the fixed stage system. There are no Staging, Production, or Archived stages in UC. Instead, aliases are free-form named pointers to versions. This is a deliberate design change to support more flexible workflows — you define the lifecycle labels that match your team's deployment process rather than fitting into a fixed four-stage enum.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Unity Catalog model aliases for lifecycle management",
+        "lines": [
+          "from mlflow import MlflowClient",
+          "",
+          "client = MlflowClient()",
+          "MODEL_NAME = 'ml.prod.churn_model'",
+          "",
+          "# Set aliases (replaces old stage transitions)",
+          "client.set_registered_model_alias(MODEL_NAME, 'Champion', version='5')",
+          "client.set_registered_model_alias(MODEL_NAME, 'Challenger', version='6')",
+          "client.set_registered_model_alias(MODEL_NAME, 'Baseline', version='3')",
+          "",
+          "# Load by alias — endpoint URL never changes",
+          "model = mlflow.pyfunc.load_model(f'models:/{MODEL_NAME}@Champion')",
+          "",
+          "# Promote Challenger to Champion atomically",
+          "client.set_registered_model_alias(MODEL_NAME, 'Champion', version='6')",
+          "client.delete_registered_model_alias(MODEL_NAME, 'Challenger')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you log and compare MLflow SparkML models across multiple runs to identify the best model programmatically? What APIs support this?",
+    "a": "After running multiple experiments (CrossValidator folds, Optuna trials, or manual runs), use mlflow.search_runs() to programmatically query and compare results. Key API: mlflow.search_runs(experiment_ids=['123'], filter_string='metrics.val_auc > 0.80', order_by=['metrics.val_auc DESC'], max_results=10) returns a pandas DataFrame of run metadata, parameters, and metrics. For nested runs (child trials), filter by tags.mlflow.parentRunId = '<parent_run_id>' to scope the search to one experiment sweep. Once you identify the best run by run_id, retrieve its model URI: f'runs:/{best_run_id}/model' and load or register it. For SparkML specifically, use mlflow.spark.log_model(spark_model, artifact_path, registered_model_name=...) to save a SparkML PipelineModel in the MLflow format — this preserves the full pipeline including all transformer stages. The Databricks Experiments UI provides a visual comparison table and parallel coordinates plot for metric/parameter relationships, useful for identifying which hyperparameter regions perform best. Programmatic best-model selection is critical in automated retraining pipelines where a human is not reviewing results.",
+    "fj": "You must manually browse the Experiments UI to find the best run — there is no API to query runs by metric and retrieve the best one.",
+    "fs": "mlflow.search_runs() is a full-featured programmatic API that returns a pandas DataFrame with all run metadata, parameters, and metrics. You can sort, filter, and select runs entirely in code, enabling automated champion selection in CI/CD pipelines without any human review of the Experiments UI.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Programmatic best-model selection from MLflow runs",
+        "lines": [
+          "import mlflow",
+          "",
+          "# Find best run from an experiment",
+          "runs = mlflow.search_runs(",
+          "    experiment_names=['/Shared/churn-model-v3'],",
+          "    filter_string='metrics.val_auc > 0.80 AND status = \"FINISHED\"',",
+          "    order_by=['metrics.val_auc DESC'],",
+          "    max_results=1",
+          ")",
+          "",
+          "best_run_id = runs.iloc[0].run_id",
+          "best_auc = runs.iloc[0]['metrics.val_auc']",
+          "print(f'Best run: {best_run_id}, AUC: {best_auc:.4f}')",
+          "",
+          "# Register best model in Unity Catalog",
+          "model_uri = f'runs:/{best_run_id}/model'",
+          "result = mlflow.register_model(",
+          "    model_uri=model_uri,",
+          "    name='ml.prod.churn_model'",
+          ")",
+          "print(f'Registered version: {result.version}')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  },
+  {
+    "q": "How do you implement feature slicing in Lakehouse Monitoring to detect performance disparities across demographic or business segments?",
+    "a": "Feature slicing in Lakehouse Monitoring computes all metrics (drift scores, data quality stats, model performance) separately for defined subgroups of data, enabling detection of differential performance across segments that might be hidden in aggregate metrics. Configuration: pass slicing_exprs as a list of column names or SQL expressions to lm.create_monitor(). Examples: slicing_exprs=['region', 'product_tier', 'CASE WHEN age < 30 THEN \"young\" WHEN age < 60 THEN \"mid\" ELSE \"senior\" END']. Lakehouse Monitoring evaluates all metrics for each slice value, writing them to the profile_metrics table with an additional slice_key and slice_value column. Analysis: query SELECT slice_key, slice_value, metric_name, metric_value FROM ml.monitoring.churn_predictions_profile_metrics WHERE slice_key IS NOT NULL ORDER BY slice_key, slice_value to compare metrics across segments. Use cases: (1) Fairness auditing — detect if model accuracy is significantly lower for a protected demographic group. (2) Business performance analysis — find if churn prediction accuracy varies by region or product tier. (3) Data quality monitoring by segment — identify if null rates are higher in specific market segments. If a slice shows consistently worse performance, it may require a dedicated model, additional training data for that segment, or feature engineering targeted at that group.",
+    "fj": "Lakehouse Monitoring computes only aggregate metrics across the full table — per-segment analysis requires writing custom SQL queries on the inference table.",
+    "fs": "slicing_exprs is a built-in parameter of lm.create_monitor() that automatically computes all standard metrics (drift, quality, performance) per segment and writes them to the output profile_metrics table. Custom SQL is only needed for custom metrics beyond the built-in set — standard sliced monitoring requires no custom queries.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Lakehouse Monitoring with feature slicing",
+        "lines": [
+          "import databricks.lakehouse_monitoring as lm",
+          "",
+          "lm.create_monitor(",
+          "    table_name='ml.prod.churn_predictions',",
+          "    profile_type=lm.InferenceLog(",
+          "        timestamp_col='prediction_ts',",
+          "        model_id_col='model_version',",
+          "        prediction_col='predicted_churn_prob',",
+          "        label_col='actual_churned',",
+          "        problem_type='classification',",
+          "    ),",
+          "    output_schema_name='ml.monitoring',",
+          "    slicing_exprs=[",
+          "        'region',",
+          "        'product_tier',",
+          "        \"CASE WHEN tenure_days < 90 THEN 'new' ELSE 'established' END\"",
+          "    ]",
+          ")",
+          "",
+          "# Query slice-level performance",
+          "spark.sql(\"\"\"",
+          "  SELECT slice_key, slice_value,",
+          "         avg(accuracy) as avg_accuracy,",
+          "         avg(f1_score) as avg_f1",
+          "  FROM ml.monitoring.churn_predictions_profile_metrics",
+          "  WHERE slice_key IS NOT NULL",
+          "  GROUP BY 1, 2 ORDER BY avg_accuracy ASC",
+          "\"\"\")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops"
+  }
+]

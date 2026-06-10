@@ -1,0 +1,1574 @@
+[
+  {
+    "q": "How should you structure a Python project in Databricks Asset Bundles (now called Declarative Automation Bundles) for Staff-level scalability?",
+    "a": "A scalable Declarative Automation Bundle project separates concerns across a standard directory tree: databricks.yml at the root holds targets (dev/staging/prod) and variable defaults; resources/ contains YAML definitions for jobs, pipelines, clusters, and permissions; src/ holds the Python package with a clear namespace (e.g., myproject.ingestion, myproject.transform, myproject.utils); tests/ contains pytest-based unit tests that import src directly; and a requirements.txt or pyproject.toml pins all dependencies. The bundle CLI (0.275.0+) supports uv for virtualenv management and the pydabs template for Python-native bundle init. By keeping all infrastructure-as-code in YAML and all business logic in importable Python modules under src/, you get a codebase that is both testable locally and deployable via databricks bundle deploy --target prod. Git integration is first-class: since every artifact is plain text, pull-request workflows, diff reviews, and rollback via git revert all work naturally.",
+    "fj": "Put all notebooks in one folder and reference them directly in the job definition YAML; no need for a Python package structure.",
+    "fs": "Notebooks are hard to unit-test, diff poorly in git, and cannot be imported. A proper Python package under src/ enables pytest-based unit tests, clean imports, and IDE refactoring — critical for Staff-level maintainability.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Bundle directory layout",
+        "lines": [
+          "my-bundle/",
+          "  databricks.yml          # bundle config + targets",
+          "  resources/",
+          "    jobs/etl_job.yml       # job definition",
+          "    pipelines/ingest.yml   # pipeline definition",
+          "  src/",
+          "    myproject/",
+          "      __init__.py",
+          "      ingestion.py",
+          "      transform.py",
+          "  tests/",
+          "    test_transform.py",
+          "  requirements.txt"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "code-for-data-processing"
+  },
+  {
+    "q": "In a Declarative Automation Bundle, how do you define separate dev, staging, and prod deployment targets with environment-specific overrides?",
+    "a": "In databricks.yml you declare a targets block where each key is an environment name (e.g., dev, staging, prod). Each target can override cluster sizes, workspace host URLs, variable values, and permission sets. The dev target should set mode: development so the CLI auto-prefixes resource names with your username and applies ephemeral cluster policies. The prod target sets mode: production and references a service-principal identity. You deploy to a specific target with databricks bundle deploy --target prod. Variables defined at the bundle level (e.g., var: cluster_size) are overridden per-target, avoiding hardcoded environment values and enabling the same bundle YAML to span the full promotion lifecycle without duplication.",
+    "fj": "Create three separate databricks.yml files, one per environment, and manually keep them in sync.",
+    "fs": "Three separate files diverge quickly and defeat the purpose of infrastructure-as-code. The targets block is designed for exactly this use-case — one source of truth with per-environment overrides.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "databricks.yml targets block",
+        "lines": [
+          "bundle:",
+          "  name: my_etl",
+          "",
+          "variables:",
+          "  cluster_size:",
+          "    default: Small",
+          "",
+          "targets:",
+          "  dev:",
+          "    mode: development",
+          "    workspace:",
+          "      host: https://adb-dev.azuredatabricks.net",
+          "    variables:",
+          "      cluster_size: Small",
+          "",
+          "  prod:",
+          "    mode: production",
+          "    workspace:",
+          "      host: https://adb-prod.azuredatabricks.net",
+          "    variables:",
+          "      cluster_size: Large",
+          "    run_as:",
+          "      service_principal_name: prod-sp@myapp"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "What are the two approaches for managing external Python library dependencies in Databricks jobs and when do you choose each?",
+    "a": "The two primary approaches are cluster-level installation via init scripts or cluster libraries, and task-level installation via %pip in notebooks or requirements.txt in job task settings. Cluster-level installation (init scripts that run pip install, or attaching a PyPI/DBFS library to the cluster) installs once per cluster start, which is efficient for large libraries shared across many tasks but adds startup latency and risks version conflicts across co-located jobs. Task-level installation using %pip install in the notebook or specifying libraries: [{pypi: {package: foo==1.2}}] in the job task YAML installs per-run in an isolated environment, which is safer for conflicting dependency trees and preferred for serverless compute where there is no persistent cluster. For Declarative Automation Bundles, you can pin dependencies in requirements.txt and reference them in the bundle YAML, giving you version-controlled, auditable dependency management that travels with the code.",
+    "fj": "Always use init scripts for all library installs because they run once and are the fastest approach.",
+    "fs": "Init scripts run at cluster startup and affect all jobs on that cluster, risking version conflicts. Task-level installs provide isolation and are required for serverless compute where init scripts are not supported.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Job task library spec in bundle YAML",
+        "lines": [
+          "tasks:",
+          "  - task_key: transform",
+          "    python_wheel_task:",
+          "      package_name: myproject",
+          "      entry_point: run_transform",
+          "    libraries:",
+          "      - pypi:",
+          "          package: pandas==2.2.0",
+          "      - pypi:",
+          "          package: great-expectations==0.18.0"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "code-for-data-processing"
+  },
+  {
+    "q": "How do you structure modular PySpark code so individual transformation functions are unit-testable without a live Spark cluster?",
+    "a": "The key is to accept and return DataFrame objects rather than reading from or writing to storage inside your transformation functions. Each function takes a DataFrame (and configuration parameters) and returns a transformed DataFrame, making it pure in the sense that it has no side effects. You then test these functions with a local SparkSession (spark = SparkSession.builder.master('local[1]').getOrCreate()) and small in-memory DataFrames. A src/myproject/transform.py module exports named functions; tests/test_transform.py imports them directly and asserts on collect() output. For functions that must interact with Delta tables, inject a path argument so tests can point to a temp directory. This pattern also enables mocking at the module level and integrates cleanly with pytest-based CI pipelines that run without a Databricks cluster.",
+    "fj": "Write all transformation logic inline in notebooks; they can be run cell by cell for testing.",
+    "fs": "Notebooks are hard to import, cannot be unit tested with pytest, and make code reuse and refactoring fragile. Functions in importable Python modules are the foundation of testable, maintainable PySpark codebases.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Testable transformation function pattern",
+        "lines": [
+          "# src/myproject/transform.py",
+          "from pyspark.sql import DataFrame",
+          "from pyspark.sql import functions as F",
+          "",
+          "def normalize_email(df: DataFrame, col: str) -> DataFrame:",
+          "    return df.withColumn(col, F.lower(F.trim(F.col(col))))",
+          "",
+          "# tests/test_transform.py",
+          "from myproject.transform import normalize_email",
+          "",
+          "def test_normalize_email(spark):",
+          "    df = spark.createDataFrame([('  Alice@Example.COM',)], ['email'])",
+          "    result = normalize_email(df, 'email')",
+          "    assert result.collect()[0].email == 'alice@example.com'"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "code-for-data-processing"
+  },
+  {
+    "q": "A pipeline must ingest files that arrive in multiple formats: Delta, Parquet, ORC, AVRO, JSON, CSV, and XML. How do you design a unified ingestion layer?",
+    "a": "Design a format-aware ingestion factory function that accepts a source path and format hint, then delegates to the correct spark.read.<format>() call with appropriate options. Delta and Parquet are self-describing and typically need no schema hints. ORC and AVRO carry embedded schemas but may need inferSchema=True for AVRO in older Spark versions. JSON and CSV require careful handling of multiline, escape characters, and header rows; supplying a schema DDL avoids full-file scans during inference. XML requires the spark-xml library (com.databricks:spark-xml) with rowTag to identify record boundaries. Binary formats can be read with spark.read.format('binaryFile'). In all cases, output should be a standardized bronze DataFrame with added metadata columns (source_file, ingestion_ts, format_type) before writing to Delta. For streaming ingestion, Auto Loader (cloudFiles) unifies most of these formats under a single API and handles file tracking natively.",
+    "fj": "Read all formats with spark.read.csv() after pre-processing them with a shell script to normalize to CSV first.",
+    "fs": "Converting upstream to CSV loses type information, is error-prone for nested JSON/AVRO schemas, and adds fragile preprocessing steps. Each format has a native reader in Spark that handles schema, encoding, and evolution correctly.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Format-aware reader factory",
+        "lines": [
+          "def read_any(spark, path: str, fmt: str):",
+          "    readers = {",
+          "        'delta':   lambda: spark.read.format('delta').load(path),",
+          "        'parquet': lambda: spark.read.parquet(path),",
+          "        'orc':     lambda: spark.read.orc(path),",
+          "        'avro':    lambda: spark.read.format('avro').load(path),",
+          "        'json':    lambda: spark.read.option('multiline', True).json(path),",
+          "        'csv':     lambda: spark.read.option('header', True).csv(path),",
+          "        'xml':     lambda: spark.read.format('xml').option('rowTag','record').load(path),",
+          "    }",
+          "    return readers[fmt]()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-acquisition"
+  },
+  {
+    "q": "What is the difference between append-only ingestion and full-load ingestion, and when is append-only preferred for batch and streaming pipelines?",
+    "a": "Append-only ingestion writes new records exclusively — no in-place updates or deletes to existing data. This makes pipelines idempotent and easy to replay: re-running the job adds at most duplicate records for the same window, which can be deduplicated downstream. It is preferred for immutable event streams (clickstreams, logs, CDC event feeds) where the source naturally only produces new rows. For batch ingestion, appending with .mode('append') or INSERT INTO ... SELECT ensures the bronze layer is a complete audit trail. For streaming, Structured Streaming with a checkpoint directory is inherently append-only — the engine tracks progress via offsets and only processes new data. The tradeoff is that downstream layers (silver, gold) must handle deduplication via MERGE or window-based dedup logic. Full-load (overwrite) pipelines are simpler but destroy history and are expensive for large tables.",
+    "fj": "Overwrite the target table on every batch run; it is simpler and ensures the table always reflects the latest source state.",
+    "fs": "Full overwrite loses audit history, is expensive for large tables, and creates data gaps if the source pipeline fails mid-run. Append-only with downstream deduplication is more resilient and preserves the full event history needed for debugging and reprocessing.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-ingestion-acquisition"
+  },
+  {
+    "q": "How does Auto Loader's schema inference work, and what is the difference between using cloudFiles.schemaHints versus cloudFiles.schemaLocation?",
+    "a": "Auto Loader's schema inference samples the first 50 GB or 1,000 files (whichever is reached first) when it encounters a new source directory. For formats without embedded types (JSON, CSV, XML), it infers all columns as strings. For typed formats (Parquet, Avro), it merges per-file schemas. The inferred schema is stored at the path specified by cloudFiles.schemaLocation (a cloud storage path), and subsequent runs load the schema from there rather than re-sampling. cloudFiles.schemaHints lets you override specific column types at read time — for example, you know event_ts should be TimestampType but Auto Loader infers it as StringType. The hint syntax is 'event_ts TIMESTAMP, amount DOUBLE'. When Auto Loader detects a new column in a micro-batch, it updates the schema location and adds the column (schema evolution). When a type change is detected, it rescues unexpected values in the _rescued_data column rather than failing the pipeline. Always point schemaLocation to a persistent location, not a temp path, so schema state survives job restarts.",
+    "fj": "Auto Loader always re-infers the schema from scratch on every run, so you do not need to set schemaLocation.",
+    "fs": "Without schemaLocation, Auto Loader re-samples on every job restart, which is slow and can produce inconsistent schemas if new files arrive with a different shape. schemaLocation is required for production-grade, idempotent Auto Loader pipelines.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Auto Loader with schema inference and hints",
+        "lines": [
+          "df = (spark.readStream",
+          "    .format('cloudFiles')",
+          "    .option('cloudFiles.format', 'json')",
+          "    .option('cloudFiles.schemaLocation', 'abfss://checkpoints@sa.dfs.core.windows.net/schema/events')",
+          "    .option('cloudFiles.schemaHints', 'event_ts TIMESTAMP, amount DOUBLE')",
+          "    .option('cloudFiles.inferColumnTypes', 'true')",
+          "    .load('abfss://raw@sa.dfs.core.windows.net/events/'))",
+          "",
+          "df.writeStream",
+          "    .format('delta')",
+          "    .option('checkpointLocation', 'abfss://checkpoints@sa.dfs.core.windows.net/ckpt/events')",
+          "    .outputMode('append')",
+          "    .start('abfss://bronze@sa.dfs.core.windows.net/events/')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-acquisition"
+  },
+  {
+    "q": "Explain how checkpointing makes Auto Loader ingestion idempotent and what happens if the checkpoint directory is deleted.",
+    "a": "Auto Loader uses Structured Streaming's checkpoint mechanism — stored at a cloud path specified by checkpointLocation — to track the offset (which files have been processed) and the streaming state. On each micro-batch, the engine atomically commits the offset after successfully writing the output. If the job crashes, it resumes from the last committed offset, re-reading only unprocessed files. This makes the pipeline exactly-once under normal conditions: no file is processed twice unless the checkpoint is lost. If the checkpoint directory is deleted, Auto Loader treats the source as brand new and re-processes all files from the beginning. In append-only pipelines this creates duplicates downstream; in overwrite pipelines it causes a full reload. To protect against accidental deletion, store checkpoints in a different storage account or container from the raw data, apply lifecycle retention policies, and use versioned cloud storage. In Lakeflow Declarative Pipelines, checkpoint and schema directories are managed automatically by the platform.",
+    "fj": "Checkpoints only affect performance; deleting them simply forces a fresh scan with no data consequences.",
+    "fs": "Deleting checkpoints causes Auto Loader to reprocess all files from the beginning, producing duplicates in append-only sinks. This is a correctness issue, not just a performance issue, and can corrupt downstream aggregations.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-ingestion-acquisition"
+  },
+  {
+    "q": "Write a PySpark query demonstrating ROLLUP and CUBE for hierarchical and multi-dimensional sales aggregations.",
+    "a": "ROLLUP computes hierarchical subtotals rolling up from the rightmost column to the leftmost: GROUP BY ROLLUP(region, country, city) produces subtotals for (region, country, city), (region, country), (region), and the grand total (). This is ideal for drill-down reports where the hierarchy is meaningful. CUBE computes aggregates for every possible subset of the grouping columns, so GROUP BY CUBE(year, quarter, product) gives subtotals for all 8 combinations including the grand total. In PySpark's DataFrame API you use df.rollup() and df.cube() since GROUPING SETS is only available in SQL mode. Both return NULL for the rolled-up dimensions, which you disambiguate with GROUPING_ID() or coalesce. Pivot is different — it transforms distinct values of one column into separate output columns, effectively transposing rows to columns. These three operators are the backbone of summary reporting in a lakehouse gold layer.",
+    "fj": "Use multiple separate GROUP BY queries with UNION ALL to produce subtotals at each level; it achieves the same result.",
+    "fs": "Multiple UNION ALL queries scan the data multiple times (one pass per GROUP BY), are harder to maintain, and produce a much larger query plan. ROLLUP/CUBE/GROUPING SETS scan the data once and are more efficient for hierarchical reporting.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "ROLLUP and CUBE in PySpark and SQL",
+        "lines": [
+          "# PySpark DataFrame API",
+          "from pyspark.sql import functions as F",
+          "",
+          "# ROLLUP: hierarchical subtotals region -> country",
+          "df.rollup('region', 'country') \\",
+          "  .agg(F.sum('revenue').alias('total_revenue')) \\",
+          "  .orderBy('region', 'country') \\",
+          "  .show()",
+          "",
+          "# CUBE: all combinations of year x quarter",
+          "df.cube('year', 'quarter') \\",
+          "  .agg(F.sum('revenue').alias('total_revenue')) \\",
+          "  .show()",
+          "",
+          "-- SQL equivalent",
+          "SELECT region, country, SUM(revenue)",
+          "FROM sales",
+          "GROUP BY ROLLUP(region, country);",
+          "",
+          "-- PIVOT: product columns per year",
+          "SELECT * FROM sales",
+          "PIVOT (SUM(revenue) FOR product IN ('A','B','C'))"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-transformation-quality"
+  },
+  {
+    "q": "How do you implement data quality constraints in Delta Lake, and what is the difference between CHECK constraints and NOT NULL constraints?",
+    "a": "Delta Lake supports two categories of table-level constraints enforced at write time. NOT NULL constraints prevent null values in a specified column and are added with ALTER TABLE t ALTER COLUMN c SET NOT NULL. They are enforced on INSERT, UPDATE, and MERGE operations. CHECK constraints enforce arbitrary boolean expressions — for example, ALTER TABLE orders ADD CONSTRAINT valid_amount CHECK (amount > 0) — and any write that violates the expression is rejected with an AnalysisException. Both constraint types are recorded in the table properties (tblproperties) and are visible via SHOW TBLPROPERTIES or DESCRIBE EXTENDED. Unlike expectations in Lakeflow Declarative Pipelines (which can warn or quarantine), Delta table constraints always hard-fail violating writes. This is appropriate for silver and gold layers where data correctness is non-negotiable. For bronze ingestion where you want to land all data and flag bad rows, use CASE-based quality columns or expectations instead of hard constraints.",
+    "fj": "Implement data quality by adding a WHERE clause to every query that reads from the table, so bad rows are filtered at read time.",
+    "fs": "WHERE clauses at read time are defensive but do not prevent bad data from entering the table. Constraints fail the write, keeping the table clean by construction. They also self-document the data contract in the table schema.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Delta Lake table constraints",
+        "lines": [
+          "-- Add NOT NULL constraint",
+          "ALTER TABLE orders ALTER COLUMN order_id SET NOT NULL;",
+          "",
+          "-- Add CHECK constraint",
+          "ALTER TABLE orders",
+          "  ADD CONSTRAINT valid_amount CHECK (amount > 0);",
+          "",
+          "ALTER TABLE orders",
+          "  ADD CONSTRAINT valid_status",
+          "  CHECK (status IN ('pending','shipped','delivered','cancelled'));",
+          "",
+          "-- Inspect constraints",
+          "SHOW TBLPROPERTIES orders;",
+          "",
+          "-- Drop constraint",
+          "ALTER TABLE orders DROP CONSTRAINT valid_amount;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-transformation-quality"
+  },
+  {
+    "q": "What is the difference between Delta Sharing's Databricks-to-Databricks (D2D) protocol and the open sharing protocol, and when should you use each?",
+    "a": "Delta Sharing is an open protocol for sharing live Delta Lake data without copying it. The Databricks-to-Databricks protocol is an optimized path where both the provider and recipient are on Databricks: the recipient's workspace accesses shared tables via Unity Catalog, with full Databricks authentication (token or service principal), Unity Catalog governance, and native support for reading live Delta tables including time travel and Change Data Feed. The open sharing protocol targets non-Databricks recipients: the provider generates a pre-signed credential (a short-lived Bearer token or an activation link), and the recipient uses any Delta Sharing-compatible client (pandas, Apache Spark with the delta-sharing library, Power BI, etc.) to read Parquet snapshots of the shared data. Use D2D when the recipient is also on Databricks and you want governance, audit logs, and live streaming. Use open sharing when sharing with data scientists on laptops, BI tools, or partners outside your Databricks deployment.",
+    "fj": "Delta Sharing always copies data to the recipient's storage; it is a data export mechanism.",
+    "fs": "Delta Sharing shares live data in place via pre-signed URLs to the provider's cloud storage. No data is copied. The recipient reads Parquet files directly from the provider's object storage under short-lived credentials.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-sharing-federation"
+  },
+  {
+    "q": "Walk through the steps to share a Delta table to a non-Databricks recipient using the Delta Sharing open protocol.",
+    "a": "First, enable Delta Sharing on the Unity Catalog metastore (it is enabled by default on new metastores). Then create a share with CREATE SHARE my_share, and add tables to it with ALTER SHARE my_share ADD TABLE catalog.schema.orders. Next, create a recipient: CREATE RECIPIENT analyst_team. This generates an activation link. The recipient downloads a credentials JSON file from the activation link, which contains the endpoint URL and a Bearer token. The recipient can then use pandas (pd.read_delta_sharing_table()) or the delta-sharing Python client to read the table. On the provider side you manage who can see what via grants: GRANT SELECT ON SHARE my_share TO RECIPIENT analyst_team. You can add table partitions to scope what data is exposed, and you can add table properties like CDF_ENABLED to share change data. All access is audited in Unity Catalog's audit logs.",
+    "fj": "Export the Delta table to CSV and send the file to the recipient via email or S3 presigned URL.",
+    "fs": "CSV export loses Delta metadata, requires a manual refresh on every update, and creates a stale copy. Delta Sharing provides live access to the current table state without any data movement.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Create and manage a Delta Share",
+        "lines": [
+          "-- Provider side",
+          "CREATE SHARE customer_share",
+          "  COMMENT 'Orders data for partner analysts';",
+          "",
+          "ALTER SHARE customer_share",
+          "  ADD TABLE main.sales.orders",
+          "  PARTITION (region = 'US');",
+          "",
+          "CREATE RECIPIENT external_analyst;",
+          "-- returns activation_link",
+          "",
+          "GRANT SELECT ON SHARE customer_share",
+          "  TO RECIPIENT external_analyst;",
+          "",
+          "SHOW ALL IN SHARE customer_share;",
+          "SHOW GRANTS ON SHARE customer_share;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-sharing-federation"
+  },
+  {
+    "q": "What is Lakehouse Federation in Databricks Unity Catalog and what governance capabilities does it provide?",
+    "a": "Lakehouse Federation is Unity Catalog's capability to register and query external databases (PostgreSQL, MySQL, Snowflake, Redshift, SQL Server, BigQuery, and more) without moving the data into Databricks. You create a connection object that holds the JDBC credentials (stored in a secret scope), then create a foreign catalog that maps to the external database, and finally reference foreign tables in standard SQL queries. Unity Catalog enforces column-level permissions, row filters, and audit logging on federated queries exactly as it does for native Delta tables. This means data engineers can join a Databricks-managed Delta table with a live Snowflake table in a single SQL query while Unity Catalog governs access consistently. From a governance perspective, the data owner never has to grant direct database access to individual users — all access flows through Unity Catalog's permission model. The actual query pushdown is handled by Databricks; predicates are pushed to the external system where possible to minimize data transfer.",
+    "fj": "Lakehouse Federation copies data from external databases into Delta Lake on a schedule, making it available as a Delta table.",
+    "fs": "Lakehouse Federation queries data in place via JDBC without copying it. This avoids data duplication and ensures the federated query always reflects the live state of the external system.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-sharing-federation"
+  },
+  {
+    "q": "How do you configure a foreign catalog and foreign table in Unity Catalog for Lakehouse Federation to a PostgreSQL database?",
+    "a": "Creating a Lakehouse Federation connection requires three steps. First, create a connection object: CREATE CONNECTION pg_conn TYPE POSTGRESQL OPTIONS (host '...', port '5432', database 'orders_db', user secret('scope','user'), password secret('scope','pass')). The connection stores credentials securely and references Databricks secret scopes. Second, create a foreign catalog mapped to the external database: CREATE FOREIGN CATALOG pg_orders USING CONNECTION pg_conn OPTIONS (database 'orders_db'). Third, the schemas and tables inside the external database are automatically discoverable via SHOW SCHEMAS IN pg_orders and SHOW TABLES IN pg_orders.public. You query them with standard SQL: SELECT * FROM pg_orders.public.orders WHERE region = 'US'. Unity Catalog enforces whatever grants you have on the foreign catalog. You can also grant privileges: GRANT USE CATALOG ON FOREIGN CATALOG pg_orders TO data_analysts. No data is replicated; every query executes a live JDBC call to PostgreSQL with predicate pushdown where the driver supports it.",
+    "fj": "Use a Databricks job with a JDBC read to extract the external table into a Delta table, then manage permissions on the Delta table.",
+    "fs": "Periodic extraction creates stale copies and duplicates storage. Foreign catalogs query live data and unify governance under Unity Catalog without ETL overhead.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Lakehouse Federation setup",
+        "lines": [
+          "-- Step 1: Create connection",
+          "CREATE CONNECTION pg_conn TYPE POSTGRESQL",
+          "  OPTIONS (",
+          "    host 'pg-host.example.com',",
+          "    port '5432',",
+          "    database 'orders_db',",
+          "    user secret('my_scope', 'pg_user'),",
+          "    password secret('my_scope', 'pg_pass')",
+          "  );",
+          "",
+          "-- Step 2: Create foreign catalog",
+          "CREATE FOREIGN CATALOG pg_orders",
+          "  USING CONNECTION pg_conn",
+          "  OPTIONS (database 'orders_db');",
+          "",
+          "-- Step 3: Query live data",
+          "SELECT o.order_id, c.name",
+          "FROM pg_orders.public.orders o",
+          "JOIN main.sales.customers c ON o.customer_id = c.id;",
+          "",
+          "-- Govern access",
+          "GRANT USE CATALOG ON FOREIGN CATALOG pg_orders",
+          "  TO data_analysts;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-sharing-federation"
+  },
+  {
+    "q": "How do you manage providers, recipients, and shares in Delta Sharing, and what is the difference between a provider and a recipient?",
+    "a": "In Delta Sharing, a share provider is the Databricks workspace (or Unity Catalog metastore) that owns the data and creates the share. A recipient is an entity (another Databricks workspace or an external application) that is granted access to a share. You manage providers and recipients via SQL commands or the Databricks UI. CREATE RECIPIENT creates an external recipient and returns an activation link; CREATE SHARE creates a named container for data objects. ALTER SHARE ... ADD TABLE adds tables or schemas. GRANT SELECT ON SHARE ... TO RECIPIENT ... gives a recipient read access. You can list shares with SHOW SHARES, list recipients with SHOW RECIPIENTS, and view what a recipient has access to with SHOW ALL IN SHARE. For Databricks-to-Databricks sharing, the recipient logs in with their own workspace credentials and does not need an activation link. For open sharing, the recipient downloads a credentials file from the activation link. The metastore admin can revoke access at any time by dropping the recipient or revoking the grant.",
+    "fj": "Recipients must be individual users with Databricks accounts; you cannot share data with external applications or non-Databricks tools.",
+    "fs": "The open sharing protocol was designed specifically for non-Databricks recipients. Any tool that implements the Delta Sharing REST API (pandas, Power BI, Tableau) can act as a recipient using the credentials JSON file.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Delta Sharing management commands",
+        "lines": [
+          "SHOW SHARES;",
+          "SHOW RECIPIENTS;",
+          "",
+          "-- What does a recipient have access to?",
+          "SHOW GRANTS TO RECIPIENT analyst_team;",
+          "",
+          "-- Revoke access",
+          "REVOKE SELECT ON SHARE my_share",
+          "  FROM RECIPIENT analyst_team;",
+          "",
+          "-- Drop recipient",
+          "DROP RECIPIENT IF EXISTS analyst_team;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-sharing-federation"
+  },
+  {
+    "q": "What are Databricks system tables and which key tables should a Staff data engineer query for cost, audit, and workload observability?",
+    "a": "System tables are read-only, Databricks-managed tables in the system catalog that expose operational telemetry across your entire account. They live in the system catalog and span schemas like billing, compute, lakeflow, and access. Key tables include: system.billing.usage for DBU consumption per workspace/cluster/job (use this for cost chargebacks), system.compute.clusters for cluster configuration and lifecycle events, system.lakeflow.job_run_timeline and system.lakeflow.task_run_timeline for job performance and failure analysis, system.access.audit for a complete audit trail of all API calls and data access events, and system.access.column_lineage plus system.access.table_lineage for data lineage across Unity Catalog. You query these like regular Delta tables from any SQL warehouse or notebook with appropriate admin permissions. System tables are cross-workspace within a region — a single query can aggregate cost or job failures across all workspaces in your account, which is essential for platform observability at Staff level.",
+    "fj": "You must use the Databricks REST API to pull cost and usage data into a separate reporting database; there is no SQL-queryable source for this.",
+    "fs": "System tables expose billing, audit, compute, and job data as queryable Delta tables in the system catalog. This is more scalable, auditable, and SQL-native than polling REST APIs.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Cost monitoring via system tables",
+        "lines": [
+          "-- Top 10 most expensive jobs by DBU last 7 days",
+          "SELECT",
+          "  u.usage_metadata.job_id,",
+          "  SUM(u.usage_quantity) AS total_dbus,",
+          "  SUM(u.usage_quantity * p.pricing.default) AS est_cost_usd",
+          "FROM system.billing.usage u",
+          "JOIN system.billing.list_prices p",
+          "  ON u.sku_name = p.sku_name",
+          "  AND u.usage_date BETWEEN p.price_start_time AND COALESCE(p.price_end_time, current_date())",
+          "WHERE u.usage_date >= current_date() - INTERVAL 7 DAYS",
+          "  AND u.billing_origin_product = 'JOBS'",
+          "GROUP BY 1",
+          "ORDER BY 3 DESC",
+          "LIMIT 10;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  },
+  {
+    "q": "How do you use the Query Profiler UI and Spark UI together to diagnose a slow Databricks SQL query?",
+    "a": "The Query Profiler in Databricks SQL shows the logical query plan with per-node metrics: rows in/out, time spent, bytes shuffled, and bytes spilled to disk. Start here by looking for the most time-consuming node (the widest bar). Shuffle-heavy nodes indicate missing broadcast hints or poorly chosen join order. Spill indicates that a sort or hash aggregate exceeded available executor memory — check the configured spark.sql.shuffle.partitions and executor memory. High row counts at a filter node that should be pruning aggressively suggests missing or stale statistics (run ANALYZE TABLE to refresh). The Spark UI complements this with lower-level detail: the Stages tab shows shuffle read/write bytes and GC time per stage; the SQL tab links to the query's physical plan with stage boundaries; the Storage tab shows cached RDD/DataFrame sizes. A common diagnosis pattern is: Query Profiler shows high shuffle bytes → Spark UI Stages confirms large shuffle write → root cause is a skewed join key (many nulls or a hot value) → fix with a salt-based skew join or AQE's skew join optimization.",
+    "fj": "Just look at the wall-clock run time in the job run history; if it is longer than yesterday, the query regressed.",
+    "fs": "Wall-clock time tells you that something is wrong but not why. The Query Profiler and Spark UI give you operator-level metrics (shuffle bytes, spill, GC, row counts) needed to identify the specific bottleneck and apply the right fix.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  },
+  {
+    "q": "How do you use the Databricks CLI and REST API to monitor active Lakeflow Job runs programmatically?",
+    "a": "The Databricks CLI (v0.200+, the new Go-based CLI) provides databricks jobs list, databricks jobs get --job-id <id>, and databricks runs list --job-id <id> for inspecting job configurations and run history. For active run monitoring, databricks runs get --run-id <id> returns the current state (PENDING, RUNNING, TERMINATED) along with task-level states. The REST API equivalents are GET /api/2.1/jobs/runs/list and GET /api/2.1/jobs/runs/get. For streaming pipelines in Lakeflow Declarative Pipelines, use GET /api/2.0/pipelines/{pipeline_id}/events to retrieve the event log programmatically. You can integrate these into external monitoring tools (PagerDuty, Datadog, Grafana) by polling the runs API on a cron schedule or by configuring webhook notifications. System tables (system.lakeflow.job_run_timeline) provide a SQL-queryable history but are not real-time; the REST API is the right choice for live alerting. The Databricks CLI also supports databricks jobs run-now --job-id <id> for triggering runs and databricks runs cancel for stopping them.",
+    "fj": "Check the Databricks UI manually every morning to see if last night's jobs succeeded.",
+    "fs": "Manual UI checks do not scale and do not provide real-time alerting. The REST API and CLI enable programmatic monitoring, automated remediation, and integration with enterprise alerting systems.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "REST API call to list recent failed runs",
+        "lines": [
+          "import requests, os",
+          "",
+          "host  = os.environ['DATABRICKS_HOST']",
+          "token = os.environ['DATABRICKS_TOKEN']",
+          "",
+          "resp = requests.get(",
+          "    f'{host}/api/2.1/jobs/runs/list',",
+          "    headers={'Authorization': f'Bearer {token}'},",
+          "    params={'job_id': 12345, 'limit': 20}",
+          ")",
+          "runs = resp.json()['runs']",
+          "failed = [r for r in runs if r['state']['result_state'] == 'FAILED']",
+          "for r in failed:",
+          "    print(r['run_id'], r['state']['state_message'])"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  },
+  {
+    "q": "How do you create a Databricks SQL Alert to notify a team when a data quality metric falls below a threshold?",
+    "a": "A Databricks SQL Alert is built on top of a saved SQL query. First, write and save a query in Databricks SQL that returns a single numeric value — for example, SELECT COUNT(*) AS null_count FROM orders WHERE customer_id IS NULL. Then create an Alert on that query, set the condition (e.g., null_count > 100), and configure the notification destination (email, Slack webhook, PagerDuty, or a custom webhook). Set the refresh schedule (e.g., every 15 minutes) so the query re-runs automatically. When the condition is met, all configured destinations receive a notification. Alerts can be in OK, TRIGGERED, or UNKNOWN state. You can also use alerts for SLA monitoring (e.g., alert if a table has not been updated in the last 2 hours by checking MAX(updated_at) < current_timestamp - INTERVAL 2 HOURS). SQL Alerts integrate with Unity Catalog permissions — you can share an alert with a group so multiple users receive it.",
+    "fj": "Write a notebook with a assert statement and schedule it as a job; if the assert fails, the job fails and sends an email via job failure notifications.",
+    "fs": "A failed job notification tells you only that the job failed, not the specific data quality metric value. SQL Alerts are purpose-built for threshold-based monitoring with richer context (the query result is included in the notification) and do not require a full notebook execution.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "SQL query backing a data quality alert",
+        "lines": [
+          "-- Saved query: 'dq_null_customer_id'",
+          "SELECT COUNT(*) AS null_count",
+          "FROM main.sales.orders",
+          "WHERE customer_id IS NULL",
+          "  AND order_date >= current_date() - INTERVAL 1 DAY;",
+          "",
+          "-- Alert condition: null_count > 50",
+          "-- Notification: email + Slack webhook",
+          "-- Schedule: every 30 minutes"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  },
+  {
+    "q": "How do you configure email and webhook notifications for Lakeflow Job success, failure, and duration warnings?",
+    "a": "In Lakeflow Jobs (previously Workflows), you configure notifications at both the job level and the individual task level. Job-level notifications trigger on job start, success, failure, and duration warning. Task-level notifications trigger on individual task failure and are preferable when you want an alert on every retry failure (job-level notifications are suppressed during retries). To configure, navigate to the job's Edit page, expand the Notifications section, and add up to three destinations per event type. Destinations can be email addresses or system notification destinations (Slack, PagerDuty, Microsoft Teams, or any webhook). For webhooks you provide a URL and the payload is a JSON with job metadata. In Declarative Automation Bundles YAML, you configure this via the email_notifications or webhook_notifications blocks under the job or task definition. Duration warnings require setting a duration_threshold_seconds; the notification fires if the run exceeds this time, useful for detecting pipeline regressions before they cause SLA breaches.",
+    "fj": "Configure notifications only on the job level; task-level notifications are redundant because a failed task always causes the job to fail.",
+    "fs": "Job-level failure notifications are suppressed during task retries. If a task fails 3 times before the job ultimately fails, you receive only one job-level notification. Task-level notifications fire on each individual failure, enabling faster incident response during transient errors.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Notification config in bundle YAML",
+        "lines": [
+          "resources:",
+          "  jobs:",
+          "    etl_job:",
+          "      email_notifications:",
+          "        on_failure:",
+          "          - de-team@company.com",
+          "        on_duration_warning_threshold_exceeded:",
+          "          - de-team@company.com",
+          "      health:",
+          "        rules:",
+          "          - metric: RUN_DURATION_SECONDS",
+          "            op: GREATER_THAN",
+          "            value: 3600  # alert if > 1h",
+          "      tasks:",
+          "        - task_key: transform",
+          "          email_notifications:",
+          "            on_failure:",
+          "              - de-team@company.com"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  },
+  {
+    "q": "How do you monitor a Lakeflow Declarative Pipeline's streaming progress and diagnose lag using the event log?",
+    "a": "Lakeflow Declarative Pipelines expose an event log as a Delta table at the path you specify in the pipeline settings (or the default system path). The event log contains one row per pipeline event: flow_progress events show micro-batch metrics including batch_id, num_input_rows, num_output_rows, and timing. To check for lag, query the event log for recent flow_progress events and compare num_input_rows (data arriving) to num_output_rows (data processed). Large discrepancies or decreasing throughput indicate backpressure. The pipeline UI also shows a flow graph with per-node row rates and latency metrics. For structured streaming underlying metrics, you can access the StreamingQueryProgress objects via spark.streams.active[0].lastProgress in a notebook attached to the cluster. Key lag indicators are: inputRowsPerSecond much higher than processedRowsPerSecond, growing number of queued files in Auto Loader (visible in the Auto Loader metrics node), and increasing trigger processing time. For production alerting, create a SQL Alert on the event log table querying for flows with zero output rows in the last N minutes.",
+    "fj": "Look at the pipeline UI bar chart; if the bars are all green, the pipeline is healthy.",
+    "fs": "Green status bars indicate no hard failures but do not reveal processing lag or throughput degradation. You need to query the event log for input vs output row rates to detect streaming backpressure before it becomes an SLA breach.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Query pipeline event log for lag",
+        "lines": [
+          "SELECT",
+          "  details:flow_progress:name::string AS flow_name,",
+          "  details:flow_progress:metrics:num_input_rows::long AS in_rows,",
+          "  details:flow_progress:metrics:num_output_rows::long AS out_rows,",
+          "  timestamp",
+          "FROM event_log('my_pipeline_id')",
+          "WHERE event_type = 'flow_progress'",
+          "  AND timestamp > current_timestamp() - INTERVAL 1 HOUR",
+          "ORDER BY timestamp DESC;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  },
+  {
+    "q": "What architectural patterns make a long-running Databricks pipeline resilient to transient failures?",
+    "a": "Several patterns work together. First, idempotent writes using Delta MERGE or .mode('overwrite') with a partition predicate ensure re-running a failed stage produces the same result without duplicates. Second, task-level retries in Lakeflow Jobs (set max_retries and min_retry_interval_millis per task) handle transient cluster or network errors without requiring human intervention. Third, checkpoint-based streaming (Auto Loader with checkpointLocation, or Lakeflow Declarative Pipelines) means a pipeline restart resumes from the last successful commit. Fourth, modular job DAGs with task dependencies allow partial repairs — if only one task fails, use Repair Run to re-execute only that task and its dependents rather than the full pipeline. Fifth, health rules (run duration thresholds and SQL alerts on system tables) provide early warning before a slow-but-not-failing pipeline breaches an SLA. Finally, separating compute from storage (serverless or autoscaling clusters) means the pipeline survives spot instance preemptions by resuming on a new node.",
+    "fj": "Set a very high timeout on the job so it never times out; long-running jobs are inherently fragile but you cannot avoid it.",
+    "fs": "High timeouts mask problems and delay alerting. The correct approach is idempotent writes, checkpoints, per-task retries, and partial repair runs — together these make the pipeline resilient to transient failures without manual intervention.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  },
+  {
+    "q": "Describe the steps to use a Query Profile to identify and fix a shuffle spill bottleneck in Databricks SQL.",
+    "a": "Open the Query Profile in the Databricks SQL Query History UI. In the profile's operator tree, look for Sort, HashAggregate, or Exchange nodes with large 'spill (bytes)' or 'spill (disk)' metrics — any non-zero spill means the operator ran out of executor memory and wrote intermediate data to disk, which is 10–100x slower than in-memory processing. Common root causes are: (1) spark.sql.shuffle.partitions set too low (default 200), causing each partition to be too large; increase to push more rows per partition and reduce per-partition memory pressure. (2) A skewed join key (e.g., a customer_id with millions of rows for one value) causes one task to process far more data than others; fix with Adaptive Query Execution's skew join optimization (enabled by default in Databricks Runtime 7.3+) or by salting the join key. (3) An oversized sort before a window function; add a narrower partition clause to limit rows per partition. After changes, run EXPLAIN to verify the new physical plan, then re-run and compare Query Profiles. Photon engine (enabled on all-purpose and SQL warehouse clusters) significantly reduces spill frequency for columnar operations by using CPU-cache-aware vectorized processing.",
+    "fj": "Increase the cluster size to give more memory; spill always disappears with more RAM.",
+    "fs": "More RAM delays but does not eliminate spill caused by data skew or incorrect partition counts. You must diagnose the root cause (skew, wrong partition count, missing broadcast) and fix the query or configuration; otherwise the problem reappears as data volumes grow.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Diagnose and fix spill",
+        "lines": [
+          "-- Check current shuffle partitions",
+          "SELECT current_setting('spark.sql.shuffle.partitions');",
+          "",
+          "-- Increase shuffle partitions to reduce per-partition size",
+          "SET spark.sql.shuffle.partitions = 800;",
+          "",
+          "-- Check if AQE skew join is enabled (default true in DBR)",
+          "SET spark.sql.adaptive.skewJoin.enabled = true;",
+          "",
+          "-- Force broadcast for a small table to eliminate shuffle",
+          "SELECT /*+ BROADCAST(small_dim) */",
+          "  f.order_id, d.region",
+          "FROM fact_orders f",
+          "JOIN small_dim d ON f.product_id = d.product_id;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "cost-performance-optimization"
+  },
+  {
+    "q": "When should you use Photon engine versus standard Databricks Runtime, and how does serverless compute fit into cost optimization?",
+    "a": "Photon is a vectorized C++ query engine that runs alongside the JVM-based Spark engine. It accelerates SQL and DataFrame operations (scans, joins, aggregations, window functions, and sort) by processing data in columnar batches that fit CPU cache, using SIMD instructions. Photon is automatically enabled on SQL warehouses and can be enabled on all-purpose and job clusters via the photon_worker_type setting. It provides the largest gains on I/O-bound and CPU-bound SQL queries — typically 2–5x faster — and its vectorized shuffle reduces spill in large join workloads. For Python-heavy UDF code that Photon cannot accelerate, the benefit is smaller. Serverless compute optimizes cost by eliminating cluster startup time (~30 seconds vs 3–5 minutes for interactive clusters), auto-scaling to zero when idle, and billing at a per-second granularity. For bursty SQL workloads, serverless SQL warehouses are the most cost-efficient option. For ETL jobs with predictable runtimes, job clusters with spot instances are typically cheaper. Combining Photon (for query speed) with serverless (for idle-time cost reduction) is the standard recommendation for SQL analytics workloads.",
+    "fj": "Enable Photon on all clusters to reduce cost; it accelerates every workload equally.",
+    "fs": "Photon primarily accelerates SQL and DataFrame operations. Workloads dominated by Python UDFs, arbitrary Python logic, or ML model inference see little benefit. Over-provisioning Photon clusters for non-SQL workloads may increase cost without proportional benefit.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "cost-performance-optimization"
+  },
+  {
+    "q": "What caching strategies are available in Databricks and when does each one help repeated query patterns?",
+    "a": "Databricks offers three levels of caching. Delta caching (automatically enabled on clusters with SSD-backed instance types) caches Parquet file content in local NVMe or SSD storage on each worker node. It is transparent — the first read from cloud storage populates the cache, and subsequent reads of the same file data are served from local disk, typically 5–10x faster than cloud storage I/O. CACHE TABLE / spark.catalog.cacheTable() caches a table or query result as an in-memory RDD across executor memory. This is beneficial for a small reference table queried in many joins within the same session, but it consumes executor heap memory and is lost when the cluster restarts. .persist(StorageLevel.MEMORY_AND_DISK) on a DataFrame caches a computed result for reuse within a single job, avoiding re-computation of expensive transformations. The right strategy depends on: use Delta caching for tables read repeatedly by many users; use CACHE TABLE for small dimension tables in a long-running interactive session; use .persist() for intermediate DataFrames reused multiple times in a programmatic pipeline.",
+    "fj": "Always call .persist() after every DataFrame transformation to speed up subsequent operations.",
+    "fs": "Indiscriminate .persist() consumes executor memory and causes GC pressure, often slowing the pipeline overall. Caching is beneficial only when the same DataFrame is read multiple times in the same job, and the cost of materialization is less than the savings from avoiding recomputation.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Caching strategies",
+        "lines": [
+          "# Cache a small reference table in memory for the session",
+          "spark.catalog.cacheTable('main.dims.product_dim')",
+          "",
+          "# Persist an expensive intermediate DataFrame",
+          "from pyspark import StorageLevel",
+          "enriched = (raw_df",
+          "    .join(product_dim, 'product_id')",
+          "    .withColumn('margin', F.col('revenue') - F.col('cost')))",
+          "enriched.persist(StorageLevel.MEMORY_AND_DISK)",
+          "",
+          "# Use enriched multiple times without re-computation",
+          "enriched.groupBy('region').agg(F.sum('margin')).show()",
+          "enriched.filter('margin < 0').write.format('delta').save('/bad_margin')",
+          "",
+          "# Release when done",
+          "enriched.unpersist()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "cost-performance-optimization"
+  },
+  {
+    "q": "How do OPTIMIZE and auto-optimize settings improve Delta table query performance and what file size should you target?",
+    "a": "Delta Lake's OPTIMIZE command compacts small files in a table or partition into larger files, defaulting to a target size of 1 GB per file (configurable via delta.targetFileSize). Small files (the 'small file problem') arise from high-frequency streaming writes or many small INSERT operations; they cause excessive metadata reads and slow full table scans. OPTIMIZE can optionally include ZORDER BY column1, column2 to co-locate rows with similar values in the same files, improving data skipping on those columns. Auto-optimize includes two features: optimizeWrite (enabled via delta.autoOptimize.optimizeWrite = true) dynamically increases partition write batch size to produce larger files during writes, reducing the need for post-write OPTIMIZE; and autoCompact (delta.autoOptimize.autoCompact = true) automatically runs a lightweight compaction after writes when the table has too many small files, targeting 128 MB files. For tables using Liquid Clustering, OPTIMIZE also applies clustering incrementally — only files that are not already clustered are reorganized. A good target file size is 256 MB–1 GB depending on the query pattern; very large files hurt streaming checkpointing performance.",
+    "fj": "Run OPTIMIZE daily on all tables regardless of their write patterns; it is always beneficial.",
+    "fs": "OPTIMIZE is expensive — it rewrites files — and on streaming tables that need low-latency output it can interfere with checkpoint progress. For streaming tables, autoCompact with a 128 MB target is preferable to full OPTIMIZE runs. OPTIMIZE is most valuable for batch-appended tables with many small files.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "OPTIMIZE and auto-optimize settings",
+        "lines": [
+          "-- Manual OPTIMIZE with ZORDER",
+          "OPTIMIZE main.sales.orders",
+          "  ZORDER BY (customer_id, order_date);",
+          "",
+          "-- Enable auto-optimize on a table",
+          "ALTER TABLE main.sales.orders",
+          "  SET TBLPROPERTIES (",
+          "    'delta.autoOptimize.optimizeWrite' = 'true',",
+          "    'delta.autoOptimize.autoCompact'   = 'true'",
+          "  );",
+          "",
+          "-- Set custom target file size (256 MB)",
+          "ALTER TABLE main.sales.orders",
+          "  SET TBLPROPERTIES (",
+          "    'delta.targetFileSize' = '268435456'",
+          "  );"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "cost-performance-optimization"
+  },
+  {
+    "q": "How do you implement Access Control Lists (ACLs) for Unity Catalog data objects, Lakeflow Jobs, and clusters?",
+    "a": "In Unity Catalog, data object permissions are managed via SQL GRANT/REVOKE statements. The privilege hierarchy is: metastore → catalog → schema → table/view. You grant USE CATALOG and USE SCHEMA before granting SELECT or MODIFY on tables. Privileges are inherited: granting SELECT on a catalog grants it for all tables within unless overridden. For non-data objects, Lakeflow Jobs use workspace-level ACLs: in the job settings you add permissions (Can View, Can Manage Run, Can Manage) for users or groups. Cluster-level ACLs (Can Attach To, Can Restart, Can Manage) control who can use a shared cluster. For service principals used by automated jobs, grant only the minimum required privileges (principle of least privilege). In practice, you grant groups rather than individuals to avoid per-user sprawl. Unity Catalog also supports row-level security and column masking via dynamic view functions (current_user(), is_member()), enabling fine-grained access control where different users see different rows from the same table without duplicating data.",
+    "fj": "Use Databricks workspace-level table ACLs (legacy Hive metastore permissions) for all data governance; they work the same as Unity Catalog.",
+    "fs": "Legacy Hive metastore ACLs are workspace-scoped and lack cross-workspace governance, lineage, data classification, and column-level masking. Unity Catalog is the supported governance layer and provides a superset of legacy ACL capabilities.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Unity Catalog GRANT examples",
+        "lines": [
+          "-- Grant read on a catalog hierarchy",
+          "GRANT USE CATALOG ON CATALOG main TO data_analysts;",
+          "GRANT USE SCHEMA ON SCHEMA main.sales TO data_analysts;",
+          "GRANT SELECT ON TABLE main.sales.orders TO data_analysts;",
+          "",
+          "-- Revoke write on a specific table",
+          "REVOKE MODIFY ON TABLE main.sales.orders FROM data_analysts;",
+          "",
+          "-- Row-level security via dynamic view",
+          "CREATE VIEW main.sales.my_orders AS",
+          "  SELECT * FROM main.sales.orders",
+          "  WHERE owner = current_user();"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-security-compliance"
+  },
+  {
+    "q": "What are the three main techniques for anonymizing or pseudonymizing PII in a Databricks lakehouse, and when is each appropriate?",
+    "a": "Hashing replaces a PII value with a fixed-length deterministic digest (SHA-256, SHA3-256). The same input always produces the same hash, enabling joins across datasets without exposing the raw value. However, hashes of low-cardinality PII (e.g., SSNs, phone numbers) are reversible via rainbow tables unless you add a secret salt. Tokenization replaces PII with a random token stored in a secure mapping table; the token has no mathematical relationship to the original value, making it cryptographically stronger than hashing. Reversal requires access to the mapping table, which can be governed separately. Masking replaces part of the value with a redacted representation (e.g., last 4 digits of a credit card: ****-****-****-1234) for display purposes. It is one-way and non-reversible, appropriate for audit logs or customer-facing screens. In Databricks, column masking is implemented as a dynamic view in Unity Catalog using a mask function registered via CREATE MASKING POLICY. Hashing and tokenization are appropriate for analytics joins; masking is appropriate for display and logging scenarios where the original value is never needed downstream.",
+    "fj": "Encrypt all PII columns with AES-256 and store the encryption key in the table itself as a separate column for easy decryption.",
+    "fs": "Storing the encryption key alongside the encrypted data provides no security — anyone who can read the table can also decrypt it. Keys must be stored in a separate, access-controlled secret store (Databricks Secret Scope, Azure Key Vault, AWS KMS).",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Salted SHA-256 hashing of PII",
+        "lines": [
+          "from pyspark.sql import functions as F",
+          "",
+          "SECRET_SALT = dbutils.secrets.get('my_scope', 'pii_salt')",
+          "",
+          "df_anon = df.withColumn(",
+          "    'email_hash',",
+          "    F.sha2(F.concat(F.lit(SECRET_SALT), F.col('email')), 256)",
+          ").drop('email')",
+          "",
+          "df_anon.write.format('delta') \\",
+          "    .mode('overwrite') \\",
+          "    .save('/gold/users_anon')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-security-compliance"
+  },
+  {
+    "q": "How do you implement GDPR right-to-be-forgotten in a Delta Lake lakehouse and why is VACUUM critical to the process?",
+    "a": "When a deletion request arrives (typically stored in a deletion_requests table with user_id and request_ts), the process runs a DELETE statement against every Delta table containing that user's PII: DELETE FROM bronze.events WHERE user_id = '...'. Delta's ACID guarantees make this a transactional, logged operation. However, Delta's time travel feature retains the deleted data in old Parquet files for the default 30-day retention window. To permanently purge the data you must: first, set delta.deletedFileRetentionDuration = 'interval 0 days' on the table (or a very short interval), then run VACUUM table_name RETAIN 0 HOURS. VACUUM deletes Parquet files no longer referenced by the transaction log. Without VACUUM, the deleted rows remain accessible via time travel queries (SELECT * FROM orders VERSION AS OF 1) and exist in cloud storage, violating GDPR's right to erasure. For the full multi-hop architecture, deletion must propagate through bronze → silver → gold, typically driven by a scheduled Lakeflow Job that processes the deletion_requests table and runs the DELETE + VACUUM sequence per affected table. Note: RETAIN 0 HOURS requires disabling the safety check (spark.databricks.delta.retentionDurationCheck.enabled = false).",
+    "fj": "Run a SELECT query filtered to exclude the deleted user whenever the data is read; the data is logically deleted even if physically present.",
+    "fs": "Logical deletion via query filters does not satisfy GDPR's right to erasure, which requires physical deletion from all storage systems. An auditor or compromised query can bypass the filter. VACUUM is required to permanently delete the Parquet files containing the personal data.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "GDPR delete + VACUUM sequence",
+        "lines": [
+          "-- Step 1: Delete the user's PII rows",
+          "DELETE FROM main.bronze.events",
+          "WHERE user_id = '${user_id}';",
+          "",
+          "-- Step 2: Shorten retention window",
+          "ALTER TABLE main.bronze.events",
+          "  SET TBLPROPERTIES ('delta.deletedFileRetentionDuration' = 'interval 7 days');",
+          "",
+          "-- Step 3: After retention window, VACUUM",
+          "-- (disable safety check only in scheduled maintenance job)",
+          "SET spark.databricks.delta.retentionDurationCheck.enabled = false;",
+          "VACUUM main.bronze.events RETAIN 0 HOURS;",
+          "SET spark.databricks.delta.retentionDurationCheck.enabled = true;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-security-compliance"
+  },
+  {
+    "q": "Explain the difference between Azure Key Vault-backed and Databricks-backed secret scopes, and how you use secrets in notebooks.",
+    "a": "A Databricks-backed secret scope stores secret values encrypted within Databricks' own secrets service. You create it with databricks secrets create-scope --scope my_scope and add secrets with databricks secrets put --scope my_scope --key db_password. Values are stored and encrypted by Databricks. An Azure Key Vault-backed secret scope is a thin proxy: Databricks reads the secret value directly from an Azure Key Vault at runtime using the workspace's managed identity or service principal. You create it by specifying the Key Vault DNS name and resource ID; the actual secret values live in Key Vault and are never stored in Databricks. Azure Key Vault-backed scopes are preferred in enterprise Azure environments because they centralize secret rotation, auditing, and access control in Key Vault — rotating a secret in Key Vault immediately affects all Databricks jobs that reference it. In notebooks and jobs, you retrieve secrets with dbutils.secrets.get('scope_name', 'key_name'). The returned string is never displayed in notebook output — Databricks redacts it as [REDACTED]. You cannot list secret values via the API, only their key names.",
+    "fj": "Store database passwords in notebook variables at the top of the notebook and mark the notebook as private in the workspace.",
+    "fs": "Notebook variables are stored in plain text in the notebook source, visible in git history, exported notebooks, and to anyone with workspace read access. Secret scopes encrypt values at rest and in transit, and redact them in output — the only correct approach for production credentials.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Using Databricks secret scopes",
+        "lines": [
+          "# Retrieve a secret at runtime",
+          "password = dbutils.secrets.get(scope='my_scope', key='db_password')",
+          "",
+          "# Use in a JDBC connection (password never printed)",
+          "jdbc_url = 'jdbc:postgresql://host:5432/orders'",
+          "df = (spark.read",
+          "    .format('jdbc')",
+          "    .option('url', jdbc_url)",
+          "    .option('dbtable', 'orders')",
+          "    .option('user', dbutils.secrets.get('my_scope', 'db_user'))",
+          "    .option('password', password)",
+          "    .load())"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-security-compliance"
+  },
+  {
+    "q": "What network security controls does Databricks provide and when would a Staff data engineer configure each one?",
+    "a": "Databricks provides layered network security controls. IP access lists restrict which IP addresses or CIDR ranges can call the Databricks REST API and access the web UI — useful for limiting API access to corporate VPN egress IPs only, preventing credential-theft-based attacks from untrusted networks. Private endpoints (AWS PrivateLink / Azure Private Link) route traffic between your VPC/VNet and the Databricks control plane and workspace storage over a private backbone, never traversing the public internet — required for most financial and healthcare compliance frameworks. VNet injection (Azure) or custom VPC (AWS) deploys Databricks compute clusters inside your own virtual network, giving you control over security groups, Network Security Groups (NSGs), outbound firewall rules, and DNS configuration. This is essential when clusters need to access private data sources (internal databases, on-prem systems via VPN). Transit encryption ensures all data in motion between cluster nodes and to/from cloud storage uses TLS 1.2+. At Staff level, you typically combine all three: private endpoints to eliminate public internet exposure, VNet injection to enforce egress controls, and IP access lists as a defense-in-depth layer on the REST API.",
+    "fj": "The cluster's cloud storage access is already encrypted at rest by the cloud provider; no additional network configuration is needed.",
+    "fs": "Encryption at rest protects stored data but does nothing for data in transit or for API access from untrusted networks. Network controls (private endpoints, VNet injection, IP access lists) are needed to prevent unauthorized access and to meet compliance requirements for data in transit.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-security-compliance"
+  },
+  {
+    "q": "How do you create discoverable metadata in Unity Catalog — table descriptions, column comments, and tags — and why does this matter for data governance?",
+    "a": "Unity Catalog provides three layers of metadata. Table-level and column-level descriptions are set with COMMENT ON TABLE ... IS '...' or COMMENT ON COLUMN ... IS '...' (or in CREATE TABLE ... COMMENT '...'). These appear in the Catalog Explorer UI and are searchable via the catalog's search functionality, making tables discoverable without needing to ask a data engineer. Tags are key-value labels applied to catalogs, schemas, tables, or columns via ALTER TABLE t SET TAGS ('pii' = 'true', 'domain' = 'sales'). Tags are distinct from comments — they are structured metadata designed for automated governance: a data cataloging tool or a compliance script can query all tables with TAG pii = 'true' to find PII-containing tables without manual inventory. In combination, descriptions explain the business meaning (what is this table for?) and tags drive programmatic classification, access policy enforcement, and data quality monitoring. Unity Catalog's information_schema.table_tags and information_schema.column_tags views make tags queryable via SQL, enabling audit reports like 'which tables contain PII but have no masking policy applied?'",
+    "fj": "Document table schemas in a separate Confluence wiki page and link it in the table description; the wiki is searchable and easier to maintain.",
+    "fs": "External wikis are decoupled from the actual table and drift out of sync. Unity Catalog metadata travels with the table, is version-controlled in the transaction log, and is queryable via SQL — making it the single source of truth for catalog discovery and compliance automation.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Setting Unity Catalog metadata",
+        "lines": [
+          "-- Table comment",
+          "COMMENT ON TABLE main.sales.orders IS",
+          "  'Fact table: one row per customer order. Source: Shopify webhook. Owner: DE team.';",
+          "",
+          "-- Column comment",
+          "COMMENT ON COLUMN main.sales.orders.customer_id IS",
+          "  'Internal customer UUID. Hashed before sharing externally.';",
+          "",
+          "-- Tags for programmatic governance",
+          "ALTER TABLE main.sales.orders",
+          "  SET TAGS ('pii' = 'true', 'domain' = 'sales', 'tier' = 'gold');",
+          "",
+          "-- Query all PII-tagged tables",
+          "SELECT table_name, catalog_name, schema_name",
+          "FROM system.information_schema.table_tags",
+          "WHERE tag_name = 'pii' AND tag_value = 'true';"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-governance"
+  },
+  {
+    "q": "How does Unity Catalog's tag-based data classification differ from column comments, and how do you build a classification workflow?",
+    "a": "Column comments are free-text descriptions meant for human readers; they have no programmatic semantics. Tags are structured key-value pairs that can be queried, filtered, and acted upon programmatically. A classification workflow typically involves: (1) Define a taxonomy of tag keys (sensitivity, pii_type, retention_years) and allowed values (sensitivity: public/internal/confidential/restricted). (2) Apply tags via a classification job that scans tables for column name patterns (e.g., columns named *email*, *ssn*, *phone*) and automatically applies pii_type = 'email' tags, with human review before applying confidential or restricted tags. (3) Enforce policies based on tags: a Unity Catalog masking policy can be applied to all columns with sensitivity = 'restricted', dynamically masking values for non-privileged users. (4) Audit via SQL queries on system.information_schema.column_tags to ensure all columns with sensitive names have appropriate tags. This workflow scales across thousands of tables without manual per-table governance, making it the foundation of a compliant, self-documenting data platform.",
+    "fj": "Apply the SENSITIVE keyword as a column comment on PII fields; this is sufficient for GDPR compliance documentation.",
+    "fs": "Free-text comments are not machine-readable and cannot drive automated policies, masking rules, or audit queries. Tags are structured metadata that Unity Catalog can act upon programmatically — comments alone do not constitute a compliant classification system.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-governance"
+  },
+  {
+    "q": "What are storage credentials and external locations in Unity Catalog, and how do they control access to cloud object storage?",
+    "a": "A storage credential is a Unity Catalog object that wraps a cloud identity (an AWS IAM role ARN or an Azure managed identity / service principal) with permission to read and write a cloud storage bucket or container. You create it with CREATE STORAGE CREDENTIAL my_cred WITH AWS_IAM_ROLE (role_arn = '...') and then grant USE STORAGE CREDENTIAL on it to trusted users or service principals. An external location binds a storage credential to a specific cloud path: CREATE EXTERNAL LOCATION my_location URL 's3://my-bucket/path/' WITH STORAGE CREDENTIAL my_cred. Once created, you grant READ FILES, WRITE FILES, or CREATE TABLE on the external location. This two-layer design means a user can be granted CREATE TABLE on an external location without having direct IAM or RBAC access to the underlying cloud storage — Unity Catalog mediates all access. External locations are also the foundation for external tables and volumes in Unity Catalog. All access to files at the external location path is audited in system.access.audit, providing a complete record of who read or wrote what data.",
+    "fj": "Grant the cluster's instance profile direct S3 bucket access via IAM; this is simpler and avoids Unity Catalog overhead.",
+    "fs": "Instance profile-level S3 access bypasses Unity Catalog governance — there is no per-user audit trail, no column-level access control, and no ability to revoke access without modifying the IAM policy. External locations provide fine-grained, auditable access control without direct cloud IAM changes.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Storage credentials and external locations",
+        "lines": [
+          "-- Create storage credential (Azure managed identity)",
+          "CREATE STORAGE CREDENTIAL azure_cred",
+          "  WITH AZURE_MANAGED_IDENTITY (connector_id = '/sub/.../mi-id');",
+          "",
+          "-- Create external location",
+          "CREATE EXTERNAL LOCATION raw_data",
+          "  URL 'abfss://raw@mystorageacct.dfs.core.windows.net/'",
+          "  WITH (STORAGE CREDENTIAL azure_cred);",
+          "",
+          "-- Grant access to a group",
+          "GRANT READ FILES, WRITE FILES ON EXTERNAL LOCATION raw_data",
+          "  TO de_team;",
+          "",
+          "-- Create external table using the location",
+          "CREATE TABLE main.bronze.events",
+          "  LOCATION 'abfss://raw@mystorageacct.dfs.core.windows.net/events/';"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-governance"
+  },
+  {
+    "q": "Where do you find diagnostic information when a Databricks job fails, and in what order should you check each source?",
+    "a": "A systematic diagnosis starts with the highest-level view and drills down. First, check the Lakeflow Jobs UI Runs tab — the failed run's event timeline shows which task failed and the failure message. This is often enough for user-level errors (invalid SQL, missing file). Second, open the task's cluster driver log (stderr/stdout) for Python tracebacks, Spark driver-side errors, and OOM messages. This reveals most Python and Scala exceptions. Third, if the failure is a Spark execution error (task failures, shuffle errors, GC overhead), open the Spark UI for that run — the Stages tab shows failed tasks with their exception stack traces. Fourth, for cost or pattern analysis across many runs, query system tables: system.lakeflow.task_run_timeline for task-level duration and state, and system.compute.cluster_events for cluster-level issues (node loss, spot preemption). Fifth, if the problem is data-related (wrong row counts, constraint violations), query the Delta table history (DESCRIBE HISTORY) to identify when the issue was introduced. This layered approach prevents wasted time reading low-level logs for what is actually a simple configuration error.",
+    "fj": "Always start with the cluster's Spark UI; it contains all the information you need to diagnose any Databricks failure.",
+    "fs": "The Spark UI contains low-level execution detail but requires a running or recently terminated cluster to access. Many failures (Python import errors, job configuration mistakes, insufficient permissions) are visible only in the driver logs or the Jobs UI event log, never in the Spark UI.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Query system tables for job failure analysis",
+        "lines": [
+          "SELECT",
+          "  run_id,",
+          "  task_key,",
+          "  result_state,",
+          "  error_message,",
+          "  DATEDIFF(SECOND, start_time, end_time) AS duration_sec",
+          "FROM system.lakeflow.task_run_timeline",
+          "WHERE result_state = 'FAILED'",
+          "  AND start_time > current_timestamp() - INTERVAL 7 DAYS",
+          "ORDER BY start_time DESC",
+          "LIMIT 50;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "How do you analyze a Python stack trace from a failed Databricks job to identify whether the root cause is in user code, a library, or Spark internals?",
+    "a": "A Python stack trace in Databricks always prints from outermost frame to innermost (the actual error). Start by reading the last line — the exception type and message (e.g., AnalysisException: Table not found, pyspark.errors.PySparkException: ...). If the exception type is from pyspark.sql.utils or pyspark.errors, the error originated in Spark's Java/Scala layer and was wrapped in Python. The py4j.protocol.Py4JJavaError lines in the middle of the trace indicate the Java-Python boundary; the real root cause is in the Caused by: section that follows. If the top-most frames in the trace reference your src/myproject/ files, the bug is in user code. If the frames reference a third-party library (great_expectations, dbt, etc.), check whether the library version is compatible with the Databricks Runtime. For Scala/Java stack traces (visible in the driver log), look for the top-most non-Spark frame — lines from org.apache.spark or com.databricks are framework internals; the first line from your package or a third-party library is the root cause. NullPointerException in Spark internals almost always means a null value reached a function that expected non-null.",
+    "fj": "Restart the cluster and re-run the job; transient errors in the Spark internals are common and usually resolve on retry.",
+    "fs": "While transient failures do occur (spot instance loss, network blip), most stack traces indicate a deterministic bug that will fail every time. Blindly retrying without reading the stack trace wastes time and can mask data correctness issues like silent data corruption or constraint violations.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "How does the Repair Run feature in Lakeflow Jobs work and when should you use it instead of a full re-run?",
+    "a": "Repair Run re-executes only the failed tasks in a Lakeflow Job run plus any downstream tasks that depend on them, without re-running tasks that completed successfully. You access it from the Runs tab by clicking the failed run and selecting Repair run. The dialog lists all failed tasks and the tasks that will be re-run due to dependencies. Repair Run is appropriate when: (1) a transient failure occurred (spot instance preemption, a transient API rate limit) and the preceding successful tasks are expensive to re-run; (2) you fixed the code or data that caused the failure and want to validate the fix without waiting for the next scheduled run; (3) a multi-hop pipeline failed in the silver transformation after successfully landing bronze data — re-running from bronze wastes compute and risks re-ingesting duplicates if the ingestion is not idempotent. Do not use Repair Run when the failure was caused by incorrect output from an upstream task — in that case you need to re-run from the failing upstream task. Note: Repair Run is distinct from retries; retries happen automatically within a run based on task retry settings, while Repair Run is a manual action on a terminated run.",
+    "fj": "Always trigger a full job re-run from the beginning to ensure consistency; partial re-runs can leave the pipeline in an inconsistent state.",
+    "fs": "Full re-runs are expensive and potentially incorrect if the ingestion layer is not idempotent. Repair Run was specifically designed to safely re-execute only the failed portion, preserving the outputs of successful tasks. For idempotent write operations, partial re-runs are both safe and preferred.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "How do you build and deploy Databricks resources using Declarative Automation Bundles (formerly DABs) end to end?",
+    "a": "The end-to-end workflow for a Declarative Automation Bundle is: (1) Initialize: databricks bundle init using the default or a custom template, which creates databricks.yml, resources/, src/, and tests/ directories. (2) Develop: define jobs, pipelines, clusters, and permissions as YAML in resources/. Write Python code in src/ and unit tests in tests/. (3) Validate: databricks bundle validate checks the YAML for syntax and schema errors and reports the full resolved configuration including variable substitutions. (4) Deploy to dev: databricks bundle deploy --target dev provisions all resources in the dev workspace with user-prefixed names (if mode: development). (5) Run: databricks bundle run my_job --target dev triggers the job and streams output to the terminal. (6) Deploy to production: after CI tests pass, the pipeline runs databricks bundle deploy --target prod using a service principal. (7) Destroy (if needed): databricks bundle destroy --target dev removes all provisioned resources. All YAML resource definitions are stored in git, making every deployment auditable, diffable, and rollback-able via git revert.",
+    "fj": "Create jobs manually in the Databricks UI and export the JSON configuration as documentation; the UI is the source of truth.",
+    "fs": "Manual UI creation means configuration is not version-controlled, cannot be code-reviewed, and cannot be promoted consistently between environments. Declarative Automation Bundles make the YAML the source of truth, enabling GitOps workflows where every change is reviewed, tested, and auditable.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Bundle workflow CLI commands",
+        "lines": [
+          "# Initialize a new bundle",
+          "databricks bundle init",
+          "",
+          "# Validate configuration",
+          "databricks bundle validate --target dev",
+          "",
+          "# Deploy to dev environment",
+          "databricks bundle deploy --target dev",
+          "",
+          "# Run a specific job",
+          "databricks bundle run etl_job --target dev",
+          "",
+          "# Deploy to production (CI/CD)",
+          "databricks bundle deploy --target prod",
+          "",
+          "# Tear down dev resources",
+          "databricks bundle destroy --target dev"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "How do you set up a Git-based CI/CD pipeline for Databricks using Declarative Automation Bundles and GitHub Actions?",
+    "a": "The CI/CD pipeline for Declarative Automation Bundles with GitHub Actions has three stages. On every pull request: run unit tests (pytest src/) and databricks bundle validate --target staging to catch YAML errors before merge. On merge to main: run databricks bundle deploy --target staging to provision in the staging workspace and execute integration tests with databricks bundle run integration_test --target staging. On a tagged release or manual approval: run databricks bundle deploy --target prod. Authentication from GitHub Actions to Databricks uses a service principal: store DATABRICKS_HOST and DATABRICKS_TOKEN as GitHub Secrets and pass them as environment variables to the CLI. The bundle uses run_as: service_principal_name: ... in the prod target so deployed jobs run as the service principal, not a human user. Databricks Repos provides an alternative for notebook-based pipelines: you push to a git branch and Databricks auto-syncs the repo, but DABs are preferred for production because they provide schema validation, dependency management, and multi-environment support that Repos alone does not.",
+    "fj": "Use Databricks Repos with auto-sync; push code to git and it automatically deploys to production.",
+    "fs": "Auto-sync in Databricks Repos deploys immediately without validation, testing, or environment promotion gates. DABs with GitHub Actions enforce a PR review → staging validation → production deployment workflow that prevents bad code from reaching production.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "GitHub Actions workflow for DABs CI/CD",
+        "lines": [
+          "# .github/workflows/deploy.yml",
+          "name: Deploy to Databricks",
+          "on:",
+          "  push:",
+          "    branches: [main]",
+          "",
+          "jobs:",
+          "  deploy:",
+          "    runs-on: ubuntu-latest",
+          "    steps:",
+          "      - uses: actions/checkout@v4",
+          "      - name: Install Databricks CLI",
+          "        run: pip install databricks-cli",
+          "      - name: Deploy to staging",
+          "        env:",
+          "          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_STAGING }}",
+          "          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_STAGING }}",
+          "        run: databricks bundle deploy --target staging",
+          "      - name: Run integration tests",
+          "        run: databricks bundle run smoke_test --target staging"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "How do you use the Databricks CLI for deployment automation and environment promotion beyond just bundle deploy?",
+    "a": "The Databricks CLI (v0.200+, the Go-based rewrite) provides a rich command surface beyond bundle operations. For deployment automation: databricks jobs create --json @job.json creates a job from a JSON spec (useful outside DABs); databricks jobs reset --job-id <id> --json @job.json updates an existing job's configuration. For environment promotion: databricks workspace import-dir uploads notebook directories; databricks repos update syncs a Databricks Repo to a specific git commit, branch, or tag — enabling a promote-by-SHA workflow where you can pin production to a tested commit. For secret management as part of deployment: databricks secrets create-scope and databricks secrets put populate the secret store that notebooks reference. For cluster policy management: databricks cluster-policies create --json @policy.json. For pipeline operations: databricks pipelines create and databricks pipelines start. All commands support --profile to target different workspaces without changing environment variables, making multi-workspace automation straightforward in CI scripts. The CLI's json output (--output json) integrates with jq for scripted post-processing.",
+    "fj": "Use the Databricks REST API with curl for all automation; the CLI is just a wrapper with no additional capabilities.",
+    "fs": "The Databricks CLI handles authentication, error formatting, and pagination automatically. Using raw curl requires implementing token refresh, error handling, and pagination manually. For complex automation tasks like bundle deploy, the CLI provides capabilities (template expansion, dependency resolution) that have no equivalent REST API call.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "CLI commands for deployment automation",
+        "lines": [
+          "# Promote a Repos-based workflow to production",
+          "databricks repos update \\",
+          "  --repo-id 12345 \\",
+          "  --branch main",
+          "",
+          "# Update a job configuration without DABs",
+          "databricks jobs reset \\",
+          "  --job-id 67890 \\",
+          "  --json @resources/jobs/etl_job.json",
+          "",
+          "# Populate secrets as part of deployment",
+          "databricks secrets put-secret my_scope db_password \\",
+          "  --string-value $DB_PASSWORD",
+          "",
+          "# Trigger a pipeline update and poll for completion",
+          "databricks pipelines start --pipeline-id abc-123",
+          "databricks pipelines get --pipeline-id abc-123 \\",
+          "  | jq '.state'"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "What are the key benefits of Liquid Clustering over static Hive partitioning and Z-Ordering in Delta Lake?",
+    "a": "Static Hive partitioning requires choosing a column at table creation time and produces a directory-per-partition structure. If you choose a low-cardinality column the data is skewed; high-cardinality columns produce too many small partitions. Changing the partition key requires a full table rewrite. Z-Ordering co-locates rows with similar values in the same files for multi-column data skipping, but it reorganizes the entire table or partition on every OPTIMIZE run and is not compatible with Liquid Clustering. Liquid Clustering uses a flexible, file-level clustering metadata layer stored in the Delta transaction log. Key advantages: (1) Incremental clustering — only unclustered files are reorganized on each OPTIMIZE run, so the cost scales with the amount of new data, not total table size. (2) Mutable clustering keys — you can change clustering columns with ALTER TABLE t CLUSTER BY (new_col) without rewriting existing data. (3) Better data skipping — clustering metadata provides fine-grained min/max statistics per clustered column, enabling aggressive file skipping even on multi-column predicates. (4) Automatic application via OPTIMIZE — no ZORDER BY clause needed. Databricks recommends Liquid Clustering for all new tables and migration from Z-Ordering for existing performance-critical tables.",
+    "fj": "Z-Ordering and Liquid Clustering are equivalent for single-column data skipping; choose whichever syntax you prefer.",
+    "fs": "Z-Ordering rewrites the full table or partition on every OPTIMIZE, is not incremental, and cannot be changed without a full rewrite. Liquid Clustering is incremental, supports mutable clustering keys, and has better data skipping mechanics — it is a strict improvement over Z-Ordering for nearly all use cases.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Liquid Clustering vs Z-Ordering syntax",
+        "lines": [
+          "-- Create table with Liquid Clustering",
+          "CREATE TABLE main.sales.orders",
+          "  CLUSTER BY (customer_id, order_date);",
+          "",
+          "-- Run incremental clustering",
+          "OPTIMIZE main.sales.orders;",
+          "",
+          "-- Change clustering keys (no full rewrite needed)",
+          "ALTER TABLE main.sales.orders",
+          "  CLUSTER BY (region, order_date);",
+          "",
+          "-- Old approach: Z-Ordering (not compatible with Liquid Clustering)",
+          "-- OPTIMIZE main.sales.orders ZORDER BY (customer_id, order_date);"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-modelling"
+  },
+  {
+    "q": "How do you design fact and dimension table schemas optimized for analytics workloads in a Databricks lakehouse gold layer?",
+    "a": "A gold layer for analytics workloads is typically modeled as a star schema: a central fact table (one row per business event — order, click, session) surrounded by conformed dimension tables (customer, product, date, geography). The fact table contains foreign keys to dimensions, additive measures (revenue, quantity), and degenerate dimensions (order_number). Dimension tables carry descriptive attributes and a surrogate key (a UUID or integer generated via IDENTITY column in Delta). For Databricks specifically: use Delta tables with Liquid Clustering on the fact table's most-queried dimensions (customer_id, order_date) for data skipping. Keep dimension tables small enough to broadcast in joins (typically < 100 MB) to avoid shuffle. Use MERGE INTO for slowly-changing dimension (SCD) type-2 logic, tracking effective_start and effective_end dates. Partition large fact tables by a date-based column only if the partition column appears in the WHERE clause of almost every query and the partition cardinality is manageable (days or months, not seconds). Use materialized views or pre-aggregated gold tables for known reporting queries to reduce latency at the BI tool layer.",
+    "fj": "Model all data as a single wide denormalized table with all dimension attributes flattened; this avoids joins and is faster.",
+    "fs": "A single wide table duplicates dimension attributes (e.g., customer_name replicated per order), causing storage bloat, update anomalies, and cache inefficiency. Star schema with broadcast joins achieves the same query speed while maintaining consistency and enabling independent dimension updates.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Star schema DDL in Delta Lake",
+        "lines": [
+          "-- Dimension table with surrogate key",
+          "CREATE TABLE main.gold.dim_customer (",
+          "  customer_sk  BIGINT GENERATED ALWAYS AS IDENTITY,",
+          "  customer_id  STRING NOT NULL,",
+          "  name         STRING,",
+          "  region       STRING,",
+          "  effective_start DATE,",
+          "  effective_end   DATE,",
+          "  is_current      BOOLEAN",
+          ") CLUSTER BY (customer_id);",
+          "",
+          "-- Fact table with Liquid Clustering",
+          "CREATE TABLE main.gold.fact_orders (",
+          "  order_id      STRING NOT NULL,",
+          "  customer_sk   BIGINT,",
+          "  product_sk    BIGINT,",
+          "  order_date    DATE,",
+          "  revenue       DECIMAL(12,2),",
+          "  quantity      INT",
+          ") CLUSTER BY (customer_sk, order_date);"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-modelling"
+  },
+  {
+    "q": "How do you manage schema evolution in a multi-hop pipeline where bronze receives raw JSON, silver applies transformations, and gold serves analytics?",
+    "a": "Schema evolution must be handled deliberately at each hop. In the bronze layer, enable schema evolution on the Auto Loader stream using cloudFiles.schemaEvolutionMode = addNewColumns; new top-level fields are automatically added to the bronze Delta table as nullable columns. The rescued_data column captures any fields that do not fit the current schema. In the silver layer, transformation code must be defensive: use df.select() with explicit column lists rather than SELECT * to avoid silently propagating new columns into business-logic outputs; handle unexpected columns with error logging or a quarantine table. When a new column is intentional and should flow through, update the silver table schema with spark.sql('ALTER TABLE silver.orders ADD COLUMNS (new_field STRING)') and release a new version of the transformation job. In the gold layer, schema changes are explicit and controlled — consumers depend on stable schemas, so new columns are added with a review process and communicated via changelogs. Delta's mergeSchema option (set globally via spark.databricks.delta.schema.autoMerge.enabled = true or per-write with option('mergeSchema', 'true')) allows writes to add new columns without failing; this should be enabled in bronze and disabled in gold to maintain gold schema stability.",
+    "fj": "Enable mergeSchema globally on all tables in all layers; new columns flow through automatically without any pipeline changes.",
+    "fs": "Automatic schema merging in silver and gold layers breaks downstream consumers that rely on stable schemas. Bronze should be permissive; silver should be explicit; gold should be locked. Indiscriminate mergeSchema propagates upstream source system changes directly to BI dashboards, causing silent breakage.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Schema evolution configuration per layer",
+        "lines": [
+          "# Bronze: permissive Auto Loader with schema evolution",
+          "spark.readStream \\",
+          "    .format('cloudFiles') \\",
+          "    .option('cloudFiles.format', 'json') \\",
+          "    .option('cloudFiles.schemaEvolutionMode', 'addNewColumns') \\",
+          "    .load(raw_path) \\",
+          "    .writeStream \\",
+          "    .option('mergeSchema', 'true') \\",
+          "    .start(bronze_path)",
+          "",
+          "# Silver: explicit column selection, no mergeSchema",
+          "bronze_df = spark.read.format('delta').load(bronze_path)",
+          "silver_df = bronze_df.select('order_id','customer_id','amount','ts')",
+          "silver_df.write.format('delta').mode('overwrite').save(silver_path)",
+          "",
+          "# Gold: locked schema, mergeSchema disabled (default)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-modelling"
+  },
+  {
+    "q": "How does Databricks Photon engine accelerate vectorized shuffle compared to JVM Spark, and what workloads see the biggest gains?",
+    "a": "Photon is Databricks' native vectorized query engine written in C++. Unlike JVM Spark which processes data row-by-row and deals with JVM object overhead and garbage collection pressure, Photon processes columnar batches of data using SIMD (Single Instruction, Multiple Data) CPU instructions that apply the same operation to multiple values simultaneously within a CPU cache line. For shuffle specifically, Photon's vectorized shuffle keeps data in compact columnar format during sort and network transfer, achieving 1.5x higher shuffle throughput compared to JVM Spark by sorting within CPU cache and minimizing deserialization overhead. Workloads that benefit most: large-scale SQL aggregations, window functions, sort-based operations, hash joins on large tables, and I/O-bound scans with predicate pushdown. Workloads that see less benefit: Python UDF-heavy pipelines (Photon cannot accelerate arbitrary Python code), ML model inference, and RDD-based operations (Photon is SQL/DataFrame only). Photon is automatically enabled on all SQL Warehouses and can be enabled on job and all-purpose clusters by selecting a Photon-enabled runtime and instance type.",
+    "fj": "Photon accelerates all Databricks workloads equally; enable it on every cluster for maximum cost savings.",
+    "fs": "Photon accelerates SQL and DataFrame operations. Python UDFs, RDD operations, and ML inference run on the standard JVM path. Enabling Photon on clusters running primarily Python UDF workloads adds cost (Photon-enabled instances are more expensive) without proportional speedup.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "cost-performance-optimization"
+  },
+  {
+    "q": "What are the key system tables a Staff data engineer queries for end-to-end observability, and write a query showing cross-workspace cost attribution?",
+    "a": "The core system tables for end-to-end observability are: system.billing.usage (DBU consumption per workspace/job/cluster/user with custom tags), system.billing.list_prices (pricing tiers per SKU), system.lakeflow.job_run_timeline and task_run_timeline (job and task-level run history with states and durations), system.compute.clusters (cluster lifecycle — created, started, terminated events), system.access.audit (every API call, data access event, and permission change), and system.access.table_lineage and column_lineage (upstream/downstream table dependencies). For cross-workspace cost attribution at Staff level, you join billing.usage with a custom cost_center mapping table (workspace_id → team → cost_center) to allocate cloud spend to business units. The system catalog is available in every workspace but spans all workspaces in the account within a region, so a single query gives a complete account-wide view. Key governance pattern: grant read access to system.billing.usage to FinOps team members as a Unity Catalog privilege (GRANT SELECT ON TABLE system.billing.usage TO finops_team) rather than giving them workspace admin rights.",
+    "fj": "Pull cost data from the cloud provider's billing dashboard (AWS Cost Explorer, Azure Cost Management); Databricks does not have SQL-queryable cost data.",
+    "fs": "Cloud provider billing shows total compute spend but cannot attribute cost to specific Databricks jobs, pipelines, or users. system.billing.usage provides job-level, cluster-level, and user-level DBU attribution that maps directly to business operations.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Cross-workspace cost attribution query",
+        "lines": [
+          "SELECT",
+          "  u.workspace_id,",
+          "  cc.team,",
+          "  cc.cost_center,",
+          "  u.sku_name,",
+          "  SUM(u.usage_quantity)                             AS total_dbus,",
+          "  SUM(u.usage_quantity * p.pricing.default)        AS est_usd",
+          "FROM system.billing.usage        u",
+          "JOIN system.billing.list_prices  p",
+          "  ON  u.sku_name       = p.sku_name",
+          "  AND u.usage_date BETWEEN p.price_start_time",
+          "                      AND COALESCE(p.price_end_time, current_date())",
+          "JOIN main.ops.workspace_cost_centers cc",
+          "  ON  u.workspace_id = cc.workspace_id",
+          "WHERE u.usage_date >= date_trunc('MONTH', current_date())",
+          "GROUP BY 1,2,3,4",
+          "ORDER BY est_usd DESC;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  },
+  {
+    "q": "Walk through configuring Auto Loader for a high-throughput streaming pipeline with schema hints, rescue data, and a checkpoint in production.",
+    "a": "A production-grade Auto Loader stream requires four configuration decisions. First, set cloudFiles.format to the source format (json, csv, parquet, avro, etc.). Second, set cloudFiles.schemaLocation to a persistent cloud path where Auto Loader stores the inferred or provided schema; this is required for restartability — without it the schema is re-inferred on every restart. Third, use cloudFiles.schemaHints to override specific column types that Auto Loader infers incorrectly (e.g., timestamps inferred as strings) — the format is a DDL snippet like 'event_ts TIMESTAMP, user_id LONG'. Fourth, set cloudFiles.inferColumnTypes = true to have Auto Loader attempt type inference for JSON rather than defaulting all columns to strings. The _rescued_data column automatically captures any values that do not match the inferred schema, enabling you to audit and recover bad records downstream. The writeStream must set checkpointLocation to a different persistent path for offset tracking. In Lakeflow Declarative Pipelines, Databricks manages the schema location and checkpoint automatically — you only need to specify the source format and any schema hints.",
+    "fj": "Set cloudFiles.schemaLocation to /tmp/ for simplicity; the schema will be re-inferred if the job restarts.",
+    "fs": "A /tmp/ path is not persistent across cluster restarts and is local to the driver node, not shared across a cluster. Using a non-persistent location causes schema re-inference on every restart, which is slow and can produce inconsistent results if the source data has evolved.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Production Auto Loader configuration",
+        "lines": [
+          "checkpoint_base = 'abfss://checkpoints@sa.dfs.core.windows.net/'",
+          "",
+          "stream = (",
+          "  spark.readStream",
+          "    .format('cloudFiles')",
+          "    .option('cloudFiles.format', 'json')",
+          "    .option('cloudFiles.schemaLocation',",
+          "            checkpoint_base + 'schema/events')",
+          "    .option('cloudFiles.schemaHints',",
+          "            'event_ts TIMESTAMP, user_id LONG, amount DOUBLE')",
+          "    .option('cloudFiles.inferColumnTypes', 'true')",
+          "    .option('cloudFiles.maxFilesPerTrigger', '1000')",
+          "    .load('abfss://raw@sa.dfs.core.windows.net/events/')",
+          ")",
+          "",
+          "stream.writeStream",
+          "  .format('delta')",
+          "  .option('checkpointLocation', checkpoint_base + 'ckpt/events')",
+          "  .option('mergeSchema', 'true')",
+          "  .outputMode('append')",
+          "  .trigger(availableNow=True)",
+          "  .start('abfss://bronze@sa.dfs.core.windows.net/events/')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-acquisition"
+  },
+  {
+    "q": "How do you write efficient Spark SQL and PySpark code for advanced window function transformations?",
+    "a": "Window functions in Spark SQL and PySpark compute a value for each row based on a partition of rows without collapsing them into groups, unlike GROUP BY. The window spec defines PARTITION BY (the grouping key), ORDER BY (sort order within the partition), and the window frame (ROWS or RANGE between specific offsets). Common patterns: running totals with SUM(amount) OVER (PARTITION BY customer_id ORDER BY order_date ROWS UNBOUNDED PRECEDING), lag/lead for period-over-period change with LAG(revenue, 1) OVER (PARTITION BY region ORDER BY month), and dense ranking for top-N per group with DENSE_RANK() OVER (PARTITION BY category ORDER BY sales DESC). PySpark uses Window.partitionBy().orderBy() and rowsBetween() / rangeBetween() for frame specification. Performance tip: large PARTITION BY cardinality causes many small partitions and shuffle overhead; ensure the partition key matches your data's natural clustering. For very large partitions (e.g., entire dataset partitioned by a single low-cardinality column), the task processing that partition will spill — add a secondary partition key or use AQE's skew join handling.",
+    "fj": "Use a self-join to compute lag values: join the table to itself on order_date - 1 day to get the previous day's value.",
+    "fs": "Self-joins require a full shuffle of both sides of the join and are O(n²) in the worst case. Window functions process each partition in a single sorted pass, are far more efficient, and express the intent more clearly in SQL.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "pyspark",
+        "label": "Window function examples in PySpark",
+        "lines": [
+          "from pyspark.sql import Window",
+          "from pyspark.sql import functions as F",
+          "",
+          "# Running total of revenue per customer",
+          "w_running = Window.partitionBy('customer_id') \\",
+          "                   .orderBy('order_date') \\",
+          "                   .rowsBetween(Window.unboundedPreceding, 0)",
+          "",
+          "# Lag: previous month's revenue",
+          "w_lag = Window.partitionBy('region').orderBy('month')",
+          "",
+          "# Dense rank within category",
+          "w_rank = Window.partitionBy('category').orderBy(F.desc('sales'))",
+          "",
+          "result = df \\",
+          "    .withColumn('running_revenue', F.sum('revenue').over(w_running)) \\",
+          "    .withColumn('prev_revenue', F.lag('revenue', 1).over(w_lag)) \\",
+          "    .withColumn('rank_in_cat', F.dense_rank().over(w_rank))"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-transformation-quality"
+  },
+  {
+    "q": "What are the key differences between a Delta Sharing provider workspace and a recipient in the Databricks-to-Databricks protocol?",
+    "a": "In the Databricks-to-Databricks Delta Sharing protocol, the provider is the Unity Catalog metastore that owns and controls the data being shared. The provider creates share objects, adds tables or schemas to shares, creates recipient objects representing other Databricks workspaces, and grants SELECT on shares to those recipients. The recipient is identified by its Unity Catalog metastore ID (not an activation link as in open sharing). The recipient workspace accesses the shared data by browsing to the shared tables in their own Unity Catalog Catalog Explorer under a provider catalog — no special client library is needed. From the recipient's perspective, the shared tables appear as read-only tables they can query with standard SQL. The provider retains full control: they can revoke access, add or remove tables from a share, and filter what data is exposed via partition filters. All access by the recipient is audited in the provider's system.access.audit table. The key advantage over open sharing is that the recipient gets a native Unity Catalog table experience with full governance, rather than managing a credentials file.",
+    "fj": "In Databricks-to-Databricks sharing, the recipient installs the delta-sharing Python client and uses an activation link the same way as any other recipient.",
+    "fs": "Databricks-to-Databricks sharing uses metastore ID-based authentication, not activation links. The recipient accesses shared tables natively via their Unity Catalog catalog without any additional client library — the shared tables appear directly in their workspace catalog.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-sharing-federation"
+  },
+  {
+    "q": "How do you write a PySpark MERGE statement to implement SCD Type 2 slowly changing dimensions in a Databricks gold layer?",
+    "a": "SCD Type 2 preserves historical dimension attribute values by closing the old record (setting effective_end and is_current = false) and inserting a new record with the updated values when a dimension attribute changes. In Delta Lake, this is implemented with a two-phase MERGE: first update closing records, then insert the new versions. PySpark's DeltaTable.merge() API or Spark SQL MERGE INTO handles both phases in a single atomic transaction. The business key (e.g., customer_id) links incoming source records to existing dimension records. You match on business key AND is_current = true to find the active record. WHEN MATCHED AND <attribute changed> THEN UPDATE sets effective_end and is_current = false. WHEN NOT MATCHED THEN INSERT adds the new record with effective_start = today and is_current = true. Delta's MERGE guarantees the full operation is atomic, preventing partial updates. For high-volume dimensions, cluster the target table on the business key to minimize file scanning during the MERGE.",
+    "fj": "Delete the old dimension record and insert the new one; this is equivalent to SCD Type 2.",
+    "fs": "Delete + insert destroys the historical record, which is the opposite of SCD Type 2's intent. SCD Type 2 requires preserving both the old and new records so time-travel queries can reconstruct dimension values as of any date.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "SCD Type 2 MERGE in Databricks SQL",
+        "lines": [
+          "MERGE INTO main.gold.dim_customer AS tgt",
+          "USING (",
+          "  SELECT s.customer_id, s.name, s.region, current_date() AS eff_start",
+          "  FROM main.silver.customer_updates s",
+          ") AS src",
+          "ON tgt.customer_id = src.customer_id AND tgt.is_current = true",
+          "WHEN MATCHED AND (",
+          "  tgt.name   <> src.name OR",
+          "  tgt.region <> src.region",
+          ") THEN UPDATE SET",
+          "  tgt.effective_end = current_date() - INTERVAL 1 DAY,",
+          "  tgt.is_current    = false",
+          "WHEN NOT MATCHED THEN INSERT (",
+          "  customer_id, name, region,",
+          "  effective_start, effective_end, is_current",
+          ") VALUES (",
+          "  src.customer_id, src.name, src.region,",
+          "  src.eff_start, '9999-12-31', true",
+          ");"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-modelling"
+  },
+  {
+    "q": "When using Declarative Automation Bundles, how do you manage environment-specific configurations such as cluster policies, instance pool IDs, and secret scope names across dev, staging, and prod targets?",
+    "a": "Environment-specific configuration in Declarative Automation Bundles is managed through the variables block in databricks.yml, combined with target-level overrides. Define variables at the top-level bundle scope for every environment-sensitive value: cluster_policy_id, instance_pool_id, secret_scope, max_workers, and catalog_name. Each variable has a default value (typically the dev value) and is overridden in the relevant target block. Job and pipeline resource YAML files reference these variables with ${var.cluster_policy_id} syntax. This approach means resource YAML files are completely environment-agnostic — they work the same in dev and prod because they read from variables, not hardcoded strings. For secrets, you parameterize the scope name (${var.secret_scope}) and reference specific keys via dbutils.secrets.get() inside notebooks or Python code. For catalog names, the variable approach lets dev code query main_dev.bronze.events while prod queries main.bronze.events without any code changes. The bundle validate command resolves all variables for a given target and shows the fully expanded configuration, making it easy to verify what will actually be deployed.",
+    "fj": "Hardcode dev values in the bundle YAML and use sed/awk in CI scripts to replace them with prod values before deploying.",
+    "fs": "String replacement scripts are fragile, hard to audit, and do not validate that replaced values are correct types. The variables system in Declarative Automation Bundles is type-aware, version-controlled, and validated by databricks bundle validate before any deployment.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Variables and target overrides in databricks.yml",
+        "lines": [
+          "variables:",
+          "  catalog:        {default: main_dev}",
+          "  secret_scope:   {default: dev_scope}",
+          "  max_workers:    {default: 2}",
+          "  policy_id:      {default: DEV_POLICY_ID}",
+          "",
+          "targets:",
+          "  dev:",
+          "    mode: development",
+          "  prod:",
+          "    mode: production",
+          "    variables:",
+          "      catalog:       main",
+          "      secret_scope:  prod_scope",
+          "      max_workers:   10",
+          "      policy_id:     PROD_POLICY_ID",
+          "",
+          "# In resources/jobs/etl_job.yml",
+          "# job_clusters:",
+          "#   - job_cluster_key: main_cluster",
+          "#     new_cluster:",
+          "#       policy_id: ${var.policy_id}",
+          "#       autoscale:",
+          "#         max_workers: ${var.max_workers}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "What are the tradeoffs between Liquid Clustering and traditional date-based Hive partitioning for a fact table that receives daily batch loads?",
+    "a": "Date-based Hive partitioning creates a directory per partition value (year=2024/month=06/day=10). Queries with a WHERE date = '2024-06-10' predicate skip all other partitions entirely — this is partition pruning and it is extremely effective when the date column is always in the WHERE clause. However, partitioning has a hard minimum file size per partition: small partitions cause the small file problem and excessive metadata overhead, especially when each daily partition has only a few files. Adding a second dimension (e.g., region) requires multi-level partitioning, which explodes the number of directories. Liquid Clustering on order_date achieves similar data skipping via file-level statistics and the clustering metadata, without the directory overhead. It also works across multiple clustering keys without the combinatorial explosion of multi-level partitioning. The tradeoff: partition pruning at the partition level is slightly faster than Liquid Clustering's file-level statistics for very selective date queries because partition pruning happens at the metadata level before opening any file. Liquid Clustering wins for: tables with more than one common filter column, tables where the partition column has high cardinality or evolving access patterns, and tables where the clustering key will change over time.",
+    "fj": "Always use Liquid Clustering for new tables; Hive partitioning is completely obsolete and has no use cases.",
+    "fs": "Hive date partitioning remains efficient for very large tables (> 100 TB) with overwhelmingly date-filtered access patterns, as partition pruning at the metadata layer can be faster than file-level statistics scanning. For most tables and mixed access patterns, Liquid Clustering is preferable, but the tradeoff is nuanced.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-modelling"
+  },
+  {
+    "q": "What is the purpose of the PIVOT clause in Databricks SQL and how does it differ from ROLLUP and CUBE?",
+    "a": "PIVOT transforms row values into column headers, effectively rotating a column's distinct values into separate output columns — this is a transpose operation often used to create wide summary tables for BI tools. For example, a table with columns (year, quarter, revenue) can be pivoted on quarter to produce columns Q1, Q2, Q3, Q4 with revenue values. ROLLUP and CUBE, by contrast, do not change the column shape: they keep the same columns and add extra rows representing subtotals and grand totals at different levels of aggregation. ROLLUP computes hierarchical subtotals (left to right across the GROUP BY keys), and CUBE computes subtotals for every possible subset of keys. In PySpark the DataFrame API supports .rollup() and .cube() natively, but PIVOT is accessed via df.groupBy().pivot('col').agg(...). GROUPING SETS (which underlies both ROLLUP and CUBE) is only available in Spark SQL mode, not the DataFrame API. PIVOT is computationally more expensive when the distinct values of the pivot column are high-cardinality because Spark must scan the column to discover distinct values unless you specify them explicitly.",
+    "fj": "PIVOT and ROLLUP both add extra rows to the result; the difference is just which dimension is aggregated.",
+    "fs": "PIVOT changes the result shape by turning row values into columns (reducing the number of rows, increasing columns). ROLLUP adds extra aggregation rows at hierarchical levels without changing the column structure. They solve fundamentally different reporting problems.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "PIVOT vs ROLLUP in Databricks SQL",
+        "lines": [
+          "-- PIVOT: quarters become columns",
+          "SELECT * FROM (",
+          "  SELECT year, quarter, revenue FROM sales",
+          ")",
+          "PIVOT (",
+          "  SUM(revenue)",
+          "  FOR quarter IN ('Q1','Q2','Q3','Q4')",
+          ");",
+          "",
+          "-- ROLLUP: extra rows for subtotals",
+          "SELECT year, quarter, SUM(revenue)",
+          "FROM sales",
+          "GROUP BY ROLLUP(year, quarter);"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-transformation-quality"
+  },
+  {
+    "q": "How do you implement Delta Lake table constraints as part of a data quality strategy, and what happens when a constraint is violated?",
+    "a": "Delta Lake enforces table constraints at write time via two mechanisms: CHECK constraints (arbitrary boolean expressions) and NOT NULL constraints. When a write operation (INSERT, UPDATE, MERGE) includes a row that violates a CHECK constraint, Spark raises an AnalysisException with the message 'Constraint violated: ...' and the entire write is rejected — no partial writes occur because Delta's ACID semantics mean the transaction is atomically rolled back. This fail-fast behavior is intentional for silver and gold layers where corrupt data must never land. You add constraints with ALTER TABLE t ADD CONSTRAINT name CHECK (expr) and drop them with ALTER TABLE t DROP CONSTRAINT name. Both constraint types are visible in SHOW TBLPROPERTIES (prefixed with delta.constraints.) and in DESCRIBE EXTENDED. For bronze ingestion where you want to land all data including bad records (for later triage), do not use table constraints — use Lakeflow Declarative Pipelines expectations instead, which offer three modes: fail (same as constraint), warn (log but continue), and drop (quarantine failing rows). The combination of expectations in bronze and hard constraints in silver/gold creates a layered quality enforcement strategy.",
+    "fj": "Add a CHECK constraint to the bronze table to reject bad rows at ingestion time and keep the lakehouse clean from the start.",
+    "fs": "Rejecting rows in bronze means they are lost permanently — you cannot go back and reprocess them after fixing the upstream issue. Bronze should be a faithful landing zone. Quality enforcement belongs in silver/gold where you have business rules context and a quarantine path.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Delta constraints and violation behavior",
+        "lines": [
+          "-- Add constraints to silver/gold tables",
+          "ALTER TABLE main.silver.orders",
+          "  ADD CONSTRAINT positive_amount CHECK (amount > 0);",
+          "",
+          "ALTER TABLE main.silver.orders",
+          "  ADD CONSTRAINT valid_status",
+          "  CHECK (status IN ('pending','shipped','delivered','cancelled'));",
+          "",
+          "ALTER TABLE main.silver.orders",
+          "  ALTER COLUMN order_id SET NOT NULL;",
+          "",
+          "-- Inspect all constraints",
+          "SHOW TBLPROPERTIES main.silver.orders;",
+          "-- Output includes: delta.constraints.positive_amount -> amount > 0",
+          "",
+          "-- This INSERT will fail with AnalysisException",
+          "-- INSERT INTO main.silver.orders VALUES ('x', -10.0, 'pending');"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-transformation-quality"
+  },
+  {
+    "q": "How do you configure Databricks Secret Scopes at the infrastructure level and what are the two types of scopes?",
+    "a": "Databricks offers two secret scope types. A Databricks-backed scope stores encrypted secret values within the Databricks secrets service itself. You create it with the Databricks CLI: databricks secrets create-scope --scope my_scope (or via the REST API POST /api/2.0/secrets/scopes/create). Secrets are added with databricks secrets put --scope my_scope --key my_key --string-value 'value'. The values are AES-256 encrypted at rest by Databricks. An Azure Key Vault-backed scope proxies secret lookups to an Azure Key Vault instance using the workspace's managed identity. You create it by specifying the Key Vault's DNS name and resource ID in the scope creation payload; Databricks never stores the secret value — it reads from Key Vault at runtime. The Key Vault-backed approach is preferred in regulated Azure environments because it centralizes secret lifecycle management: rotation, expiry, and access auditing all happen in Key Vault. Both scope types are accessed identically in code via dbutils.secrets.get('scope', 'key'); the implementation detail is transparent to notebooks. ACLs on Databricks-backed scopes control which users can READ, WRITE, or MANAGE the scope — granular access control beyond workspace membership.",
+    "fj": "Create one secret scope per workspace and put all secrets in it; scope isolation is unnecessary overhead.",
+    "fs": "Putting all secrets in one scope means any user with READ on the scope can access all credentials, violating least-privilege. Separate scopes per application, team, or sensitivity level enforce granular access control and limit blast radius if a credential is compromised.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Creating and using Databricks secret scopes",
+        "lines": [
+          "# CLI: create Databricks-backed scope",
+          "# databricks secrets create-scope --scope prod_scope",
+          "",
+          "# CLI: add a secret",
+          "# databricks secrets put-secret prod_scope db_password \\",
+          "#   --string-value $DB_PASS",
+          "",
+          "# CLI: list secrets in scope (keys only, not values)",
+          "# databricks secrets list-secrets --scope prod_scope",
+          "",
+          "# In notebook/job: retrieve at runtime",
+          "import os",
+          "pwd = dbutils.secrets.get(scope='prod_scope', key='db_password')",
+          "# pwd is redacted in all output: [REDACTED]",
+          "",
+          "# Set as env var for subprocess compatibility",
+          "os.environ['DB_PASSWORD'] = pwd"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-security-compliance"
+  },
+  {
+    "q": "Describe the end-to-end process for deploying Databricks resources using the Databricks CLI and how it fits into a CI/CD pipeline without Declarative Automation Bundles.",
+    "a": "When not using Declarative Automation Bundles (DABs), the Databricks CLI provides individual resource management commands for jobs, clusters, pipelines, notebooks, and secrets. A typical CI/CD workflow without DABs: (1) Store job JSON definitions in the repository (jobs/etl_job.json). (2) In the CI pipeline, authenticate via DATABRICKS_HOST and DATABRICKS_TOKEN environment variables (from CI secrets). (3) Check if the job exists: databricks jobs list --output json | jq to find the job_id. (4) Create or update: databricks jobs create --json @jobs/etl_job.json for new jobs, or databricks jobs reset --job-id $ID --json @jobs/etl_job.json to update existing ones. (5) Promote notebooks: databricks workspace import-dir ./notebooks /Shared/etl_prod. (6) Run integration tests: databricks runs submit --json @test_run.json and poll databricks runs get --run-id $RUN_ID until state is TERMINATED. (7) On failure, retrieve logs via databricks runs get-output --run-id $RUN_ID. This approach is more manual than DABs (no variable substitution, no schema validation) but is compatible with any scripting framework and does not require the Databricks CLI v0.275.0+ DABs features.",
+    "fj": "Use the Databricks REST API directly with curl in CI pipelines; the CLI is just a wrapper with no advantages.",
+    "fs": "The CLI handles token authentication, retry logic, pagination, and provides structured --output json for piping to jq. Raw curl scripts must implement all of this manually and are harder to maintain. The CLI is the correct choice for automation unless a non-CLI SDK (e.g., databricks-sdk-py) is preferred.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "CLI-based CI/CD without DABs",
+        "lines": [
+          "#!/bin/bash",
+          "# Deploy job and run smoke test",
+          "",
+          "JOB_ID=$(databricks jobs list --output json \\",
+          "  | jq -r '.jobs[] | select(.settings.name==\"etl_job\") | .job_id')",
+          "",
+          "if [ -z \"$JOB_ID\" ]; then",
+          "  databricks jobs create --json @jobs/etl_job.json",
+          "else",
+          "  databricks jobs reset --job-id $JOB_ID --json @jobs/etl_job.json",
+          "fi",
+          "",
+          "RUN_ID=$(databricks jobs run-now --job-id $JOB_ID \\",
+          "  --output json | jq -r '.run_id')",
+          "",
+          "# Poll for completion",
+          "until [ $(databricks runs get --run-id $RUN_ID \\",
+          "  | jq -r '.state.life_cycle_state') = 'TERMINATED' ]; do",
+          "  sleep 30",
+          "done"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "debugging-deploying"
+  },
+  {
+    "q": "What are the monitoring and alerting best practices for streaming pipelines in Lakeflow Declarative Pipelines, including event log queries and SQL Alert setup?",
+    "a": "For Lakeflow Declarative Pipelines in streaming mode, the primary monitoring surfaces are the pipeline event log, the pipeline UI flow graph, and SQL Alerts built on top of event log queries. The event log is a Delta table automatically maintained by the platform at the path configured in the pipeline settings. Each micro-batch emits flow_progress events containing metrics: num_input_rows, num_output_rows, batch_duration_ms, and backlog_bytes. Query the event log to detect processing lag (num_input_rows >> num_output_rows sustained over multiple batches), zero-output stalls (num_output_rows = 0 for > 5 minutes), and growing batch duration (indicative of increasing data volume or a resource bottleneck). Create a SQL Alert on this query with a 5-minute refresh schedule and route to Slack or PagerDuty. Additionally, monitor for error events in the event log (event_type = 'error') which appear when an expectation fails or a source read encounters a schema mismatch. For infrastructure-level monitoring, query system.lakeflow.pipeline_events (if available in your region) alongside the event log. The pipeline UI shows a real-time flow graph with row rates, but this is not suitable for automated alerting — always build SQL-based alerting on the event log Delta table for production pipelines.",
+    "fj": "Check the Lakeflow Declarative Pipelines UI every morning to see if streaming pipelines are healthy; automated monitoring is not needed for streaming.",
+    "fs": "Streaming pipelines can degrade silently (processing lag, growing backlog) without raising a hard error. Without automated SQL Alerts on the event log, a pipeline can fall hours behind SLA before a human notices. Automated monitoring is essential for production streaming pipelines.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Event log SQL Alert for streaming lag",
+        "lines": [
+          "-- Alert: pipeline has zero output rows in last 10 minutes",
+          "SELECT COUNT(*) AS stalled_flows",
+          "FROM (",
+          "  SELECT",
+          "    details:flow_progress:name::string AS flow_name,",
+          "    MAX(details:flow_progress:metrics:num_output_rows::long) AS max_out",
+          "  FROM event_log('my_pipeline_id')",
+          "  WHERE event_type = 'flow_progress'",
+          "    AND timestamp > current_timestamp() - INTERVAL 10 MINUTES",
+          "  GROUP BY 1",
+          ")",
+          "WHERE max_out = 0;",
+          "",
+          "-- Alert condition: stalled_flows > 0",
+          "-- Schedule: every 5 minutes",
+          "-- Notification: PagerDuty webhook"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "monitoring-alerting"
+  }
+]

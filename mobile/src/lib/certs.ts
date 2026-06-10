@@ -1,4 +1,5 @@
 import type { TrackColorKey } from './theme';
+import { GENERATED } from './content.generated';
 
 export type CertProvider = 'databricks' | 'snowflake' | 'aws' | 'gcp' | 'azure' | 'dbt';
 export type CertLevel = 'fundamentals' | 'associate' | 'professional' | 'specialist';
@@ -1499,6 +1500,6 @@ export function certById(id: string): CertDef | undefined {
   return CERTS.find((c) => c.id === id);
 }
 
-export function certTotalCards(_certId: string): number {
-  return 0;
+export function certTotalCards(certId: string): number {
+  return GENERATED[`cert-${certId}`]?.length ?? 0;
 }

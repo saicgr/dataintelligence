@@ -94,6 +94,15 @@ import costEngineer from './generated/cost-engineer.json';
 import aep from './generated/aep.json';
 import dbtMetricflow from './generated/dbt-metricflow.json';
 import dbtSemanticLayer from './generated/dbt-semantic-layer.json';
+// Databricks certification tracks — gap cards authored from official May 2026 exam guides
+import certDbDeAssociate from './generated/cert-databricks-de-associate.json';
+import certDbDeProfessional from './generated/cert-databricks-de-professional.json';
+import certDbGenaiAssociate from './generated/cert-databricks-genai-associate.json';
+import certDbContextEngineer from './generated/cert-databricks-context-engineer.json';
+import certDbSparkDeveloper from './generated/cert-databricks-spark-developer.json';
+import certDbDataAnalyst from './generated/cert-databricks-data-analyst.json';
+import certDbMlAssociate from './generated/cert-databricks-ml-associate.json';
+import certDbMlProfessional from './generated/cert-databricks-ml-professional.json';
 
 export interface GeneratedCard {
   q: string;
@@ -209,4 +218,13 @@ export const GENERATED: Record<string, GeneratedCard[]> = {
   aep: aep as unknown as GeneratedCard[],
   'dbt-metricflow': dbtMetricflow as unknown as GeneratedCard[],
   'dbt-semantic-layer': dbtSemanticLayer as unknown as GeneratedCard[],
+  // Databricks cert tracks (not shown in Skills tab — accessed only via cert detail screens)
+  'cert-databricks-de-associate': certDbDeAssociate as unknown as GeneratedCard[],
+  'cert-databricks-de-professional': certDbDeProfessional as unknown as GeneratedCard[],
+  'cert-databricks-genai-associate': certDbGenaiAssociate as unknown as GeneratedCard[],
+  'cert-databricks-context-engineer': certDbContextEngineer as unknown as GeneratedCard[],
+  'cert-databricks-spark-developer': certDbSparkDeveloper as unknown as GeneratedCard[],
+  'cert-databricks-data-analyst': certDbDataAnalyst as unknown as GeneratedCard[],
+  'cert-databricks-ml-associate': certDbMlAssociate as unknown as GeneratedCard[],
+  'cert-databricks-ml-professional': certDbMlProfessional as unknown as GeneratedCard[],
 };
