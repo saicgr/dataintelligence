@@ -344,6 +344,10 @@ const RAW_TRACKS: Track[] = [
   { slug: 'pre-sales', name: 'Pre-Sales & Solutions Eng', color: 'rag', icon: '💼', q: 0, domain: 'de', group: 'concept' },
   { slug: 'customer-success', name: 'Customer Success (CSM)', color: 'eval', icon: '💚', q: 0, domain: 'de', group: 'concept' },
   { slug: 'risk-compliance', name: 'Risk & Compliance', color: 'sysd', icon: '⚖️', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'cost-engineer', name: 'Cloud Cost Engineering', color: 'kafka', icon: '📐', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'aep', name: 'Adobe Experience Platform', color: 'rag', icon: '🔴', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'dbt-metricflow', name: 'dbt MetricFlow', color: 'dbt', icon: '📐', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'dbt-semantic-layer', name: 'dbt Semantic Layer', color: 'dbt', icon: '🧱', q: 0, domain: 'de', group: 'concept' },
 ];
 
 export const TRACKS: Track[] = RAW_TRACKS.map((t) => ({

@@ -90,6 +90,10 @@ import supplyChain from './generated/supply-chain.json';
 import preSales from './generated/pre-sales.json';
 import customerSuccess from './generated/customer-success.json';
 import riskCompliance from './generated/risk-compliance.json';
+import costEngineer from './generated/cost-engineer.json';
+import aep from './generated/aep.json';
+import dbtMetricflow from './generated/dbt-metricflow.json';
+import dbtSemanticLayer from './generated/dbt-semantic-layer.json';
 
 export interface GeneratedCard {
   q: string;
@@ -201,4 +205,8 @@ export const GENERATED: Record<string, GeneratedCard[]> = {
   'pre-sales': preSales as unknown as GeneratedCard[],
   'customer-success': customerSuccess as unknown as GeneratedCard[],
   'risk-compliance': riskCompliance as unknown as GeneratedCard[],
+  'cost-engineer': costEngineer as unknown as GeneratedCard[],
+  aep: aep as unknown as GeneratedCard[],
+  'dbt-metricflow': dbtMetricflow as unknown as GeneratedCard[],
+  'dbt-semantic-layer': dbtSemanticLayer as unknown as GeneratedCard[],
 };

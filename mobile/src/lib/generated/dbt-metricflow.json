@@ -1,0 +1,569 @@
+[
+  {
+    "q": "What are the four required top-level sections inside a MetricFlow semantic model YAML block and what does each declare?",
+    "a": "A semantic model has four sections: (1) `entities` — the join keys MetricFlow uses to traverse between semantic models (declared as primary, foreign, unique, or natural type); (2) `dimensions` — the categorical or time attributes consumers can GROUP BY; (3) `measures` — the aggregatable columns (SUM, COUNT, AVG, etc.) that serve as building blocks for metrics; (4) `defaults` — an optional block that sets `agg_time_dimension` so every measure automatically knows which time column to use. The `model` key (a `ref()` or `source()` call) anchors the entire semantic model to a physical dbt artifact. In the new YAML spec (dbt Core v1.12+), `semantic_model:` is nested inside the model's own YAML entry under `models:` rather than being a standalone top-level block.",
+    "fj": "Confusing measures with metrics. Measures are raw aggregations declared inside a semantic model; metrics are the named, consumable definitions (potentially composing multiple measures) that BI tools and the CLI query. You cannot query a measure directly — only a metric.",
+    "fs": "Semantic model = fact table contract. Entities = join keys, dimensions = GROUP BY columns, measures = SUM/COUNT columns, defaults = clock. Metrics live in a separate YAML file and reference these measures.",
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Can a single dbt model back multiple semantic models?",
+        "a": "Yes. MetricFlow allows multiple semantic models to reference the same underlying dbt model. This is useful when the same fact table needs different entity perspectives — for example, one semantic model for order-level revenue analysis and another for order-line-item analysis — without duplicating data."
+      },
+      {
+        "q": "What happens if you omit `defaults.agg_time_dimension`?",
+        "a": "MetricFlow cannot automatically resolve time-based aggregations for measures that don't individually declare `agg_time_dimension`. This causes a validation error (`AggTimeDimensionNotFoundError`) when querying with a time dimension. Best practice: always set `defaults.agg_time_dimension` at the semantic model level so all measures inherit it unless they override."
+      },
+      {
+        "q": "Is the global namespace for entity, dimension, and metric names scoped per model file or project-wide?",
+        "a": "Project-wide. MetricFlow registers all entity names, dimension names, measure names, and metric names in a single flat namespace across the entire dbt project. Two teams defining a dimension both named `region` will trigger a collision and a validation failure. The fix is to prefix names with a domain abbreviation, e.g., `fin_region` and `mktg_region`."
+      }
+    ]
+  },
+  {
+    "q": "What are the four entity key types in MetricFlow — primary, foreign, unique, and natural — and when do you use each?",
+    "a": "`primary` — exactly one non-null record per row; every row in the table has this key. MetricFlow uses it as the canonical join target for foreign keys in other models. `foreign` — zero, one, or multiple rows can share the same key value; the typical FK column in a fact table pointing to a primary key in a dimension table. `unique` — exactly one record per non-null row but null values are allowed (sparse); used for natural business identifiers that are unique but not universally present. `natural` — a real-world identifier (e.g., ISO country code) that uniquely identifies a record based on business meaning rather than a surrogate. MetricFlow uses entity types to pick join strategies: foreign→primary gets a LEFT JOIN, primary→primary also uses LEFT JOIN but fan-out paths are blocked.",
+    "fj": "Mixing up `primary` and `unique`. Primary means every row has a non-null key; unique means non-null rows are unique but nulls are allowed. Declaring a sparse lookup table as primary when it has nulls causes MetricFlow to permit erroneous join paths.",
+    "fs": "Primary = every row has one. Unique = non-null rows have one. Foreign = many rows can share one. Natural = the real world assigned it. Entity types drive join strategy selection — choose wrong and MetricFlow builds wrong SQL.",
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "Why does MetricFlow block a fan-out join (primary→foreign direction)?",
+        "a": "A fan-out join occurs when one row on the driving side matches multiple rows on the other side, multiplying rows and inflating aggregation results. For example, if one order maps to three shipments, a SUM(revenue) join in that direction would triple-count revenue. MetricFlow detects this via entity type declarations and raises a validation error at `dbt sl validate` time rather than silently returning wrong numbers."
+      },
+      {
+        "q": "How do you declare an entity whose join key is a SQL expression rather than a direct column?",
+        "a": "Use the `expr` field on the entity definition. Example: `expr: substring(order_key FROM 1 FOR 8)`. MetricFlow inlines that SQL expression whenever it needs to join on that entity. This lets you derive a join key from composite or transformed column values without adding a new column to the source model."
+      },
+      {
+        "q": "Can two semantic models share the same entity name to establish an automatic join path?",
+        "a": "Yes — that is exactly how MetricFlow discovers join paths. If `fct_orders` declares `customer_id: foreign` and `dim_customers` declares `customer_id: primary`, MetricFlow recognizes the LEFT JOIN path and automatically makes all `dim_customers` dimensions available when querying metrics on `fct_orders`. Shared entity names are intentional and required for multi-hop traversal."
+      }
+    ]
+  },
+  {
+    "q": "What are the two dimension types in MetricFlow, what fields are required for each, and how does grain work on a time dimension?",
+    "a": "`categorical` dimensions represent discrete attribute values — product category, region, boolean flags. They map to a column or SQL `expr` and have no grain concept; only `name` and `type: categorical` are required. `time` dimensions enable temporal grouping and require a `granularity` field (in the legacy spec: `type_params.time_granularity`) that declares the finest resolution stored in the column — e.g., `day`, `week`, `month`. MetricFlow automatically coarsens time queries to any grain equal to or coarser than the declared grain (`day` grain → week, month, quarter, year are all valid at query time). Requesting a finer grain than declared fails at validation. Only `time` dimensions participate in the time spine join that produces rows for missing periods.",
+    "fj": "Forgetting to set `granularity` on a time dimension — this causes a validation error. Also, treating `is_partition: true` as optional: without it on partitioned tables, MetricFlow cannot push time-range filters down to prune partitions, causing full scans.",
+    "fs": "Categorical = labels you GROUP BY. Time = timestamps you TRUNCATE; declare the finest grain stored and MetricFlow handles all coarser grains automatically at query time.",
+    "level": "Jr",
+    "followups": [
+      {
+        "q": "What does `is_partition: true` do on a time dimension?",
+        "a": "It signals to MetricFlow that this column is a partition key in the underlying table. MetricFlow uses this hint to push time-range filters down before joining, allowing the warehouse to prune partitions early and avoid full table scans. It is especially important on multi-terabyte Snowflake or BigQuery tables where partition pruning is the primary cost-reduction lever."
+      },
+      {
+        "q": "Can you define a dimension using a SQL expression rather than a direct column reference?",
+        "a": "Yes. Use `expr: <SQL>` on the dimension. For example: `expr: CASE WHEN revenue > 1000 THEN 'high' ELSE 'low' END`. MetricFlow inlines this SQL in the GROUP BY whenever the dimension is requested. The `expr` field accepts any SQL that the target warehouse supports."
+      },
+      {
+        "q": "How many time dimensions can a semantic model declare, and which one drives metric aggregation?",
+        "a": "A semantic model can have any number of time dimensions. The one designated as `agg_time_dimension` in `defaults` (or per measure) drives time-series aggregation for metrics. Additional time dimensions are fully queryable as group-by attributes — for example, querying orders by `shipped_at` month even though `created_at` is the `agg_time_dimension`."
+      }
+    ]
+  },
+  {
+    "q": "What is the MetricFlow time spine, why is it required, and how do you create one for a Snowflake project?",
+    "a": "The time spine is a dbt model containing one row per calendar day (or sub-day grain) for a continuous date range. MetricFlow uses it as a scaffold when `join_to_timespine: true` is set on a measure: it LEFT JOINs the spine to the aggregated fact subquery so every date in the requested range has a row, even dates with no fact data. Without a spine, zero-activity days are absent from results and time-series charts show gaps instead of zeros. For Snowflake, create it with the GENERATOR function: `SELECT DATEADD(day, SEQ4(), '2020-01-01')::DATE AS date_day FROM TABLE(GENERATOR(ROWCOUNT => 3650))`. Register it by setting `config: metricflow_time_spine: {column_name: date_day, granularity: day}` in the model config block.",
+    "fj": "Generating the time spine with only 2 years of history when financial metrics need 5-year trends. Always extend the spine beyond the maximum reporting horizon — a day-grain spine covering 10 years is only ~3,650 rows and costs essentially nothing.",
+    "fs": "Time spine is the date scaffold. join_to_timespine creates rows for missing dates; fill_nulls_with fills those rows with a value. You need both for gap-free time series charts.",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How do you configure a sub-day (hourly) time spine in addition to the default daily spine?",
+        "a": "Create a second dbt model with one row per hour and register it with `granularity: hour` in its config. MetricFlow selects the appropriate spine based on the finest time granularity requested at query time. Only one spine can be the default; sub-day spines are opt-in. Ensure the sub-day spine covers a smaller date range (e.g., 90 days of hourly data) to keep the row count manageable."
+      },
+      {
+        "q": "What SQL does MetricFlow generate when `join_to_timespine: true` is set?",
+        "a": "MetricFlow generates a LEFT JOIN from the time spine to the aggregated metric subquery, matching on the truncated date dimension. This produces one row per spine date within the queried range, with the metric value from the fact subquery where data exists and NULL (or the `fill_nulls_with` value) where it does not. The time spine drives the date range, not the fact table."
+      },
+      {
+        "q": "What is the `grain` field on the time spine model config and what breaks if it is wrong?",
+        "a": "`grain` declares the resolution of each row in the spine. MetricFlow uses this to validate that the spine can satisfy requested time granularities. If the spine declares `grain: day` but a query requests `hour`, MetricFlow raises an `InvalidGranularityError` at query time. Setting `grain` too coarse (e.g., `month` for a daily spine) causes validation failures for any query requesting day-level detail."
+      }
+    ]
+  },
+  {
+    "q": "Explain the four core metric types in MetricFlow — simple, ratio, cumulative, and derived — with their key YAML fields.",
+    "a": "**Simple**: a single aggregation on one measure. Required: `type: simple`, `agg` (sum/count/avg/min/max/percentile). Optional: `expr`, `fill_nulls_with`, `join_to_timespine`, `non_additive_dimension`. **Ratio**: numerator measure divided by denominator measure. Required: `type: ratio`, `numerator`, `denominator`. Optional: independent `filter` on each component; MetricFlow auto-wraps denominator in NULLIF to prevent division-by-zero. **Cumulative**: rolling or period-to-date accumulation of an input metric. Required: `type: cumulative`, `input_metric`. Optional: `window` (e.g., `7 days` for trailing window) or `grain_to_date` (e.g., `month` for MTD) — only one of the two. Also `period_agg`. **Derived**: arbitrary arithmetic expression over two or more named metrics. Required: `type: derived`, `expr` (Jinja arithmetic), `input_metrics` list. Optional: `alias` per input metric, `filter` per input.",
+    "fj": "Trying to reference a measure name directly in a derived metric `expr`. Derived metrics must reference other metric names, not measure names. You must define intermediate simple metrics first.",
+    "fs": "Simple=one agg. Ratio=A÷B (NULLIF auto-applied). Cumulative=rolling window OR period-to-date. Derived=formula over other metrics (not measures).",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How do you implement a 7-day rolling average of daily active users?",
+        "a": "Define a simple metric `daily_active_users` with `agg: count_distinct` on `user_id`. Then define a cumulative metric: `type: cumulative`, `input_metric: daily_active_users`, `window: 7 days`, `period_agg: average`. MetricFlow generates the window frame SQL and joins to the time spine automatically."
+      },
+      {
+        "q": "Can a derived metric apply a filter to only one of its input metrics?",
+        "a": "Yes. Place a `filter:` block inside the specific `input_metrics` entry. For example: `input_metrics: [{name: revenue, filter: '{{ Dimension(\"order__is_refund\") }} = false'}]`. The filter applies only to that component's aggregation before the expression is evaluated, leaving other input metrics unfiltered."
+      },
+      {
+        "q": "What is a conversion metric and how does it differ from a ratio metric?",
+        "a": "A conversion metric (`type: conversion`) tracks whether a specific follow-on event (e.g., purchase) occurred within a time window after a base event (e.g., sign-up) for the same entity. It requires `entity`, `base_metric`, `conversion_metric`, `calculation`, and optionally `window`. Use it when event ordering and timing matter. Use ratio when you just need A÷B counts with no temporal dependency between events."
+      }
+    ]
+  },
+  {
+    "q": "How do metric-level `filter` expressions work in MetricFlow, and what Jinja template functions are available?",
+    "a": "MetricFlow filter expressions use Jinja-templated WHERE clauses. Four template functions are available: (1) `{{ Dimension('entity__dimension_name') }}` — references a categorical dimension, e.g., `{{ Dimension('order__channel') }} = 'web'`. (2) `{{ TimeDimension('dimension_name', 'granularity') }}` — references a time dimension at a specific grain, e.g., `{{ TimeDimension('metric_time', 'week') }} >= '2024-01-01'`. (3) `{{ Entity('entity_name') }}` — references an entity key column directly. (4) `{{ Metric('metric_name', group_by=['entity_name']) }}` — references another metric's value for metric-to-metric filtering. Filters can be placed at the metric level (always applied), at the `numerator`/`denominator` level in ratio metrics, or per entry in `input_metrics` for derived metrics. In the CLI `--where` flag, curly braces require shell escaping in zsh (`setopt BRACECCL` or single-quote the argument).",
+    "fj": "Writing raw SQL column names inside a filter block instead of using `Dimension()` or `TimeDimension()`. MetricFlow's filter syntax only accepts the Jinja template functions — bare SQL column references are rejected at parse time.",
+    "fs": "Four Jinja helpers: Dimension(), TimeDimension(), Entity(), Metric(). All referenced dimensions must be declared in the semantic model graph. Metric() enables metric-to-metric filters for advanced segmentation.",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Can you apply a filter to only the denominator of a ratio metric without affecting the numerator?",
+        "a": "Yes. Place `filter:` inside the `denominator:` block of the ratio metric YAML. The filter is applied only to that component's aggregation subquery. The `numerator:` block can have its own independent filter. This is useful for conversion rate metrics where the denominator includes all users but the numerator filters to converted users."
+      },
+      {
+        "q": "What happens if a filter references a dimension that requires a join to a different semantic model?",
+        "a": "MetricFlow resolves the join path automatically (subject to the two-hop limit). If the referenced dimension is reachable via a valid entity join chain, the filter generates the required JOIN SQL. If it's unreachable, `dbt sl validate` raises a validation error at build time — not a silent query-time failure."
+      },
+      {
+        "q": "How do you write a metric that counts only mobile web orders without adding the platform filter to every measure?",
+        "a": "Add `filter: {{ Dimension('order__platform') }} = 'mobile_web'` at the metric level. This scopes the filter to this specific metric definition, leaving the underlying `order_count` measure reusable for other metrics that need all platforms. The metric-level filter is invisible to BI consumers — they just query `mobile_web_orders` without constructing the filter themselves."
+      }
+    ]
+  },
+  {
+    "q": "How does `fill_nulls_with` work and when must you combine it with `join_to_timespine`?",
+    "a": "`fill_nulls_with` is a measure-level property that replaces NULL aggregation results with a specified scalar (typically `0`). On its own, it only fills NULLs that arise from LEFT JOINs already present in the query — it does not create new rows for date periods entirely absent from the fact table. To also generate rows for missing time periods, you must set `join_to_timespine: true`, which scaffolds every date in the requested range from the time spine before the LEFT JOIN. Use both together on revenue and count metrics so BI charts show `0` on zero-activity days instead of gaps. For ratio metrics, apply `fill_nulls_with: 0` to the numerator and denominator measures individually rather than at the metric level to avoid masking legitimate NULL (indeterminate) division results.",
+    "fj": "Setting `fill_nulls_with: 0` on a ratio metric's output — this replaces a legitimate NULL (no denominator data) with 0 rather than surfacing the true absence of data. Fill the numerator and denominator measures individually instead.",
+    "fs": "join_to_timespine creates the missing rows from the spine. fill_nulls_with populates them with a value. You need both for a gap-free time series. Never fill the ratio metric output — fill the component measures.",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "Can `fill_nulls_with` accept a non-zero value?",
+        "a": "Yes — any scalar matching the measure's data type. For example, `fill_nulls_with: -1` as a sentinel meaning 'data unavailable'. However, non-zero fills in metrics feeding financial reports or alert thresholds are risky — document the intent clearly in the measure's `description` and confirm downstream BI tools handle the sentinel correctly."
+      },
+      {
+        "q": "Does `fill_nulls_with` apply before or after metric-level filters?",
+        "a": "After. MetricFlow evaluates the metric's `filter` (WHERE clause) first, then joins to the time spine (if `join_to_timespine: true`), then applies `fill_nulls_with`. This means a filter that removes all rows for a date still produces a filled-zero row for that date when `join_to_timespine: true` is set."
+      },
+      {
+        "q": "What happens to a cumulative metric if you forget `join_to_timespine: true`?",
+        "a": "The cumulative metric only produces rows for dates that exist in the fact data. If there are no events on a Sunday, Sunday is absent from results entirely. BI tools either interpolate incorrectly or show a gap in the trend line. Adding `join_to_timespine: true` forces the spine to produce the Sunday row with the correct carry-forward cumulative value, giving a complete continuous time series."
+      }
+    ]
+  },
+  {
+    "q": "What is a saved query in MetricFlow, what are its key YAML fields, and how do exports work?",
+    "a": "A saved query is a pre-defined metric query stored as YAML, allowing teams to share and version commonly used metric+dimension combinations. Key YAML fields: `name` (unique identifier), `description`, `metrics` (list), `group_by` (list of dimension or entity names), `where` (optional Jinja filter clause), and `exports` (optional list of materialization targets). Each export entry has `name`, `config.export_as` (`table` or `view`), and `config.schema`. Saved queries are executed with `dbt sl query --saved-query <name>`, listed with `dbt sl list saved-queries`, and exports are run with `dbt sl export` or `dbt sl export-all`. The `--show-exports` flag on `list saved-queries` reveals configured export targets. Exports (materialize results to warehouse) require dbt Cloud Team+.",
+    "fj": "Assuming saved queries are like dbt snapshots and auto-create incremental tables. They are query templates. The `exports` block is what creates warehouse artifacts — without exports, a saved query is purely definitional.",
+    "fs": "Saved query = named, versioned metric query template. exports block = what materializes results to a warehouse table for non-JDBC consumers. dbt sl query --saved-query runs it live; dbt sl export-all materializes all exports.",
+    "level": "Mid",
+    "followups": [
+      {
+        "q": "How do you view a saved query's full parameters and exports in one CLI command?",
+        "a": "Run `dbt sl list saved-queries --show-exports --show-parameters`. The `--show-exports` flag appends export target details (schema, materialization type) and `--show-parameters` shows the full metric, group-by, and filter configuration for each saved query."
+      },
+      {
+        "q": "What is the difference between `dbt sl export` and `dbt sl export-all`?",
+        "a": "`dbt sl export` runs exports for a specific saved query and can target a single export within it using `--select export_name`. `dbt sl export-all` runs all configured exports for all saved queries in the project at once — suitable for a scheduled job that refreshes all materialized semantic outputs after each dbt run."
+      },
+      {
+        "q": "Can a saved query filter on a dimension that is not in the `group_by` list?",
+        "a": "Yes. A `where` clause can filter on any dimension declared in the participating semantic models, even if that dimension is absent from `group_by`. MetricFlow resolves the necessary join path to evaluate the filter and excludes the filtering dimension from the SELECT and GROUP BY, leaving only the declared `group_by` dimensions in the output."
+      }
+    ]
+  },
+  {
+    "q": "Walk through the key `dbt sl` CLI commands for developing, validating, and debugging a new metric from scratch.",
+    "a": "Five-step loop: (1) `dbt parse` — regenerates `semantic_manifest.json` after any YAML change; must run before any `dbt sl` command sees the update. (2) `dbt sl validate` — compile-time check: validates entity graph consistency, missing column references, ambiguous join paths, grain mismatches; no warehouse connection required. (3) `dbt sl list metrics` and `dbt sl list dimensions --metrics <name>` — confirm the metric is registered and inspect which dimensions are reachable via the join graph. (4) `dbt sl query --metrics <name> --group-by metric_time --compile` (dbt Cloud) or `mf query --metrics <name> --explain` (dbt Core) — extract the generated SQL without executing; review join types and filter placement. (5) `dbt sl query --metrics <name> --group-by metric_time --limit 10` — execute live data to spot-check values. For dbt Core open-source users, all `dbt sl` commands map to `mf` equivalents.",
+    "fj": "Skipping `dbt parse` after YAML changes. The semantic manifest is not auto-updated — `dbt sl validate` will report stale errors from the previous manifest until `dbt parse` rebuilds it.",
+    "fs": "parse → validate → list → compile/explain → live query. Parse is the one step developers most often skip, causing confusing stale errors in validate.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What does `dbt sl validate --timeout 60` do?",
+        "a": "It sets a 60-second timeout for the data warehouse validation step — the phase that verifies SQL expressions actually compile against the warehouse schema (e.g., checking column data types). Without a timeout, validation can hang indefinitely on a slow or suspended warehouse connection."
+      },
+      {
+        "q": "How do you filter a `dbt sl query` to a specific date range?",
+        "a": "Use `--where` with TimeDimension Jinja syntax: `--where \"{{ TimeDimension('metric_time', 'day') }} >= '2024-01-01'\"`. In dbt Core/mf, the `--start-time` and `--end-time` flags provide a shorthand. Multiple `--where` flags are combined with AND. In zsh, wrap the entire where argument in single quotes to prevent curly brace interpretation."
+      },
+      {
+        "q": "How do you view the MetricFlow dataflow plan for a query?",
+        "a": "Add `--show-dataflow-plan` to any `dbt sl query` or `mf query` command. The plan displays the logical nodes (joins, aggregations, filters) MetricFlow constructs before compiling to SQL. This is the primary tool for spotting unexpected fan-outs or extra join hops that inflate metric values."
+      }
+    ]
+  },
+  {
+    "q": "Describe the dbt Cloud Semantic Layer architecture: what components sit between a BI tool query and the data warehouse?",
+    "a": "The request chain is: **BI tool → dbt Cloud Semantic Layer API → MetricFlow engine → Data warehouse**. The BI tool connects via JDBC (Arrow Flight SQL protocol), ADBC (Arrow-native, lower serialization overhead), or the GraphQL API. dbt Cloud hosts the Semantic Layer service, which loads the compiled `semantic_manifest.json` produced by `dbt parse`. When a query arrives, the MetricFlow engine resolves metric and dimension names against the manifest, traverses the entity join graph, and generates warehouse-dialect SQL (Snowflake, BigQuery, Databricks, Redshift, etc.). That SQL executes in the warehouse; results flow back through the same chain. MetricFlow is a query generation engine — all computation happens in the downstream warehouse. A Python `dbt-sl-sdk` wraps the GraphQL API for notebook consumers. There is no result cache by default; every query hits the warehouse live.",
+    "fj": "Thinking MetricFlow is a compute engine that executes queries itself. It is purely a SQL generation and routing layer. All computation happens in the warehouse.",
+    "fs": "BI → JDBC/ADBC/GraphQL → dbt Cloud manifest → MetricFlow SQL gen → Warehouse. MetricFlow translates, the warehouse computes. No intermediate cache by default.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is the difference between the JDBC and ADBC connection protocols for the Semantic Layer?",
+        "a": "JDBC uses the Arrow Flight SQL protocol over JDBC drivers — the most mature and widely supported option. Results are serialized from the warehouse through the Semantic Layer to the BI client. ADBC (Arrow Database Connectivity) is Arrow-native end-to-end, eliminating serialization overhead by keeping results in Apache Arrow columnar format through the entire pipeline. ADBC offers significantly better throughput for large result sets. Python clients using `adbc_driver_flightsql` and tools like Hex/Mode benefit most from ADBC."
+      },
+      {
+        "q": "What is `semantic_manifest.json` and how does it get updated in production?",
+        "a": "`semantic_manifest.json` is the compiled artifact produced by `dbt parse` that encodes all semantic models, entities, dimensions, measures, and metrics in a machine-readable format. The Semantic Layer API loads this manifest at startup. Updating metric definitions requires running `dbt parse` (or a full `dbt build`) and redeploying the manifest to dbt Cloud — typically via a CI/CD pipeline triggered on merge to main. Until the manifest is redeployed, newly added metrics are invisible to BI consumers."
+      },
+      {
+        "q": "How does dbt Cloud authenticate Semantic Layer API requests?",
+        "a": "Authentication uses a service token scoped to the dbt Cloud environment, created in Account Settings → Service Tokens. Each JDBC/ADBC connection must pass the token along with the `host`, `port` (443), and `environmentId`. Tokens should be scoped to 'Semantic Layer Only' (read-only) permissions and rotated on a schedule. Multiple teams should not share a single token — use separate tokens per team to enable revocation without disrupting other consumers."
+      }
+    ]
+  },
+  {
+    "q": "How do you connect Tableau Desktop to the dbt Cloud Semantic Layer and what are the most common failure modes?",
+    "a": "Steps: (1) Download the dbt Semantic Layer `.taco` connector file from Tableau Exchange. (2) Install the Arrow Flight SQL JDBC driver (provided by dbt Labs, NOT the generic Simba/other drivers) into Tableau's driver folder (`~/Library/Tableau/Drivers` on macOS, `C:/Program Files/Tableau/Drivers` on Windows). (3) In Tableau, connect via 'Other Databases (JDBC)' or the named dbt connector, supplying `host`, `port` (443), `environmentId`, and the service token. (4) Tableau lists metrics as columns and dimensions as groupable fields. Common failures: wrong JDBC driver version (Tableau's error message is generic — always verify driver version matches dbt's release notes); port 443 blocked by corporate firewall to dbt Cloud; stale `semantic_manifest.json` making newly added metrics invisible; service token with expired or insufficient scope; `.taco` file not placed in the correct Tableau connectors directory.",
+    "fj": "Using a generic JDBC driver (e.g., Simba Snowflake driver) instead of dbt's specific Arrow Flight SQL driver. Tableau will appear to connect but fail silently or return no metrics because the protocol is incompatible.",
+    "fs": "Tableau needs TWO artifacts beyond credentials: the .taco connector file AND the specific dbt Arrow Flight JDBC driver in the correct folder. Missing either causes a silent connection failure with a generic error.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How does connecting Looker to the dbt Semantic Layer differ architecturally from Tableau?",
+        "a": "Looker uses its native dbt Semantic Layer integration rather than JDBC. It generates LookML Explores that proxy metric/dimension queries to the Semantic Layer GraphQL API. Metrics and dimensions appear in Looker as native LookML fields. This avoids JDBC driver installation and is faster to set up, but requires Looker admin access to configure the connection and a Looker version that supports the dbt integration (Looker 23.0+)."
+      },
+      {
+        "q": "How would you expose Semantic Layer metrics to a team that only has SQL client access and no BI tool?",
+        "a": "Configure saved query exports with `export_as: table` targeting a schema the team can query. Schedule `dbt sl export-all` after each dbt run. The materialized tables appear as ordinary warehouse tables queryable via any SQL client (DBeaver, DataGrip, psql) without JDBC or Semantic Layer API access."
+      },
+      {
+        "q": "What version constraints exist for the Tableau dbt Semantic Layer connector?",
+        "a": "The certified connector requires Tableau Desktop 2023.1+ and Tableau Server 2023.1+. Older versions may work with community connectors but lack official support. Always check the dbt Labs release notes for the Tableau connector alongside each dbt Cloud environment version, as the connector and the Semantic Layer API version must be compatible."
+      }
+    ]
+  },
+  {
+    "q": "What are the critical breaking changes when migrating from legacy dbt metrics v1 to MetricFlow and how do you automate the migration?",
+    "a": "Key breaking changes: (1) `type_params` block deprecated — all nested fields (`measure`, `numerator`, `denominator`, `window`, `grain_to_date`, `percentile`) must be promoted to top-level keys on the metric. (2) `semantic_models:` as a standalone top-level YAML key replaced by `semantic_model:` nested under the model entry in the new spec (dbt Core v1.12+). (3) Entities and dimensions move from standalone sections to under `columns:` in the new spec, creating a 1:1 mapping between physical columns and semantic declarations. (4) Standalone `measures:` concept replaced by `type: simple` metrics in the new spec. (5) **Cross-project refs (dbt Mesh) are unsupported** in the new spec — teams using Mesh must stay on the legacy spec until this is resolved. Automation: run `dbt-autofix deprecations --semantic-layer` then `dbt parse && dbt sl validate` to verify. In the dbt Cloud IDE, run the command and click 'Commit and sync'.",
+    "fj": "Migrating your project while still using dbt packages (e.g., dbt_utils, dbt_project_evaluator) that haven't been updated by their maintainers. Package metrics still on the old spec cause silent failures — check package compatibility before migrating.",
+    "fs": "Three big changes: type_params goes flat, semantic_models becomes nested under models, measures become simple metrics. Run dbt-autofix to automate the mechanical rewrite, then validate.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "After migrating, how do you confirm the metric values are unchanged?",
+        "a": "Run `dbt sl query` for a set of key metrics before and after migration on an identical date range and diff the results. A practical approach: create a saved query capturing the pre-migration baseline and export it to a table; after migration, run the same query and compare with a dbt test asserting <1% absolute difference. This becomes the migration acceptance gate."
+      },
+      {
+        "q": "What is `dbt-autofix` and where does it come from?",
+        "a": "`dbt-autofix` is a dbt Labs CLI utility that mechanically rewrites legacy metric YAML to the current spec — renaming fields, promoting `type_params` keys to top level, and restructuring semantic model blocks. It is available as a standalone pip package and built into the dbt Cloud IDE. It handles structural rewrites but cannot make business-logic decisions (e.g., which `agg_time_dimension` to assign to a migrated measure)."
+      },
+      {
+        "q": "After migration, will existing BI dashboards connected via JDBC break?",
+        "a": "Not if metric names and dimension names are unchanged. The JDBC API is name-based, so as long as identifiers are preserved and the manifest is redeployed after `dbt parse`, existing dashboards continue to work. The primary breaking risk is if you rename metrics or entity names during the migration — rename changes are the equivalent of a breaking API change for BI consumers."
+      }
+    ]
+  },
+  {
+    "q": "How does MetricFlow resolve multi-hop join paths across semantic models, what is the hop limit, and how is the path encoded in dimension names?",
+    "a": "MetricFlow builds a directed graph where semantic models are nodes and shared entity names are edges (foreign→primary). When a query requests a dimension not present in the metric's own semantic model, MetricFlow performs a graph traversal to find a join path. The hard limit is **two hops** (joining up to three tables). Example of a valid two-hop path: `fct_orders → dim_customers (hop 1) → dim_countries (hop 2)` — the dimension `customer__country__name` is reachable. A third hop (`dim_regions`) would require three hops from `fct_orders` and is blocked. The traversal path is encoded in query dimension names using double-underscore notation: `customer__country__name` tells MetricFlow to join `orders→customers` then `customers→countries`. MetricFlow uses LEFT OUTER JOINs along the path. If multiple equally-valid paths exist to the same dimension, `dbt sl validate` raises an ambiguity error.",
+    "fj": "Assuming the two-hop limit is per query. The limit is per dimension — you can join more than three semantic models in a single query as long as no individual dimension requires more than two hops to reach.",
+    "fs": "Two hops = three tables max per dimension. Double-underscore encodes the path: entity__entity__dimension. If MetricFlow finds two routes to the same dimension, it raises an AmbiguousJoinPathError — fix by renaming one entity.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you resolve an ambiguous join path where MetricFlow finds two routes to the same dimension?",
+        "a": "Rename the intermediate entity in one of the semantic models to break the ambiguity — MetricFlow only joins on exact entity name matches. For example, rename `address_id` to `billing_address_id` in one model and `shipping_address_id` in another. This makes the paths distinct and removes the ambiguity. There is no `prefer_join` or `disable_join` flag."
+      },
+      {
+        "q": "What join type does MetricFlow use when joining two fact-level (primary entity) semantic models?",
+        "a": "A FULL OUTER JOIN, to preserve rows that exist in one fact table but not the other. This prevents dropping sessions with no purchases (or vice versa) when combining metrics from different fact sources. MetricFlow selects FULL OUTER JOIN automatically when it detects the join is between two primary-entity semantic models, not between a fact and dimension."
+      },
+      {
+        "q": "What happens when a query requests a dimension that is exactly two hops away but the intermediate entity has nullable foreign keys?",
+        "a": "MetricFlow still uses LEFT OUTER JOINs along the path. Rows where the intermediate entity is NULL will produce NULL for all dimensions further along the path. MetricFlow does not fail — it returns NULLs for those rows in the result set. To prevent this, add a `not_null` dbt test on the intermediate foreign key column to ensure data quality before the semantic layer exposes the dimension."
+      }
+    ]
+  },
+  {
+    "q": "A metric returns different values in a BI dashboard versus a manual SQL query against the source table. Describe your debugging methodology using MetricFlow tools.",
+    "a": "Systematic six-step approach: (1) **Extract generated SQL**: run `dbt sl query --metrics <name> --group-by metric_time --compile` (or `mf query --explain`) and compare the generated SQL line-by-line against your manual query. (2) **Check JOIN types**: MetricFlow defaults to LEFT OUTER JOINs; if your manual query uses INNER JOINs, row counts differ for unmatched dimension keys. (3) **Check entity types for fan-out**: if a wrong entity type (e.g., `primary` declared where `foreign` is correct) creates a fan-out, aggregations inflate. Run `dbt sl query --show-dataflow-plan` to spot fan-out nodes. (4) **Check metric-level filters**: the metric YAML may have a `filter` clause your manual SQL omits. (5) **Check fill_nulls_with and join_to_timespine**: a `0` fill for missing periods changes SUM totals when manual SQL excludes those periods. (6) **Check manifest freshness**: run `dbt parse` if the metric definition was recently changed — stale manifest means the Semantic Layer API executes old logic.",
+    "fj": "Assuming the discrepancy is a MetricFlow bug and filing an issue upstream before investigating your own YAML. The vast majority of discrepancies are caused by JOIN type differences, fan-outs, timezone handling, or filter mismatches in your own semantic model.",
+    "fs": "Start with --compile to extract the SQL, then work backwards: JOIN types → entity fan-out → metric filters → fill/spine → manifest freshness. 90% of discrepancies are found in the first two steps.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How do you identify whether a discrepancy is caused by a fan-out join?",
+        "a": "Run the intermediate JOIN step as a standalone SQL query (paste from `--compile` output) and COUNT(*) the result before aggregation. Compare against COUNT(*) of the base fact table for the same date range. If the joined result has more rows, you have a fan-out. The fix: change the entity type on the offending relationship, or pre-join in the dbt model to collapse the fan-out before it reaches the semantic layer."
+      },
+      {
+        "q": "How do you write a regression test that catches future metric discrepancies in CI?",
+        "a": "Create a dbt singular test or use `dbt-unit-testing` to query the metric via the Python SDK for a fixed historical date range and assert the value matches a stored expected value (e.g., checked into a seed CSV). Run this test on every PR modifying the semantic model YAML or the backing dbt model. A >1% deviation from the expected value fails the PR."
+      },
+      {
+        "q": "A metric was accurate last quarter but is wrong this quarter. How do you investigate a historical drift?",
+        "a": "Check the git log for changes to the semantic model YAML, backing dbt model SQL, and metric YAML in the relevant time window. MetricFlow applies the current definition retroactively — if a filter was added or an entity type was changed, historical query results change silently. Checkout the old commit hash, run `dbt parse` and `dbt sl query` against historical data with the old definition to confirm the discrepancy started at the deployment date."
+      }
+    ]
+  },
+  {
+    "q": "Compare MetricFlow to LookML and AtScale as semantic layer approaches — what are the practical trade-offs for a Data or Analytics Engineering team?",
+    "a": "**Portability**: MetricFlow is BI-agnostic — metrics defined once flow to Tableau, Looker, Hex, Mode, Python via JDBC/ADBC/GraphQL. LookML is Looker-proprietary; migrating off Looker requires rewriting all metric definitions. AtScale supports MDX for Excel/OLAP clients which MetricFlow does not. **Governance**: MetricFlow lives in the dbt git repo alongside transformations — PR reviews, CI validation (`dbt sl validate`), and lineage are native. LookML is also git-tracked but in a separate Looker repo. AtScale has stronger row-level security and column-level RBAC at the semantic layer; MetricFlow inherits warehouse permissions only. **Join logic**: MetricFlow auto-generates joins from entity declarations. LookML requires explicit `join:` blocks with manually specified conditions. **BI richness**: LookML has richer features (drill fields, liquid templating, explores) MetricFlow does not replicate — MetricFlow is intentionally thin. **Latency**: MetricFlow routes through dbt Cloud API (extra hop, ~<100ms overhead). LookML compiles directly in Looker's engine. Native Snowflake Semantic Views or Databricks Metric Views have zero extra hops. **Cost**: MetricFlow is open-source; dbt Cloud Team+ needed for the JDBC endpoint.",
+    "fj": "Recommending MetricFlow for everything. The honest answer: use MetricFlow when you have multi-BI-tool requirements and want metrics in version control. Stay on LookML if Looker is your single BI tool and you use advanced explore features. Consider native semantic views for Snowflake/Databricks single-platform shops.",
+    "fs": "MetricFlow wins on portability + git governance + open-source. LookML wins on Looker BI richness + direct query latency. AtScale wins on MDX/Excel OLAP support + granular RBAC. Match the tool to the org's BI stack and governance needs.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Can MetricFlow and LookML coexist in the same org without duplicating metric definitions?",
+        "a": "Yes. Looker's native dbt Semantic Layer integration proxies MetricFlow queries through Looker Explores. Metrics defined once in MetricFlow appear in Looker as native LookML fields — no LookML duplication needed. Existing LookML explores can coexist with dbt Semantic Layer explores in the same Looker instance during a migration period."
+      },
+      {
+        "q": "What is the main argument against MetricFlow in a Snowflake-only shop?",
+        "a": "Snowflake Semantic Views (released 2024-2025) embed metric definitions as first-class Snowflake objects, avoiding the dbt Cloud dependency and extra network hop. For shops already committed to Snowflake, native semantic views offer lower latency, native RBAC, and no additional subscription cost. The counter-argument is portability and git-driven governance — native Snowflake objects don't provide multi-BI-tool reach or PR-reviewed metric versioning."
+      },
+      {
+        "q": "How does MetricFlow differ from dbt's `metrics:` v1 spec (legacy)?",
+        "a": "Legacy dbt metrics v1 (dbt 1.0–1.5) were single-table aggregation definitions using a `metrics.calculate()` Jinja macro — no semantic models, no entity-based join resolution, no multi-hop joins. MetricFlow (dbt 1.6+) replaced this with a full semantic graph, warehouse-native SQL generation, cumulative/derived/ratio types, time spine support, and a JDBC/ADBC API for BI tools. The v1 YAML schema is incompatible — migration requires introducing semantic model blocks and rewriting all metric YAML."
+      }
+    ]
+  },
+  {
+    "q": "How would you govern metric definitions across 50+ analytics engineers and 8 domain teams in a large dbt MetricFlow project to prevent metric sprawl and silent inconsistency?",
+    "a": "Three-layer governance framework: (1) **Namespace and naming conventions**: prefix all measure, dimension, and metric names with a domain code (`fin_`, `mktg_`, `ops_`); leave entity names unprefixed (intentionally global for join resolution). Enforce via a `dbt-score` or custom pre-commit lint rule that rejects non-prefixed names in CI. (2) **Ownership and review gates**: use `CODEOWNERS` to assign `semantic_models/` and `metrics/` subdirectories to domain teams; metric changes require approval from the designated 'metric steward' for that domain. Require `meta.owner` and `description` on every metric — a custom dbt test blocks the PR if these fields are absent. (3) **CI contracts**: `dbt sl validate` on every PR is a merge gate. Use dbt's `config.contract.enforced: true` on high-stakes semantic models to prevent undeclared column renames from reaching BI consumers. Add a `metrics_change_log.md` entry requirement for PRs modifying public metrics, enforced via a PR template checklist.",
+    "fj": "Treating metric governance as a documentation-only problem — requiring descriptions but not enforcing them via automated checks. Documentation without automation is bypassed under deadline pressure.",
+    "fs": "Prefix names by domain + CODEOWNERS for review gates + required owner/description enforced by CI tests + dbt sl validate as a merge gate. Governance must be automated, not advisory.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How do you handle two teams that have conflicting definitions of the same business metric (e.g., 'active users')?",
+        "a": "Surface the conflict quantitatively: query both definitions for the same date range and document the numerical difference. Convene metric stewards from both teams with a business stakeholder. The outcome is one canonical metric in a shared semantic model owned by a platform team, plus explicitly named domain-scoped variants (`active_users_product`, `active_users_marketing`). Mark conflicting definitions `meta.deprecated: true` with a `meta.successor` pointer and a removal date. Never silently overwrite one team's definition."
+      },
+      {
+        "q": "What tooling detects near-duplicate metric definitions before they proliferate?",
+        "a": "Parse `target/manifest.json` with a Python script (using dbt's manifest schema) to extract all metric `agg` types, measure references, and filter hashes. Flag metrics with identical measure+filter combinations but different names as duplicate candidates. Run this as a custom CI lint step. The `dbt_project_evaluator` community package also provides extensible rules for detecting incomplete or duplicated metric metadata."
+      },
+      {
+        "q": "How do you version public metrics to prevent breaking BI dashboards when a definition must change?",
+        "a": "Model dbt metric versioning after dbt's model versioning feature (dbt 1.6+): maintain `metrics/v1/revenue.yml` and `metrics/v2/revenue.yml` with distinct names (`revenue_v1`, `revenue_v2`). Keep v1 in production with a `meta.deprecation_date` and a Slack/email notification to all dashboard owners. Remove v1 only after confirming zero JDBC query traffic (monitor via dbt Cloud audit logs). Set a 2-sprint minimum migration window."
+      }
+    ]
+  },
+  {
+    "q": "How do you configure MetricFlow for a Snowflake-backed project, including warehouse-specific performance and security considerations?",
+    "a": "Snowflake-specific setup: (1) **Connection**: `profiles.yml` with `type: snowflake`; the service account needs `SELECT` on all source tables and `CREATE TABLE/VIEW` on export schemas. Use a dedicated role (e.g., `semantic_layer_role`) separate from transformation roles. (2) **Time spine**: use Snowflake's GENERATOR: `SELECT DATEADD(day, SEQ4(), '2020-01-01')::DATE AS date_day FROM TABLE(GENERATOR(ROWCOUNT => 3650))`. Register with `config: metricflow_time_spine: {column_name: date_day, granularity: day}`. (3) **Clustering**: cluster fact tables on their primary time dimension column so MetricFlow's time-range filters prune micro-partitions — e.g., `CLUSTER BY (event_date)`. (4) **Dedicated virtual warehouse**: provision a separate warehouse (Medium or Large) exclusively for Semantic Layer queries to prevent contention with dbt transformation jobs. (5) **Column masking**: the service account inherits Snowflake Dynamic Data Masking policies — if PII columns are masked for the service role, MetricFlow dimensions built on those columns return masked values to all BI consumers. Audit masking policies before go-live.",
+    "fj": "Using the same Snowflake virtual warehouse for both dbt transformation runs and MetricFlow Semantic Layer queries. When a heavy dbt run fires, Semantic Layer latency spikes and BI dashboards time out.",
+    "fs": "Dedicate a separate Snowflake warehouse to the Semantic Layer. Cluster fact tables on the time dimension column. Audit column masking on the service account — masking policies are invisible to MetricFlow and affect all BI consumers equally.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does Snowflake's query result cache interact with MetricFlow queries?",
+        "a": "Snowflake caches query results for up to 24 hours for byte-for-byte identical SQL. If MetricFlow generates identical SQL across repeated BI queries (same metric, dimensions, filters, date range), all subsequent queries after the first are served from the result cache at zero compute cost. The cache is invalidated when the underlying table is written to (i.e., after a dbt run), so the first dashboard load after a dbt run incurs full compute cost."
+      },
+      {
+        "q": "Does MetricFlow support Snowflake Dynamic Tables as the backing dbt model?",
+        "a": "Yes. Any dbt model materialized as a Snowflake Dynamic Table is queryable by MetricFlow via its semantic model declaration. Dynamic Tables auto-refresh on a configured schedule, making the Semantic Layer always query the latest materialized state. This is useful for near-real-time dashboards — configure `TARGET_LAG = '10 minutes'` on the Dynamic Table backing your fact semantic model."
+      },
+      {
+        "q": "How would you test MetricFlow SQL performance on Snowflake before going to production?",
+        "a": "Use `dbt sl query --compile` to extract the generated SQL, run it in Snowflake with `EXPLAIN` to inspect the query plan, and review step costs in the Snowflake Query Profile UI. Look for full table scans (missing clustering key filter pushdown). Check `SYSTEM$CLUSTERING_DEPTH()` on the fact table — recluster if depth exceeds 1.4. Run the query 3 times on a cold cache and average the execution times to establish a baseline latency budget."
+      }
+    ]
+  },
+  {
+    "q": "How do you configure MetricFlow with Databricks and Unity Catalog, and what are the key integration points and constraints?",
+    "a": "Databricks-specific setup: (1) **Connection**: `profiles.yml` with `type: databricks`, `http_path` pointing to a SQL warehouse endpoint (not an interactive cluster), and `catalog` for Unity Catalog. The service principal needs `USE CATALOG`, `USE SCHEMA`, `SELECT` on source tables, and `CREATE TABLE` on export schemas. (2) **SQL warehouse**: MetricFlow must use a SQL warehouse — interactive clusters are session-based and not compatible with the always-on Semantic Layer API model. Serverless SQL warehouses are preferred for auto-scaling and fast cold starts. (3) **Time spine**: use `SELECT EXPLODE(SEQUENCE(DATE '2020-01-01', DATE '2030-12-31', INTERVAL 1 DAY)) AS date_day`. (4) **Liquid clustering**: for Delta tables backing large fact semantic models, use `CLUSTER BY (event_date)` to align with MetricFlow's time-range filter pushdown — liquid clustering automatically optimizes over time. (5) **Unity Catalog lineage**: SQL-level lineage from Semantic Layer query executions is captured automatically in Unity Catalog's lineage UI.",
+    "fj": "Connecting MetricFlow to an interactive Databricks cluster instead of a SQL warehouse. Interactive clusters are session-scoped, don't support concurrent connections well, and will timeout for long-running Semantic Layer sessions.",
+    "fs": "SQL warehouses only (not clusters). Service principal with Unity Catalog grants. Liquid clustering on fact table time columns. Serverless warehouses for scale-to-zero cost control.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How does Unity Catalog's row-level filtering interact with MetricFlow metric values?",
+        "a": "Unity Catalog row filters are enforced at the Delta engine level, below the SQL layer MetricFlow generates. Row filters apply transparently — MetricFlow never sees filtered-out rows. This means a service principal with a restrictive row filter produces different metric values than one without. If the Semantic Layer service principal is restricted, ALL BI consumers see restricted data. Audit which row filters apply to the service principal before go-live and document this in the semantic model description."
+      },
+      {
+        "q": "Can MetricFlow reference Delta Live Tables (DLT) outputs as backing models?",
+        "a": "Not directly — DLT pipelines materialize tables in a Unity Catalog schema, and those tables are queryable like any Delta table. Create a dbt model that references the DLT output table via a direct SQL reference or `source()`, then build the semantic model on that dbt model. MetricFlow never interacts with DLT pipeline logic directly."
+      },
+      {
+        "q": "What is the recommended Databricks SQL warehouse tier for a production Semantic Layer?",
+        "a": "Serverless SQL warehouses are preferred — they scale to zero when idle, start in seconds, and auto-scale horizontally. For predictable latency SLAs where cold-start latency is unacceptable, a dedicated Pro SQL warehouse with `auto_stop_mins: 10` balances cost and warmth. Avoid Shared SQL warehouses in production — query queuing from other users introduces unpredictable and uncontrollable latency."
+      }
+    ]
+  },
+  {
+    "q": "Design the complete semantic model YAML for a `fct_orders` table with a primary order entity, foreign customer entity, an order date time dimension, a revenue measure, and a cancelled status categorical dimension. Include a ratio metric for cancellation rate.",
+    "a": "```yaml\n# Legacy spec (dbt Core < 1.12)\nsemantic_models:\n  - name: orders\n    model: ref('fct_orders')\n    description: \"Order-level fact table for revenue and cancellation metrics.\"\n    defaults:\n      agg_time_dimension: order_date\n    entities:\n      - name: order_id\n        type: primary\n      - name: customer_id\n        type: foreign\n        expr: customer_id\n    dimensions:\n      - name: order_date\n        type: time\n        type_params:\n          time_granularity: day\n      - name: is_cancelled\n        type: categorical\n        expr: \"CASE WHEN status = 'cancelled' THEN TRUE ELSE FALSE END\"\n    measures:\n      - name: revenue\n        agg: sum\n        expr: order_amount_usd\n        agg_time_dimension: order_date\n      - name: cancelled_orders\n        agg: sum\n        expr: \"CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END\"\n        agg_time_dimension: order_date\n      - name: total_orders\n        agg: count\n        expr: order_id\n        agg_time_dimension: order_date\n\nmetrics:\n  - name: cancellation_rate\n    type: ratio\n    numerator: cancelled_orders\n    denominator: total_orders\n    description: \"Fraction of orders cancelled. Denominator uses NULLIF auto-protection.\"\n```\nIn the new spec (dbt Core v1.12+), `semantic_model:` nests under the model YAML entry, entities/dimensions live under `columns:`, and `type_params` is replaced by top-level `granularity:` on the column.",
+    "fj": "Forgetting `agg_time_dimension` on each measure when `defaults.agg_time_dimension` is not set. Also, trying to define the ratio metric's numerator and denominator as raw column expressions instead of named measures — they must reference declared measure names.",
+    "fs": "Entity=join key type matters for join graph. Measure=named aggregation reusable across metrics. Ratio metric references measure names, not column names. Always set agg_time_dimension at defaults level to DRY up measure declarations.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "How would you add a metric for average order value using these existing measures?",
+        "a": "Add a measure `order_count: agg: count, expr: order_id` (or reuse `total_orders`). Then define a ratio metric: `type: ratio, numerator: revenue, denominator: total_orders`. Alternatively, add a `agg: average` measure directly: `avg_order_value: agg: average, expr: order_amount_usd` and expose it as a simple metric."
+      },
+      {
+        "q": "How do you make `is_cancelled` available for metrics defined in a different semantic model for the same customer?",
+        "a": "As long as the other semantic model declares `customer_id` as an entity that joins to `orders` (directly or via a shared entity), MetricFlow can traverse `other_model → orders` and expose `order__is_cancelled` as a groupable dimension in queries on the other model's metrics — up to the two-hop limit."
+      },
+      {
+        "q": "What change do you make if `order_amount_usd` is stored in cents (integer) but the metric should display in dollars?",
+        "a": "Set `expr: order_amount_usd / 100.0` on the `revenue` measure. MetricFlow inlines this as `SUM(order_amount_usd / 100.0)` in the generated SQL. No changes needed to the metric definition — the measure expression handles the unit conversion transparently."
+      }
+    ]
+  },
+  {
+    "q": "What is `non_additive_dimension` on a MetricFlow measure, when do you need it, and how does it interact with cumulative and ratio metrics?",
+    "a": "`non_additive_dimension` tells MetricFlow that a measure cannot be simply summed across values of a specific dimension — instead it must be re-aggregated using the declared `agg` function within each dimension slice. The canonical example is a `current_mrr` measure on a subscriptions snapshot table: you cannot SUM monthly_mrr across all months to get today's MRR — you need the LATEST value per customer. Declare it as: `non_additive_dimension: {name: snapshot_date, window_choice: max}`. MetricFlow then generates a MAX(snapshot_date) filter per customer before summing, preventing incorrect cross-period aggregation. Non-additive dimensions are supported on `simple` metric measures. They do NOT work on measures used as inputs to cumulative metrics (cumulative metrics handle their own windowing logic). For ratio metrics, apply `non_additive_dimension` to the numerator or denominator measure definitions individually before the ratio is computed.",
+    "fj": "Omitting `non_additive_dimension` on snapshot/balance metrics (MRR, account balance, active seat count). Without it, MetricFlow SUM()s across all snapshot dates and returns a wildly inflated number. This is the silent inflation bug that most commonly affects finance metrics.",
+    "fs": "Non-additive = 'don't SUM across this dimension, re-aggregate instead'. Required for any snapshot or balance metric (MRR, headcount, inventory). window_choice: max selects the latest snapshot row per grain before aggregating.",
+    "level": "Staff",
+    "followups": [
+      {
+        "q": "What are the two `window_choice` options for `non_additive_dimension` and what does each do?",
+        "a": "`window_choice: max` selects the row with the maximum value of the non-additive dimension (e.g., the most recent snapshot date) within each grouping before aggregation — used for 'current balance' style metrics. `window_choice: min` selects the minimum value — used for 'opening balance' or 'first observation' metrics. No other window choices are currently supported."
+      },
+      {
+        "q": "How do you verify that a `non_additive_dimension` is working correctly in generated SQL?",
+        "a": "Run `dbt sl query --metrics <metric_name> --group-by metric_time__month --compile`. In the generated SQL, look for a window function or a MAX(snapshot_date) subquery that filters each customer to their latest snapshot row before the outer SUM. If the SQL shows a simple `SUM(mrr)` across all rows with no date filter, `non_additive_dimension` is misconfigured or missing."
+      },
+      {
+        "q": "Can `non_additive_dimension` reference a dimension from a joined semantic model?",
+        "a": "No. `non_additive_dimension` must reference a dimension declared within the same semantic model as the measure. It cannot traverse entity joins. If the non-additive filtering dimension lives in a separate semantic model, you must denormalize it into the backing dbt model and declare it as a local dimension before using it in `non_additive_dimension`."
+      }
+    ]
+  },
+  {
+    "q": "A company has 200+ dbt models and 60 metrics spread across 8 teams. Design a strategy to govern metric definitions, prevent name collisions, and enforce consistency at scale.",
+    "a": "Four-pillar strategy: (1) **Namespace discipline**: MetricFlow has a single flat project-wide namespace. Prefix all measure, dimension, and metric names with a 2-4 char domain code (`fin_`, `mktg_`, `ops_`, `eng_`). Leave entity names global (unprefixed) — this is intentional for join resolution. Enforce via automated lint in CI. (2) **Ownership infrastructure**: use `CODEOWNERS` to map `semantic_models/<domain>/` and `metrics/<domain>/` to domain teams. Every metric requires `meta.owner` and `description` — a custom dbt test blocks the PR otherwise. (3) **CI gates**: `dbt sl validate` runs on every PR touching YAML files and is a hard merge gate. Add a `dbt_project_evaluator` rule for duplicate measure+filter combinations. (4) **Consumer contracts and deprecation workflow**: high-stakes semantic models use `config.contract.enforced: true` to block undeclared column renames. Deprecations require `meta.deprecated: true`, `meta.successor`, and a 2-sprint freeze period announced via Slack. Metric registry (dbt docs site) is the canonical discovery surface — mandate its use over ad-hoc Slack queries.",
+    "fj": "Relying on code review alone for metric governance without automated enforcement. Reviewers miss subtle naming collisions and missing metadata under time pressure. Automation must be the primary gate.",
+    "fs": "Flat namespace = enforce domain prefixes everywhere except entity names. CODEOWNERS + CI dbt sl validate = automated ownership and correctness. Contracts + deprecation workflow = consumer protection.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you identify orphaned metrics (defined but never queried) for deprecation candidates?",
+        "a": "Parse dbt Cloud Semantic Layer API audit logs (available at `/api/v2/accounts/{id}/audit-logs/`) to build a metric query frequency table. Schedule a weekly report flagging metrics with zero queries in the past 30 days. Cross-reference with Tableau/Looker usage APIs to confirm no BI tool consumption. Surface this report to domain metric stewards monthly as part of a 'metric health review'."
+      },
+      {
+        "q": "How do you handle a situation where a finance team insists their revenue metric formula must remain private?",
+        "a": "Create a restricted private git repository for finance metrics, imported into the main project via a private dbt package reference. Finance retains code access control and ownership; MetricFlow exposes only the compiled metric outputs via the Semantic Layer API without exposing the YAML source. The manifest is compiled from all packages — the formula stays private but the metric name is public."
+      },
+      {
+        "q": "How do you measure the ROI of the MetricFlow investment to justify dbt Cloud cost to leadership?",
+        "a": "Quantify: (1) Hours per sprint saved on 'metric discrepancy' investigations before vs. after MetricFlow (one source of truth eliminates analyst debates). (2) BI tool license savings if a cheaper tool replaces Looker enabled by MetricFlow's BI-agnostic layer. (3) Developer time saved not rewriting the same metric logic in each BI tool. (4) Incident reduction from metric inconsistencies in exec dashboards. Frame as operational leverage: each analytics engineer hour saved on discrepancy debugging compounds across the team."
+      }
+    ]
+  },
+  {
+    "q": "A three-hop join chain (events → sessions → users → user_segments) exceeds MetricFlow's two-hop limit. Design a solution that makes user_segment available for an events metric within the constraint.",
+    "a": "Three resolution options: (1) **Denormalize one hop in dbt** (recommended): create `fct_events_enriched` as an intermediate dbt model that pre-joins `events` to `user_segments` via `users` and `sessions`. The semantic model on this model only needs one hop to reach any `user_segment` dimension. This is preferred for high-frequency metrics because the JOIN is done once at materialization time, not at every query. (2) **Bridge semantic model**: create `dim_session_user_segment` that collapses `sessions → users → user_segments` into a single grain model. This semantic model is two entities from `fct_events`, keeping the total hops at two. (3) **Denormalize segment into sessions**: if `user_segment` is a slowly changing attribute, materialize it as a column directly in the `fct_sessions` dbt model via a dbt snapshot join, eliminating the hop to `user_segments` entirely. Guiding principle: push extra hops into dbt transformations; keep MetricFlow semantic models as thin as possible over already-shaped dbt models.",
+    "fj": "Trying to add a `join_hint` or `max_hops` override in the semantic model YAML to force the three-hop traversal. No such override exists — the two-hop limit is architectural, not configurable.",
+    "fs": "Two-hop limit is hard. Push the extra hop into a dbt model join (denormalize) — the pre-join happens once at materialisation time not at every metric query. Bridge semantic models are a lighter alternative when you can't change the dbt model.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "What are the trade-offs of denormalizing into a wide fact model versus creating a bridge semantic model?",
+        "a": "Wide fact models give MetricFlow fewer joins (better query performance) but require a dbt model rebuild whenever a new segment attribute is added — tight coupling between the transformation and semantic layer. Bridge semantic models keep dbt models normalized and push join logic to the semantic layer graph, preserving flexibility, but add complexity to the entity graph and require careful entity typing to prevent fan-outs."
+      },
+      {
+        "q": "Can you use a dbt ephemeral model as the base for a semantic model to avoid materializing the join?",
+        "a": "Technically yes — MetricFlow can reference `ref('ephemeral_model')` and dbt inlines the CTE. But every Semantic Layer query rebuilds the ephemeral CTE, increasing complexity and warehouse cost for high-frequency dashboard queries. Use ephemeral models only for low-frequency exploration. For production metrics, materialize as an incremental or table model."
+      },
+      {
+        "q": "How does denormalizing the join affect dbt model testing?",
+        "a": "Denormalized models gain new columns that must be tested for correctness. Add `accepted_values` and `not_null` dbt tests on the joined segment columns. Consider a `relationships` test asserting the segment key correctly maps to the source. The semantic model's accuracy is only as good as the upstream dbt model tests — validate at the model layer before trusting metric outputs."
+      }
+    ]
+  },
+  {
+    "q": "How does MetricFlow handle grain and `agg_time_dimension` — what is `metric_time`, and what breaks when the declared grain is too coarse?",
+    "a": "`metric_time` is a MetricFlow-reserved virtual dimension that always resolves to the designated `agg_time_dimension` for a metric, regardless of what the underlying column is actually named. This abstraction means BI consumers always group by `metric_time__day` / `metric_time__week` without needing to know whether the physical column is `event_ts`, `order_created_at`, or `ds`. The `granularity` declared on a time dimension is the finest resolution MetricFlow will permit at query time — declaring `granularity: day` on a daily-truncated date column is correct. If you declare `granularity: month` on a column that actually stores daily dates, MetricFlow blocks day-grain queries (`InvalidGranularityError`) even though the underlying data would support it. Conversely, if you query a coarser grain than the declared grain (e.g., requesting `metric_time__month` on a day-grain dimension), MetricFlow auto-generates `DATE_TRUNC('month', ...)` SQL — no manual SQL needed. The `agg_time_dimension` on the metric (or inherited from `defaults`) controls which time dimension drives time-series grouping; a metric can be grouped by any other time dimension in the graph at query time via explicit `group-by` reference.",
+    "fj": "Assuming you must write DATE_TRUNC yourself in a dimension `expr` to support weekly or monthly breakdowns. MetricFlow handles coarser-grain truncation automatically at query time from the declared finest grain — manually adding DATE_TRUNC creates incorrect double-truncation.",
+    "fs": "metric_time is an alias for the metric's agg_time_dimension. Declare the finest grain the column actually stores. MetricFlow handles all coarser grains automatically. Too-coarse declaration blocks finer queries; correct declaration unlocks all coarser grains for free.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "Can a single query group by two different time dimensions simultaneously?",
+        "a": "Yes. You can specify multiple time dimensions in the `group-by` list of a `dbt sl query` command or saved query. For example, `--group-by metric_time__month --group-by order__shipped_date__week` produces a result segmented by both time axes. MetricFlow resolves the necessary joins to expose both dimensions and applies the appropriate DATE_TRUNC for each."
+      },
+      {
+        "q": "What happens if a consumer requests a finer grain than what the time spine covers?",
+        "a": "MetricFlow raises an `InvalidGranularityError` at query time if the requested grain is finer than either the time dimension's declared `granularity` or the time spine's declared `grain`. For example, requesting `hour` grain when the spine is `day` grain fails validation before any SQL is generated."
+      },
+      {
+        "q": "How do you handle a non-standard fiscal week (e.g., starting Saturday) in MetricFlow time dimensions?",
+        "a": "MetricFlow uses the warehouse's default ISO week definition (Monday start). For fiscal weeks, create a derived column in the backing dbt model: `DATEADD(day, -2, DATE_TRUNC('week', DATEADD(day, 2, event_date))) AS fiscal_week_start`. Declare this as a `type: time` dimension with `granularity: week`. Consumers group by this fiscal-week dimension for correct fiscal-period breakdowns."
+      }
+    ]
+  },
+  {
+    "q": "Design a MetricFlow + Snowflake architecture for near-real-time operational dashboards with a 15-minute data freshness SLA.",
+    "a": "Architecture stack: (1) **Ingestion**: Snowpipe or Snowpipe Streaming loads raw events into a landing schema with 1–5 minute latency. (2) **Transformation**: dbt models backing semantic models are materialized as `incremental` with `strategy: append` or `merge`, scheduled via dbt Cloud jobs every 10 minutes. Alternatively, use Snowflake Dynamic Tables with `TARGET_LAG = '5 minutes'` to auto-refresh without a dbt job scheduler. (3) **Time spine**: ensure the spine covers `CURRENT_DATE + 1` so today's data has an anchor. (4) **Dedicated SQL warehouse**: pre-warm the Semantic Layer warehouse with `AUTO_SUSPEND = 300` so it doesn't cold-start when the dashboard fires post-refresh. (5) **Freshness monitoring**: add a dbt test asserting `MAX(updated_at)` on each fact model is within 20 minutes of `CURRENT_TIMESTAMP`; alert via Slack on failure. (6) **Metric consistency**: the Semantic Layer always queries the latest materialized snapshot — no partial-write reads because Snowflake's atomic micro-partition model ensures either all new data or none is visible per query.",
+    "fj": "Configuring the Semantic Layer against a daily-refreshed dbt model and expecting 15-minute freshness. MetricFlow queries the current state of the backing dbt model — if the model only refreshes daily, all metric queries return stale data regardless of Semantic Layer configuration.",
+    "fs": "Near-RT = Snowpipe + 10-min incremental dbt jobs (or 5-min Dynamic Tables) + pre-warmed dedicated warehouse. MetricFlow has no freshness concept — it queries whatever the backing model contains. Freshness SLA lives in the dbt model refresh schedule.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you prevent MetricFlow Semantic Layer queries from contending with the 10-minute incremental dbt jobs on Snowflake?",
+        "a": "Use separate Snowflake virtual warehouses: one for dbt transformation jobs (XL or 2XL for heavy merges) and a separate dedicated Medium or Large warehouse exclusively for the Semantic Layer. Snowflake virtual warehouses are isolated compute pools — a heavy dbt run on the transformation warehouse has zero impact on the Semantic Layer warehouse. Configure the Semantic Layer's dbt Cloud environment to target the dedicated warehouse."
+      },
+      {
+        "q": "What monitoring do you add to detect when the incremental dbt refresh job falls behind the 15-minute SLA?",
+        "a": "Add a dbt singular test: `SELECT DATEDIFF(minute, MAX(updated_at), CURRENT_TIMESTAMP) AS minutes_stale FROM {{ ref('fct_events') }} HAVING minutes_stale > 20`. Run this test as a standalone `dbt test --select fct_events` step after each incremental job. Configure dbt Cloud notifications to alert a Slack channel on test failure. Also monitor Snowflake Task execution history if using Tasks for scheduling."
+      },
+      {
+        "q": "Is sub-minute data freshness achievable with MetricFlow on Snowflake?",
+        "a": "Not natively. MetricFlow queries a materialized table snapshot — it cannot query a live stream. Even with Snowflake Dynamic Tables, the minimum `TARGET_LAG` is 1 minute. True sub-minute operational metrics require a streaming OLAP system (ClickHouse, Apache Druid) outside the MetricFlow ecosystem. For 15-minute SLA requirements, the Dynamic Table + dedicated warehouse architecture is sufficient and cost-effective."
+      }
+    ]
+  },
+  {
+    "q": "Evaluate whether to build MetricFlow semantic models on raw fact tables, pre-aggregated summary tables, or a hybrid approach for a 2-billion-row Snowflake event table powering 30 metrics.",
+    "a": "Decision framework across three dimensions: (1) Raw fact tables give full dimensional flexibility but on a 2B-row table unclustered queries run 60-180 seconds, violating BI SLAs. (2) Pre-aggregated summary tables give sub-second queries but lock in grain and dimensions - adding a new dimension requires rebuilding the aggregation pipeline and a dbt model change. (3) Hybrid pattern (recommended): keep the semantic model backed by the raw fact table with clustering on event_date. For the top 10-15 highest-traffic metric+dimension combinations (identified from Semantic Layer API usage logs), create saved query exports that materialize as Snowflake tables on each dbt run. BI dashboards query the materialized tables at sub-second latency; ad-hoc exploration uses the live raw semantic model. Make the raw fact model incremental with strategy append on event_date so each run only touches new data. Liquid clustering on event_date is the primary cost lever - MetricFlow time-range filters prune micro-partitions automatically.",
+    "fj": "Choosing pre-aggregated tables exclusively to solve the latency problem. This trades query latency for dimensional inflexibility - every new business question requiring a new dimension triggers a pipeline rebuild. The hybrid approach avoids both traps by letting the raw semantic model serve exploration while exports serve dashboards.",
+    "fs": "Raw = max flexibility, slow without clustering. Pre-agg = fast, rigid. Hybrid = raw semantic model + saved query exports for top-traffic combinations. API usage logs tell you which 15 combinations to materialize.",
+    "level": "Principal",
+    "followups": [
+      {
+        "q": "How do you decide which saved query combinations to materialize versus leave as dynamic queries?",
+        "a": "Pull 30 days of Semantic Layer API query logs and build a frequency table of metric+dimension combinations. Materialize the top 15 that: exceed 50 daily queries; run over 10 seconds on the raw table; and have stable, rarely-changing dimension sets. Leave dynamic: newly launched metrics with evolving definitions; high-cardinality per-user or per-event combinations that produce enormous tables; and one-off analyst exploration queries."
+      },
+      {
+        "q": "If you add a new dimension to the semantic model after a saved query export is already running in production, what happens?",
+        "a": "Saved query exports only materialize the metrics and dimensions declared in the export group_by list. Adding a new dimension to the semantic model does NOT automatically update the materialized export. You must update the saved query YAML to include the new dimension and redeploy. The existing materialized table continues refreshing with the old column set until the YAML is updated and dbt sl export-all runs with the new definition."
+      },
+      {
+        "q": "What is the cost impact of 30 saved query exports each running against a 2B-row Snowflake table every 6 hours?",
+        "a": "30 exports times 4 runs per day equals 120 Snowflake queries per day. With a day-grain incremental model and clustering on event_date, each export scans only the new partition (not the full 2B rows). Estimate roughly 5 XS-warehouse-minutes per export times 120 per day equals 600 warehouse-minutes per day. Compare this to the BI dashboard latency savings and engineer SLA. Use a larger warehouse for shorter per-query runtimes if total daily credit consumption is unacceptable."
+      }
+    ]
+  },
+  {
+    "q": "You need MetricFlow to support week-over-week and fiscal-quarter granularities that the default day-grain time spine does not cover. How do you configure a custom-granularity time spine table, and what are the YAML registration requirements?",
+    "a": "MetricFlow's custom granularity feature (introduced in dbt Core v1.9 / dbt Cloud GA 2025) lets you define named, non-standard calendar periods — iso_week, fiscal_quarter, retail_445_week — by mapping each calendar day to its containing custom period. Step 1 — Build the spine model. The spine must still have one row per day at the base grain, but you add additional columns for each custom period: `SELECT date_day, DATE_TRUNC('week', date_day + 1)::DATE AS iso_week_start, my_fiscal_quarter_udf(date_day) AS fiscal_quarter_key FROM ...`. Crucially, each custom period column must produce a value that is consistent for every day inside that period and distinct across periods — MetricFlow uses these as GROUP BY keys, not as display labels. Step 2 — Register the spine with custom granularities. In the spine model's YAML config block, add: `config: metricflow_time_spine: {column_name: date_day, granularity: day, custom_granularities: [{name: iso_week, column_name: iso_week_start}, {name: fiscal_quarter, column_name: fiscal_quarter_key}]}`. The `name` value becomes the string consumers pass to `--group-by metric_time__iso_week` in the CLI. Step 3 — Reference the granularity in metrics. Any metric whose underlying semantic model declares a `time` dimension at `day` grain can be queried at `iso_week` or `fiscal_quarter` granularity with no further YAML changes — MetricFlow automatically selects the custom period column from the spine during join planning. Step 4 — Validate: run `dbt sl validate` and inspect the `MetricFlowSemanticManifest` output for `custom_granularities` to confirm they are registered. Common failure: the custom period column contains NULLs for dates outside the coverage range (e.g., before fiscal year start) — MetricFlow will coerce those rows to NULL groups and silently drop them from aggregations; ensure full date coverage in the spine.",
+    "fj": "To add a fiscal-quarter granularity, you create a separate time spine model at quarterly grain with one row per quarter and register it alongside the daily spine.",
+    "fs": "Custom granularities are additional columns on the SAME day-grain spine model, not separate models; each column maps every calendar day to its containing custom period value, and MetricFlow selects the right column at query time based on the requested granularity name.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "How does MetricFlow's join planner choose between the day-grain spine and a custom-granularity column when a metric is queried at `fiscal_quarter` grain?",
+        "a": "MetricFlow's query planner inspects the requested `group_by` grain. If the grain matches a registered custom granularity name (e.g., `fiscal_quarter`), the planner rewrites the time spine join to GROUP BY the custom period column (`fiscal_quarter_key`) instead of a DATE_TRUNC expression on `date_day`. The planner does not aggregate through the day-grain column at all for that query — it joins fact subquery rows directly to the spine's custom period column. This means the custom period column must be a valid GROUP BY key in the warehouse (stable, deterministic per day), not a display string that varies within the period."
+      },
+      {
+        "q": "What happens when two custom granularities in the same spine have overlapping or ambiguous date mappings, such as a retail 4-4-5 week that crosses a fiscal quarter boundary?",
+        "a": "MetricFlow treats each custom granularity column as independent; it does not validate that custom periods are hierarchically consistent with each other. If you query with both `fiscal_quarter` and `retail_445_week` as group-by dimensions simultaneously, MetricFlow generates a GROUP BY on both columns — producing a row for each (fiscal_quarter, 445_week) combination that has data. If a 4-4-5 week spans a fiscal quarter boundary, it will appear in two fiscal quarter rows with its metrics split. This is mathematically correct but often unexpected. The fix is to document in your semantic model's README that mixed-granularity queries across non-nested custom periods produce split rows, and to validate against known totals using `dbt sl query --metrics revenue --group-by metric_time__fiscal_quarter` and cross-referencing against the source ERP."
+      },
+      {
+        "q": "How do you test that a custom granularity is producing correct aggregations without comparing against a reference BI tool?",
+        "a": "Use `dbt sl query --metrics <name> --group-by metric_time__<custom_grain>` in the CLI and validate two properties: (1) completeness — the number of rows returned equals the number of expected periods in the queried date range (e.g., 4 fiscal quarters for a 1-year range); (2) additivity — summing the custom-grain values equals the total returned by a grain-free query (`dbt sl query --metrics revenue` with no group-by). If custom period rows sum to a different total, the spine has gaps (missing days between periods) or overlaps (a day appearing in two custom period keys). A quick gap check: `SELECT COUNT(DISTINCT date_day) FROM time_spine WHERE date_day BETWEEN '2024-01-01' AND '2024-12-31'` should equal 366; a period-overlap check: `SELECT fiscal_quarter_key, COUNT(*) FROM time_spine GROUP BY fiscal_quarter_key HAVING COUNT(*) NOT IN (90,91,92)` flags quarters with wrong day counts."
+      }
+    ]
+  },
+  {
+    "q": "A ratio metric (`ratio_metric: {numerator: ..., denominator: ...}`) returns NULL for several date ranges in production. Walk through your complete debugging methodology.",
+    "a": "A ratio metric returns NULL when the denominator evaluates to zero or NULL for a given time period, since MetricFlow performs `SAFE_DIVIDE` (BigQuery) or a `CASE WHEN denominator = 0 THEN NULL END` guard (Snowflake/Redshift) to prevent division-by-zero errors. The NULL is not a MetricFlow bug but a data signal that requires systematic diagnosis. Step 1 — Isolate numerator and denominator independently. Run `dbt sl query --metrics <numerator_measure_as_metric> --group-by metric_time__day --where \"metric_time__day >= '2025-01-01'\"` and the same for the denominator. If the denominator metric returns 0 or NULL for the affected dates, those are the root-cause rows. Step 2 — Check for join fanout or filtering reducing denominator to zero. Ratio metrics in MetricFlow can use measures from different semantic models. If the denominator measure comes from a different semantic model than the numerator, MetricFlow must join them — if the join produces no rows for certain periods (no denominator data, not zero-count but entirely absent), the result is NULL, not 0. Run `dbt sl explain --metrics <ratio_metric> --group-by metric_time__day` to see the full SQL. Inspect the WHERE clause: if a dimension filter in the metric definition excludes the denominator's time range (e.g., a `filter: \"{{ dimension('status') }} = 'active'\"` where no 'active' records existed in January 2025), the denominator is absent. Step 3 — Check `join_to_timespine` configuration. If the denominator measure does NOT have `join_to_timespine: true` and there are dates with no denominator events, those dates will have no denominator row — the ratio for those dates is NULL. Fix: enable `join_to_timespine: true` on the denominator measure and set `fill_nulls_with: 0`; this inserts a 0-denominator row for missing dates, which MetricFlow then correctly returns as NULL (0-denominator is correctly undefined). If you want 0 instead of NULL for missing-data dates, that requires application-level post-processing — MetricFlow does not support `fill_nulls_with` on ratio metrics directly, only on component measures. Step 4 — Check for grain mismatch. If the numerator is a day-grain measure and the denominator is a month-grain measure (from a separate semantic model with month-granularity time dimension), MetricFlow will join them at the coarser grain — day-level ratio queries will be NULL for days that are not month boundaries. Fix: ensure both measures' underlying time dimensions are at the same or finer grain than the query's requested grain. Step 5 — Validate with `dbt sl validate` to surface configuration errors that may be silently degrading the ratio, such as a denominator measure declared with `agg_time_dimension` pointing to a different column than the numerator.",
+    "fj": "A NULL ratio always means the data is missing for those dates and there is nothing to configure — just filter the date range to exclude missing periods.",
+    "fs": "NULL ratio values have multiple distinct root causes — zero denominator, missing denominator rows (absent vs. zero-count), join fanout between separate semantic models, `join_to_timespine` omission, or time dimension grain mismatch — and each requires a different fix; always use `dbt sl explain` to inspect the generated SQL before drawing conclusions.",
+    "level": "Sr",
+    "followups": [
+      {
+        "q": "What is the difference between `fill_nulls_with: 0` on a measure vs. on the ratio metric itself, and why can't you set it on a ratio metric?",
+        "a": "Setting `fill_nulls_with: 0` on a component measure (numerator or denominator) instructs MetricFlow to replace NULL metric values produced by `join_to_timespine` with 0 before the ratio computation — so a date with no events gets a 0-count denominator row rather than an absent row. The ratio MetricFlow then computes is `numerator / 0` which correctly returns NULL (division by zero). MetricFlow does not support `fill_nulls_with` on the ratio metric block itself because a ratio's nullability is semantically determined by the denominator: filling the final NULL ratio with 0 would misrepresent undefined ratios as zero ratios, which is statistically incorrect. To surface 0 for missing-data periods in a dashboard, post-process in the BI tool with a COALESCE, clearly documented as a display convention, not a data assertion."
+      },
+      {
+        "q": "How do you use `dbt sl explain` to identify whether a NULL ratio is caused by a join issue vs. a data gap?",
+        "a": "`dbt sl explain --metrics conversion_rate --group-by metric_time__day --where \"metric_time__day = '2025-03-15'\"` outputs the full SQL MetricFlow would execute for a single day. Examine: (1) if the denominator subquery's `WHERE` clause excludes that date (e.g., a metric-level filter referencing a status column), the absence is filter-induced; (2) if the denominator subquery returns a valid date range but the outer LEFT JOIN to the numerator produces no match, it is a join-path issue; (3) if the time spine is present in the query but the denominator subquery has no rows for that date even without additional filters, it is a pure data gap. Knowing the cause determines whether you fix the filter, the join config, or accept the gap as correct behavior."
+      },
+      {
+        "q": "How would you structure a ratio metric where numerator and denominator come from two separate semantic models with different entity granularities, such as session-level conversions over order-level revenue?",
+        "a": "MetricFlow ratio metrics only join numerator and denominator measures through shared time dimensions — they cannot join across entity keys at computation time. If sessions and orders are in different semantic models, the ratio must be computed at the shared aggregate grain (typically `metric_time__day` or coarser) where both measures can be reduced to a single value per time period before dividing. Do not declare a shared session/order entity just to enable the join — a fan-out join at the session/order cross-join grain would multiply numerators incorrectly. The correct pattern: define the numerator measure with `agg: count` at day grain in the sessions semantic model, define the denominator measure at day grain in the orders semantic model, declare the ratio metric referencing both, and query at day grain or coarser. MetricFlow will independently aggregate each into daily totals and then divide, which is the correct computation for a conversion-like ratio."
+      }
+    ]
+  }
+]

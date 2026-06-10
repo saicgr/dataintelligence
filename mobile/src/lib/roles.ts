@@ -133,6 +133,11 @@ export const ROLES: RoleDef[] = [
   { key: 'supply-chain-analyst', name: 'Supply Chain Analyst', emoji: '⛓️', family: 'Business & Management', blurb: 'Supply chain, SQL, analytics, logistics' },
   { key: 'revops-analyst', name: 'RevOps / Marketing Analyst', emoji: '📣', family: 'Business & Management', blurb: 'Revenue ops, attribution, SQL, CRM' },
   { key: 'pricing-analyst', name: 'Pricing Analyst', emoji: '💲', family: 'Business & Management', blurb: 'Price modeling, stats, SQL, Excel' },
+  // Adobe / Vendor roles
+  { key: 'workfront-arch', name: 'Workfront Fusion Architect', emoji: '🏛️', family: 'Vendor', blurb: 'Fusion architecture, security, governance', tag: 'new' },
+  { key: 'workfront-lead', name: 'Workfront Fusion Lead', emoji: '🔧', family: 'Vendor', blurb: 'Fusion lead dev, mentoring, best practices', tag: 'new' },
+  { key: 'workfront-solution-arch', name: 'Workfront Solution Architect', emoji: '⚙️', family: 'Vendor', blurb: 'End-to-end Workfront solution design', tag: 'new' },
+  { key: 'aep-de', name: 'Adobe AEP Data Engineer', emoji: '🔴', family: 'Vendor', blurb: 'AEP ingestion, XDM, CDP, governance', tag: 'new' },
   // Everything
   { key: 'all', name: 'Explore all tracks', emoji: '🌐', family: 'All', blurb: 'Every track, unfiltered' },
 ];
@@ -177,7 +182,7 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   'databricks-de': ['python-drills', 'sql-coding', 'databricks', 'spark', 'pyspark', 'sql', 'dbt', 'modeling', 'python', 'scala', 'aws', 'data-reliability', ...SHIP, ...CRAFT],
   'databricks-ml': ['python-drills', 'databricks', 'mosaic', 'mlsys', 'python', 'scala', 'llms', 'evals', 'spark', ...SHIP, ...CRAFT],
   'databricks-arch': ['databricks', 'architecture', 'security', 'spark', 'sql', 'aws', 'git', 'terraform', 'cicd', 'observability', 'data-reliability', ...CRAFT],
-  'snowflake-de': ['sql-coding', 'snowflake', 'sql', 'dbt', 'modeling', 'python', 'aws', 'git', 'cicd', 'data-reliability', ...CRAFT],
+  'snowflake-de': ['sql-coding', 'snowflake', 'sql', 'dbt', 'dbt-metricflow', 'dbt-semantic-layer', 'modeling', 'python', 'data-governance', 'aws', 'git', 'cicd', 'data-reliability', ...CRAFT],
   'snowflake-arch': ['snowflake', 'architecture', 'security', 'sql', 'modeling', 'aws', 'git', 'terraform', 'data-reliability', ...CRAFT],
   'snowflake-admin': ['snowflake', 'security', 'sql', 'observability', 'git', 'terraform', 'data-reliability', ...CRAFT],
   'snowflake-ai': ['snowflake', 'cortex', 'llms', 'rag', 'evals', 'python', 'sql', 'git', ...CRAFT],
@@ -191,7 +196,7 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   'scrum-master': ['agile-pm', 'stakeholder-mgmt', 'program-management', ...CRAFT],
   'eng-manager': ['program-management', 'stakeholder-mgmt', 'agile-pm', 'sysd', 'architecture', ...CRAFT],
   'finops-eng': ['finops', 'aws', 'gcp', 'azure', 'architecture', ...CRAFT],
-  'cost-engineer': ['finops', 'aws', 'gcp', 'azure', 'databricks', 'snowflake', 'sql-coding', 'sql', 'modeling', ...CRAFT],
+  'cost-engineer': ['cost-engineer', 'finops', 'aws', 'gcp', 'azure', 'databricks', 'snowflake', 'sql-coding', 'sql', 'modeling', ...CRAFT],
   'business-analyst': ['sql-coding', 'business-analysis', 'sql', 'statistics', 'bi', 'modeling', 'stakeholder-mgmt', ...CRAFT],
   'data-pm': ['sql-coding', 'product-management', 'business-analysis', 'sql', 'bi', 'statistics', 'modeling', 'stakeholder-mgmt', ...CRAFT],
   'ai-pm': ['ai-product-mgmt', 'product-management', 'llms', 'agents', 'evals', 'stakeholder-mgmt', ...CRAFT],
@@ -206,6 +211,11 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   'supply-chain-analyst': ['sql-coding', 'supply-chain', 'sql', 'statistics', 'modeling', 'bi', ...CRAFT],
   'revops-analyst': ['sql-coding', 'sql', 'bi', 'statistics', 'business-analysis', 'customer-success', ...CRAFT],
   'pricing-analyst': ['sql-coding', 'finance-fundamentals', 'sql', 'statistics', 'modeling', ...CRAFT],
+  // Adobe / Vendor roles
+  'workfront-arch': ['workfront', 'architecture', 'security', 'apis', 'data-integration', 'stakeholder-mgmt', ...SHIP, ...CRAFT],
+  'workfront-lead': ['workfront', 'program-management', 'leadership', 'apis', 'data-integration', 'stakeholder-mgmt', ...SHIP, ...CRAFT],
+  'workfront-solution-arch': ['workfront', 'architecture', 'stakeholder-mgmt', 'pre-sales', 'apis', 'data-integration', ...SHIP, ...CRAFT],
+  'aep-de': ['aep', 'data-governance', 'data-integration', 'sql-coding', 'sql', 'python', 'apis', 'aws', ...SHIP, ...CRAFT],
   all: [], // resolved dynamically to every track in content.ts
 };
 
