@@ -49,10 +49,27 @@ export type Mode = 'cram' | 'maintain';
 type SessionKind = 'daily' | 'track' | 'fresh' | 'weakspot' | 'lesson' | 'basics' | 'saved' | 'company' | 'incident' | 'diagnostic' | 'single';
 
 /** Duolingo-style feedback events emitted by the store, consumed by the FeedbackBridge. */
-export type FeedbackKind = 'correct' | 'wrong' | 'complete' | 'streak' | 'levelUp';
+export type FeedbackKind = 'correct' | 'wrong' | 'complete' | 'streak' | 'levelUp' | 'firstCard' | 'goalMet' | 'badge';
 export interface FeedbackEvent {
   kind: FeedbackKind;
   at: number;
+}
+
+/** Per-card issue reports — manual-first: stored locally, pushed to Supabase when signed in,
+ *  and the founder reviews them in Studio (no in-app triage). */
+export type ReportCategory = 'inaccurate' | 'outdated' | 'typo' | 'unclear' | 'alt-answer';
+export interface CardReport {
+  cat: ReportCategory;
+  note?: string;
+  at: number;
+}
+
+/** Last seen LIVE league standing — lets us show a promotion/relegation moment after week rollover. */
+export interface LeagueSnapshot {
+  week: string;
+  rank: number;
+  tier: string;
+  size: number;
 }
 
 const DAY = 86_400_000;
@@ -142,6 +159,16 @@ interface State {
   // Developer view: reveals all stages/questions unlocked. Only ever active when __DEV__
   // (see `isDev`), so a production build can never expose it regardless of this flag.
   devMode: boolean;
+  // Voice recall tried at least once (unlocks the 🎙 badge).
+  voiceTried: boolean;
+  // Badge ids whose unlock toast has already been shown.
+  badgesSeen: string[];
+  // Last live weekly-league standing + which week's result moment we've shown.
+  leagueSnapshot: LeagueSnapshot | null;
+  leagueResultShownWeek: string | null;
+  // Per-card issue reports + the offline queue of not-yet-pushed card ids.
+  reports: Record<string, CardReport>;
+  pendingReports: string[];
 
   // auth (from Supabase session; not persisted here)
   userId: string | null;
@@ -165,6 +192,13 @@ interface State {
   reveal: boolean;
   lastChoice: number | null;
   inSession: boolean; // playing a deck (vs browsing the Learn path)
+  // Per-session accumulators (transient — reset by FRESH_SESSION at every session start).
+  // Hits/misses only count OBJECTIVE signals (MCQ, production formats, recall checks) — never raw self-grades.
+  sessionXp: number;
+  sessionHits: number;
+  sessionMisses: number;
+  // One-shot halo on the ContinueHero right after onboarding (cleared on first press).
+  heroPulse: boolean;
 
   // actions
   setRole: (r: Role) => void;
@@ -186,6 +220,11 @@ interface State {
   emit: (kind: FeedbackKind) => void;
   clearEvent: () => void;
   clearLevelUp: () => void;
+  markVoiceTried: () => void;
+  markBadgesSeen: (ids: string[]) => void;
+  /** Record an objective correctness signal (recall check / voice key-point check) into session accuracy. */
+  noteCheck: (ok: boolean) => void;
+  clearHeroPulse: () => void;
   setReminders: (v: boolean) => void;
   setDailyGoal: (n: number) => void;
   applyHintCost: (n: number) => void;
@@ -283,6 +322,17 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
   return { deck, meta: deckCounts(deck, s.progress, now) };
 }
 
+/** Fresh-session reset spread shared by every start* action — also re-arms the per-session accumulators. */
+const FRESH_SESSION = {
+  idx: 0,
+  reveal: false,
+  lastChoice: null,
+  inSession: true,
+  sessionXp: 0,
+  sessionHits: 0,
+  sessionMisses: 0,
+} as const;
+
 const initial = buildDeck({
   sessionKind: 'daily',
   trackSlug: null,
@@ -331,6 +381,12 @@ export const useStore = create<State>()(
       checkpointsDone: [],
       notifAsked: false,
       devMode: false,
+      voiceTried: false,
+      badgesSeen: [],
+      leagueSnapshot: null,
+      leagueResultShownWeek: null,
+      reports: {},
+      pendingReports: [],
       onboarded: false,
       reminders: true,
       targetCompany: '',
@@ -356,6 +412,10 @@ export const useStore = create<State>()(
       reveal: false,
       lastChoice: null,
       inSession: false,
+      sessionXp: 0,
+      sessionHits: 0,
+      sessionMisses: 0,
+      heroPulse: false,
 
       rebuildSession: () => {
         const { deck, meta } = buildDeck(get());
@@ -389,7 +449,7 @@ export const useStore = create<State>()(
         const st = get();
         const today = dayKey(Date.now());
         const used = st.codeRunDay === today ? st.codeRunsToday : 0; // reset on a new day
-        if (!st.unlocked && used >= FREE_CODE_RUNS) return false; // free quota spent
+        if (!st.unlocked && !(__DEV__ && st.devMode) && used >= FREE_CODE_RUNS) return false; // free quota spent (dev mode is uncapped)
         set({ codeRunDay: today, codeRunsToday: used + 1 });
         return true;
       },
@@ -414,6 +474,16 @@ export const useStore = create<State>()(
       emit: (kind) => set({ lastEvent: { kind, at: Date.now() } }),
       clearEvent: () => set({ lastEvent: null }),
       clearLevelUp: () => set({ levelUpTo: null }),
+      markVoiceTried: () => {
+        if (!get().voiceTried) set({ voiceTried: true });
+      },
+      markBadgesSeen: (ids) =>
+        set((s) => ({ badgesSeen: [...new Set([...s.badgesSeen, ...ids])] })),
+      noteCheck: (ok) =>
+        set((s) => (ok ? { sessionHits: s.sessionHits + 1 } : { sessionMisses: s.sessionMisses + 1 })),
+      clearHeroPulse: () => {
+        if (get().heroPulse) set({ heroPulse: false });
+      },
       setReminders: (reminders) => {
         set({ reminders });
         void setDailyReminder(reminders);
@@ -423,57 +493,57 @@ export const useStore = create<State>()(
 
       startDaily: () => {
         track('session_started', { kind: 'daily' });
-        set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startTrack: (slug, level) => {
         track('session_started', { kind: 'track', track: slug, level: level ?? 'all' });
-        set({ sessionKind: 'track', trackSlug: slug, sessionLevel: level ?? null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'track', trackSlug: slug, sessionLevel: level ?? null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startFresh: () => {
         track('session_started', { kind: 'fresh' });
-        set({ sessionKind: 'fresh', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'fresh', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startSaved: () => {
         track('session_started', { kind: 'saved' });
-        set({ sessionKind: 'saved', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'saved', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startWeakspot: () => {
         track('session_started', { kind: 'weakspot' });
-        set({ sessionKind: 'weakspot', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'weakspot', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startBasics: () => {
         track('session_started', { kind: 'basics' });
-        set({ sessionKind: 'basics', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'basics', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startCompany: (key) => {
         track('session_started', { kind: 'company', company: key });
-        set({ sessionKind: 'company', companyKey: key, trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'company', companyKey: key, trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startIncident: (id) => {
         track('session_started', { kind: 'incident', incident: id });
-        set({ sessionKind: 'incident', incidentId: id, trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'incident', incidentId: id, trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startDiagnostic: () => {
         track('session_started', { kind: 'diagnostic' });
-        set({ sessionKind: 'diagnostic', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'diagnostic', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startLesson: (slug, lessonIdx) => {
         track('session_started', { kind: 'lesson', track: slug, lesson: lessonIdx });
-        set({ sessionKind: 'lesson', trackSlug: slug, lessonIdx, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'lesson', trackSlug: slug, lessonIdx, ...FRESH_SESSION });
         get().rebuildSession();
       },
       startSingle: (cardId) => {
         track('session_started', { kind: 'single', card: cardId });
-        set({ sessionKind: 'single', singleId: cardId, idx: 0, reveal: false, lastChoice: null, inSession: true });
+        set({ sessionKind: 'single', singleId: cardId, ...FRESH_SESSION });
         get().rebuildSession();
       },
       exitTrack: () => {
@@ -486,7 +556,8 @@ export const useStore = create<State>()(
       },
       completeOnboarding: (role, mode, level) => {
         track('onboarded', { role, mode, level: level ?? 'all' });
-        set({ role, mode, userLevel: level ?? null, onboarded: true, idx: 0, reveal: false, lastChoice: null });
+        // heroPulse: one-shot halo on the ContinueHero so the first next-action is unmissable.
+        set({ role, mode, userLevel: level ?? null, onboarded: true, heroPulse: true, idx: 0, reveal: false, lastChoice: null });
         get().rebuildSession();
       },
       setUserLevel: (userLevel) => {
@@ -505,11 +576,18 @@ export const useStore = create<State>()(
         const card = deck[st.idx];
         const now = Date.now();
         const today = dayKey(now);
+        // First card EVER rated — inherently one-time (existing users always have progress).
+        const firstEver = !!card && Object.keys(st.progress).length === 0;
         const progress = { ...st.progress };
         if (card) progress[card.id] = schedule(progress[card.id], r, now);
         const nextIdx = st.idx + 1;
         const gain = xpFor(card?.kind, r);
         const xp = st.xp + gain;
+        // Session accuracy counts only OBJECTIVE formats (MCQ/production kinds, where the rating is
+        // derived from correctness) — flip self-grades feed it via noteCheck() instead.
+        const objective = !!card && (card.kind === 'choice' || PRODUCTION_KINDS.has(card.kind));
+        const sessionHits = st.sessionHits + (objective && r !== 'again' ? 1 : 0);
+        const sessionMisses = st.sessionMisses + (objective && r === 'again' ? 1 : 0);
         // Weekly league XP (resets each ISO week).
         const wk = weekKey(now);
         const weeklyXp = (st.weeklyXpWeek === wk ? st.weeklyXp : 0) + gain;
@@ -540,12 +618,19 @@ export const useStore = create<State>()(
           if (streak % 5 === 0) freezes = Math.min(2, freezes + 1); // earn a freeze every 5 days
         }
 
+        // Daily-goal crossing — fires at most once per day (cardsToday is monotonic within a day).
+        const prevToday = st.goalDay === today ? st.cardsToday : 0;
+        const goalCrossed = prevToday < st.dailyGoal && cardsToday >= st.dailyGoal;
+
         set({
           progress,
           idx: nextIdx,
           reveal: false,
           lastChoice: null,
           xp,
+          sessionXp: st.sessionXp + gain,
+          sessionHits,
+          sessionMisses,
           weeklyXp,
           weeklyXpWeek: wk,
           streak,
@@ -563,6 +648,9 @@ export const useStore = create<State>()(
         if (streakBumped && (streak === 7 || streak === 30 || streak === 100)) void maybeRequestReview();
         if (streakBumped) get().emit('streak');
         else if (done) get().emit('complete');
+        // Mid-session moments (the end-of-deck events above win when they collide).
+        else if (firstEver) get().emit('firstCard');
+        else if (goalCrossed) get().emit('goalMet');
         if (level(xp) > level(st.xp)) {
           set({ levelUpTo: level(xp) });
           get().emit('levelUp');
@@ -676,7 +764,7 @@ export const useStore = create<State>()(
     }),
     {
       name: 'fieldnotes-v1',
-      version: 11,
+      version: 12,
       storage: createJSONStorage(() => AsyncStorage),
       partialize: (s) => ({
         role: s.role,
@@ -707,6 +795,12 @@ export const useStore = create<State>()(
         checkpointsDone: s.checkpointsDone,
         notifAsked: s.notifAsked,
         devMode: s.devMode,
+        voiceTried: s.voiceTried,
+        badgesSeen: s.badgesSeen,
+        leagueSnapshot: s.leagueSnapshot,
+        leagueResultShownWeek: s.leagueResultShownWeek,
+        reports: s.reports,
+        pendingReports: s.pendingReports,
         onboarded: s.onboarded,
         reminders: s.reminders,
         targetCompany: s.targetCompany,
@@ -773,6 +867,15 @@ export const useStore = create<State>()(
           if (typeof p.codeRunDay !== 'string') p.codeRunDay = null;
           if (typeof p.codeRunsToday !== 'number') p.codeRunsToday = 0;
         }
+        if (from < 12) {
+          // v12 added quick-win badges, league result snapshots, and per-card issue reports.
+          if (typeof p.voiceTried !== 'boolean') p.voiceTried = false;
+          if (!Array.isArray(p.badgesSeen)) p.badgesSeen = [];
+          if (typeof p.leagueSnapshot !== 'object') p.leagueSnapshot = null;
+          if (typeof p.leagueResultShownWeek !== 'string') p.leagueResultShownWeek = null;
+          if (typeof p.reports !== 'object' || p.reports === null) p.reports = {};
+          if (!Array.isArray(p.pendingReports)) p.pendingReports = [];
+        }
         return p;
       },
       onRehydrateStorage: () => (state) => {
@@ -796,6 +899,13 @@ export function useActiveDeck(): SessionCard[] {
 export const isPro = (s: State) => s.unlocked;
 /** Developer view is active only in dev builds — `__DEV__` guards it so production users never see it. */
 export const isDev = (s: State) => __DEV__ && s.devMode;
+/**
+ * Pro gate used by feature code: a real entitlement OR dev mode (dev builds only).
+ * Derives only — purchase state (`owned`/`unlocked`) is never faked, so the paywall
+ * and Profile plan cards stay truthful. With dev ON, locked→paywall routes are
+ * unreachable; toggle dev OFF to test the paywall.
+ */
+export const isProActive = (s: State) => s.unlocked || (__DEV__ && s.devMode);
 export const ownsPack = (packId: string) => (s: State) => !!s.owned[packId];
 export const level = (xp: number) => Math.floor(xp / 1000) + 1;
 export const xpInLevel = (xp: number) => xp % 1000;
