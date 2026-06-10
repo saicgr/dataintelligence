@@ -10,6 +10,7 @@
  * through an optional `recordMock` store action (see INTEGRATION NOTES) — absence is a graceful no-op.
  */
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
@@ -106,7 +107,7 @@ export default function MockInterview() {
   if (phase === 'intro') {
     return (
       <Screen>
-        <Pressable onPress={() => router.back()}>
+        <Pressable onPress={() => safeBack(router)}>
           <T muted weight="700" size={13}>‹ Close</T>
         </Pressable>
         <CardEnter>
@@ -172,7 +173,7 @@ export default function MockInterview() {
           startWeakspot();
           router.replace('/');
         }}
-        onExit={() => router.back()}
+        onExit={() => safeBack(router)}
       />
     );
   }

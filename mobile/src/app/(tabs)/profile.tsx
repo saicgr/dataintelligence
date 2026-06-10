@@ -9,6 +9,7 @@ import { PACKS, SUB_YEARLY_PER_MONTH } from '../../lib/products';
 import { useStore } from '../../lib/store';
 import { ACCENTS, type AccentKey, radius, useTheme } from '../../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
+import { HowProWorks } from '../../components/how-pro-works';
 
 export default function Profile() {
   const { c } = useTheme();
@@ -81,7 +82,10 @@ export default function Profile() {
               Browse free. Pro adds the weekly &ldquo;stay current&rdquo; fresh stream, unlimited cards,
               and smart weak-spot scheduling.
             </T>
-            <Row style={{ marginTop: 10, alignItems: 'baseline', gap: 6 }}>
+            <View style={{ marginTop: 12 }}>
+              <HowProWorks onPurple />
+            </View>
+            <Row style={{ marginTop: 12, alignItems: 'baseline', gap: 6 }}>
               <T color="#fff" size={26} weight="900">{SUB_YEARLY_PER_MONTH}</T>
               <T color="#dcd7ff" size={13} weight="700">/mo · billed yearly</T>
             </Row>

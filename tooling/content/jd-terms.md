@@ -5,7 +5,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | vertex-ai | 36 | 5 | 9 | 13 | 6 | 3 | ✅ 25+ balanced |
 | looker | 39 | 6 | 14 | 10 | 6 | 3 | ✅ 25+ balanced |
-| snaplogic | 40 | 4 | 7 | 22 | 3 | 4 | ✅ 25+ balanced |
+| snaplogic | 40 | 5 | 17 | 11 | 4 | 3 | ✅ 25+ balanced |
 | mosaic | 41 | 2 | 8 | 21 | 7 | 3 | ✅ 25+ balanced |
 | git | 43 | 8 | 22 | 5 | 5 | 3 | ✅ 25+ balanced |
 | tableau | 43 | 11 | 19 | 4 | 6 | 3 | ✅ 25+ balanced |
@@ -23,40 +23,40 @@
 | scala | 49 | 9 | 17 | 14 | 6 | 3 | ✅ 25+ balanced |
 | statistics | 49 | 11 | 19 | 10 | 6 | 3 | ✅ 25+ balanced |
 | terraform | 49 | 8 | 13 | 19 | 6 | 3 | ✅ 25+ balanced |
-| voice-ai | 52 | 4 | 5 | 35 | 5 | 3 | ✅ 25+ balanced |
+| voice-ai | 52 | 8 | 15 | 22 | 5 | 2 | ✅ 25+ balanced |
 | sql | 54 | 11 | 29 | 6 | 5 | 3 | ✅ 25+ balanced |
-| aem | 58 | 5 | 7 | 39 | 3 | 4 | ✅ 25+ balanced |
-| kafka | 58 | 5 | 12 | 32 | 6 | 3 | ✅ 25+ balanced |
+| aem | 58 | 9 | 17 | 22 | 6 | 4 | ✅ 25+ balanced |
+| kafka | 58 | 7 | 15 | 28 | 6 | 2 | ✅ 25+ balanced |
 | rag | 59 | 5 | 14 | 31 | 6 | 3 | ✅ 25+ balanced |
 | spark | 59 | 4 | 21 | 25 | 6 | 3 | ✅ 25+ balanced |
 | flutter | 61 | 8 | 18 | 23 | 9 | 3 | ✅ 25+ balanced |
-| cicd | 68 | 6 | 12 | 41 | 6 | 3 | ✅ 25+ balanced |
+| cicd | 68 | 8 | 18 | 34 | 6 | 2 | ✅ 25+ balanced |
+| cortex | 69 | 8 | 22 | 30 | 7 | 2 | ✅ 25+ balanced |
 | nodejs | 69 | 8 | 18 | 34 | 6 | 3 | ✅ 25+ balanced |
 | evals | 70 | 8 | 16 | 37 | 6 | 3 | ✅ 25+ balanced |
-| trading | 71 | 5 | 5 | 53 | 5 | 3 | ✅ 25+ balanced |
-| cortex | 73 | 3 | 13 | 48 | 6 | 3 | ✅ 25+ balanced |
-| llms | 81 | 7 | 13 | 52 | 6 | 3 | ✅ 25+ balanced |
+| trading | 71 | 9 | 16 | 35 | 8 | 3 | ✅ 25+ balanced |
+| llms | 79 | 10 | 25 | 34 | 8 | 2 | ✅ 25+ balanced |
 | python | 89 | 3 | 37 | 40 | 6 | 3 | ✅ 25+ balanced |
-| apis | 90 | 7 | 21 | 53 | 6 | 3 | ✅ 25+ balanced |
+| apis | 91 | 9 | 31 | 42 | 6 | 3 | ✅ 25+ balanced |
 | typescript | 94 | 16 | 24 | 45 | 6 | 3 | ✅ 25+ balanced |
-| vectordb | 98 | 6 | 17 | 66 | 6 | 3 | ✅ 25+ balanced |
-| gcp | 104 | 9 | 30 | 57 | 6 | 2 | ✅ 25+ balanced |
-| snowflake | 105 | 10 | 22 | 64 | 6 | 3 | ✅ 25+ balanced |
-| mlsys | 112 | 3 | 18 | 83 | 6 | 2 | ✅ 25+ balanced |
-| bi | 120 | 7 | 33 | 71 | 6 | 3 | ✅ 25+ balanced |
-| observability | 133 | 6 | 14 | 104 | 6 | 3 | ✅ 25+ balanced |
-| databricks | 134 | 8 | 27 | 90 | 6 | 3 | ✅ 25+ balanced |
-| modeling | 141 | 6 | 18 | 108 | 6 | 3 | ✅ 25+ balanced |
-| agentic-ai | 151 | 3 | 5 | 134 | 6 | 3 | ✅ 25+ balanced |
-| agents | 152 | 6 | 13 | 124 | 6 | 3 | ✅ 25+ balanced |
-| kubernetes | 152 | 12 | 11 | 121 | 6 | 2 | ✅ 25+ balanced |
-| azure | 154 | 11 | 32 | 103 | 6 | 2 | ✅ 25+ balanced |
-| azure-ai | 157 | 4 | 16 | 128 | 6 | 3 | ✅ 25+ balanced |
-| architecture | 167 | 9 | 15 | 135 | 6 | 2 | ✅ 25+ balanced |
-| aws | 179 | 11 | 27 | 133 | 6 | 2 | ✅ 25+ balanced |
-| databases | 203 | 8 | 18 | 168 | 6 | 3 | ✅ 25+ balanced |
-| security | 205 | 9 | 22 | 166 | 6 | 2 | ✅ 25+ balanced |
-| data-integration | 249 | 7 | 20 | 213 | 6 | 3 | ✅ 25+ balanced |
+| vectordb | 94 | 12 | 28 | 39 | 10 | 5 | ✅ 25+ balanced |
+| gcp | 101 | 11 | 38 | 44 | 6 | 2 | ✅ 25+ balanced |
+| snowflake | 103 | 12 | 35 | 46 | 8 | 2 | ✅ 25+ balanced |
+| mlsys | 107 | 14 | 30 | 43 | 14 | 6 | ✅ 25+ balanced |
+| bi | 116 | 11 | 46 | 49 | 6 | 4 | ✅ 25+ balanced |
+| modeling | 127 | 16 | 32 | 64 | 11 | 4 | ✅ 25+ balanced |
+| databricks | 131 | 14 | 38 | 60 | 12 | 7 | ✅ 25+ balanced |
+| observability | 133 | 16 | 45 | 53 | 14 | 5 | ✅ 25+ balanced |
+| agentic-ai | 144 | 4 | 53 | 76 | 8 | 3 | ✅ 25+ balanced |
+| agents | 152 | 15 | 35 | 80 | 15 | 7 | ✅ 25+ balanced |
+| kubernetes | 152 | 20 | 51 | 59 | 16 | 6 | ✅ 25+ balanced |
+| azure | 154 | 20 | 45 | 63 | 19 | 7 | ✅ 25+ balanced |
+| azure-ai | 157 | 15 | 41 | 74 | 18 | 9 | ✅ 25+ balanced |
+| architecture | 166 | 18 | 48 | 78 | 16 | 6 | ✅ 25+ balanced |
+| aws | 180 | 19 | 41 | 103 | 12 | 5 | ✅ 25+ balanced |
+| databases | 199 | 24 | 65 | 84 | 20 | 6 | ✅ 25+ balanced |
+| security | 212 | 27 | 78 | 83 | 18 | 6 | ✅ 25+ balanced |
+| data-integration | 248 | 11 | 102 | 102 | 25 | 8 | ✅ 25+ balanced |
 TRACKS-TABLE-END -->
 
 Single source-of-truth backlog of technical terms pulled from job descriptions, cross-referenced
@@ -113,72 +113,72 @@ this JD touches a term that maps to it.
 | SQL | sql | 45 | ✅ covered | 24 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, Autodesk-PrincipalDE-Snowflake 2026-06-08, Capaciti-SRE 2026-06-08, CapacityEng-SRE 2026-06-08, DE-BI-ETL 2026-06-08, DE-Reltio-MDM 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, DataQuality-SrDE 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, Kforce-DWAnalyst 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, LeadDE-Azure-AI 2026-06-08, LeadSnowflakeEng 2026-06-08, Molina-DataGovernance 2026-06-08, PrincipalObservabilityArch 2026-06-08, SeniorDE-AWS-Contract 2026-06-08, Snowflake-SolEng 2026-06-08, StaffDE-Warehouse 2026-06-08, UHC-ReportingDev 2026-06-08 |  |
 | AWS | aws | 105 | ✅ covered | 22 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-SanJose 2026-06-08, AWS-MigrationSpec 2026-06-08, AWS-PlatformEng 2026-06-08, Allconnect-SrSWE 2026-06-08, Block-MLAI 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, CloudInfraArch-AWS 2026-06-08, DE-BI-ETL 2026-06-08, DE-Reltio-MDM 2026-06-08, DataQuality-SrDE 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, Genesis10-DataIntegration 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, LeadSnowflakeEng 2026-06-08, Lumen-SrDirDE 2026-06-08, Optum-SrAIML 2026-06-08, PrincipalObservabilityArch 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 |  |
 | CI/CD | cicd | 11 | ✅ covered | 22 | skip — covered | 2026-06-08 | AILead-MultiAgent 2026-06-08, AIML-SanJose 2026-06-08, Ascensus-SrDE-Oracle 2026-06-08, ClevelandClinic-AISWE 2026-06-08, DE-Reltio-MDM 2026-06-08, DataPlatformEngMgr 2026-06-08, DataScientist-CPG 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, GD-AIEngineer 2026-06-08, Genesis10-DataIntegration 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, LeadSnowflakeEng 2026-06-08, Lumen-SrDirDE 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, Optum-SrAIML 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 |  |
-| Snowflake | snowflake | 92 | ✅ covered | 21 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, Autodesk-PrincipalDE-Snowflake 2026-06-08, Block-MLAI 2026-06-08, ClevelandClinic-AISWE 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, DataPlatformEngMgr 2026-06-08, DataQuality-SrDE 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, GD-AIEngineer 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, Kforce-DWAnalyst 2026-06-08, LeadSnowflakeEng 2026-06-08, Lumen-SrDirDE 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, OptumAI-Scientist 2026-06-08, Snowflake-SolEng 2026-06-08, SnowflakeDataArch 2026-06-08, SolArch-Azure-Purview 2026-06-08, StaffDE-Warehouse 2026-06-08, TEKsystems-SWE 2026-06-08, UHC-ReportingDev 2026-06-08 |  |
-| GCP | gcp | 28 | ✅ covered | 19 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-SanJose 2026-06-08, Block-MLAI 2026-06-08, ClevelandClinic-AISWE 2026-06-08, CloudInfraArch-AWS 2026-06-08, Databricks-BIDev-Mid 2026-06-08, Genesis10-DataIntegration 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, IntegrationDE-DataFusion 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, LeadSnowflakeEng 2026-06-08, Lumen-SrDirDE 2026-06-08, Optum-SrAIML 2026-06-08, PrincipalObservabilityArch 2026-06-08, SnowflakeDataArch 2026-06-08, TechLead-FullStack-AI 2026-06-08 |  |
+| Snowflake | snowflake | 90 | ✅ covered | 21 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, Autodesk-PrincipalDE-Snowflake 2026-06-08, Block-MLAI 2026-06-08, ClevelandClinic-AISWE 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, DataPlatformEngMgr 2026-06-08, DataQuality-SrDE 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, GD-AIEngineer 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, Kforce-DWAnalyst 2026-06-08, LeadSnowflakeEng 2026-06-08, Lumen-SrDirDE 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, OptumAI-Scientist 2026-06-08, Snowflake-SolEng 2026-06-08, SnowflakeDataArch 2026-06-08, SolArch-Azure-Purview 2026-06-08, StaffDE-Warehouse 2026-06-08, TEKsystems-SWE 2026-06-08, UHC-ReportingDev 2026-06-08 |  |
+| GCP | gcp | 27 | ✅ covered | 19 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-SanJose 2026-06-08, Block-MLAI 2026-06-08, ClevelandClinic-AISWE 2026-06-08, CloudInfraArch-AWS 2026-06-08, Databricks-BIDev-Mid 2026-06-08, Genesis10-DataIntegration 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, IntegrationDE-DataFusion 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, LeadSnowflakeEng 2026-06-08, Lumen-SrDirDE 2026-06-08, Optum-SrAIML 2026-06-08, PrincipalObservabilityArch 2026-06-08, SnowflakeDataArch 2026-06-08, TechLead-FullStack-AI 2026-06-08 |  |
 | ETL/ELT | data-integration | 18 | ✅ covered | 17 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, Ascensus-SrDE-Oracle 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, Capaciti-SRE 2026-06-08, CapacityEng-SRE 2026-06-08, DE-BI-ETL 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, HR-DataSteward 2026-06-08, IntegrationDE-DataFusion 2026-06-08, Kforce-DWAnalyst 2026-06-08, LeadSnowflakeEng 2026-06-08, Lumen-SrDirDE 2026-06-08, Snowflake-SolEng 2026-06-08, SnowflakeDataArch 2026-06-08, TEKsystems-SWE 2026-06-08 | lives in data-integration |
-| LLM | agentic-ai | 84 | ✅ covered | 17 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AIML-Architect 2026-06-08, AIML-SanJose 2026-06-08, Autodesk-PrincipalDE-Snowflake 2026-06-08, Block-MLAI 2026-06-08, CVS-ClaudeAIEng 2026-06-08, DE-Reltio-MDM 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, LeadDE-Azure-AI 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, Optum-SrAIML 2026-06-08, OptumAI-Scientist 2026-06-08, PrincipalObservabilityArch 2026-06-08, Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in agentic-ai |
-| Power BI | bi | 35 | ✅ covered | 17 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, AWS-FDE 2026-06-08, Ascensus-SrDE-Oracle 2026-06-08, Autodesk-PrincipalDE-Snowflake 2026-06-08, Azure-FDE 2026-06-08, DataScientist-CPG 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, HR-DataSteward 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, LeadSnowflakeEng 2026-06-08, Molina-DataGovernance 2026-06-08, RobertHalf-AIDash 2026-06-08, SeniorDE-AWS-Contract 2026-06-08, SnowflakeDataArch 2026-06-08, SolArch-Azure-Purview 2026-06-08, UHC-ReportingDev 2026-06-08 | lives in bi |
-| Databricks | databricks | 101 | ✅ covered | 15 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AIML-Architect 2026-06-08, ClevelandClinic-AISWE 2026-06-08, DE-BI-ETL 2026-06-08, DataQuality-SrDE 2026-06-08, DataScientist-CPG 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, Genesis10-DataIntegration 2026-06-08, HR-DataSteward 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, Lumen-SrDirDE 2026-06-08, Molina-DataGovernance 2026-06-08, PrincipalObservabilityArch 2026-06-08, UHC-ReportingDev 2026-06-08 |  |
+| LLM | agentic-ai | 78 | ✅ covered | 17 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AIML-Architect 2026-06-08, AIML-SanJose 2026-06-08, Autodesk-PrincipalDE-Snowflake 2026-06-08, Block-MLAI 2026-06-08, CVS-ClaudeAIEng 2026-06-08, DE-Reltio-MDM 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, LeadDE-Azure-AI 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, Optum-SrAIML 2026-06-08, OptumAI-Scientist 2026-06-08, PrincipalObservabilityArch 2026-06-08, Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in agentic-ai |
+| Power BI | bi | 34 | ✅ covered | 17 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, AWS-FDE 2026-06-08, Ascensus-SrDE-Oracle 2026-06-08, Autodesk-PrincipalDE-Snowflake 2026-06-08, Azure-FDE 2026-06-08, DataScientist-CPG 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, HR-DataSteward 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, LeadSnowflakeEng 2026-06-08, Molina-DataGovernance 2026-06-08, RobertHalf-AIDash 2026-06-08, SeniorDE-AWS-Contract 2026-06-08, SnowflakeDataArch 2026-06-08, SolArch-Azure-Purview 2026-06-08, UHC-ReportingDev 2026-06-08 | lives in bi |
+| Databricks | databricks | 100 | ✅ covered | 15 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AIML-Architect 2026-06-08, ClevelandClinic-AISWE 2026-06-08, DE-BI-ETL 2026-06-08, DataQuality-SrDE 2026-06-08, DataScientist-CPG 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, Genesis10-DataIntegration 2026-06-08, HR-DataSteward 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, Lumen-SrDirDE 2026-06-08, Molina-DataGovernance 2026-06-08, PrincipalObservabilityArch 2026-06-08, UHC-ReportingDev 2026-06-08 |  |
 | Terraform | terraform | 41 | ✅ covered | 15 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-PlatformEng 2026-06-08, Allconnect-SrSWE 2026-06-08, CapacityEng-SRE 2026-06-08, CloudInfraArch-AWS 2026-06-08, DataPlatformEngMgr 2026-06-08, Databricks-PlatformAdmin 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, LeadSnowflakeEng 2026-06-08, Optum-SrAIML 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 |  |
 | Data Modeling | modeling | 5 | ✅ covered | 13 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, Ascensus-SrDE-Oracle 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, Capaciti-SRE 2026-06-08, DataQuality-SrDE 2026-06-08, Databricks-BIDev-Mid 2026-06-08, Kforce-DWAnalyst 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, Lumen-SrDirDE 2026-06-08, SnowflakeDataArch 2026-06-08 |  |
 | AI Agents | agents | 2 | ✅ covered | 12 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, Ascensus-SrDE-Oracle 2026-06-08, ClevelandClinic-AISWE 2026-06-08, CopilotStudio-AIEng 2026-06-08, DataQuality-SrDE 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 |  |
-| Data Warehouse | security | 37 | ✅ covered | 12 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, DE-Reltio-MDM 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, HR-DataSteward 2026-06-08, Kforce-DWAnalyst 2026-06-08, Lumen-SrDirDE 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, Snowflake-SolEng 2026-06-08, SnowflakeDataArch 2026-06-08, StaffDE-Warehouse 2026-06-08 | lives in security |
+| Data Warehouse | security | 36 | ✅ covered | 12 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, DE-Reltio-MDM 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, HR-DataSteward 2026-06-08, Kforce-DWAnalyst 2026-06-08, Lumen-SrDirDE 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, Snowflake-SolEng 2026-06-08, SnowflakeDataArch 2026-06-08, StaffDE-Warehouse 2026-06-08 | lives in security |
 | Kubernetes | kubernetes | 75 | ✅ covered | 12 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-SanJose 2026-06-08, AWS-PlatformEng 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, CloudInfraArch-AWS 2026-06-08, GD-AIEngineer 2026-06-08, Genesis10-DataIntegration 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, TEKsystems-SWE 2026-06-08, TechLead-FullStack-AI 2026-06-08 |  |
 | RAG | rag | 41 | ✅ covered | 12 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-SanJose 2026-06-08, AWS-FDE 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08, Azure-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, LeadDE-Azure-AI 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 |  |
 | Agentic AI | agentic-ai | 2 | ✅ covered | 11 | skip — covered | 2026-06-08 | AILead-MultiAgent 2026-06-08, AIML-AgentEng 2026-06-08, AIML-SanJose 2026-06-08, Block-MLAI 2026-06-08, CVS-ClaudeAIEng 2026-06-08, CloudInfraArch-AWS 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, LeadAIML-Burgeon 2026-06-08, Optum-SrAIML 2026-06-08, TechLead-FullStack-AI 2026-06-08 |  |
 | Docker | docker | 42 | ✅ covered | 11 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-SanJose 2026-06-08, AWS-PlatformEng 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, ClevelandClinic-AISWE 2026-06-08, CloudInfraArch-AWS 2026-06-08, GD-AIEngineer 2026-06-08, Optum-SrAIML 2026-06-08, TEKsystems-SWE 2026-06-08, TechLead-FullStack-AI 2026-06-08 |  |
 | MLOps | azure-ai | 19 | ✅ covered | 11 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-Architect 2026-06-08, AIML-SanJose 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, Azure-FDE 2026-06-08, DataScientist-CPG 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, OptumAI-Scientist 2026-06-08 | lives in azure-ai |
-| REST APIs | data-integration | 19 | ✅ covered | 11 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AWS-FDE 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, ClevelandClinic-AISWE 2026-06-08, GD-AIEngineer 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadDE-Azure-AI 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, PrincipalObservabilityArch 2026-06-08, TechLead-FullStack-AI 2026-06-08 | lives in data-integration |
+| REST APIs | data-integration | 18 | ✅ covered | 11 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AWS-FDE 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, ClevelandClinic-AISWE 2026-06-08, GD-AIEngineer 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadDE-Azure-AI 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, PrincipalObservabilityArch 2026-06-08, TechLead-FullStack-AI 2026-06-08 | lives in data-integration |
 | Spark | spark | 59 | ✅ covered | 11 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-Architect 2026-06-08, Capaciti-SRE 2026-06-08, CapacityEng-SRE 2026-06-08, DE-BI-ETL 2026-06-08, DataQuality-SrDE 2026-06-08, Databricks-BIDev-Mid 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, LeadDE-Azure-AI 2026-06-08, OptumAI-Scientist 2026-06-08, PrincipalObservabilityArch 2026-06-08 |  |
 | Vector Databases | vectordb | 24 | ✅ covered | 11 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, LeadDE-Azure-AI 2026-06-08, Lumen-SrDirDE 2026-06-08 | lives in vectordb |
-| Embeddings | vectordb | 31 | ✅ covered | 10 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08, GD-AIEngineer 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in vectordb |
+| Embeddings | vectordb | 28 | ✅ covered | 10 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08, GD-AIEngineer 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in vectordb |
 | Azure DevOps | azure-ai | 24 | ✅ covered | 9 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08, Azure-FDE 2026-06-08, CloudInfraArch-AWS 2026-06-08, DataScientist-CPG 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in azure-ai |
-| Data Governance | data-integration | 14 | ✅ covered | 9 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, DataPlatformEngMgr 2026-06-08, HR-DataSteward 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, Lumen-SrDirDE 2026-06-08, Molina-DataGovernance 2026-06-08, SnowflakeDataArch 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in data-integration |
+| Data Governance | data-integration | 13 | ✅ covered | 9 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, DataPlatformEngMgr 2026-06-08, HR-DataSteward 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, Lumen-SrDirDE 2026-06-08, Molina-DataGovernance 2026-06-08, SnowflakeDataArch 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in data-integration |
 | GitHub Actions | cicd | 18 | ✅ covered | 9 | skip — covered | 2026-06-08 | AWS-PlatformEng 2026-06-08, Allconnect-SrSWE 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, Azure-FDE 2026-06-08, CloudInfraArch-AWS 2026-06-08, DataScientist-CPG 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, Optum-SrAIML 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in cicd |
 | Machine Learning | azure-ai | 27 | ✅ covered | 9 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AzureDatabricks-ML 2026-06-08, Block-MLAI 2026-06-08, ClevelandClinic-AISWE 2026-06-08, DataScientist-CPG 2026-06-08, Elbit-PrincipalAI 2026-06-08, OptumAI-Scientist 2026-06-08, RobertHalf-AIDash 2026-06-08, TechLead-FullStack-AI 2026-06-08 | lives in azure-ai |
 | Git | git | 41 | ✅ covered | 8 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08, DE-Reltio-MDM 2026-06-08, Databricks-BIDev-Mid 2026-06-08, Databricks-PlatformAdmin 2026-06-08, Genesis10-DataIntegration 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, LeadSnowflakeEng 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 |  |
 | Kafka | kafka | 55 | ✅ covered | 8 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, GD-AIEngineer 2026-06-08, Genesis10-DataIntegration 2026-06-08, LeadSnowflakeEng 2026-06-08, PrincipalObservabilityArch 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 |  |
 | MCP | agents | 12 | ✅ covered | 8 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, CVS-ClaudeAIEng 2026-06-08, ClevelandClinic-AISWE 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, NodeJS-AIEng-SAP 2026-06-08 | lives in agents |
 | Microsoft Fabric | azure | 17 | ✅ covered | 8 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AIML-Architect 2026-06-08, Azure-FDE 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, LeadDE-Azure-AI 2026-06-08, Lumen-SrDirDE 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in azure |
-| Prompt Engineering | agentic-ai | 17 | ✅ covered | 8 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-SanJose 2026-06-08, CVS-ClaudeAIEng 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, LeadDE-Azure-AI 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in agentic-ai |
+| Prompt Engineering | agentic-ai | 16 | ✅ covered | 8 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AIML-SanJose 2026-06-08, CVS-ClaudeAIEng 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, LeadDE-Azure-AI 2026-06-08, NodeJS-AIEng-SAP 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in agentic-ai |
 | PySpark | pyspark | 44 | ✅ covered | 8 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, Autodesk-PrincipalDE-Snowflake 2026-06-08, DE-BI-ETL 2026-06-08, DataScientist-CPG 2026-06-08, Databricks-BIDev-Mid 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, LeadDE-Azure-AI 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 |  |
 | Airflow | airflow | 42 | ✅ covered | 7 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, Block-MLAI 2026-06-08, Capaciti-SRE 2026-06-08, CapacityEng-SRE 2026-06-08, GD-AIEngineer 2026-06-08, SeniorDE-AWS-Contract 2026-06-08, StaffDE-Warehouse 2026-06-08 |  |
 | Azure Data Factory | azure | 16 | ✅ covered | 7 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, AzureDatabricks-ML 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, Databricks-BIDev-Mid 2026-06-08, Kforce-DWAnalyst 2026-06-08, LeadSnowflakeEng 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in azure |
-| BigQuery | gcp | 45 | ✅ covered | 7 | skip — covered | 2026-06-08 | DataPlatformEngMgr 2026-06-08, Genesis10-DataIntegration 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, StaffDE-Warehouse 2026-06-08 | lives in gcp |
-| Dimensional Modeling | modeling | 14 | ✅ covered | 7 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, DE-Reltio-MDM 2026-06-08, Databricks-BIDev-Mid 2026-06-08, LeadDE-Azure-AI 2026-06-08, LeadSnowflakeEng 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in modeling |
+| BigQuery | gcp | 43 | ✅ covered | 7 | skip — covered | 2026-06-08 | DataPlatformEngMgr 2026-06-08, Genesis10-DataIntegration 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08, StaffDE-Warehouse 2026-06-08 | lives in gcp |
+| Dimensional Modeling | modeling | 13 | ✅ covered | 7 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, DE-Reltio-MDM 2026-06-08, Databricks-BIDev-Mid 2026-06-08, LeadDE-Azure-AI 2026-06-08, LeadSnowflakeEng 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in modeling |
 | Generative AI | azure-ai | 11 | ✅ covered | 7 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AIML-Architect 2026-06-08, AIML-SanJose 2026-06-08, Block-MLAI 2026-06-08, CloudInfraArch-AWS 2026-06-08, Optum-SrAIML 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in azure-ai |
 | Java | java | 42 | ✅ covered | 7 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08, DataPlatformEngMgr 2026-06-08, Elbit-PrincipalAI 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, IntegrationDE-DataFusion 2026-06-08, LeadSnowflakeEng 2026-06-08, TechLead-FullStack-AI 2026-06-08 |  |
 | S3 | aws | 102 | ✅ covered | 7 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-MigrationSpec 2026-06-08, AWS-PlatformEng 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, Genesis10-DataIntegration 2026-06-08 | lives in aws |
 | AWS Lambda | aws | 10 | ✅ covered | 6 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-PlatformEng 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08, CloudInfraArch-AWS 2026-06-08, Genesis10-DataIntegration 2026-06-08 | lives in aws |
-| LangChain | agentic-ai | 15 | ✅ covered | 6 | skip — covered | 2026-06-08 | AILead-MultiAgent 2026-06-08, AILeadDev-Agentic 2026-06-08, AWS-FDE 2026-06-08, Azure-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08 | lives in agentic-ai |
-| LangGraph | agentic-ai | 17 | ✅ covered | 6 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, Azure-FDE 2026-06-08, ClevelandClinic-AISWE 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, LeadDE-Azure-AI 2026-06-08 | lives in agentic-ai |
+| LangChain | agentic-ai | 12 | ✅ covered | 6 | skip — covered | 2026-06-08 | AILead-MultiAgent 2026-06-08, AILeadDev-Agentic 2026-06-08, AWS-FDE 2026-06-08, Azure-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08 | lives in agentic-ai |
+| LangGraph | agentic-ai | 13 | ✅ covered | 6 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, Azure-FDE 2026-06-08, ClevelandClinic-AISWE 2026-06-08, FTI-AIML-DoD 2026-06-08, GD-AIEngineer 2026-06-08, LeadDE-Azure-AI 2026-06-08 | lives in agentic-ai |
 | Microsoft Copilot Studio | azure-ai | 12 | ✅ covered | 6 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08, CopilotStudio-AIEng 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in azure-ai |
 | PyTorch | azure-ai | 19 | ✅ covered | 6 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, Block-MLAI 2026-06-08, Elbit-PrincipalAI 2026-06-08, FTI-AIML-DoD 2026-06-08, OptumAI-Scientist 2026-06-08 | lives in azure-ai |
 | RBAC | azure | 29 | ✅ covered | 6 | skip — covered | 2026-06-08 | DataPlatformEngMgr 2026-06-08, Databricks-PlatformAdmin 2026-06-08, HR-DataSteward 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, IntegrationDE-DataFusion 2026-06-08, Lumen-SrDirDE 2026-06-08 | lives in azure |
 | Tableau | tableau | 32 | ✅ covered | 6 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, DataQuality-SrDE 2026-06-08, LeadSnowflakeEng 2026-06-08, Molina-DataGovernance 2026-06-08, RobertHalf-AIDash 2026-06-08, UHC-ReportingDev 2026-06-08 |  |
 | TensorFlow | azure-ai | 16 | ✅ covered | 6 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AIML-SanJose 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, Elbit-PrincipalAI 2026-06-08, FTI-AIML-DoD 2026-06-08, OptumAI-Scientist 2026-06-08 | lives in azure-ai |
 | API Gateway | architecture | 13 | ✅ covered | 5 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08, CloudInfraArch-AWS 2026-06-08, InfraEng-Cloud-K8s 2026-06-08 | lives in architecture |
-| Data Lineage | data-integration | 13 | ✅ covered | 5 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, DataQuality-SrDE 2026-06-08, HR-DataSteward 2026-06-08, Lumen-SrDirDE 2026-06-08 | lives in data-integration |
+| Data Lineage | data-integration | 12 | ✅ covered | 5 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, DataQuality-SrDE 2026-06-08, HR-DataSteward 2026-06-08, Lumen-SrDirDE 2026-06-08 | lives in data-integration |
 | data pipelines | security | 19 | ✅ covered | 5 | skip — covered | 2026-06-08 | HybridDA-Consultant-FDE 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in security |
 | Data Quality | data-integration | 39 | ✅ covered | 5 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, DataQuality-SrDE 2026-06-08, HR-DataSteward 2026-06-08, IntegrationDE-DataFusion 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in data-integration |
 | Delta Lake | databricks | 15 | ✅ covered | 5 | skip — covered | 2026-06-08 | DataScientist-CPG 2026-06-08, Databricks-BIDev-Mid 2026-06-08, Genesis10-DataIntegration 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in databricks |
 | GitHub Copilot | agents | 12 | ✅ covered | 5 | skip — covered | 2026-06-08 | AILead-MultiAgent 2026-06-08, Allconnect-SrSWE 2026-06-08, DataQuality-SrDE 2026-06-08, GD-AIEngineer 2026-06-08, Optum-OracleDBA 2026-06-08 | lives in agents |
 | Google ADK | agents | 11 | ✅ covered | 5 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in agents |
 | guardrails | voice-ai | 17 | ✅ covered | 5 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08, Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in voice-ai |
-| IAM | aws | 37 | ✅ covered | 5 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-MigrationSpec 2026-06-08, AWS-PlatformEng 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in aws |
+| IAM | security | 44 | ✅ covered | 5 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-MigrationSpec 2026-06-08, AWS-PlatformEng 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in security |
 | observability | observability | 43 | ✅ covered | 5 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, DataQuality-SrDE 2026-06-08, IntegrationDE-DataFusion 2026-06-08, StaffDE-Warehouse 2026-06-08 |  |
 | Oracle | databases | 57 | ✅ covered | 5 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, DE-BI-ETL 2026-06-08, GD-AIEngineer 2026-06-08, Genesis10-DataIntegration 2026-06-08, Optum-OracleDBA 2026-06-08 | lives in databases |
 | Power Automate | azure-ai | 18 | ✅ covered | 5 | skip — covered | 2026-06-08 | CopilotStudio-AIEng 2026-06-08, LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in azure-ai |
 | TypeScript | typescript | 59 | ✅ covered | 5 | skip — covered | 2026-06-08 | Allconnect-SrSWE 2026-06-08, DataQuality-SrDE 2026-06-08, TechLead-FullStack-AI 2026-06-08, Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 |  |
-| AutoGen | agentic-ai | 12 | ✅ covered | 4 | skip — covered | 2026-06-08 | AILead-MultiAgent 2026-06-08, AILeadDev-Agentic 2026-06-08, Azure-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08 | lives in agentic-ai |
+| AutoGen | agentic-ai | 11 | ✅ covered | 4 | skip — covered | 2026-06-08 | AILead-MultiAgent 2026-06-08, AILeadDev-Agentic 2026-06-08, Azure-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08 | lives in agentic-ai |
 | Claude | agents | 30 | ✅ covered | 4 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, DataQuality-SrDE 2026-06-08, GD-AIEngineer 2026-06-08, RobertHalf-AIDash 2026-06-08 | lives in agents |
-| Cloud SQL | gcp | 19 | ✅ covered | 4 | skip — covered | 2026-06-08 | LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in gcp |
+| Cloud SQL | gcp | 18 | ✅ covered | 4 | skip — covered | 2026-06-08 | LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in gcp |
 | CloudWatch | aws | 50 | ✅ covered | 4 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-PlatformEng 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in aws |
-| CrewAI | agentic-ai | 12 | ✅ covered | 4 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, Azure-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08, LeadDE-Azure-AI 2026-06-08 | lives in agentic-ai |
+| CrewAI | agentic-ai | 11 | ✅ covered | 4 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, Azure-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08, LeadDE-Azure-AI 2026-06-08 | lives in agentic-ai |
 | Data Lake | azure | 21 | ✅ covered | 4 | skip — covered | 2026-06-08 | DE-BI-ETL 2026-06-08, Molina-DataGovernance 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08, Snowflake-SolEng 2026-06-08 | lives in azure |
-| Dataflow | gcp | 20 | ✅ covered | 4 | skip — covered | 2026-06-08 | LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in gcp |
+| Dataflow | gcp | 19 | ✅ covered | 4 | skip — covered | 2026-06-08 | LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in gcp |
 | dbt | dbt | 43 | ✅ covered | 4 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, DE-BI-ETL 2026-06-08, LeadSnowflakeEng 2026-06-08, StaffDE-Warehouse 2026-06-08 |  |
-| DLP | security | 44 | ✅ covered | 4 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, DataSecurityEng-BigID 2026-06-08, IntegrationDE-DataFusion 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in security |
+| DLP | security | 46 | ✅ covered | 4 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, DataSecurityEng-BigID 2026-06-08, IntegrationDE-DataFusion 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in security |
 | Firestore | gcp | 10 | ✅ covered | 4 | skip — covered | 2026-06-08 | LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in gcp |
 | Go | go | 49 | ✅ covered | 4 | skip — covered | 2026-06-08 | DataPlatformEngMgr 2026-06-08, FreeWheel-BigDataSWE 2026-06-08, Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 |  |
 | IaC | aws | 30 | ✅ covered | 4 | skip — covered | 2026-06-08 | Capaciti-SRE 2026-06-08, DataPlatformEngMgr 2026-06-08, Databricks-PlatformAdmin 2026-06-08, InfraEng-Cloud-K8s 2026-06-08 | lives in aws |
@@ -192,15 +192,15 @@ this JD touches a term that maps to it.
 | Query Optimization | azure | 17 | ✅ covered | 4 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08, DE-Snowflake-Healthcare 2026-06-08, LeadSnowflakeEng 2026-06-08, Optum-OracleDBA 2026-06-08 | lives in azure |
 | Redshift | aws | 25 | ✅ covered | 4 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, DataQuality-SrDE 2026-06-08, Genesis10-DataIntegration 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in aws |
 | scikit-learn | azure-ai | 14 | ✅ covered | 4 | skip — covered | 2026-06-08 | AIML-SanJose 2026-06-08, ArchSystems-AIML-Fed 2026-06-08, DataScientist-CPG 2026-06-08, FTI-AIML-DoD 2026-06-08 | lives in azure-ai |
-| Semantic Layer | bi | 32 | ✅ covered | 4 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, Databricks-BIDev-Mid 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in bi |
-| Stored Procedures | snowflake | 15 | ✅ covered | 4 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08, DE-BI-ETL 2026-06-08, LeadSnowflakeEng 2026-06-08, Molina-DataGovernance 2026-06-08 | lives in snowflake |
+| Semantic Layer | bi | 30 | ✅ covered | 4 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, Databricks-BIDev-Mid 2026-06-08, HybridDA-Consultant-FDE 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in bi |
+| Stored Procedures | snowflake | 13 | ✅ covered | 4 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08, DE-BI-ETL 2026-06-08, LeadSnowflakeEng 2026-06-08, Molina-DataGovernance 2026-06-08 | lives in snowflake |
 | Synapse | azure | 22 | ✅ covered | 4 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, Azure-FDE 2026-06-08, DE-BI-ETL 2026-06-08, DataScientist-CPG 2026-06-08 | lives in azure |
 | UiPath | data-integration | 11 | ✅ covered | 4 | skip — covered | 2026-06-08 | LeadAIML-Burgeon 2026-06-08, LeadAIML-MCP-19 2026-06-08, LeadAIML-MCP-21 2026-06-08, LeadAIML-MCP-24 2026-06-08 | lives in data-integration |
 | ADLS | azure | 41 | ✅ covered | 3 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08, Databricks-PlatformAdmin 2026-06-08, HR-DataSteward 2026-06-08 | lives in azure |
 | AKS | azure | 16 | ✅ covered | 3 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08, InfraEng-Cloud-K8s 2026-06-08, TechLead-FullStack-AI 2026-06-08 | lives in azure |
-| Amazon Bedrock | agentic-ai | 15 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in agentic-ai |
+| Amazon Bedrock | agentic-ai | 13 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in agentic-ai |
 | APIs | apis | 26 | ✅ covered | 3 | skip — covered | 2026-06-08 | HybridDA-Consultant-FDE 2026-06-08, IntegrationDE-DataFusion 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 |  |
-| AWS Glue | aws | 13 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, Genesis10-DataIntegration 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in aws |
+| AWS Glue | aws | 12 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, Genesis10-DataIntegration 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in aws |
 | Azure ML | azure-ai | 90 | ✅ covered | 3 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, Azure-FDE 2026-06-08, DataScientist-CPG 2026-06-08 | lives in azure-ai |
 | Bedrock Agents | agentic-ai | 12 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in agentic-ai |
 | Claude Code | agents | 19 | ✅ covered | 3 | skip — covered | 2026-06-08 | Allconnect-SrSWE 2026-06-08, Block-MLAI 2026-06-08, CVS-ClaudeAIEng 2026-06-08 | lives in agents |
@@ -221,7 +221,7 @@ this JD touches a term that maps to it.
 | Grafana | observability | 21 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-PlatformEng 2026-06-08, Capaciti-SRE 2026-06-08 | lives in observability |
 | JavaScript | typescript | 26 | ✅ covered | 3 | skip — covered | 2026-06-08 | CVS-ClaudeAIEng 2026-06-08, ClevelandClinic-AISWE 2026-06-08, DataPlatformEngMgr 2026-06-08 | lives in typescript |
 | Kinesis | aws | 21 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, PrincipalObservabilityArch 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in aws |
-| Knowledge Bases | agentic-ai | 16 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in agentic-ai |
+| Knowledge Bases | agentic-ai | 14 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in agentic-ai |
 | Looker | looker | 34 | ✅ covered | 3 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, DE-BI-ETL 2026-06-08, LeadSnowflakeEng 2026-06-08 |  |
 | MDM | security | 15 | ✅ covered | 3 | skip — covered | 2026-06-08 | DE-Reltio-MDM 2026-06-08, HR-DataSteward 2026-06-08, HybridDA-Consultant-FDE 2026-06-08 | lives in security |
 | Microservices | architecture | 17 | ✅ covered | 3 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, IntegrationDE-DataFusion 2026-06-08, TechLead-FullStack-AI 2026-06-08 | lives in architecture |
@@ -230,20 +230,20 @@ this JD touches a term that maps to it.
 | NLP | aws | 13 | ✅ covered | 3 | skip — covered | 2026-06-08 | Block-MLAI 2026-06-08, Elbit-PrincipalAI 2026-06-08, OptumAI-Scientist 2026-06-08 | lives in aws |
 | Orchestration | azure-ai | 35 | ✅ covered | 3 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in azure-ai |
 | Performance Tuning | azure | 12 | ✅ covered | 3 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08, Optum-OracleDBA 2026-06-08, SnowflakeDataArch 2026-06-08 | lives in azure |
-| Pinecone | vectordb | 23 | ✅ covered | 3 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AWS-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08 | lives in vectordb |
+| Pinecone | vectordb | 22 | ✅ covered | 3 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AWS-FDE 2026-06-08, FTI-AIML-DoD 2026-06-08 | lives in vectordb |
 | PostgreSQL | databases | 21 | ✅ covered | 3 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08, Optum-OracleDBA 2026-06-08, TEKsystems-SWE 2026-06-08 | lives in databases |
 | Prometheus | observability | 30 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-PlatformEng 2026-06-08, Capaciti-SRE 2026-06-08 | lives in observability |
-| RDS | aws | 16 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-PlatformEng 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, Genesis10-DataIntegration 2026-06-08 | lives in aws |
+| RDS | security | 17 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-PlatformEng 2026-06-08, CapMarkets-DE-DTCC 2026-06-08, Genesis10-DataIntegration 2026-06-08 | lives in security |
 | React | typescript | 20 | ✅ covered | 3 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08, ClevelandClinic-AISWE 2026-06-08, TEKsystems-SWE 2026-06-08 | lives in typescript |
 | SFTP | data-integration | 22 | ✅ covered | 3 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08, LeadDE-Azure-AI 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in data-integration |
 | SQL Server | azure | 24 | ✅ covered | 3 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08, DE-BI-ETL 2026-06-08, HR-DataSteward 2026-06-08 | lives in azure |
-| VPC | security | 32 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-MigrationSpec 2026-06-08, AWS-PlatformEng 2026-06-08 | lives in security |
+| VPC | security | 33 | ✅ covered | 3 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, AWS-MigrationSpec 2026-06-08, AWS-PlatformEng 2026-06-08 | lives in security |
 | Access Control | security | 37 | ✅ covered | 2 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, LeadDE-Azure-AI 2026-06-08 | lives in security |
 | Action Groups | agentic-ai | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in agentic-ai |
 | Amazon Q | aws | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, DataQuality-SrDE 2026-06-08 | lives in aws |
 | Angular | aem | 12 | ✅ covered | 2 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08, TechLead-FullStack-AI 2026-06-08 | lives in aem |
 | ASR | voice-ai | 24 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in voice-ai |
-| Athena | aws | 33 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, DataQuality-SrDE 2026-06-08 | lives in aws |
+| Athena | aws | 32 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, DataQuality-SrDE 2026-06-08 | lives in aws |
 | Azure AI Foundry | azure-ai | 55 | ✅ covered | 2 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, Azure-FDE 2026-06-08 | lives in azure-ai |
 | Azure AI Search | azure-ai | 36 | ✅ covered | 2 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, Azure-FDE 2026-06-08 | lives in azure-ai |
 | Azure Databricks | azure | 20 | ✅ covered | 2 | skip — covered | 2026-06-08 | AzureDatabricks-ML 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in azure |
@@ -252,12 +252,12 @@ this JD touches a term that maps to it.
 | Big Data | data-integration | 14 | ✅ covered | 2 | skip — covered | 2026-06-08 | Capaciti-SRE 2026-06-08, FreeWheel-BigDataSWE 2026-06-08 | lives in data-integration |
 | BigID | security | 14 | ✅ covered | 2 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, DataSecurityEng-BigID 2026-06-08 | lives in security |
 | Capacity Planning | observability | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | CapacityEng-SRE 2026-06-08, IntegrationDE-DataFusion 2026-06-08 | lives in observability |
-| Cartesia | cortex | 17 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in cortex |
-| CDC | data-integration | 34 | ✅ covered | 2 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in data-integration |
-| Chroma | vectordb | 28 | ✅ covered | 2 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, FTI-AIML-DoD 2026-06-08 | lives in vectordb |
+| Cartesia | cortex | 15 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in cortex |
+| CDC | data-integration | 33 | ✅ covered | 2 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in data-integration |
+| Chroma | vectordb | 24 | ✅ covered | 2 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, FTI-AIML-DoD 2026-06-08 | lives in vectordb |
 | Codex | agents | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | Block-MLAI 2026-06-08, GD-AIEngineer 2026-06-08 | lives in agents |
-| Cost Monitoring | snowflake | 12 | ✅ covered | 2 | skip — covered | 2026-06-08 | Databricks-PlatformAdmin 2026-06-08, StaffDE-Warehouse 2026-06-08 | lives in snowflake |
-| Data Mart | bi | 23 | ✅ covered | 2 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, DE-BI-ETL 2026-06-08 | lives in bi |
+| Cost Monitoring | snowflake | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | Databricks-PlatformAdmin 2026-06-08, StaffDE-Warehouse 2026-06-08 | lives in snowflake |
+| Data Mart | bi | 20 | ✅ covered | 2 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, DE-BI-ETL 2026-06-08 | lives in bi |
 | Data Masking | security | 15 | ✅ covered | 2 | skip — covered | 2026-06-08 | LeadSnowflakeEng 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in security |
 | data mesh | architecture | 15 | ✅ covered | 2 | skip — covered | 2026-06-08 | Lumen-SrDirDE 2026-06-08, Snowflake-SolEng 2026-06-08 | lives in architecture |
 | Data Migration | architecture | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | DE-Snowflake-Healthcare 2026-06-08, Optum-OracleDBA 2026-06-08 | lives in architecture |
@@ -268,10 +268,10 @@ this JD touches a term that maps to it.
 | ECS | aws | 16 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, CloudInfraArch-AWS 2026-06-08 | lives in aws |
 | EHR | data-integration | 27 | ✅ covered | 2 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08, DE-Snowflake-Healthcare 2026-06-08 | lives in data-integration |
 | EKS | kubernetes | 27 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, CapMarkets-DE-DTCC 2026-06-08 | lives in kubernetes |
-| ElevenLabs | cortex | 12 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in cortex |
-| Encryption | security | 58 | ✅ covered | 2 | skip — covered | 2026-06-08 | HR-DataSteward 2026-06-08, IntegrationDE-DataFusion 2026-06-08 | lives in security |
+| ElevenLabs | cortex | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in cortex |
+| Encryption | security | 59 | ✅ covered | 2 | skip — covered | 2026-06-08 | HR-DataSteward 2026-06-08, IntegrationDE-DataFusion 2026-06-08 | lives in security |
 | Entra ID | azure | 18 | ✅ covered | 2 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08, Databricks-PlatformAdmin 2026-06-08 | lives in azure |
-| ERP | modeling | 14 | ✅ covered | 2 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in modeling |
+| ERP | modeling | 13 | ✅ covered | 2 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in modeling |
 | feature engineering | azure-ai | 14 | ✅ covered | 2 | skip — covered | 2026-06-08 | AIML-SanJose 2026-06-08, DataScientist-CPG 2026-06-08 | lives in azure-ai |
 | feature stores | azure-ai | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08, Lumen-SrDirDE 2026-06-08 | lives in azure-ai |
 | Five9 | voice-ai | 23 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in voice-ai |
@@ -284,47 +284,47 @@ this JD touches a term that maps to it.
 | Indexing | vectordb | 25 | ✅ covered | 2 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08, Optum-OracleDBA 2026-06-08 | lives in vectordb |
 | Jira | security | 29 | ✅ covered | 2 | skip — covered | 2026-06-08 | CVS-ClaudeAIEng 2026-06-08, DataScientist-CPG 2026-06-08 | lives in security |
 | Knowledge Graphs | data-integration | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | GD-AIEngineer 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in data-integration |
-| Lakeflow | databricks | 30 | ✅ covered | 2 | skip — covered | 2026-06-08 | DE-Reltio-MDM 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in databricks |
+| Lakeflow | databricks | 29 | ✅ covered | 2 | skip — covered | 2026-06-08 | DE-Reltio-MDM 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in databricks |
 | LIME | azure-ai | 12 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, Azure-FDE 2026-06-08 | lives in azure-ai |
 | Linux | docker | 13 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08, CloudInfraArch-AWS 2026-06-08 | lives in docker |
 | Matillion | data-integration | 17 | ✅ covered | 2 | skip — covered | 2026-06-08 | LeadSnowflakeEng 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in data-integration |
 | MES | data-integration | 14 | ✅ covered | 2 | skip — covered | 2026-06-08 | GD-AIEngineer 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in data-integration |
-| Microsoft Purview | security | 18 | ✅ covered | 2 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in security |
+| Microsoft Purview | security | 17 | ✅ covered | 2 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, SolArch-Azure-Purview 2026-06-08 | lives in security |
 | Neo4j | databases | 18 | ✅ covered | 2 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in databases |
 | networking | azure-ai | 15 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08, CloudInfraArch-AWS 2026-06-08 | lives in azure-ai |
 | NICE | leadership | 14 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in leadership |
-| NIST | security | 39 | ✅ covered | 2 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in security |
+| NIST | security | 38 | ✅ covered | 2 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in security |
 | PCI-DSS | security | 15 | ✅ covered | 2 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in security |
 | PII handling | observability | 17 | ✅ covered | 2 | skip — covered | 2026-06-08 | DataPlatformEngMgr 2026-06-08, IntegrationDE-DataFusion 2026-06-08 | lives in observability |
 | PLM | data-integration | 12 | ✅ covered | 2 | skip — covered | 2026-06-08 | GD-AIEngineer 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in data-integration |
 | Plotly | hex | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08, DataScientist-CPG 2026-06-08 | lives in hex |
 | PowerShell | azure | 20 | ✅ covered | 2 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08, CloudInfraArch-AWS 2026-06-08 | lives in azure |
-| predictive models | mlsys | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, HybridDA-Consultant-FDE 2026-06-08 | lives in mlsys |
+| predictive models | mlsys | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08, HybridDA-Consultant-FDE 2026-06-08 | lives in mlsys |
 | QuickSight | aws | 15 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, DataQuality-SrDE 2026-06-08 | lives in aws |
 | reinforcement learning | agents | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08, Elbit-PrincipalAI 2026-06-08 | lives in agents |
 | Scala | scala | 49 | ✅ covered | 2 | skip — covered | 2026-06-08 | FreeWheel-BigDataSWE 2026-06-08, LeadSnowflakeEng 2026-06-08 |  |
-| Secrets Manager | security | 20 | ✅ covered | 2 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in security |
-| semantic caching | agentic-ai | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in agentic-ai |
-| Semantic Modeling | modeling | 13 | ✅ covered | 2 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in modeling |
+| Secrets Manager | security | 23 | ✅ covered | 2 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in security |
+| semantic caching | agentic-ai | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in agentic-ai |
+| Semantic Modeling | modeling | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in modeling |
 | SHAP | typescript | 28 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08, Azure-FDE 2026-06-08 | lives in typescript |
-| SIEM | security | 52 | ✅ covered | 2 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in security |
+| SIEM | security | 54 | ✅ covered | 2 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in security |
 | Sierra | voice-ai | 21 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in voice-ai |
-| SLO | architecture | 41 | ✅ covered | 2 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08, NodeJS-AIEng-SAP 2026-06-08 | lives in architecture |
+| SLO | architecture | 40 | ✅ covered | 2 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08, NodeJS-AIEng-SAP 2026-06-08 | lives in architecture |
 | Snowflake Schema | bi | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | DE-Reltio-MDM 2026-06-08, Kforce-DWAnalyst 2026-06-08 | lives in bi |
-| Snowpipe | snowflake | 16 | ✅ covered | 2 | skip — covered | 2026-06-08 | LeadSnowflakeEng 2026-06-08, SnowflakeDataArch 2026-06-08 | lives in snowflake |
+| Snowpipe | snowflake | 15 | ✅ covered | 2 | skip — covered | 2026-06-08 | LeadSnowflakeEng 2026-06-08, SnowflakeDataArch 2026-06-08 | lives in snowflake |
 | Spring Boot | architecture | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08, TechLead-FullStack-AI 2026-06-08 | lives in architecture |
 | SQS | aws | 18 | ✅ covered | 2 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08, AgenticAI-Platform2 2026-06-08 | lives in aws |
-| SSIS | agentic-ai | 21 | ✅ covered | 2 | skip — covered | 2026-06-08 | Molina-DataGovernance 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in agentic-ai |
-| Star Schema | modeling | 27 | ✅ covered | 2 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, DE-Reltio-MDM 2026-06-08 | lives in modeling |
+| SSIS | agentic-ai | 22 | ✅ covered | 2 | skip — covered | 2026-06-08 | Molina-DataGovernance 2026-06-08, SeniorDE-AWS-Contract 2026-06-08 | lives in agentic-ai |
+| Star Schema | modeling | 25 | ✅ covered | 2 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08, DE-Reltio-MDM 2026-06-08 | lives in modeling |
 | Streams | kafka | 20 | ✅ covered | 2 | skip — covered | 2026-06-08 | LeadSnowflakeEng 2026-06-08, SnowflakeDataArch 2026-06-08 | lives in kafka |
 | Tasks | agents | 56 | ✅ covered | 2 | skip — covered | 2026-06-08 | LeadSnowflakeEng 2026-06-08, SnowflakeDataArch 2026-06-08 | lives in agents |
 | TTS | voice-ai | 18 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in voice-ai |
-| Unity Catalog | databricks | 39 | ✅ covered | 2 | skip — covered | 2026-06-08 | Databricks-PlatformAdmin 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in databricks |
+| Unity Catalog | databricks | 37 | ✅ covered | 2 | skip — covered | 2026-06-08 | Databricks-PlatformAdmin 2026-06-08, PrincipalObservabilityArch 2026-06-08 | lives in databricks |
 | Vectorization | azure-ai | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | GD-AIEngineer 2026-06-08, OntologyDE-KnowledgeGraph 2026-06-08 | lives in azure-ai |
 | voice AI | voice-ai | 41 | ✅ covered | 2 | skip — covered | 2026-06-08 | Zoom-AppliedAIEng 2026-06-08, Zoom-AppliedAIMgr 2026-06-08 | lives in voice-ai |
-| VPN | security | 11 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08, CloudInfraArch-AWS 2026-06-08 | lives in security |
+| VPN | security | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08, CloudInfraArch-AWS 2026-06-08 | lives in security |
 | Vue.js | typescript | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | TEKsystems-SWE 2026-06-08, TechLead-FullStack-AI 2026-06-08 | lives in typescript |
-| Weaviate | vectordb | 29 | ✅ covered | 2 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AWS-FDE 2026-06-08 | lives in vectordb |
+| Weaviate | vectordb | 27 | ✅ covered | 2 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08, AWS-FDE 2026-06-08 | lives in vectordb |
 | Windows Server | azure | 10 | ✅ covered | 2 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08, CloudInfraArch-AWS 2026-06-08 | lives in azure |
 | .NET | azure-ai | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in azure-ai |
 | Adobe Experience Platform | aem | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | TechLead-FullStack-AI 2026-06-08 | lives in aem |
@@ -333,7 +333,7 @@ this JD touches a term that maps to it.
 | Akamai | architecture | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08 | lives in architecture |
 | Alerting | observability | 30 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataQuality-SrDE 2026-06-08 | lives in observability |
 | Amazon SageMaker | aws | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in aws |
-| analytics | data-integration | 68 | ✅ covered | 1 | skip — covered | 2026-06-08 | Snowflake-SolEng 2026-06-08 | lives in data-integration |
+| analytics | data-integration | 67 | ✅ covered | 1 | skip — covered | 2026-06-08 | Snowflake-SolEng 2026-06-08 | lives in data-integration |
 | Anomaly Detection | aws | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in aws |
 | Ansible | terraform | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | Capaciti-SRE 2026-06-08 | lives in terraform |
 | Anthos | kubernetes | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08 | lives in kubernetes |
@@ -342,7 +342,7 @@ this JD touches a term that maps to it.
 | Argo Workflows | kubernetes | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | TEKsystems-SWE 2026-06-08 | lives in kubernetes |
 | ArgoCD | kubernetes | 22 | ✅ covered | 1 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08 | lives in kubernetes |
 | ARM templates | azure | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in azure |
-| Atlas API | databases | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | SolArch-Azure-Purview 2026-06-08 | lives in databases |
+| Atlas API | databases | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | SolArch-Azure-Purview 2026-06-08 | lives in databases |
 | Audit Vault | databases | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | Optum-OracleDBA 2026-06-08 | lives in databases |
 | Automation | azure | 19 | ✅ covered | 1 | skip — covered | 2026-06-08 | Optum-OracleDBA 2026-06-08 | lives in azure |
 | AutoML | azure-ai | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataScientist-CPG 2026-06-08 | lives in azure-ai |
@@ -355,31 +355,31 @@ this JD touches a term that maps to it.
 | Azure Monitor | azure-ai | 35 | ✅ covered | 1 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08 | lives in azure-ai |
 | Azure SQL | azure | 46 | ✅ covered | 1 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08 | lives in azure |
 | Batch Ingestion | rag | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | LeadDE-Azure-AI 2026-06-08 | lives in rag |
-| Batch Pipelines | architecture | 19 | ✅ covered | 1 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08 | lives in architecture |
+| Batch Pipelines | architecture | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08 | lives in architecture |
 | business glossary | azure | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | SolArch-Azure-Purview 2026-06-08 | lives in azure |
 | C++ | cpp | 21 | ✅ covered | 1 | skip — covered | 2026-06-08 | Elbit-PrincipalAI 2026-06-08 |  |
 | Caboodle | data-integration | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08 | lives in data-integration |
 | CCPA | security | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
 | Chaos Engineering | architecture | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | Capaciti-SRE 2026-06-08 | lives in architecture |
 | chatbots | voice-ai | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | CopilotStudio-AIEng 2026-06-08 | lives in voice-ai |
-| ChromaDB | vectordb | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in vectordb |
+| ChromaDB | vectordb | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in vectordb |
 | Chronicles | data-integration | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08 | lives in data-integration |
 | CipherTrust | security | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataSecurityEng-BigID 2026-06-08 | lives in security |
 | Clarity | data-integration | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08 | lives in data-integration |
-| Claude API | llms | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | CVS-ClaudeAIEng 2026-06-08 | lives in llms |
+| Claude API | llms | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | CVS-ClaudeAIEng 2026-06-08 | lives in llms |
 | cloud computing | architecture | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | Snowflake-SolEng 2026-06-08 | lives in architecture |
 | cloud migration | architecture | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08 | lives in architecture |
 | CloudFront | aws | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in aws |
 | cluster policies | databricks | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | Databricks-PlatformAdmin 2026-06-08 | lives in databricks |
 | Cognito | aws | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in aws |
-| Comprehend | aws | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in aws |
+| Comprehend | aws | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in aws |
 | computer vision | azure-ai | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | Elbit-PrincipalAI 2026-06-08 | lives in azure-ai |
 | containerization | agents | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | HybridDA-Consultant-FDE 2026-06-08 | lives in agents |
 | Cosmos DB | azure-ai | 32 | ✅ covered | 1 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08 | lives in azure-ai |
 | cost optimization | aws | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | SnowflakeDataArch 2026-06-08 | lives in aws |
 | Cribl | observability | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in observability |
 | CSS3 | typescript | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08 | lives in typescript |
-| Cyera | security | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
+| Cyera | security | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
 | Dagster | architecture | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | StaffDE-Warehouse 2026-06-08 | lives in architecture |
 | Dash | observability | 42 | ✅ covered | 1 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08 | lives in observability |
 | dashboards | observability | 29 | ✅ covered | 1 | skip — covered | 2026-06-08 | RobertHalf-AIDash 2026-06-08 | lives in observability |
@@ -387,7 +387,7 @@ this JD touches a term that maps to it.
 | Data Classification | security | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
 | Data Fabric | data-integration | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | Snowflake-SolEng 2026-06-08 | lives in data-integration |
 | data ingestion | data-integration | 24 | ✅ covered | 1 | skip — covered | 2026-06-08 | Lumen-SrDirDE 2026-06-08 | lives in data-integration |
-| Data Labeling | mlsys | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in mlsys |
+| Data Labeling | mlsys | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in mlsys |
 | data lifecycle management | architecture | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | HR-DataSteward 2026-06-08 | lives in architecture |
 | Data Observability | observability | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | SeniorDE-AWS-Contract 2026-06-08 | lives in observability |
 | Data Security | security | 20 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
@@ -397,7 +397,7 @@ this JD touches a term that maps to it.
 | Databricks SQL | databricks | 19 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in databricks |
 | Datapump | databases | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | Optum-OracleDBA 2026-06-08 | lives in databases |
 | Dataverse | azure-ai | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | CopilotStudio-AIEng 2026-06-08 | lives in azure-ai |
-| DAX | bi | 26 | ✅ covered | 1 | skip — covered | 2026-06-08 | Databricks-BIDev-Mid 2026-06-08 | lives in bi |
+| DAX | bi | 25 | ✅ covered | 1 | skip — covered | 2026-06-08 | Databricks-BIDev-Mid 2026-06-08 | lives in bi |
 | DB2 | data-integration | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | Optum-OracleDBA 2026-06-08 | lives in data-integration |
 | DBA | security | 31 | ✅ covered | 1 | skip — covered | 2026-06-08 | Optum-OracleDBA 2026-06-08 | lives in security |
 | Debezium | data-integration | 28 | ✅ covered | 1 | skip — covered | 2026-06-08 | SeniorDE-AWS-Contract 2026-06-08 | lives in data-integration |
@@ -408,24 +408,24 @@ this JD touches a term that maps to it.
 | Domain-Driven Modeling | architecture | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | SeniorDE-AWS-Contract 2026-06-08 | lives in architecture |
 | drift monitoring | azure-ai | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataScientist-CPG 2026-06-08 | lives in azure-ai |
 | DSPM | security | 24 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
-| DSPy | agentic-ai | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in agentic-ai |
+| DSPy | agentic-ai | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in agentic-ai |
 | DTCC | trading | 44 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in trading |
-| DVC | mlsys | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in mlsys |
+| DVC | mlsys | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in mlsys |
 | DynamoDB | aws | 36 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in aws |
 | Elasticsearch | vectordb | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | Genesis10-DataIntegration 2026-06-08 | lives in vectordb |
-| Embarcadero ER/Studio | modeling | 19 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in modeling |
+| Embarcadero ER/Studio | modeling | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in modeling |
 | enterprise data architecture | architecture | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08 | lives in architecture |
 | Epic | data-integration | 27 | ✅ covered | 1 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08 | lives in data-integration |
-| ER Diagrams | modeling | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in modeling |
+| ER Diagrams | modeling | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in modeling |
 | Event Streams | kafka | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08 | lives in kafka |
 | Event-Driven Processing | architecture | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in architecture |
 | Exadata | databases | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | Optum-OracleDBA 2026-06-08 | lives in databases |
-| Excel | bi | 21 | ✅ covered | 1 | skip — covered | 2026-06-08 | UHC-ReportingDev 2026-06-08 | lives in bi |
+| Excel | bi | 20 | ✅ covered | 1 | skip — covered | 2026-06-08 | UHC-ReportingDev 2026-06-08 | lives in bi |
 | Faker | security | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08 | lives in security |
 | FHIR | data-integration | 32 | ✅ covered | 1 | skip — covered | 2026-06-08 | ClevelandClinic-AISWE 2026-06-08 | lives in data-integration |
 | fine-tuning | azure-ai | 17 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in azure-ai |
 | firewalls | security | 17 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in security |
-| Fivetran | data-integration | 25 | ✅ covered | 1 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08 | lives in data-integration |
+| Fivetran | data-integration | 24 | ✅ covered | 1 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08 | lives in data-integration |
 | FIX Protocol | trading | 17 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in trading |
 | Flask | azure-ai | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08 | lives in azure-ai |
 | Flux | kubernetes | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08 | lives in kubernetes |
@@ -437,8 +437,8 @@ this JD touches a term that maps to it.
 | GitLab | data-integration | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | DE-Reltio-MDM 2026-06-08 | lives in data-integration |
 | GitLab Duo | agents | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | DE-Reltio-MDM 2026-06-08 | lives in agents |
 | GKE | kubernetes | 20 | ✅ covered | 1 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08 | lives in kubernetes |
-| Google Cloud Data Fusion | data-integration | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08 | lives in data-integration |
-| Governed Metrics | bi | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08 | lives in bi |
+| Google Cloud Data Fusion | data-integration | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08 | lives in data-integration |
+| Governed Metrics | bi | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08 | lives in bi |
 | Great Expectations | databricks | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08 | lives in databricks |
 | Harness | azure-ai | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | Capaciti-SRE 2026-06-08 | lives in azure-ai |
 | healthcare data | data-integration | 20 | ✅ covered | 1 | skip — covered | 2026-06-08 | UHC-ReportingDev 2026-06-08 | lives in data-integration |
@@ -451,9 +451,9 @@ this JD touches a term that maps to it.
 | Informatica EDC | data-integration | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | SolArch-Azure-Purview 2026-06-08 | lives in data-integration |
 | Informatica IDQ | data-integration | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | SolArch-Azure-Purview 2026-06-08 | lives in data-integration |
 | ISO 15022 | trading | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in trading |
-| ISO 27001 | security | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in security |
+| ISO 27001 | security | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in security |
 | JSON | data-integration | 43 | ✅ covered | 1 | skip — covered | 2026-06-08 | TechLead-FullStack-AI 2026-06-08 | lives in data-integration |
-| JWT | security | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in security |
+| JWT | security | 20 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in security |
 | Keras | azure-ai | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | AIML-SanJose 2026-06-08 | lives in azure-ai |
 | Key Vault | azure | 19 | ✅ covered | 1 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08 | lives in azure |
 | Kubeflow | mlsys | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in mlsys |
@@ -463,33 +463,33 @@ this JD touches a term that maps to it.
 | Liquibase | cicd | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in cicd |
 | LLM gateway | llms | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08 | lives in llms |
 | LLM orchestration | azure-ai | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | HybridDA-Consultant-FDE 2026-06-08 | lives in azure-ai |
-| load balancers | apis | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in apis |
-| Load Balancing | architecture | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08 | lives in architecture |
+| load balancers | apis | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in apis |
+| Load Balancing | architecture | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08 | lives in architecture |
 | Load Testing | architecture | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | Capaciti-SRE 2026-06-08 | lives in architecture |
-| LoRA | bi | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in bi |
-| Marketo | data-integration | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08 | lives in data-integration |
-| Medallion Architecture | bi | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in bi |
+| LoRA | bi | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in bi |
+| Marketo | data-integration | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08 | lives in data-integration |
+| Medallion Architecture | bi | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in bi |
 | message queue | architecture | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in architecture |
-| Metadata | data-integration | 59 | ✅ covered | 1 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08 | lives in data-integration |
+| Metadata | data-integration | 57 | ✅ covered | 1 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08 | lives in data-integration |
 | Microsoft 365 | azure-ai | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | CVS-ClaudeAIEng 2026-06-08 | lives in azure-ai |
 | Microsoft Copilot | azure-ai | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | Azure-FDE 2026-06-08 | lives in azure-ai |
-| Milvus | vectordb | 23 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in vectordb |
+| Milvus | vectordb | 22 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in vectordb |
 | MIP sensitivity labels | security | 23 | ✅ covered | 1 | skip — covered | 2026-06-08 | SolArch-Azure-Purview 2026-06-08 | lives in security |
 | ML Pipelines | azure-ai | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | AzureDatabricks-ML 2026-06-08 | lives in azure-ai |
 | model deployment | azure-ai | 17 | ✅ covered | 1 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08 | lives in azure-ai |
 | model monitoring | azure-ai | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | GD-AIEngineer 2026-06-08 | lives in azure-ai |
 | model registry | azure-ai | 33 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataScientist-CPG 2026-06-08 | lives in azure-ai |
-| Monitoring | security | 32 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataQuality-SrDE 2026-06-08 | lives in security |
+| Monitoring | security | 31 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataQuality-SrDE 2026-06-08 | lives in security |
 | Mosaic AI | mosaic | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in mosaic |
 | Multithreading | python | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | FreeWheel-BigDataSWE 2026-06-08 | lives in python |
 | Neptune | data-integration | 25 | ✅ covered | 1 | skip — covered | 2026-06-08 | SeniorDE-AWS-Contract 2026-06-08 | lives in data-integration |
 | NestJS | nodejs | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in nodejs |
-| NetSuite | data-integration | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | RobertHalf-AIDash 2026-06-08 | lives in data-integration |
+| NetSuite | data-integration | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | RobertHalf-AIDash 2026-06-08 | lives in data-integration |
 | New Relic | observability | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in observability |
 | Next.js | typescript | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | Allconnect-SrSWE 2026-06-08 | lives in typescript |
 | OCI | kubernetes | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08 | lives in kubernetes |
 | OCSF | security | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in security |
-| Okta | security | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in security |
+| Okta | security | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | CloudInfraArch-AWS 2026-06-08 | lives in security |
 | OneLake | azure | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | SolArch-Azure-Purview 2026-06-08 | lives in azure |
 | Ontology | palantir | 31 | ✅ covered | 1 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08 | lives in palantir |
 | Ontotext | databases | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08 | lives in databases |
@@ -504,21 +504,21 @@ this JD touches a term that maps to it.
 | pandas-profiling | python | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08 | lives in python |
 | Partitioning | spark | 19 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in spark |
 | PEFT | cortex | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in cortex |
-| PeopleSoft | data-integration | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | HR-DataSteward 2026-06-08 | lives in data-integration |
-| Pipeline Reliability | modeling | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | StaffDE-Warehouse 2026-06-08 | lives in modeling |
+| PeopleSoft | data-integration | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | HR-DataSteward 2026-06-08 | lives in data-integration |
+| Pipeline Reliability | modeling | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | StaffDE-Warehouse 2026-06-08 | lives in modeling |
 | PK Protect | security | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataSecurityEng-BigID 2026-06-08 | lives in security |
 | planning algorithms | agentic-ai | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | AIML-AgentEng 2026-06-08 | lives in agentic-ai |
 | Power Apps | azure-ai | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | CopilotStudio-AIEng 2026-06-08 | lives in azure-ai |
 | Power Platform | azure-ai | 18 | ✅ covered | 1 | skip — covered | 2026-06-08 | CopilotStudio-AIEng 2026-06-08 | lives in azure-ai |
 | Power Query | azure | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | Databricks-BIDev-Mid 2026-06-08 | lives in azure |
 | PowerCenter | data-integration | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | IntegrationDE-DataFusion 2026-06-08 | lives in data-integration |
-| Predictive Analytics | mlsys | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | UHC-ReportingDev 2026-06-08 | lives in mlsys |
-| Presto | gcp | 19 | ✅ covered | 1 | skip — covered | 2026-06-08 | FreeWheel-BigDataSWE 2026-06-08 | lives in gcp |
-| prompt injection | agentic-ai | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08 | lives in agentic-ai |
+| Predictive Analytics | mlsys | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | UHC-ReportingDev 2026-06-08 | lives in mlsys |
+| Presto | gcp | 17 | ✅ covered | 1 | skip — covered | 2026-06-08 | FreeWheel-BigDataSWE 2026-06-08 | lives in gcp |
+| prompt injection | agentic-ai | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | AgenticAI-Bedrock-GitLab 2026-06-08 | lives in agentic-ai |
 | Proofpoint | security | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
 | Property Graph | databases | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08 | lives in databases |
 | Pub/Sub | gcp | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in gcp |
-| Qlik | data-integration | 17 | ✅ covered | 1 | skip — covered | 2026-06-08 | SeniorDE-AWS-Contract 2026-06-08 | lives in data-integration |
+| Qlik | data-integration | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | SeniorDE-AWS-Contract 2026-06-08 | lives in data-integration |
 | QLoRA | llms | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | FTI-AIML-DoD 2026-06-08 | lives in llms |
 | R | data-integration | 23 | ✅ covered | 1 | skip — covered | 2026-06-08 | Elbit-PrincipalAI 2026-06-08 | lives in data-integration |
 | RabbitMQ | agents | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in agents |
@@ -529,25 +529,25 @@ this JD touches a term that maps to it.
 | RDF | databases | 31 | ✅ covered | 1 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08 | lives in databases |
 | React Native | flutter | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | TechLead-FullStack-AI 2026-06-08 | lives in flutter |
 | Real-Time Data Processing | architecture | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in architecture |
-| recommendation engines | mlsys | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08 | lives in mlsys |
+| recommendation engines | mlsys | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | AIML-Architect 2026-06-08 | lives in mlsys |
 | Reconciliation | data-integration | 29 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataQuality-SrDE 2026-06-08 | lives in data-integration |
 | Redis | agentic-ai | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08 | lives in agentic-ai |
 | Regulated Environments | data-integration | 28 | ✅ covered | 1 | skip — covered | 2026-06-08 | StaffDE-Warehouse 2026-06-08 | lives in data-integration |
-| Reltio | data-integration | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | DE-Reltio-MDM 2026-06-08 | lives in data-integration |
+| Reltio | data-integration | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | DE-Reltio-MDM 2026-06-08 | lives in data-integration |
 | rerankers | azure-ai | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | NodeJS-AIEng-SAP 2026-06-08 | lives in azure-ai |
-| REST API | data-integration | 60 | ✅ covered | 1 | skip — covered | 2026-06-08 | TEKsystems-SWE 2026-06-08 | lives in data-integration |
+| REST API | data-integration | 58 | ✅ covered | 1 | skip — covered | 2026-06-08 | TEKsystems-SWE 2026-06-08 | lives in data-integration |
 | Retention Policies | security | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in security |
 | RMAN | databases | 41 | ✅ covered | 1 | skip — covered | 2026-06-08 | Optum-OracleDBA 2026-06-08 | lives in databases |
 | RMF | security | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08 | lives in security |
 | Route 53 | aws | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08 | lives in aws |
 | RTTM | trading | 22 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in trading |
 | Salesforce | modeling | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | Autodesk-PrincipalDE-Snowflake 2026-06-08 | lives in modeling |
-| SAP | modeling | 30 | ✅ covered | 1 | skip — covered | 2026-06-08 | SeniorDE-AWS-Contract 2026-06-08 | lives in modeling |
-| SAP HANA | modeling | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | NodeJS-AIEng-SAP 2026-06-08 | lives in modeling |
+| SAP | modeling | 28 | ✅ covered | 1 | skip — covered | 2026-06-08 | SeniorDE-AWS-Contract 2026-06-08 | lives in modeling |
+| SAP HANA | modeling | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | NodeJS-AIEng-SAP 2026-06-08 | lives in modeling |
 | SAP Joule | agentic-ai | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | NodeJS-AIEng-SAP 2026-06-08 | lives in agentic-ai |
 | Schema Design | aws | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in aws |
 | SDV | mlsys | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | ArchSystems-AIML-Fed 2026-06-08 | lives in mlsys |
-| Secrets Management | security | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | Databricks-PlatformAdmin 2026-06-08 | lives in security |
+| Secrets Management | security | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | Databricks-PlatformAdmin 2026-06-08 | lives in security |
 | Secure Data Access | security | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | StaffDE-Warehouse 2026-06-08 | lives in security |
 | security controls | security | 25 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataPlatformEngMgr 2026-06-08 | lives in security |
 | Security Groups | security | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-MigrationSpec 2026-06-08 | lives in security |
@@ -566,20 +566,20 @@ this JD touches a term that maps to it.
 | Snowflake Cortex | cortex | 6 | ✅ covered | 1 | skip — covered | 2026-06-08 | Kforce-DWAnalyst 2026-06-08 |  |
 | Snowpark | snowflake | 19 | ✅ covered | 1 | skip — covered | 2026-06-08 | LeadSnowflakeEng 2026-06-08 | lives in snowflake |
 | SnowSQL | snowflake | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | LeadSnowflakeEng 2026-06-08 | lives in snowflake |
-| SOC 2 | security | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08 | lives in security |
+| SOC 2 | security | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | InfraEng-Cloud-K8s 2026-06-08 | lives in security |
 | SOX | data-integration | 22 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in data-integration |
 | SPARQL | databases | 38 | ✅ covered | 1 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08 | lives in databases |
 | Splunk | security | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in security |
-| SQLAlchemy | gcp | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | TEKsystems-SWE 2026-06-08 | lives in gcp |
+| SQLAlchemy | gcp | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | TEKsystems-SWE 2026-06-08 | lives in gcp |
 | SRE | observability | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapacityEng-SRE 2026-06-08 | lives in observability |
 | SSAS | bi | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in bi |
 | SSRS | bi | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | Molina-DataGovernance 2026-06-08 | lives in bi |
 | SST | aws | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | Allconnect-SrSWE 2026-06-08 | lives in aws |
 | Stardog | databases | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | OntologyDE-KnowledgeGraph 2026-06-08 | lives in databases |
 | statistics | statistics | 5 | ✅ covered | 1 | skip — covered | 2026-06-08 | OptumAI-Scientist 2026-06-08 |  |
-| Step Functions | aws | 21 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in aws |
+| Step Functions | aws | 20 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in aws |
 | Streaming Ingestion | databricks | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | LeadDE-Azure-AI 2026-06-08 | lives in databricks |
-| Streamlit | cortex | 24 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataScientist-CPG 2026-06-08 | lives in cortex |
+| Streamlit | cortex | 22 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataScientist-CPG 2026-06-08 | lives in cortex |
 | Structured Streaming | databricks | 23 | ✅ covered | 1 | skip — covered | 2026-06-08 | PrincipalObservabilityArch 2026-06-08 | lives in databricks |
 | Sybase ASE | databases | 14 | ✅ covered | 1 | skip — covered | 2026-06-08 | Ascensus-SrDE-Oracle 2026-06-08 | lives in databases |
 | Symantec | security | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
@@ -589,16 +589,16 @@ this JD touches a term that maps to it.
 | TDE | security | 15 | ✅ covered | 1 | skip — covered | 2026-06-08 | Optum-OracleDBA 2026-06-08 | lives in security |
 | text classification | azure-ai | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | OptumAI-Scientist 2026-06-08 | lives in azure-ai |
 | text embedding | vectordb | 16 | ✅ covered | 1 | skip — covered | 2026-06-08 | OptumAI-Scientist 2026-06-08 | lives in vectordb |
-| Textract | aws | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in aws |
+| Textract | aws | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | AWS-FDE 2026-06-08 | lives in aws |
 | Trade Lifecycle | trading | 17 | ✅ covered | 1 | skip — covered | 2026-06-08 | CapMarkets-DE-DTCC 2026-06-08 | lives in trading |
 | transformers | deep-learning | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | Block-MLAI 2026-06-08 | lives in deep-learning |
 | TypeORM | nodejs | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | NodeJS-AIEng-SAP 2026-06-08 | lives in nodejs |
-| Varonis | security | 13 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
+| Varonis | security | 12 | ✅ covered | 1 | skip — covered | 2026-06-08 | AFL-DataSecurityEng 2026-06-08 | lives in security |
 | vector search | vectordb | 20 | ✅ covered | 1 | skip — covered | 2026-06-08 | AILeadDev-Agentic 2026-06-08 | lives in vectordb |
 | Vertex AI | vertex-ai | 34 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataQuality-SrDE 2026-06-08 |  |
 | Voltage | security | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | DataSecurityEng-BigID 2026-06-08 | lives in security |
 | Web APIs | apis | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | TEKsystems-SWE 2026-06-08 | lives in apis |
-| WebSocket | apis | 11 | ✅ covered | 1 | skip — covered | 2026-06-08 | NodeJS-AIEng-SAP 2026-06-08 | lives in apis |
+| WebSocket | apis | 10 | ✅ covered | 1 | skip — covered | 2026-06-08 | NodeJS-AIEng-SAP 2026-06-08 | lives in apis |
 TERMS-TABLE-END -->
 
 <!-- ALIAS-REGISTRY-START — canonical ← aliases; the agent reads this to dedupe and appends new ones. -->

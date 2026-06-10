@@ -147,7 +147,7 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   'snowflake-ai': ['snowflake', 'cortex', 'llms', 'rag', 'evals', 'python', 'sql', 'git', ...CRAFT],
   'palantir-fde': ['python-drills', 'sql-coding', 'palantir', 'python', 'typescript', 'sql', 'modeling', 'data-integration', ...SHIP, ...CRAFT],
   'integration-dev': ['data-integration', 'snaplogic', 'sql-coding', 'sql', 'python', 'kafka', 'airflow', 'git', 'cicd', 'data-reliability', ...CRAFT],
-  'aem-dev': ['aem', 'typescript', 'apis', 'architecture', 'databases', 'sql', ...SHIP, ...CRAFT],
+  'aem-dev': ['java-coding', 'aem', 'java', 'typescript', 'apis', 'architecture', 'databases', 'sql', ...SHIP, ...CRAFT],
   'workfront-dev': ['workfront', 'apis', 'data-integration', 'snaplogic', 'sql', 'python', ...SHIP, ...CRAFT],
   all: [], // resolved dynamically to every track in content.ts
 };

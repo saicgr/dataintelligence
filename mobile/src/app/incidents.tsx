@@ -1,4 +1,5 @@
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useState } from 'react';
 import { Pressable, TextInput, View } from 'react-native';
 
@@ -23,7 +24,7 @@ export default function Incidents() {
   };
   return (
     <Screen>
-      <Pressable accessibilityRole="button" accessibilityLabel="Back" onPress={() => router.back()}>
+      <Pressable accessibilityRole="button" accessibilityLabel="Back" onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>‹ Back</T>
       </Pressable>
 

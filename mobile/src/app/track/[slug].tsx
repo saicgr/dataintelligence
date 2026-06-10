@@ -1,4 +1,5 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { safeBack } from '../../lib/nav';
 import { useState } from 'react';
 import { Pressable, View } from 'react-native';
 
@@ -28,7 +29,7 @@ export default function TrackDetail() {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>‹ Library</T>
       </Pressable>
 
@@ -142,7 +143,7 @@ function LessonTrack({ slug }: { slug: string }) {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>‹ Library</T>
       </Pressable>
 

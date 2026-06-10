@@ -1,4 +1,5 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useMemo, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
@@ -54,7 +55,7 @@ export default function Checkpoint() {
   if (total === 0) {
     return (
       <Screen>
-        <Pressable onPress={() => router.back()}><T muted weight="700" size={13}>‹ Close</T></Pressable>
+        <Pressable onPress={() => safeBack(router)}><T muted weight="700" size={13}>‹ Close</T></Pressable>
         <T muted size={13} style={{ marginTop: 20, textAlign: 'center' }}>This chapter isn&apos;t ready yet.</T>
       </Screen>
     );
@@ -63,7 +64,7 @@ export default function Checkpoint() {
   if (phase === 'intro') {
     return (
       <Screen>
-        <Pressable onPress={() => router.back()}><T muted weight="700" size={13}>‹ Close</T></Pressable>
+        <Pressable onPress={() => safeBack(router)}><T muted weight="700" size={13}>‹ Close</T></Pressable>
         <Card style={{ alignItems: 'center', padding: 24, gap: 10, marginTop: 8 }}>
           <Mascot mood="focused" size={88} />
           <T size={22} weight="900">Chapter checkpoint</T>
@@ -83,7 +84,7 @@ export default function Checkpoint() {
     return (
       <Screen>
         {passed ? <Confetti /> : null}
-        <Pressable onPress={() => router.back()}><T muted weight="700" size={13}>‹ Close</T></Pressable>
+        <Pressable onPress={() => safeBack(router)}><T muted weight="700" size={13}>‹ Close</T></Pressable>
         <Card style={{ alignItems: 'center', padding: 24, gap: 8, marginTop: 8 }}>
           <Mascot mood={passed ? 'celebrate' : 'sad'} size={88} />
           <CountUp to={pct} style={{ fontSize: 46, fontWeight: '900', color: passed ? c.success : c.warn }} />
@@ -93,7 +94,7 @@ export default function Checkpoint() {
             {!passed && (
               <Btn label="↻ Try again" variant="navy" onPress={() => { setIdx(0); setCorrect(0); setRevealed(false); setPhase('quiz'); }} />
             )}
-            <Btn label="Back to path" variant={passed ? 'green' : 'ghost'} onPress={() => router.back()} />
+            <Btn label="Back to path" variant={passed ? 'green' : 'ghost'} onPress={() => safeBack(router)} />
           </View>
         </Card>
       </Screen>
@@ -103,7 +104,7 @@ export default function Checkpoint() {
   // quiz
   return (
     <Screen scroll>
-      <Pressable onPress={() => router.back()}><T muted weight="700" size={13}>‹ Close</T></Pressable>
+      <Pressable onPress={() => safeBack(router)}><T muted weight="700" size={13}>‹ Close</T></Pressable>
       <Row style={{ gap: 8 }}>
         <View style={{ flex: 1, height: 8, borderRadius: 999, backgroundColor: c.border, overflow: 'hidden' }}>
           <View style={{ width: `${(idx / total) * 100}%`, height: '100%', backgroundColor: col }} />

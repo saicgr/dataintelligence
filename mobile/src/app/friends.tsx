@@ -1,4 +1,5 @@
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, Share, TextInput, View } from 'react-native';
 
@@ -81,7 +82,7 @@ export default function Friends() {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>
           ‹ Close
         </T>

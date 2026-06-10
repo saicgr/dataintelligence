@@ -8,6 +8,7 @@
  * Entry: Practice → "💻 Code drills" with ?lang=sql|python|pyspark (optionally &problem=<id>).
  */
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, TextInput, View } from 'react-native';
 
@@ -37,7 +38,7 @@ export default function CodeLab() {
 
   return (
     <Screen>
-      <Pressable onPress={() => (problem ? setProblem(null) : router.back())}>
+      <Pressable onPress={() => (problem ? setProblem(null) : safeBack(router))}>
         <T muted weight="700" size={13}>
           {problem ? '‹ All problems' : '‹ Close'}
         </T>

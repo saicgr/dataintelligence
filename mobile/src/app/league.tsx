@@ -1,4 +1,5 @@
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useEffect, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
@@ -53,7 +54,7 @@ export default function League() {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>
           ‹ Close
         </T>
@@ -156,7 +157,7 @@ export default function League() {
       )}
 
       <Btn label="⚡ Enter the weekly contest" variant="navy" onPress={() => router.push('/contest')} />
-      <Btn label="Keep studying →" variant="primary" onPress={() => router.back()} />
+      <Btn label="Keep studying →" variant="primary" onPress={() => safeBack(router)} />
     </Screen>
   );
 }

@@ -7,6 +7,7 @@
  * contest opens. Self-contained: reads role/progress + userId from the store, routes via expo-router.
  */
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
@@ -110,7 +111,7 @@ export default function Contest() {
   if (phase === 'intro') {
     return (
       <Screen>
-        <Pressable onPress={() => router.back()}>
+        <Pressable onPress={() => safeBack(router)}>
           <T muted weight="700" size={13}>‹ Close</T>
         </Pressable>
         <CardEnter>
@@ -183,7 +184,7 @@ export default function Contest() {
           setSecondsLeft(MOCK_SECONDS_PER_Q);
           setPhase('intro');
         }}
-        onExit={() => router.back()}
+        onExit={() => safeBack(router)}
       />
     );
   }

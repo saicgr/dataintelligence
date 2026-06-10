@@ -1,4 +1,5 @@
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useState } from 'react';
 import { Linking, Pressable, TextInput, View } from 'react-native';
 
@@ -39,7 +40,7 @@ export default function JD() {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>‹ Close</T>
       </Pressable>
 
@@ -111,7 +112,7 @@ export default function JD() {
                 style={{ marginTop: 6 }}
                 onPress={() => {
                   setRole(result.bestRole);
-                  router.back();
+                  safeBack(router);
                 }}
               />
             ) : null}

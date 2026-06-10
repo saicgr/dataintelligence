@@ -1,4 +1,5 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useEffect, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
@@ -18,6 +19,7 @@ import {
 import { useStore } from '../lib/store';
 import { radius, useTheme } from '../lib/theme';
 import { Btn, H2, Row, Screen, T } from '../ui/kit';
+import { HowProWorks } from '../components/how-pro-works';
 
 // Honest Free vs Pro: '✓' live, '—' not in tier, 'soon' = built-but-not-shipped (don't sell as live).
 const ROWS: [string, string, string][] = [
@@ -54,7 +56,7 @@ export default function Paywall() {
   if (pack) {
     return (
       <Screen>
-        <Pressable onPress={() => router.back()}>
+        <Pressable onPress={() => safeBack(router)}>
           <T muted weight="700" size={13}>‹ Close</T>
         </Pressable>
         <View style={{ borderRadius: radius.xl, padding: 22, backgroundColor: track('rag'), alignItems: 'center' }}>
@@ -75,11 +77,11 @@ export default function Paywall() {
             label={`Unlock ${pack.title} — ${pack.priceLabel}`}
             onPress={async () => {
               await purchase(pack.id);
-              router.back();
+              safeBack(router);
             }}
           />
         )}
-        <Btn label="Restore purchases" variant="ghost" onPress={async () => { await restore(); router.back(); }} />
+        <Btn label="Restore purchases" variant="ghost" onPress={async () => { await restore(); safeBack(router); }} />
       </Screen>
     );
   }
@@ -99,7 +101,7 @@ export default function Paywall() {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>‹ Close</T>
       </Pressable>
 
@@ -149,7 +151,7 @@ export default function Paywall() {
         label={cta}
         onPress={async () => {
           await purchase(plan);
-          router.back();
+          safeBack(router);
         }}
       />
       <Row style={{ gap: 6, justifyContent: 'center', marginTop: 2 }}>
@@ -159,6 +161,10 @@ export default function Paywall() {
           prefer no renewals? Lifetime is one-and-done.
         </T>
       </Row>
+
+      <View style={{ backgroundColor: c.card, borderRadius: radius.lg, borderWidth: 1, borderColor: c.border, padding: 16 }}>
+        <HowProWorks />
+      </View>
 
       <H2>Free vs Pro</H2>
       <View>
@@ -181,7 +187,7 @@ export default function Paywall() {
         variant="ghost"
         onPress={async () => {
           await restore();
-          router.back();
+          safeBack(router);
         }}
       />
       <T muted size={11} style={{ textAlign: 'center', lineHeight: 16 }}>

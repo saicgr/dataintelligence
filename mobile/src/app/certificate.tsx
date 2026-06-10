@@ -1,4 +1,5 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useRef } from 'react';
 import { Alert, Pressable, View } from 'react-native';
 import { captureRef } from 'react-native-view-shot';
@@ -46,7 +47,7 @@ export default function Certificate() {
   if (!cert) {
     return (
       <Screen>
-        <Pressable onPress={() => router.back()}>
+        <Pressable onPress={() => safeBack(router)}>
           <T muted weight="700" size={13}>‹ Close</T>
         </Pressable>
         <T muted size={13} style={{ textAlign: 'center', marginTop: 40 }}>
@@ -58,7 +59,7 @@ export default function Certificate() {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>‹ Close</T>
       </Pressable>
 

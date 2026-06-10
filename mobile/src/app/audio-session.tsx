@@ -13,6 +13,7 @@
 // so it can't desync the live SessionView. See INTEGRATION NOTES for wiring.
 import { setAudioModeAsync } from 'expo-audio';
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Platform, View } from 'react-native';
 
@@ -179,7 +180,7 @@ export default function AudioSession() {
     cancelled.current = true;
     if (pauseTimer.current) clearTimeout(pauseTimer.current);
     ttsStop();
-    router.back();
+    safeBack(router);
   };
 
   const phaseLabel: Record<Phase, string> = {

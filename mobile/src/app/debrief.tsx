@@ -1,4 +1,5 @@
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useState } from 'react';
 import { Pressable, TextInput, View } from 'react-native';
 
@@ -55,7 +56,7 @@ export default function Debrief() {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>‹ Close</T>
       </Pressable>
       <T size={21} weight="900">Interview debrief</T>

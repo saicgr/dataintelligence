@@ -1,4 +1,5 @@
 import { useRouter } from 'expo-router';
+import { safeBack } from '../lib/nav';
 import { useEffect } from 'react';
 import { Pressable, Share, View } from 'react-native';
 
@@ -52,7 +53,7 @@ export default function ShareCard() {
 
   return (
     <Screen>
-      <Pressable onPress={() => router.back()}>
+      <Pressable onPress={() => safeBack(router)}>
         <T muted weight="700" size={13}>‹ Close</T>
       </Pressable>
 
