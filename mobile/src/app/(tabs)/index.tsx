@@ -32,11 +32,13 @@ import {
   roleDomain,
   searchCards,
   Track,
+  trackBySlug,
   trackCardCount,
   tracksForRole,
   tracksForRoleAtLevel,
 } from '../../lib/content';
 import { basicsForRole } from '../../lib/basics';
+import { nextSpineStep, spineDays } from '../../lib/spine';
 import { daysLeftInWeek } from '../../lib/leagues';
 import { coreTracksForRole, GROUP_LABEL, groupOrderForRole, roleByKey } from '../../lib/roles';
 import { CardState } from '../../lib/srs';
@@ -241,6 +243,9 @@ function LearnPath() {
                   else startDaily();
                 }}
               />
+            </CardEnter>
+            <CardEnter delay={85}>
+              <PlanList />
             </CardEnter>
             <CardEnter delay={90}>
               <ContestBanner />
@@ -639,6 +644,20 @@ function nextAction(role: string, progress: Record<string, CardState>, due: numb
   if (basicsLeft && !seniorPlus) {
     return { kind: 'basics', eyebrow: 'Start here', title: 'Fundamentals', sub: `The basics first · ${basicsSeen}/${basics.length}`, icon: '🌱', frac: basicsSeen / basics.length, colorKind: 'success' };
   }
+  // 3.5 Curated spine (#4): the role's "do these first" sequence drives what starts next.
+  const spine = nextSpineStep(role, progress, userLevel);
+  if (spine) {
+    const tdef = trackBySlug(spine.step.track);
+    if (tdef) {
+      return {
+        kind: 'lesson',
+        eyebrow: spine.index === 0 ? 'Start here' : 'Recommended next',
+        title: `${tdef.name} · ${lessonTitle(spine.step.track, spine.lessonIdx)}`,
+        sub: spine.step.label ?? `Step ${spine.index + 1} of your plan`,
+        icon: tdef.icon, frac: 0, colorKind: 'track', colorKey: tdef.color, slug: spine.step.track, idx: spine.lessonIdx,
+      };
+    }
+  }
   // 4. Nothing in progress, nothing due → begin the role's first track AT THE USER'S LEVEL (#10).
   const first = tracks[0];
   if (first) {
@@ -712,6 +731,84 @@ function ContinueHero({ action: a }: { action: NextAction }) {
       </View>
     </PressableScale>
     </Animated.View>
+  );
+}
+
+/**
+ * Curated "do these first" plan (#4) — the role's spine chunked into days, collapsible.
+ * The current step is the same target the ContinueHero recommends; rows are tappable.
+ */
+function PlanList() {
+  const { c, track: trackColor } = useTheme();
+  const role = useStore((s) => s.role);
+  const progress = useStore((s) => s.progress);
+  const userLevel = useStore((s) => s.userLevel);
+  const startLesson = useStore((s) => s.startLesson);
+  const [open, setOpen] = useState(false);
+  const days = spineDays(role, progress);
+  const flat = days.flatMap((d) => d.steps);
+  if (flat.length === 0) return null;
+  const doneCount = flat.filter((s) => s.done).length;
+  const currentIdx = flat.findIndex((s) => !s.done);
+  const allDone = currentIdx === -1;
+  return (
+    <View style={{ backgroundColor: c.card, borderWidth: 1, borderColor: c.border, borderRadius: radius.md }}>
+      <PressableScale onPress={() => setOpen((o) => !o)} hapticStyle="selection" scaleTo={0.99}
+        accessibilityLabel={`Your ${days.length}-day plan — ${doneCount} of ${flat.length} steps done. ${open ? 'Collapse' : 'Expand'}`}>
+        <Row style={{ padding: 12, gap: 10 }}>
+          <T size={18}>🗺️</T>
+          <View style={{ flex: 1 }}>
+            <T weight="800" size={13.5}>Your {days.length}-day plan</T>
+            <T muted size={11.5}>
+              {allDone ? 'Plan complete — review keeps it sharp' : `${doneCount}/${flat.length} steps · the proven order for this role`}
+            </T>
+          </View>
+          <T weight="900" size={13} color={c.muted}>{open ? '▾' : '▸'}</T>
+        </Row>
+      </PressableScale>
+      {open && (
+        <View style={{ paddingHorizontal: 12, paddingBottom: 12, gap: 6 }}>
+          {days.map(({ day, steps }) => (
+            <Fragment key={day}>
+              <T muted weight="800" size={10.5} style={{ letterSpacing: 0.4, marginTop: 4 }}>DAY {day}</T>
+              {steps.map((s, i) => {
+                const flatIdx = (day - 1) * 2 + i;
+                const isCurrent = flatIdx === currentIdx;
+                const col = trackColor(trackBySlug(s.track)?.color ?? 'spark');
+                return (
+                  <Pressable
+                    key={`${s.track}-${flatIdx}`}
+                    disabled={s.done}
+                    onPress={() => startLesson(s.track, firstLessonAtLevel(s.track, userLevel, progress))}
+                    accessibilityLabel={`${s.label ?? s.name} — ${s.done ? 'done' : `${s.seen} of ${s.quota} cards`}`}
+                    style={{
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      gap: 9,
+                      borderWidth: 1,
+                      borderColor: isCurrent ? col : c.border,
+                      borderRadius: radius.sm,
+                      paddingVertical: 8,
+                      paddingHorizontal: 10,
+                      opacity: s.done ? 0.55 : 1,
+                      backgroundColor: isCurrent ? col + '12' : 'transparent',
+                    }}>
+                    <T size={12} weight="900" color={s.done ? c.success : isCurrent ? col : c.muted}>
+                      {s.done ? '✓' : isCurrent ? '▶' : '○'}
+                    </T>
+                    <View style={{ flex: 1 }}>
+                      <T size={12.5} weight={isCurrent ? '800' : '700'}>{s.label ?? s.name}</T>
+                      {s.label ? <T muted size={10.5}>{s.name}</T> : null}
+                    </View>
+                    <T muted size={11} weight="800">{s.seen}/{s.quota}</T>
+                  </Pressable>
+                );
+              })}
+            </Fragment>
+          ))}
+        </View>
+      )}
+    </View>
   );
 }
 
