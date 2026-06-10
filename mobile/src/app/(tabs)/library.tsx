@@ -4,6 +4,7 @@ import { Pressable, ScrollView, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { SKILL_CATEGORY_ORDER, skillCategory, TRACKS, Track } from '../../lib/content';
+import { CERT_PROVIDER_LABEL, CERT_PROVIDER_ORDER, CERTS, CertDef, certTotalCards } from '../../lib/certs';
 import { confirmAsync } from '../../lib/dialog';
 import { ROLES } from '../../lib/roles';
 import { useStore } from '../../lib/store';
@@ -11,7 +12,7 @@ import { radius, space, useTheme } from '../../lib/theme';
 import { H2, Segmented, T } from '../../ui/kit';
 import { RolePicker } from '../../ui/RolePicker';
 
-type Tab = 'tracks' | 'skills';
+type Tab = 'tracks' | 'skills' | 'certifications';
 
 export default function Library() {
   const router = useRouter();
@@ -28,6 +29,7 @@ export default function Library() {
     !query || t.name.toLowerCase().includes(query) || t.slug.toLowerCase().includes(query);
   const skills = TRACKS.filter(match);
   const roleHits = ROLES.filter((r) => !query || r.name.toLowerCase().includes(query)).length;
+  const certHits = CERTS.filter((c) => !query || c.name.toLowerCase().includes(query) || c.shortName.toLowerCase().includes(query));
 
   // Tap a track (role) → make it active and jump to the Learn path built for it.
   // Switching is app-wide (it re-ranks Learn, mock, weak-spots…), so confirm before swapping
@@ -60,6 +62,7 @@ export default function Library() {
           options={[
             { label: `Tracks · ${ROLES.length}`, value: 'tracks' },
             { label: `Skills · ${TRACKS.length}`, value: 'skills' },
+            { label: `Certify · ${CERTS.length}`, value: 'certifications' },
           ]}
         />
       </View>
@@ -104,7 +107,7 @@ export default function Library() {
               <T muted size={13} style={{ marginTop: 8 }}>No roles match “{q}”.</T>
             )}
           </>
-        ) : (
+        ) : tab === 'skills' ? (
           <>
             <T muted size={12}>Browse any single subject — every level, all questions.</T>
             {SKILL_CATEGORY_ORDER.map((cat) => {
@@ -118,6 +121,27 @@ export default function Library() {
               );
             })}
             {skills.length === 0 && <T muted size={13} style={{ marginTop: 8 }}>No skills match “{q}”.</T>}
+          </>
+        ) : (
+          <>
+            <T muted size={12}>Structured cert prep — domains, objectives, and practice cards.</T>
+            {CERTS.length === 0 ? (
+              <T muted size={13} style={{ marginTop: 8 }}>Certifications coming soon — check back soon.</T>
+            ) : (
+              <>
+                {CERT_PROVIDER_ORDER.map((provider) => {
+                  const items = certHits.filter((c) => c.provider === provider);
+                  if (items.length === 0) return null;
+                  return (
+                    <View key={provider} style={{ gap: 11 }}>
+                      <H2>{CERT_PROVIDER_LABEL[provider]}</H2>
+                      <CertGrid certs={items} onOpen={(id) => router.push(`/cert/${id}`)} />
+                    </View>
+                  );
+                })}
+                {certHits.length === 0 && <T muted size={13} style={{ marginTop: 8 }}>No certifications match “{q}”.</T>}
+              </>
+            )}
           </>
         )}
       </ScrollView>
@@ -147,7 +171,7 @@ export default function Library() {
           <TextInput
             value={q}
             onChangeText={setQ}
-            placeholder={tab === 'tracks' ? 'Search roles…' : 'Search skills…'}
+            placeholder={tab === 'tracks' ? 'Search roles…' : tab === 'skills' ? 'Search skills…' : 'Search certifications…'}
             placeholderTextColor={c.muted}
             autoCapitalize="none"
             autoCorrect={false}
@@ -157,6 +181,58 @@ export default function Library() {
         </View>
       </View>
     </SafeAreaView>
+  );
+}
+
+function CertGrid({ certs, onOpen }: { certs: CertDef[]; onOpen: (id: string) => void }) {
+  return (
+    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 11 }}>
+      {certs.map((cert) => (
+        <CertTile key={cert.id} cert={cert} onPress={() => onOpen(cert.id)} />
+      ))}
+    </View>
+  );
+}
+
+function CertTile({ cert, onPress }: { cert: CertDef; onPress: () => void }) {
+  const { track: tint } = useTheme();
+  const col = tint(cert.color);
+  const cardCount = certTotalCards(cert.id);
+  const domainCount = cert.domains.length;
+  const detail = cardCount > 0
+    ? `${cardCount} card${cardCount === 1 ? '' : 's'}`
+    : `${domainCount} domain${domainCount === 1 ? '' : 's'}`;
+  const levelLabel = cert.level.charAt(0).toUpperCase() + cert.level.slice(1);
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`${cert.name} — ${levelLabel} certification, ${detail}`}
+      style={{
+        flexGrow: 1,
+        flexBasis: '46%',
+        minHeight: 82,
+        borderRadius: radius.md,
+        padding: 13,
+        backgroundColor: col,
+        justifyContent: 'space-between',
+        overflow: 'hidden',
+      }}>
+      <T size={30} style={{ position: 'absolute', right: 8, top: 4, opacity: 0.25 }}>
+        {cert.icon}
+      </T>
+      <T color="#fff" weight="800" size={15}>
+        {cert.shortName}
+      </T>
+      <View style={{ gap: 2 }}>
+        <T color="#fff" weight="700" size={10} style={{ opacity: 0.8, textTransform: 'uppercase', letterSpacing: 0.4 }}>
+          {levelLabel}
+        </T>
+        <T color="#fff" weight="700" size={11.5} style={{ opacity: 0.9 }}>
+          {detail}
+        </T>
+      </View>
+    </Pressable>
   );
 }
 

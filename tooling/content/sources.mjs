@@ -53,7 +53,9 @@ export const SOURCES = [
   { id: 'claude-code', fetch: () => docPage({ tool: 'Claude Code', domain: 'ai', tk: 'rag', url: 'https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md' }) },
   { id: 'anthropic', fetch: () => docPage({ tool: 'Anthropic', domain: 'ai', tk: 'rag', url: 'https://docs.claude.com/en/docs/about-claude/models' }) },
   { id: 'openai', fetch: () => docPage({ tool: 'OpenAI', domain: 'ai', tk: 'rag', url: 'https://platform.openai.com/docs/changelog' }) },
-  { id: 'databricks', fetch: () => docPage({ tool: 'Databricks', domain: 'de', tk: 'spark', url: 'https://docs.databricks.com/en/release-notes/product/index.html' }) },
+  { id: 'databricks-releases', fetch: () => docPage({ tool: 'Databricks', domain: 'de', tk: 'databricks', url: 'https://docs.databricks.com/en/release-notes/product/index.html' }) },
+  { id: 'databricks-genie', fetch: () => docPage({ tool: 'Databricks', domain: 'de', tk: 'databricks', url: 'https://docs.databricks.com/aws/en/release-notes/ai-bi/index.html' }) },
+  { id: 'databricks-delta', fetch: () => docPage({ tool: 'Databricks', domain: 'de', tk: 'databricks', url: 'https://docs.delta.io/latest/delta-update.html' }) },
   { id: 'aws', fetch: () => awsRss({ allowlist: ['s3', 'bedrock', 'sagemaker', 'glue', 'redshift', 'athena', 'vector', 'analytics'] }) },
 ];
 
