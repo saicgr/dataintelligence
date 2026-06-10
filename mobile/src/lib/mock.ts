@@ -40,15 +40,29 @@ export function correctIndex(card: SessionCard): number {
 export function buildMockDeck(
   role: string,
   progress: Record<string, CardState>,
-  now: number = Date.now()
+  now: number = Date.now(),
+  /** Optional explicit card pool (company packs, My Tracks) — replaces the role's tracks. */
+  pool?: SessionCard[]
 ): SessionCard[] {
+  // Custom pool: one bucket, same gradable filter + weakest-first sort.
+  if (pool) {
+    const deck = pool
+      .filter(isGradable)
+      .sort(
+        (a, b) =>
+          weakness(progress[b.id], now) + Math.random() * 0.4 -
+          (weakness(progress[a.id], now) + Math.random() * 0.4)
+      )
+      .slice(0, MOCK_MAX);
+    return deck;
+  }
   const tracks = tracksForRole(role).filter((t) => t.group === 'concept' || t.group === 'coding');
 
   // Per-track gradable pools, each pre-sorted weakest-first (+ jitter for variety).
   const seen = new Set<string>();
   const pools: SessionCard[][] = [];
   for (const t of tracks) {
-    const pool = bankForTrack(t.slug)
+    const trackPool = bankForTrack(t.slug)
       .filter((card) => {
         if (seen.has(card.id) || !isGradable(card)) return false;
         seen.add(card.id);
@@ -59,7 +73,7 @@ export function buildMockDeck(
           weakness(progress[b.id], now) + Math.random() * 0.4 -
           (weakness(progress[a.id], now) + Math.random() * 0.4)
       );
-    if (pool.length) pools.push(pool);
+    if (trackPool.length) pools.push(trackPool);
   }
 
   // Round-robin across tracks so the deck spans topics rather than draining one track.

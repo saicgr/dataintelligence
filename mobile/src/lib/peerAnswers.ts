@@ -30,6 +30,8 @@ export interface MostAskedTopic {
   debriefs: number;
   /** n / debriefs, 0..1 — share of debriefs that mentioned this topic */
   share: number;
+  /** Mentions in the last 90 days (recency signal). Absent until migration 0009 is applied. */
+  recent?: number;
 }
 
 const MIN_BODY = 1;
@@ -103,11 +105,13 @@ export async function mostAskedAtCompany(company: string, limit = 8): Promise<Mo
     lim: limit,
   });
   if (error || !data) return [];
-  return (data as { topic: string; n: number; debriefs: number; share: number }[]).map((r) => ({
+  return (data as { topic: string; n: number; debriefs: number; share: number; recent?: number }[]).map((r) => ({
     topic: r.topic,
     n: r.n,
     debriefs: r.debriefs,
     share: typeof r.share === 'number' ? r.share : 0,
+    // `recent` only exists once migration 0009 lands server-side — optional by design.
+    ...(typeof r.recent === 'number' ? { recent: r.recent } : {}),
   }));
 }
 

@@ -35,8 +35,9 @@ export const AXIS_LABEL: Record<Axis, string> = {
 };
 const AXIS_ORDER: Axis[] = ['concepts', 'handson', 'sysdesign', 'behavioral'];
 
-/** Track slug → axis: explicit overrides first, then the track's Learn-path group. */
-function axisForTrack(slug: string): Axis {
+/** Track slug → axis: explicit overrides first, then the track's Learn-path group.
+ *  Exported for the Autopilot's weakest-axis boost. */
+export function axisForTrack(slug: string): Axis {
   if (slug === 'sysd' || slug === 'architecture') return 'sysdesign';
   const group = trackBySlug(slug)?.group;
   if (group === 'coding' || group === 'oncall' || group === 'deploy') return 'handson';

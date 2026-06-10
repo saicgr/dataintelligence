@@ -1,26 +1,47 @@
 import { type Href, useRouter } from 'expo-router';
 import { useState } from 'react';
-import { View } from 'react-native';
+import { Pressable, View } from 'react-native';
 
+import { buildCheatSheetFromCards } from '../../lib/cheatsheet';
 import { COMPANY_SETS, COMPANY_KEYS } from '../../lib/companySets';
-import { tracksForRole } from '../../lib/content';
+import { findCardById, type SessionCard, tracksForRole } from '../../lib/content';
+import { alertInfo, confirmAsync } from '../../lib/dialog';
+import { exportSheet } from '../../lib/exportPdf';
 import { haptic, sfx } from '../../lib/feedback';
 import { FREE_CODE_RUNS, isProActive, useStore } from '../../lib/store';
 import { radius, useTheme } from '../../lib/theme';
 import { CardEnter, PressableScale, Shake } from '../../ui/anim';
-import { Card, H2, Row, Screen, T } from '../../ui/kit';
+import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
 
 export default function Practice() {
   const router = useRouter();
   const { c } = useTheme();
   const role = useStore((s) => s.role);
   const startTrack = useStore((s) => s.startTrack);
-  const startCompany = useStore((s) => s.startCompany);
   const startWeakspot = useStore((s) => s.startWeakspot);
   const startSaved = useStore((s) => s.startSaved);
-  const savedCount = useStore((s) => s.savedIds.length);
+  const savedIds = useStore((s) => s.savedIds);
+  const savedCount = savedIds.length;
   const unlocked = useStore(isProActive);
   const tracks = tracksForRole(role);
+  const progress = useStore((s) => s.progress);
+  const myTracks = useStore((s) => s.myTracks);
+  const startMyTrack = useStore((s) => s.startMyTrack);
+  const deleteMyTrack = useStore((s) => s.deleteMyTrack);
+  const createMyTrack = useStore((s) => s.createMyTrack);
+  const startMistakes = useStore((s) => s.startMistakes);
+  // Mistakes notebook badge: every card you've ever lapsed (auto-collected, zero upkeep).
+  const mistakesCount = Object.keys(progress).filter((id) => (progress[id]?.lapses ?? 0) > 0).length;
+
+  const exportMyTrack = (name: string, cardIds: string[]) => {
+    if (!unlocked) return router.push('/paywall');
+    const cards = cardIds.map((id) => findCardById(id)).filter((cd): cd is SessionCard => !!cd);
+    const sheet = buildCheatSheetFromCards(name, cards, progress);
+    if (!sheet) return alertInfo('Nothing to export yet', 'Drill a few of this deck’s cards first.');
+    void exportSheet(sheet.html).then((r) => {
+      if (!r.ok && r.error) alertInfo('Couldn’t export', r.error);
+    });
+  };
 
   const drill = (slug: string) => {
     haptic.light();
@@ -35,12 +56,6 @@ export default function Practice() {
     haptic.light();
     sfx.tap();
     startTrack(tracks[Math.floor(Math.random() * tracks.length)].slug, undefined, 12);
-    router.push('/');
-  };
-  const drillCompany = (key: string) => {
-    haptic.light();
-    sfx.tap();
-    startCompany(key);
     router.push('/');
   };
 
@@ -85,19 +100,24 @@ export default function Practice() {
         </Card>
       </CardEnter>
 
-      {/* Curated company bundles — fixes the cold-start of crowdsourced most-asked lists. */}
+      {/* Company Packs — role-aware, asked-frequency ranked. Tapping opens the pack screen
+          (free: overview + top 2 cards; Pro: full drill + company mock + cheat sheet). */}
       <CardEnter delay={30}>
         <Card style={{ padding: 14, gap: 11 }}>
           <Row style={{ gap: 9 }}>
             <T size={22}>🏢</T>
             <View style={{ flex: 1 }}>
-              <T weight="800" size={15}>By company</T>
-              <T muted size={12}>Drill the topics a company leans on — tap one</T>
+              <T weight="800" size={15}>Company packs</T>
+              <T muted size={12}>What each company actually asks, ranked — tap one</T>
             </View>
           </Row>
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
             {COMPANY_KEYS.map((key) => (
-              <PressableScale key={key} onPress={() => drillCompany(key)} hapticStyle="selection" scaleTo={0.93}>
+              <PressableScale
+                key={key}
+                onPress={() => router.push(`/company?key=${key}` as Href)}
+                hapticStyle="selection"
+                scaleTo={0.93}>
                 <Row
                   style={{
                     gap: 5,
@@ -108,6 +128,7 @@ export default function Practice() {
                     paddingVertical: 7,
                     paddingHorizontal: 13,
                   }}>
+                  <T size={12}>{COMPANY_SETS[key].emoji}</T>
                   <T weight="700" size={12}>{COMPANY_SETS[key].label}</T>
                 </Row>
               </PressableScale>
@@ -197,6 +218,83 @@ export default function Practice() {
           />
         </CardEnter>
       )}
+
+      {/* Mistakes notebook — auto-deck of every lapsed card. Free: first 10 · Pro: all + export. */}
+      {mistakesCount > 0 && (
+        <CardEnter delay={115}>
+          <Mode
+            icon="📕"
+            title={`Mistakes notebook · ${mistakesCount}`}
+            sub={unlocked ? 'Every card you’ve missed, weakest first' : `Your missed cards (first 10 free · Pro = all ${mistakesCount})`}
+            cta="Fix ▶"
+            onPress={() => {
+              haptic.light();
+              sfx.tap();
+              startMistakes();
+              router.push('/');
+            }}
+          />
+        </CardEnter>
+      )}
+
+      {/* My Tracks — user-assembled decks (built here from Saved, or from a JD in the analyzer).
+          Free: 1 deck of 20 · Pro: unlimited + cheat-sheet export. */}
+      <CardEnter delay={118}>
+        <Card style={{ padding: 14, gap: 11 }}>
+          <Row style={{ gap: 9 }}>
+            <T size={22}>🗂️</T>
+            <View style={{ flex: 1 }}>
+              <T weight="800" size={15}>My Tracks</T>
+              <T muted size={12}>Your own decks — from saved cards or a pasted JD</T>
+            </View>
+          </Row>
+          {myTracks.map((mt) => (
+            <Row key={mt.id} style={{ gap: 8, borderWidth: 1, borderColor: c.border, borderRadius: radius.md, paddingVertical: 9, paddingHorizontal: 11 }}>
+              <View style={{ flex: 1 }}>
+                <T weight="700" size={13}>{mt.name}</T>
+                <T muted size={10.5}>{mt.cardIds.length} cards · {mt.source === 'jd' ? 'from a JD' : mt.source === 'mistakes' ? 'from mistakes' : 'hand-picked'}</T>
+              </View>
+              <Pressable hitSlop={6} accessibilityRole="button" accessibilityLabel={`Drill ${mt.name}`}
+                onPress={() => {
+                  haptic.light();
+                  startMyTrack(mt.id);
+                  router.push('/');
+                }}>
+                <T weight="800" size={12.5} color={c.accentInk}>▶</T>
+              </Pressable>
+              <Pressable hitSlop={6} accessibilityRole="button" accessibilityLabel={`Export ${mt.name} cheat sheet`}
+                onPress={() => exportMyTrack(mt.name, mt.cardIds)}>
+                <T size={13}>📄</T>
+              </Pressable>
+              <Pressable hitSlop={6} accessibilityRole="button" accessibilityLabel={`Delete ${mt.name}`}
+                onPress={() =>
+                  void confirmAsync('Delete this deck?', `“${mt.name}” (${mt.cardIds.length} cards) — your card progress is kept.`, 'Delete').then(
+                    (ok) => ok && deleteMyTrack(mt.id)
+                  )
+                }>
+                <T size={13} color={c.muted}>🗑</T>
+              </Pressable>
+            </Row>
+          ))}
+          {savedCount > 0 && (
+            <Btn
+              label={`➕ New deck from Saved (${savedCount})`}
+              variant="ghost"
+              onPress={() => {
+                const id = createMyTrack('From saved cards', savedIds, 'manual');
+                if (!id) return router.push('/paywall'); // free cap: 1 deck
+                haptic.success();
+              }}
+            />
+          )}
+          {myTracks.length === 0 && savedCount === 0 && (
+            <T muted size={11.5} style={{ lineHeight: 16 }}>
+              Bookmark a few cards (🔖) or paste a JD in the analyzer to build your first deck.
+            </T>
+          )}
+          {!unlocked && <T muted size={10.5}>Free: 1 deck of up to 20 cards · Pro: unlimited + PDF export</T>}
+        </Card>
+      </CardEnter>
 
       {/* Pro tier, clearly fenced below the free value. */}
       <Row style={{ gap: 10, marginTop: 6, marginBottom: 2 }}>

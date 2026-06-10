@@ -45,7 +45,9 @@ import { CardState } from '../../lib/srs';
 import { isDev, isProActive, level, useStore, xpInLevel } from '../../lib/store';
 import { radius, space, useTheme } from '../../lib/theme';
 import { haptic, sfx } from '../../lib/feedback';
+import type { PlanItem } from '../../lib/autopilot';
 import { AnimatedProgressBar, CardEnter, CountUp, PressableScale, Shake } from '../../ui/anim';
+import { AutopilotPlanCard, useAutopilot, useStartPlanItem } from '../../ui/AutopilotPlan';
 import { H2, LevelPicker, Row, Segmented, T } from '../../ui/kit';
 import { InterviewPlanCard } from '../../ui/InterviewPlanCard';
 import { QuestStrip } from '../../ui/QuestStrip';
@@ -109,7 +111,28 @@ function LearnPath() {
   const [searchOpen, setSearchOpen] = useState(true);
   const [q, setQ] = useState('');
   const [manual, setManual] = useState<Record<string, boolean>>({});
-  const action = nextAction(role, progress, due, userLevel);
+  // Interview Autopilot: when a date is set, the derived plan replaces the generic path —
+  // and for Pro, today's next plan item takes over the ContinueHero.
+  const plan = useAutopilot();
+  const autopilotOn = plan.status !== 'dormant';
+  const baseAction = nextAction(role, progress, due, userLevel);
+  const todayFrac =
+    plan.today && plan.today.items.length > 0
+      ? plan.today.items.filter((i) => i.done).length / plan.today.items.length
+      : 0;
+  const action: NextAction =
+    unlocked && plan.status === 'active' && plan.nextItem
+      ? {
+          kind: 'autopilot',
+          eyebrow: plan.daysUntil <= 7 ? `Interview in ${plan.daysUntil}d` : 'Autopilot',
+          title: plan.nextItem.title,
+          sub: plan.nextItem.sub,
+          icon: plan.nextItem.icon,
+          frac: todayFrac,
+          colorKind: 'navy',
+          item: plan.nextItem,
+        }
+      : baseAction;
   const scrollRef = useRef<ScrollView>(null);
   const trackY = useRef<Record<string, number>>({});
   const sectionY = useRef<Record<string, number>>({});
@@ -230,7 +253,13 @@ function LearnPath() {
             {!query && (
               <Fragment>
                 <RoleHeader role={role} onPress={() => setShowSettings(true)} />
-                <InterviewPlanCard dateIso={interviewDate} onStart={startDaily} />
+                {/* Autopilot owns the interview surface while a date is set; the old static
+                    countdown card covers the dormant case (it renders null without a date). */}
+                {autopilotOn ? (
+                  <AutopilotPlanCard plan={plan} />
+                ) : (
+                  <InterviewPlanCard dateIso={interviewDate} onStart={startDaily} />
+                )}
                 <CardEnter>
                   <ContinueHero action={action} />
                 </CardEnter>
@@ -248,9 +277,11 @@ function LearnPath() {
                     }}
                   />
                 </CardEnter>
-                <CardEnter delay={50}>
-                  <PlanList />
-                </CardEnter>
+                {!autopilotOn && (
+                  <CardEnter delay={50}>
+                    <PlanList />
+                  </CardEnter>
+                )}
                 <CardEnter delay={50}>
                   <ContestBanner />
                 </CardEnter>
@@ -606,7 +637,9 @@ function RoleHeader({ role, onPress }: { role: string; onPress: () => void }) {
 /** Pinned FREE Stage-0 primer entry — basics for the role's core tracks. Hides once complete. */
 /** The single best "what do I do now" — drives the one dominant ContinueHero. */
 type NextAction = {
-  kind: 'lesson' | 'review' | 'basics';
+  kind: 'lesson' | 'review' | 'basics' | 'autopilot';
+  /** Autopilot only: the plan item the hero starts. */
+  item?: PlanItem;
   eyebrow: string;
   title: string;
   sub: string;
@@ -695,6 +728,7 @@ function ContinueHero({ action: a }: { action: NextAction }) {
   const startLesson = useStore((s) => s.startLesson);
   const startDaily = useStore((s) => s.startDaily);
   const startBasics = useStore((s) => s.startBasics);
+  const startPlanItem = useStartPlanItem();
   const heroPulse = useStore((s) => s.heroPulse);
   const clearHeroPulse = useStore((s) => s.clearHeroPulse);
   const reduced = useReducedMotion();
@@ -711,7 +745,8 @@ function ContinueHero({ action: a }: { action: NextAction }) {
   const color = a.colorKind === 'navy' ? c.navy : a.colorKind === 'success' ? c.success : track(a.colorKey ?? 'spark');
   const onPress = () => {
     clearHeroPulse();
-    if (a.kind === 'lesson' && a.slug != null && a.idx != null) startLesson(a.slug, a.idx);
+    if (a.kind === 'autopilot' && a.item) startPlanItem(a.item);
+    else if (a.kind === 'lesson' && a.slug != null && a.idx != null) startLesson(a.slug, a.idx);
     else if (a.kind === 'review') startDaily();
     else startBasics();
   };
@@ -1009,6 +1044,36 @@ function SettingsSheet({ open, onClose }: { open: boolean; onClose: () => void }
                 />
               </View>
               <RolePicker value={s.role} onChange={(v) => s.setRole(v)} query={roleQ} />
+
+              {/* Interview Autopilot entry — jd.tsx owns the date input + validation. */}
+              <Pressable
+                onPress={() => {
+                  onClose();
+                  router.push('/jd' as Href);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Interview Autopilot — set or change your interview date">
+                <Row
+                  style={{
+                    gap: 9,
+                    borderWidth: 1,
+                    borderColor: c.border,
+                    backgroundColor: dark ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.7)',
+                    borderRadius: radius.md,
+                    paddingVertical: 11,
+                    paddingHorizontal: 12,
+                    marginTop: 4,
+                  }}>
+                  <T size={16}>🛬</T>
+                  <View style={{ flex: 1 }}>
+                    <T weight="800" size={13}>Interview Autopilot</T>
+                    <T muted size={11}>
+                      {s.interviewDate ? `Planning toward ${s.interviewDate}` : 'Set your interview date → a day-by-day plan'}
+                    </T>
+                  </View>
+                  <T weight="800" size={13} color={c.muted}>›</T>
+                </Row>
+              </Pressable>
             </ScrollView>
           </BlurView>
           </Animated.View>

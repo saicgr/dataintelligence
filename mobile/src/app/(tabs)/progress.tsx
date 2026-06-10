@@ -10,6 +10,7 @@ import { exportSheet } from '../../lib/exportPdf';
 import { daysLeftInWeek, fetchLeaderboard, type Leaderboard, tierForRank, weekKey } from '../../lib/leagues';
 import { mostAskedAtCompany, type MostAskedTopic } from '../../lib/peerAnswers';
 import { readinessAxes, readinessForRole, readinessLabel } from '../../lib/readiness';
+import { buildReadinessReport } from '../../lib/readinessReport';
 import { ROLES } from '../../lib/roles';
 import { isProActive, level, useStore, xpInLevel } from '../../lib/store';
 import { useTheme } from '../../lib/theme';
@@ -30,6 +31,33 @@ export default function Progress() {
   const markBadgesSeen = useStore((s) => s.markBadgesSeen);
   const company = useStore((s) => s.targetCompany);
   const proActive = useStore(isProActive);
+  const readinessTrend = useStore((s) => s.readinessTrend);
+  const leagueSnapshot = useStore((s) => s.leagueSnapshot);
+  const jdGapTracks = useStore((s) => s.jdGapTracks);
+  const targetCompanyKey = useStore((s) => s.targetCompanyKey);
+
+  // Pro readiness report: axes + league percentile + trend + focus tracks, as a PDF.
+  const exportReadiness = () => {
+    if (!proActive) {
+      void confirmAsync(
+        'Readiness report is Pro',
+        'Export a PDF snapshot — per-axis breakdown, percentile vs this week’s league, and your trend.',
+        'See plans'
+      ).then((go) => go && router.push('/paywall'));
+      return;
+    }
+    const html = buildReadinessReport({
+      role,
+      progress,
+      trend: readinessTrend,
+      league: leagueSnapshot,
+      jdGapTracks,
+      targetCompanyKey,
+    });
+    void exportSheet(html).then((r) => {
+      if (!r.ok && r.error) alertInfo('Couldn’t export', r.error);
+    });
+  };
 
   // Pro cheat-sheet export: seen cards only (key points + tells, never the full Q&A).
   const exportTrack = (slug: string, name: string) => {
@@ -89,6 +117,7 @@ export default function Progress() {
       <H2>Your progress</H2>
       <StreakHero variant="hero" />
       <ReadinessCard role={role} progress={progress} />
+      <Btn label="📊 Export readiness report (Pro)" variant="ghost" onPress={exportReadiness} />
       <BadgesCard badges={badges} />
       <Card style={{ gap: 11 }}>
         <T muted size={12.5} style={{ textAlign: 'center' }}>

@@ -3,8 +3,13 @@ import { safeBack } from '../lib/nav';
 import { useState } from 'react';
 import { Linking, Pressable, TextInput, View } from 'react-native';
 
+import { buildCheatSheetFromCards } from '../lib/cheatsheet';
+import { matchCompanyKey } from '../lib/companySets';
+import { findCardById, type SessionCard } from '../lib/content';
 import { daysUntil } from '../lib/cramPlan';
-import { analyzeJd, JdResult } from '../lib/jd';
+import { alertInfo } from '../lib/dialog';
+import { exportSheet } from '../lib/exportPdf';
+import { analyzeJd, extractSkills, jdCardPool, JdResult, type JdSkill } from '../lib/jd';
 import { isProActive, useStore } from '../lib/store';
 import { radius, useTheme } from '../lib/theme';
 import { InterviewPlanCard } from '../ui/InterviewPlanCard';
@@ -22,13 +27,51 @@ export default function JD() {
   const interviewDate = useStore((s) => s.interviewDate);
   const setInterviewDate = useStore((s) => s.setInterviewDate);
   const startDaily = useStore((s) => s.startDaily);
+  const startSingle = useStore((s) => s.startSingle);
+  const applyJdPlan = useStore((s) => s.applyJdPlan);
+  const createMyTrack = useStore((s) => s.createMyTrack);
   const [text, setText] = useState('');
   const [result, setResult] = useState<JdResult | null>(null);
+  const [skills, setSkills] = useState<JdSkill[]>([]);
   const [dateText, setDateText] = useState(interviewDate ?? '');
 
   const analyze = () => {
     if (text.trim().length < 20) return;
     setResult(analyzeJd(text, progress));
+    setSkills(extractSkills(text, progress));
+  };
+
+  // Pro: one tap → role + date + target company + gap tracks land in Autopilot.
+  const buildPlan = () => {
+    if (!result) return;
+    applyJdPlan({
+      role: result.bestRole,
+      dateIso: interviewDate,
+      companyKey: matchCompanyKey(text),
+      gapTracks: result.gaps.map((t) => t.slug),
+    });
+    router.replace('/');
+  };
+
+  const createDeck = () => {
+    if (!result) return;
+    const ids = jdCardPool(text, progress);
+    if (ids.length === 0) return alertInfo('No matching cards', 'Paste more of the JD (the skills/requirements section).');
+    const company = matchCompanyKey(text);
+    const name = `${company ? company[0].toUpperCase() + company.slice(1) : result.bestRoleName} JD · gaps`;
+    const id = createMyTrack(name, ids, 'jd');
+    if (!id) return router.push('/paywall'); // free cap (1 deck) reached
+    alertInfo('My Track created', `“${name}” is in your Library → My Tracks (${Math.min(ids.length, 200)} cards).`);
+  };
+
+  const exportJdSheet = () => {
+    const ids = jdCardPool(text, progress, 60);
+    const cards = ids.map((id) => findCardById(id)).filter((cd): cd is SessionCard => !!cd);
+    const sheet = buildCheatSheetFromCards('JD prep', cards, progress);
+    if (!sheet) return alertInfo('Nothing to export yet', 'The sheet covers JD skills you’ve already studied — drill a few first.');
+    void exportSheet(sheet.html).then((r) => {
+      if (!r.ok && r.error) alertInfo('Couldn’t export', r.error);
+    });
   };
 
   const onDateChange = (v: string) => {
@@ -131,6 +174,40 @@ export default function JD() {
             </Pressable>
           ))}
 
+          {unlocked && skills.length > 0 && (
+            <>
+              <H2>Skills in this JD · your coverage</H2>
+              <Row style={{ flexWrap: 'wrap', gap: 7 }}>
+                {skills.map((sk) => {
+                  const covered = sk.cards > 0 && sk.studied >= sk.cards;
+                  const none = sk.cards === 0;
+                  const col = covered ? c.success : sk.studied === 0 ? c.danger : c.warn;
+                  return (
+                    <Pressable
+                      key={`${sk.trackSlug}-${sk.term}`}
+                      disabled={none || !sk.firstUnseenId}
+                      accessibilityRole="button"
+                      accessibilityLabel={`${sk.term}: ${sk.studied} of ${sk.cards} cards studied${sk.firstUnseenId ? ', tap to drill' : ''}`}
+                      onPress={() => {
+                        if (!sk.firstUnseenId) return;
+                        startSingle(sk.firstUnseenId);
+                        router.replace('/');
+                      }}>
+                      <View style={{ borderWidth: 1.5, borderColor: none ? c.border : col, borderRadius: 999, paddingVertical: 6, paddingHorizontal: 11, opacity: none ? 0.55 : 1 }}>
+                        <T weight="700" size={11.5} color={none ? c.muted : col}>
+                          {sk.term} · {none ? 'no cards yet' : `${sk.studied}/${sk.cards}`}
+                        </T>
+                      </View>
+                    </Pressable>
+                  );
+                })}
+              </Row>
+              <T muted size={11} style={{ lineHeight: 16 }}>
+                Tap a skill to drill its next unstudied card. Red = untouched, amber = partial, green = covered.
+              </T>
+            </>
+          )}
+
           {unlocked ? (
             <>
               {result.gaps.length > 0 && (
@@ -150,6 +227,12 @@ export default function JD() {
                   </Row>
                 </Card>
               )}
+              {/* The Pro loop: JD → plan → deck → sheet. buildPlan feeds Interview Autopilot. */}
+              <Btn label="⚡ Build my Autopilot plan →" variant="navy" onPress={buildPlan} />
+              <Row style={{ gap: 9 }}>
+                <Btn label="➕ My Track from JD" variant="ghost" style={{ flex: 1 }} onPress={createDeck} />
+                <Btn label="📄 JD cheat sheet" variant="ghost" style={{ flex: 1 }} onPress={exportJdSheet} />
+              </Row>
               <Btn
                 label="🤖 Deeper AI analysis on web →"
                 variant="ghost"

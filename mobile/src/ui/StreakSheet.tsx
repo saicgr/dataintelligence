@@ -9,7 +9,7 @@ import { Modal, Platform, Pressable, ScrollView, useWindowDimensions, View } fro
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { haptic } from '../lib/feedback';
-import { useStore } from '../lib/store';
+import { isProActive, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
 import { Row, Segmented, T } from './kit';
 import { StreakHero } from './StreakHero';
@@ -34,7 +34,19 @@ export function StreakSheet({ open, onClose }: { open: boolean; onClose: () => v
   const restDays = useStore((s) => s.restDays);
   const dailyGoal = useStore((s) => s.dailyGoal);
   const setDailyGoal = useStore((s) => s.setDailyGoal);
+  const pro = useStore(isProActive);
+  const brokenValue = useStore((s) => s.streakBrokenValue);
+  const brokenDay = useStore((s) => s.streakBrokenDay);
+  const lastRepairQuarter = useStore((s) => s.lastRepairQuarter);
+  const repairStreak = useStore((s) => s.repairStreak);
   const untilFreeze = streak % 5 === 0 ? 5 : 5 - (streak % 5);
+  const freezeCap = pro ? 5 : 2;
+  // A recent break (≤7 days) is repairable — Pro, once per quarter.
+  const now = Date.now();
+  const q = `${new Date(now).getUTCFullYear()}-Q${Math.floor(new Date(now).getUTCMonth() / 3) + 1}`;
+  const brokenRecently =
+    brokenValue != null && !!brokenDay && now - Date.parse(`${brokenDay}T00:00:00Z`) <= 7 * 86_400_000;
+  const repairUsed = lastRepairQuarter === q;
 
   return (
     <Modal visible={open} transparent animationType="slide" onRequestClose={onClose} statusBarTranslucent>
@@ -81,11 +93,40 @@ export function StreakSheet({ open, onClose }: { open: boolean; onClose: () => v
 
               <ExplainRow
                 icon="🧊"
-                title={`Streak freezes · ${freezes}/2 banked`}
+                title={`Streak freezes · ${freezes}/${freezeCap} banked`}
                 body={`A freeze auto-covers a missed day so your streak survives. Earn one every 5 streak days${
-                  freezes >= 2 ? ' (you’re full)' : streak > 0 ? ` — next in ${untilFreeze} day${untilFreeze === 1 ? '' : 's'}` : ''
-                }. No tapping needed — it spends itself.`}
+                  freezes >= freezeCap ? ' (you’re full)' : streak > 0 ? ` — next in ${untilFreeze} day${untilFreeze === 1 ? '' : 's'}` : ''
+                }. ${pro ? 'Pro grants +3 every month (bank up to 5).' : 'Pro banks 5 and adds +3 every month.'} No tapping needed — it spends itself.`}
               />
+              {brokenRecently && (
+                <ExplainRow
+                  icon="🔧"
+                  title={`Streak repair · your ${brokenValue}-day streak broke`}
+                  body={
+                    repairUsed
+                      ? 'Repair is once per quarter and you’ve used this quarter’s. Keep the new streak alive!'
+                      : pro
+                        ? 'Restore the streak you lost (once per quarter) — your days since the break count on top.'
+                        : 'Pro can restore a recently-broken streak once per quarter.'
+                  }
+                  action={
+                    repairUsed
+                      ? undefined
+                      : {
+                          label: pro ? '🔧 Repair my streak' : 'See Pro plans ›',
+                          onPress: () => {
+                            if (!pro) {
+                              onClose();
+                              router.push('/paywall');
+                              return;
+                            }
+                            haptic.success();
+                            repairStreak();
+                          },
+                        }
+                  }
+                />
+              )}
               <ExplainRow
                 icon="🛌"
                 title={restDays.length ? `Rest days · ${restDays.length}/week scheduled` : 'Rest days'}

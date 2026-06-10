@@ -9,7 +9,7 @@
  * but does NOT touch SessionView internals or the daily SRS schedule. Score persistence is best-effort
  * through an optional `recordMock` store action (see INTEGRATION NOTES) — absence is a graceful no-op.
  */
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { safeBack } from '../lib/nav';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, View } from 'react-native';
@@ -21,6 +21,7 @@ import {
   MOCK_SECONDS_PER_Q,
   scoreMock,
 } from '../lib/mock';
+import { COMPANY_SETS, rankCompanyCards } from '../lib/companySets';
 import { type SessionCard } from '../lib/content';
 import { haptic, sfx } from '../lib/feedback';
 import { useStore } from '../lib/store';
@@ -39,9 +40,23 @@ export default function MockInterview() {
   // Optional persistence hook — present once store.recordMock is wired (see INTEGRATION NOTES).
   const recordMock = useStore((s) => (s as { recordMock?: (score: number, missed: string[]) => void }).recordMock);
 
+  // Company-shaped mock (Company Packs): ?company=<key> swaps the pool for the pack's ranked cards.
+  const { company } = useLocalSearchParams<{ company?: string }>();
+  const companySet = company ? COMPANY_SETS[company] : undefined;
+
   // Deck is frozen for the lifetime of one round (rebuilt only on replay).
   const [round, setRound] = useState(0);
-  const deck = useMemo(() => buildMockDeck(role, progress), [role, progress, round]);
+  const deck = useMemo(
+    () =>
+      buildMockDeck(
+        role,
+        progress,
+        Date.now(),
+        companySet && company ? rankCompanyCards(company, role, progress).map((r) => r.card) : undefined
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [role, progress, round, company]
+  );
 
   const [phase, setPhase] = useState<Phase>('intro');
   const [idx, setIdx] = useState(0);
@@ -112,8 +127,8 @@ export default function MockInterview() {
         </Pressable>
         <CardEnter>
           <Card style={{ alignItems: 'center', padding: 26, gap: 8 }}>
-            <T size={46}>⏱️</T>
-            <T size={22} weight="900">Mock interview</T>
+            <T size={46}>{companySet ? companySet.emoji : '⏱️'}</T>
+            <T size={22} weight="900">{companySet ? `${companySet.label} mock` : 'Mock interview'}</T>
             <T muted size={13} style={{ textAlign: 'center', lineHeight: 20 }}>
               {deck.length} rapid-fire questions. {MOCK_SECONDS_PER_Q}s each, on the clock — no peeking,
               no second guesses. Lock in your answer and move. We score you at the end and hand you the

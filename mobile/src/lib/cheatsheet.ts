@@ -5,7 +5,7 @@
  * review, not an exportable copy of the content bank. "Export till here" falls out of
  * the seen-cards filter — you export exactly as far as you've drilled.
  */
-import { bankForTrack, trackBySlug } from './content';
+import { bankForTrack, type SessionCard, trackBySlug } from './content';
 import { extractKeyPoints } from './keypoints';
 import type { CardState } from './srs';
 
@@ -24,7 +24,18 @@ export interface CheatSheet {
 export function buildCheatSheet(slug: string, progress: Record<string, CardState>): CheatSheet | null {
   const track = trackBySlug(slug);
   const bank = bankForTrack(slug);
-  if (!track || bank.length === 0) return null;
+  if (!track) return null;
+  return buildCheatSheetFromCards(track.name, bank, progress);
+}
+
+/** Sheet for an arbitrary card pool (company packs, My Tracks, JD prep, mistakes) — same
+ *  seen-cards-only, key-points-not-full-answers contract as the track sheet. */
+export function buildCheatSheetFromCards(
+  title: string,
+  bank: SessionCard[],
+  progress: Record<string, CardState>
+): CheatSheet | null {
+  if (bank.length === 0) return null;
   const seen = bank.filter((c) => (progress[c.id]?.reps ?? 0) > 0);
   if (seen.length === 0) return null;
 
@@ -43,7 +54,7 @@ export function buildCheatSheet(slug: string, progress: Record<string, CardState
 
   const date = new Date().toISOString().slice(0, 10);
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
-  <title>${esc(track.name)} — FieldNotes cheat sheet</title>
+  <title>${esc(title)} — FieldNotes cheat sheet</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; color: #1a1d23; margin: 28px; }
@@ -61,7 +72,7 @@ export function buildCheatSheet(slug: string, progress: Record<string, CardState
     @media print { body { margin: 12px; } }
   </style></head><body>
   <header>
-    <h1>${esc(track.name)} — interview cheat sheet</h1>
+    <h1>${esc(title)} — interview cheat sheet</h1>
     <div class="meta">${seen.length} of ${bank.length} cards studied · exported ${date} · FieldNotes</div>
   </header>
   ${items}

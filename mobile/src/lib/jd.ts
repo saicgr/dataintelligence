@@ -3,7 +3,7 @@
  * job description for per-track keywords → rank tracks by fit, infer the best role, and
  * flag coverage gaps from the user's progress. Deterministic, no network.
  */
-import { Track, TRACKS, trackBySlug } from './content';
+import { bankForTrack, Track, TRACKS, trackBySlug } from './content';
 import { ROLE_TRACKS, ROLES, RoleKey, roleByKey } from './roles';
 import type { CardState } from './srs';
 
@@ -102,4 +102,72 @@ export function analyzeJd(text: string, progress: Record<string, CardState>): Jd
   const gaps = recommended.filter((t) => !seen(t.slug));
 
   return { bestRole, bestRoleName: roleByKey(bestRole)?.name ?? bestRole, matched, recommended, gaps };
+}
+
+/* ── JD → skills (Pro): term-level extraction with per-skill card coverage ─────────────── */
+
+export interface JdSkill {
+  /** The keyword as it appears in our taxonomy (e.g. "window functions", "delta lake"). */
+  term: string;
+  trackSlug: string;
+  trackName: string;
+  /** Cards in the term's track whose QUESTION mentions the term (capped scan). */
+  cards: number;
+  /** Of those, how many the user has studied. */
+  studied: number;
+  /** First unstudied matching card — the "tap to drill this skill" target. */
+  firstUnseenId: string | null;
+}
+
+/**
+ * Pull the individual SKILL TERMS a JD mentions and map each to real cards + the user's
+ * coverage ("CDC · 4 cards · 0 studied"). Same keyword taxonomy as the track matcher —
+ * fully offline, deterministic.
+ */
+export function extractSkills(text: string, progress: Record<string, CardState>, max = 20): JdSkill[] {
+  const jd = ` ${text.toLowerCase()} `;
+  const out: JdSkill[] = [];
+  for (const [slug, kws] of Object.entries(TRACK_KEYWORDS)) {
+    const t = trackBySlug(slug);
+    if (!t) continue;
+    for (const term of kws) {
+      const esc = term.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (!new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i').test(jd)) continue;
+      // The term is in the JD — count matching cards in its home track.
+      const re = new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i');
+      let cards = 0;
+      let studied = 0;
+      let firstUnseenId: string | null = null;
+      for (const card of bankForTrack(slug)) {
+        if (!re.test(card.q)) continue;
+        cards++;
+        if ((progress[card.id]?.reps ?? 0) > 0) studied++;
+        else if (!firstUnseenId) firstUnseenId = card.id;
+      }
+      out.push({ term, trackSlug: slug, trackName: t.name, cards, studied, firstUnseenId });
+    }
+  }
+  // Most actionable first: skills that HAVE cards and are least covered.
+  return out
+    .sort((a, b) => (b.cards > 0 ? 1 : 0) - (a.cards > 0 ? 1 : 0) || a.studied - b.studied || b.cards - a.cards)
+    .slice(0, max);
+}
+
+/** The card pool a JD implies (for the JD cheat sheet + "create a My Track from this JD"):
+ *  unstudied-first across the matched skills' cards, deduped, gap tracks leading. */
+export function jdCardPool(text: string, progress: Record<string, CardState>, cap = 30): string[] {
+  const skills = extractSkills(text, progress, 40);
+  const seen = new Set<string>();
+  const unstudied: string[] = [];
+  const studied: string[] = [];
+  for (const sk of skills) {
+    const re = new RegExp(`(^|[^a-z0-9])${sk.term.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i');
+    for (const card of bankForTrack(sk.trackSlug)) {
+      if (seen.has(card.id) || !re.test(card.q)) continue;
+      seen.add(card.id);
+      if ((progress[card.id]?.reps ?? 0) > 0) studied.push(card.id);
+      else unstudied.push(card.id);
+    }
+  }
+  return [...unstudied, ...studied].slice(0, cap);
 }

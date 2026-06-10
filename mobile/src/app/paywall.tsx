@@ -24,17 +24,20 @@ import { FreshProof } from '../components/fresh-proof';
 import { HowProWorks } from '../components/how-pro-works';
 import { buildCramPlan, daysUntil } from '../lib/cramPlan';
 
-// Honest Free vs Pro: '✓' live, '—' not in tier, 'soon' = built-but-not-shipped (don't sell as live).
+// Honest Free vs Pro: '✓' live, '—' not in tier. Every row here is SHIPPED — never sell vapor.
 const ROWS: [string, string, string][] = [
   ['Browse every track & read every answer', '✓', '✓'],
-  ['Stage 0 · Fundamentals primer', '✓', '✓'],
-  ['Spaced review — cards resurface when due', '✓', '✓'],
-  ['"Explain it out loud" scenarios · streak · offline', '✓', '✓'],
+  ['Spaced review · scenarios · streak · offline', '✓', '✓'],
   ['Weekly "stay current" fresh drops', 'taste', '✓'],
   ['New cards per day', '15', 'unlimited'],
-  ['Interview-aware scheduling — ramps to your date', '—', '✓'],
-  ['JD analyzer — tracks to prep + your gaps', '—', '✓'],
-  ['Most-asked-at-company lists', 'soon', 'soon'],
+  ['Company packs — ranked by what they ask', 'top 2', 'full + mock'],
+  ['Interview Autopilot — day-by-day plan to your date', 'today', 'full plan'],
+  ['JD analyzer — skills, gaps, one-tap plan', 'teaser', '✓'],
+  ['Mock interviews · incidents · voice mock · audio review', '—', '✓'],
+  ['Code drill runs per day', '3', 'unlimited'],
+  ['Cheat-sheet & readiness-report PDF exports', '—', '✓'],
+  ['My Tracks — your own decks (+ mistakes notebook)', '1 · taste', 'unlimited'],
+  ['Streak insurance — +3 freezes/mo + quarterly repair', '—', '✓'],
 ];
 
 type PlanId = typeof SUB_YEARLY_ID | typeof SUB_MONTHLY_ID | typeof BASE_PRODUCT_ID;

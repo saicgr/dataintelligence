@@ -12,18 +12,19 @@
 // Owns no store state: it builds its own copy of the daily deck from role + progress
 // so it can't desync the live SessionView. See INTEGRATION NOTES for wiring.
 import { setAudioModeAsync } from 'expo-audio';
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { safeBack } from '../lib/nav';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Platform, View } from 'react-native';
 
+import { rankCompanyCards } from '../lib/companySets';
 import {
   buildSessionDeck,
   dailyPoolForRole,
   type SessionCard,
 } from '../lib/content';
 import { haptic } from '../lib/feedback';
-import { extractKeyPoints, suggestRating } from '../lib/keypoints';
+import { coverage, extractKeyPoints, suggestRating } from '../lib/keypoints';
 import type { Rating } from '../lib/srs';
 import { isProActive, useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
@@ -32,8 +33,12 @@ import { Btn, Card, H2, Row, Screen, T } from '../ui/kit';
 
 /** Seconds the "answer out loud" prompt holds before the answer is read. */
 const ANSWER_PAUSE_MS = 7000;
+/** Voice mock gives a longer answer window — it's a real rep, not ambient review. */
+const MOCK_PAUSE_MS = 12_000;
 /** Hands-free grace: untouched grade screens auto-advance (pocket mode never stalls). */
 const GRADE_TIMEOUT_MS = 8000;
+/** Voice mock length (Pro). */
+const MOCK_CARDS = 10;
 
 type Phase = 'idle' | 'question' | 'thinking' | 'answer' | 'grade' | 'done';
 
@@ -53,6 +58,14 @@ function speakable(card: SessionCard): { q: string; a: string } {
 }
 
 export default function AudioSession() {
+  // Voice mock (Pro): ?mode=mock — a SCORED hands-free round. Optional ?company=key
+  // shapes the pool to that company pack. Keyed so switching modes remounts cleanly.
+  const { mode, company } = useLocalSearchParams<{ mode?: string; company?: string }>();
+  const mockMode = mode === 'mock';
+  return <AudioInner key={`${mockMode}-${company ?? ''}`} mockMode={mockMode} company={company} />;
+}
+
+function AudioInner({ mockMode, company }: { mockMode: boolean; company?: string }) {
   const router = useRouter();
   const { c } = useTheme();
   const role = useStore((s) => s.role);
@@ -60,6 +73,10 @@ export default function AudioSession() {
   const unlocked = useStore(isProActive);
   const soundOn = useStore((s) => s.sound);
   const markVoiceTried = useStore((s) => s.markVoiceTried);
+  const startWeakspot = useStore((s) => s.startWeakspot);
+  useEffect(() => {
+    if (mockMode && !unlocked) router.replace('/paywall');
+  }, [mockMode, unlocked, router]);
   // Opening voice recall at all earns the 🎙 badge.
   useEffect(() => {
     markVoiceTried();
@@ -69,14 +86,25 @@ export default function AudioSession() {
   const deckRef = useRef<SessionCard[]>([]);
   if (deckRef.current.length === 0) {
     const now = Date.now();
-    deckRef.current = buildSessionDeck(
-      dailyPoolForRole(role, now),
-      progress,
-      now,
-      unlocked ? 40 : 15
-    );
+    if (mockMode) {
+      // Mock pool: gradable-by-voice cards (≥2 key points so coverage scoring works),
+      // from the company pack when given, else the role's daily pool.
+      const pool = company
+        ? rankCompanyCards(company, role, progress, now).map((r) => r.card)
+        : dailyPoolForRole(role, now);
+      deckRef.current = pool.filter((cd) => extractKeyPoints(cd, 5).length >= 2).slice(0, MOCK_CARDS);
+    } else {
+      deckRef.current = buildSessionDeck(
+        dailyPoolForRole(role, now),
+        progress,
+        now,
+        unlocked ? 40 : 15
+      );
+    }
   }
   const deck = deckRef.current;
+  // Mock scoring: ≥ 'good' (self-graded off the key-point ticks) counts as correct.
+  const mockResults = useRef<{ id: string; ok: boolean }[]>([]);
 
   const [idx, setIdx] = useState(0);
   const [phase, setPhase] = useState<Phase>('idle');
@@ -104,14 +132,20 @@ export default function AudioSession() {
     }).catch(() => {});
   }, []);
 
-  // Stop any speech + clear timers on unmount.
+  // Stop any speech + clear timers + release the mic on unmount.
   useEffect(() => {
     return () => {
       cancelled.current = true;
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
       if (gradeTimer.current) clearTimeout(gradeTimer.current);
       ttsStop();
+      try {
+        recRef.current?.stop();
+      } catch {
+        /* ignore */
+      }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const wait = (ms: number) =>
@@ -119,12 +153,61 @@ export default function AudioSession() {
       pauseTimer.current = setTimeout(resolve, ms);
     });
 
+  // ── Web Speech API auto-scoring (mock mode, browsers only — no native dep) ──────────
+  // While you answer aloud, the transcript pre-ticks the key points via coverage();
+  // you can still correct the ticks before grading. Mic denied / unsupported → manual ticks.
+  const recRef = useRef<{ stop: () => void } | null>(null);
+  const transcriptRef = useRef('');
+  const startListening = () => {
+    if (Platform.OS !== 'web' || !mockMode) return;
+    const SR =
+      (window as unknown as { SpeechRecognition?: new () => unknown; webkitSpeechRecognition?: new () => unknown })
+        .SpeechRecognition ??
+      (window as unknown as { webkitSpeechRecognition?: new () => unknown }).webkitSpeechRecognition;
+    if (!SR) return;
+    try {
+      const rec = new SR() as {
+        continuous: boolean;
+        interimResults: boolean;
+        lang: string;
+        onresult: ((e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+        start: () => void;
+        stop: () => void;
+      };
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = 'en-US';
+      rec.onresult = (e) => {
+        let t = '';
+        for (let i = 0; i < e.results.length; i++) t += `${e.results[i][0].transcript} `;
+        transcriptRef.current = t;
+      };
+      rec.start();
+      recRef.current = rec;
+    } catch {
+      /* mic unavailable — self-grade fallback */
+    }
+  };
+  const stopListening = () => {
+    try {
+      recRef.current?.stop();
+    } catch {
+      /* ignore */
+    }
+    recRef.current = null;
+  };
+
   const advance = useCallback(
     (from: number) => {
       const next = from + 1;
       if (next >= deck.length) {
         setPhase('done');
-        void speak('Session complete. Nice work.');
+        if (mockMode) {
+          const ok = mockResults.current.filter((r) => r.ok).length;
+          void speak(`Mock complete. ${ok} of ${deck.length}. ${ok >= deck.length * 0.8 ? 'Strong round.' : 'Drill the misses next.'}`);
+        } else {
+          void speak('Session complete. Nice work.');
+        }
         haptic.success();
         return;
       }
@@ -133,7 +216,7 @@ export default function AudioSession() {
       void runCard(next);
     },
     // eslint-disable-next-line @typescript-eslint/no-use-before-define
-    [deck]
+    [deck, mockMode]
   );
 
   // Drive one card through question → think-pause → answer → self-grade, then advance.
@@ -150,7 +233,10 @@ export default function AudioSession() {
       setPhase('thinking');
       await speak('Answer out loud.');
       if (cancelled.current || pausedRef.current) return;
-      await wait(ANSWER_PAUSE_MS);
+      transcriptRef.current = '';
+      startListening(); // web mock: capture the spoken answer for auto-scoring
+      await wait(mockMode ? MOCK_PAUSE_MS : ANSWER_PAUSE_MS);
+      stopListening();
       if (cancelled.current || pausedRef.current) return;
 
       setPhase('answer');
@@ -161,7 +247,8 @@ export default function AudioSession() {
       const pts = extractKeyPoints(cd, 5);
       if (pts.length >= 2) {
         setPoints(pts);
-        setTicks(pts.map(() => false));
+        // Pre-tick from the spoken transcript when we have one (web mock); still correctable.
+        setTicks(transcriptRef.current.trim() ? coverage(transcriptRef.current, pts) : pts.map(() => false));
         setPhase('grade');
         void speak('Which key points did you cover? Tap them, then grade yourself.');
         // Pure hands-free flow never stalls: untouched grade screens advance unrated.
@@ -184,6 +271,7 @@ export default function AudioSession() {
   const finishGrade = (r: Rating | null) => {
     holdGrade();
     if (r && card) rateById(card.id, r);
+    if (mockMode && card) mockResults.current.push({ id: card.id, ok: r === 'good' || r === 'easy' });
     if (r) haptic.success();
     advance(idx);
   };
@@ -206,6 +294,7 @@ export default function AudioSession() {
       pausedRef.current = true;
       setPaused(true);
       if (pauseTimer.current) clearTimeout(pauseTimer.current);
+      stopListening();
       ttsStop();
       haptic.medium();
     }
@@ -214,6 +303,7 @@ export default function AudioSession() {
   const skip = () => {
     if (pauseTimer.current) clearTimeout(pauseTimer.current);
     holdGrade();
+    stopListening();
     ttsStop();
     haptic.light();
     const next = idx + 1;
@@ -249,7 +339,7 @@ export default function AudioSession() {
   return (
     <Screen scroll={false}>
       <Row style={{ justifyContent: 'space-between' }}>
-        <H2>🎧 Commute mode</H2>
+        <H2>{mockMode ? '⏱ Voice mock' : '🎧 Commute mode'}</H2>
         <Btn label="Exit" variant="ghost" onPress={exit} style={{ paddingVertical: 8, paddingHorizontal: 14 }} />
       </Row>
 
@@ -281,6 +371,11 @@ export default function AudioSession() {
             <T weight="900" size={20} style={{ textAlign: 'center' }}>
               {phaseLabel[phase]}
             </T>
+            {mockMode && phase === 'done' && (
+              <T weight="900" size={30} color={mockResults.current.filter((r) => r.ok).length >= deck.length * 0.8 ? c.success : c.warn}>
+                {mockResults.current.filter((r) => r.ok).length}/{deck.length}
+              </T>
+            )}
             {card && phase !== 'idle' && phase !== 'done' && phase !== 'grade' && (
               <T
                 muted={phase === 'thinking'}
@@ -319,23 +414,46 @@ export default function AudioSession() {
 
           {/* Controls — oversized targets, thumb-reachable, work without looking. */}
           {phase === 'idle' ? (
-            <Btn
-              label="▶  Start hands-free"
-              variant="primary"
-              onPress={start}
-              style={{ paddingVertical: 22 }}
-            />
+            <View style={{ gap: 10 }}>
+              <Btn
+                label={mockMode ? `▶  Start voice mock · ${deck.length} questions` : '▶  Start hands-free'}
+                variant="primary"
+                onPress={start}
+                style={{ paddingVertical: 22 }}
+              />
+              {!mockMode && (
+                <Btn
+                  label={unlocked ? '⏱  Voice mock — scored round →' : '⏱  Voice mock — scored round (Pro) →'}
+                  variant="ghost"
+                  onPress={() => router.replace(unlocked ? ('/audio-session?mode=mock' as Parameters<typeof router.replace>[0]) : '/paywall')}
+                />
+              )}
+            </View>
           ) : phase === 'done' ? (
             <Row style={{ gap: 10 }}>
-              <Btn
-                label="Replay"
-                variant="neutral"
-                onPress={() => {
-                  setIdx(0);
-                  setPhase('idle');
-                }}
-                style={{ flex: 1, paddingVertical: 20 }}
-              />
+              {mockMode && mockResults.current.some((r) => !r.ok) ? (
+                <Btn
+                  label="🎯 Drill misses"
+                  variant="navy"
+                  onPress={() => {
+                    // Misses were already rated 'again' → they lead the weak-spot deck.
+                    startWeakspot();
+                    router.replace('/');
+                  }}
+                  style={{ flex: 1, paddingVertical: 20 }}
+                />
+              ) : (
+                <Btn
+                  label="Replay"
+                  variant="neutral"
+                  onPress={() => {
+                    mockResults.current = [];
+                    setIdx(0);
+                    setPhase('idle');
+                  }}
+                  style={{ flex: 1, paddingVertical: 20 }}
+                />
+              )}
               <Btn label="Done" variant="green" onPress={exit} style={{ flex: 1, paddingVertical: 20 }} />
             </Row>
           ) : phase === 'grade' ? (

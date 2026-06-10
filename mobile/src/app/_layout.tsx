@@ -97,6 +97,7 @@ export default function RootLayout() {
             <Stack.Screen name="certificate" options={{ presentation: 'modal' }} />
             <Stack.Screen name="contest" options={{ presentation: 'modal' }} />
             <Stack.Screen name="code" options={{ presentation: 'modal' }} />
+            <Stack.Screen name="company" options={{ presentation: 'modal' }} />
             <Stack.Screen name="mock" options={{ presentation: 'modal' }} />
             <Stack.Screen name="checkpoint" options={{ presentation: 'modal' }} />
             <Stack.Screen name="audio-session" />

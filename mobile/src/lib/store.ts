@@ -19,14 +19,15 @@ import {
   weakSpotDeck,
 } from './content';
 import { basicsForRole } from './basics';
-import { companyBank } from './companySets';
+import { COMPANY_SETS, rankCompanyCards } from './companySets';
 import { incidentDeck } from './incidents';
+import { readinessForRole } from './readiness';
 import { maybeRequestReview } from './review';
 import { buyProduct, type PurchaseResult, restoreAll } from './iap';
 import { BASE_PRODUCT_ID, PRO_PRODUCT_IDS, SUBSCRIPTION_IDS } from './products';
 import { setDailyReminder } from './reminders';
 import type { RoleKey } from './roles';
-import { CardState, initCard, Rating, schedule } from './srs';
+import { CardState, initCard, Rating, schedule, weakness } from './srs';
 import type { AccentKey } from './theme';
 import { upsertWeeklyXp, weekKey } from './leagues';
 import { questMetricForSession } from './quests';
@@ -48,7 +49,20 @@ import {
 
 export type Role = RoleKey;
 export type Mode = 'cram' | 'maintain';
-type SessionKind = 'daily' | 'track' | 'fresh' | 'weakspot' | 'lesson' | 'basics' | 'saved' | 'company' | 'incident' | 'diagnostic' | 'single';
+type SessionKind = 'daily' | 'track' | 'fresh' | 'weakspot' | 'lesson' | 'basics' | 'saved' | 'company' | 'incident' | 'diagnostic' | 'single' | 'mytrack' | 'mistakes';
+
+/** A user-assembled custom deck ("My Track"). Card ids resolve via findCardById and dead ids
+ *  are skipped at deck-build time, so OTA content changes can't break a saved deck. */
+export interface MyTrack {
+  id: string;
+  name: string;
+  cardIds: string[];
+  createdAt: string; // ISO date
+  source: 'manual' | 'jd' | 'mistakes';
+}
+/** Free tier: one deck of up to 20 cards. Pro: unlimited. */
+export const FREE_MYTRACKS = 1;
+export const FREE_MYTRACK_CARDS = 20;
 
 /** Duolingo-style feedback events emitted by the store, consumed by the FeedbackBridge. */
 export type FeedbackKind = 'correct' | 'wrong' | 'complete' | 'streak' | 'levelUp' | 'firstCard' | 'goalMet' | 'badge';
@@ -76,6 +90,11 @@ export interface LeagueSnapshot {
 
 const DAY = 86_400_000;
 const dayKey = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+const monthKey = (ms: number) => new Date(ms).toISOString().slice(0, 7);
+const quarterKey = (ms: number) => {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-Q${Math.floor(d.getUTCMonth() / 3) + 1}`;
+};
 
 /** Production formats (do, not just recognize) earn more XP — reward the harder work (plan #21). */
 const PRODUCTION_KINDS = new Set(['scenario', 'diag', 'querybuild', 'match', 'evidence', 'order', 'classify']);
@@ -192,6 +211,28 @@ interface State {
   lessonIdx: number | null;
   sessionLevel: Level | null; // optional difficulty filter for a track session (track screen selector)
   sessionCap: number | null; // optional deck-size cap for "quick reps" entries (Surprise me) — null = normal sizing
+  myTrackId: string | null; // active custom deck for sessionKind 'mytrack'
+  // ── Premium layer (persisted) ────────────────────────────────────────────
+  /** Validated COMPANY_SETS key — the user's target company pack (feeds Autopilot + Practice). */
+  targetCompanyKey: string | null;
+  /** Gap track slugs from the last JD analysis the user committed to (Autopilot priority boost). */
+  jdGapTracks: string[];
+  /** Autopilot completion markers: 'YYYY-MM-DD' → done PlanItem ids. Pruned to 2 days on write. */
+  autopilotDone: Record<string, string[]>;
+  /** User-assembled custom decks. */
+  myTracks: MyTrack[];
+  /** Last month ('YYYY-MM') Pro freezes were granted — Pro gets +3/month (cap 5). */
+  freezeGrantMonth: string | null;
+  /** When a streak broke: its value + the day, so a Pro quarterly repair can restore it. */
+  streakBrokenValue: number | null;
+  streakBrokenDay: string | null;
+  /** Quarter ('YYYY-Qn') the one-tap streak repair was last used. */
+  lastRepairQuarter: string | null;
+  /** One readiness sample per active day (cap 60) — the report's trend line. */
+  readinessTrend: { day: string; value: number }[];
+  // ── Premium layer (transient) ────────────────────────────────────────────
+  /** Plan-item id the in-flight session fulfills; marked done in rate() when the deck completes. */
+  pendingAutopilotItem: string | null;
   userLevel: Level | null; // PERSISTED default level (Junior/Senior/Pro) chosen at onboarding → filters daily/role sessions
   sessionDeck: SessionCard[];
   sessionMeta: { due: number; fresh: number };
@@ -216,6 +257,23 @@ interface State {
   setHaptics: (v: boolean) => void;
   setAccent: (k: AccentKey) => void;
   cycleTheme: () => void;
+  // Premium layer
+  setTargetCompanyKey: (key: string | null) => void;
+  setJdGapTracks: (slugs: string[]) => void;
+  /** Mark an autopilot plan item complete for `date`; prunes markers older than yesterday. */
+  markAutopilotItem: (date: string, itemId: string) => void;
+  /** Tag the session being started as fulfilling a plan item (cleared on endSession). */
+  beginAutopilotItem: (itemId: string | null) => void;
+  /** One-tap from the JD analyzer: role + date + company + gap tracks in one shot. */
+  applyJdPlan: (p: { role: Role; dateIso: string | null; companyKey: string | null; gapTracks: string[] }) => void;
+  /** Create a custom deck. Returns its id, or null when the free cap blocks it (caller → paywall). */
+  createMyTrack: (name: string, cardIds: string[], source: MyTrack['source']) => string | null;
+  deleteMyTrack: (id: string) => void;
+  renameMyTrack: (id: string, name: string) => void;
+  startMyTrack: (id: string) => void;
+  startMistakes: () => void;
+  /** Pro, once a quarter: restore a streak that broke in the last 7 days. Returns success. */
+  repairStreak: () => boolean;
   setRestDays: (days: number[]) => void;
   setInterviewDate: (iso: string | null) => void;
   bumpQuest: (metric: 'diag' | 'fresh' | 'lesson', n?: number) => void;
@@ -276,7 +334,7 @@ interface State {
 
 type DeckInputs = Pick<
   State,
-  'sessionKind' | 'trackSlug' | 'companyKey' | 'incidentId' | 'singleId' | 'lessonIdx' | 'sessionLevel' | 'sessionCap' | 'userLevel' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
+  'sessionKind' | 'trackSlug' | 'companyKey' | 'incidentId' | 'singleId' | 'lessonIdx' | 'sessionLevel' | 'sessionCap' | 'myTrackId' | 'myTracks' | 'userLevel' | 'role' | 'unlocked' | 'devMode' | 'progress' | 'feedback' | 'savedIds'
 >;
 
 /** Ids the user disliked — buildSessionDeck pushes these to the back so they surface less (never hidden). */
@@ -315,7 +373,22 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
       isStaffPlus(s.sessionLevel ?? s.userLevel) ? 3 : 1
     );
   } else if (s.sessionKind === 'company' && s.companyKey) {
-    deck = buildSessionDeck(companyBank(s.companyKey), s.progress, now, unlockAll ? Infinity : 50, adaptive, down);
+    // Company pack: role-aware, asked-frequency ranked (curated weights + weakness — offline;
+    // the crowd signal layers on in the pack UI only). Free tier gets a 2-card taste of the pack.
+    const ranked = rankCompanyCards(s.companyKey, s.role, s.progress, now).map((r) => r.card);
+    deck = unlockAll ? ranked : ranked.slice(0, 2);
+  } else if (s.sessionKind === 'mytrack' && s.myTrackId) {
+    // Custom deck: resolve saved ids, silently skipping any that rotted away in an OTA update.
+    const mt = s.myTracks.find((m) => m.id === s.myTrackId);
+    deck = (mt?.cardIds ?? []).map((id) => findCardById(id)).filter((cd): cd is SessionCard => !!cd);
+  } else if (s.sessionKind === 'mistakes') {
+    // Mistakes notebook: every card you've ever lapsed, weakest first. Free taste = 10.
+    const missed = Object.keys(s.progress)
+      .filter((id) => (s.progress[id]?.lapses ?? 0) > 0)
+      .map((id) => findCardById(id))
+      .filter((cd): cd is SessionCard => !!cd)
+      .sort((a, b) => weakness(s.progress[b.id], now) - weakness(s.progress[a.id], now));
+    deck = unlockAll ? missed : missed.slice(0, 10);
   } else if (s.sessionKind === 'incident' && s.incidentId) {
     // Production incidents are free + short — run the whole on-call deck, weakest-first when adaptive.
     deck = buildSessionDeck(incidentDeck(s.incidentId), s.progress, now, Infinity, adaptive, down);
@@ -379,6 +452,8 @@ const initial = buildDeck({
   lessonIdx: null,
   sessionLevel: null,
   sessionCap: null,
+  myTrackId: null,
+  myTracks: [],
   userLevel: null,
   role: 'de',
   unlocked: false,
@@ -445,6 +520,17 @@ export const useStore = create<State>()(
       lessonIdx: null,
       sessionLevel: null,
       sessionCap: null,
+      myTrackId: null,
+      targetCompanyKey: null,
+      jdGapTracks: [],
+      autopilotDone: {},
+      myTracks: [],
+      freezeGrantMonth: null,
+      streakBrokenValue: null,
+      streakBrokenDay: null,
+      lastRepairQuarter: null,
+      readinessTrend: [],
+      pendingAutopilotItem: null,
       userLevel: null,
       sessionDeck: initial.deck,
       sessionMeta: initial.meta,
@@ -481,6 +567,77 @@ export const useStore = create<State>()(
         set((s) => ({
           themePref: s.themePref === 'system' ? 'light' : s.themePref === 'light' ? 'dark' : 'system',
         })),
+
+      // ── Premium layer ──────────────────────────────────────────────────────
+      setTargetCompanyKey: (key) => set({ targetCompanyKey: key && COMPANY_SETS[key] ? key : null }),
+      setJdGapTracks: (jdGapTracks) => set({ jdGapTracks }),
+      markAutopilotItem: (date, itemId) => {
+        const st = get();
+        if ((st.autopilotDone[date] ?? []).includes(itemId)) return;
+        // Plans are derived fresh daily — markers older than yesterday can never matter again.
+        const yesterday = dayKey(Date.now() - DAY);
+        const pruned: Record<string, string[]> = {};
+        for (const [d, ids] of Object.entries(st.autopilotDone)) if (d >= yesterday) pruned[d] = ids;
+        pruned[date] = [...(pruned[date] ?? []), itemId];
+        set({ autopilotDone: pruned });
+      },
+      beginAutopilotItem: (pendingAutopilotItem) => set({ pendingAutopilotItem }),
+      applyJdPlan: ({ role, dateIso, companyKey, gapTracks }) => {
+        const st = get();
+        track('jd_plan_applied', { gaps: gapTracks.length, company: companyKey ?? 'none' });
+        set({
+          role,
+          interviewDate: dateIso ?? st.interviewDate,
+          targetCompanyKey: companyKey && COMPANY_SETS[companyKey] ? companyKey : st.targetCompanyKey,
+          jdGapTracks: gapTracks,
+          idx: 0,
+          reveal: false,
+          lastChoice: null,
+        });
+        get().rebuildSession();
+      },
+      createMyTrack: (name, cardIds, source) => {
+        const st = get();
+        const pro = st.unlocked || (__DEV__ && st.devMode);
+        if (!pro && st.myTracks.length >= FREE_MYTRACKS) return null; // caller routes to paywall
+        const ids = [...new Set(cardIds)].slice(0, pro ? 200 : FREE_MYTRACK_CARDS);
+        if (ids.length === 0) return null;
+        const id = `mt-${Date.now().toString(36)}`;
+        const mt: MyTrack = { id, name: name.trim() || 'My track', cardIds: ids, createdAt: dayKey(Date.now()), source };
+        set({ myTracks: [...st.myTracks, mt] });
+        track('mytrack_created', { source, cards: ids.length });
+        return id;
+      },
+      deleteMyTrack: (id) => set((s) => ({ myTracks: s.myTracks.filter((m) => m.id !== id) })),
+      renameMyTrack: (id, name) =>
+        set((s) => ({ myTracks: s.myTracks.map((m) => (m.id === id ? { ...m, name: name.trim() || m.name } : m)) })),
+      startMyTrack: (id) => {
+        track('session_started', { kind: 'mytrack' });
+        set({ sessionKind: 'mytrack', myTrackId: id, trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
+        get().rebuildSession();
+      },
+      startMistakes: () => {
+        track('session_started', { kind: 'mistakes' });
+        set({ sessionKind: 'mistakes', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
+        get().rebuildSession();
+      },
+      repairStreak: () => {
+        const st = get();
+        const now = Date.now();
+        const pro = st.unlocked || (__DEV__ && st.devMode);
+        const q = quarterKey(now);
+        const brokenAt = st.streakBrokenDay ? Date.parse(`${st.streakBrokenDay}T00:00:00Z`) : NaN;
+        const repairable =
+          st.streakBrokenValue != null && Number.isFinite(brokenAt) && now - brokenAt <= 7 * DAY;
+        if (!pro || !repairable || st.lastRepairQuarter === q) return false;
+        // Restore the lost run and credit the days studied since the break on top of it.
+        const restored = (st.streakBrokenValue ?? 0) + st.streak;
+        set({ streak: restored, streakBrokenValue: null, streakBrokenDay: null, lastRepairQuarter: q });
+        track('streak_repaired', { restored });
+        if (st.userId) void pushStats(st.userId, restored, st.xp);
+        get().emit('streak');
+        return true;
+      },
       setRestDays: (restDays) => set({ restDays }),
       setInterviewDate: (interviewDate) => set({ interviewDate }),
       bumpQuest: (metric, n = 1) => {
@@ -504,6 +661,10 @@ export const useStore = create<State>()(
         // Push missed cards toward weak-spot by registering a lapse + making them due now.
         for (const id of missedIds) progress[id] = schedule(progress[id] ?? initCard(), 'again', now);
         set({ lastMockScore: score, progress });
+        // Autopilot: a finished mock checks off today's mock plan item (the mock screen is its
+        // own route, not a SessionView session, so it self-marks here). Id format must match
+        // autopilot.ts's mockItemId().
+        get().markAutopilotItem(dayKey(now), `${dayKey(now)}:mock`);
         if (st.userId) void pushProgress(st.userId, progress);
         // High moment → maybe ask for a store review (throttled + capped internally).
         if (score >= 80) void maybeRequestReview();
@@ -597,7 +758,8 @@ export const useStore = create<State>()(
         get().rebuildSession();
       },
       endSession: () => {
-        set({ inSession: false, sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null });
+        // Abandoned ≠ done — drop any autopilot tag so the plan item stays open.
+        set({ inSession: false, sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, pendingAutopilotItem: null });
         get().rebuildSession();
       },
       completeOnboarding: (role, mode, level) => {
@@ -656,6 +818,16 @@ export const useStore = create<State>()(
         let streak = st.streak;
         let freezes = st.freezes;
         let lastActiveDay = st.lastActiveDay;
+        const pro = st.unlocked || (__DEV__ && st.devMode);
+        // Streak insurance (Pro): +3 freezes each calendar month, banked up to 5. Idempotent.
+        const mk = monthKey(now);
+        let freezeGrantMonth = st.freezeGrantMonth;
+        if (pro && freezeGrantMonth !== mk) {
+          freezes = Math.min(5, freezes + 3);
+          freezeGrantMonth = mk;
+        }
+        let streakBrokenValue = st.streakBrokenValue;
+        let streakBrokenDay = st.streakBrokenDay;
         const done = nextIdx >= deck.length;
         if (done && lastActiveDay !== today) {
           if (lastActiveDay === dayKey(now - DAY)) {
@@ -666,10 +838,22 @@ export const useStore = create<State>()(
             freezes -= 1; // a freeze forgives the gap
             streak += 1;
           } else {
+            // The break — remember what was lost so a Pro quarterly repair can restore it.
+            if (streak > 1) {
+              streakBrokenValue = streak;
+              streakBrokenDay = today;
+            }
             streak = 1;
           }
           lastActiveDay = today;
-          if (streak % 5 === 0) freezes = Math.min(2, freezes + 1); // earn a freeze every 5 days
+          // Earn a freeze every 5 days (free banks 2, Pro banks 5).
+          if (streak % 5 === 0) freezes = Math.min(pro ? 5 : 2, freezes + 1);
+        }
+
+        // One readiness sample per active day — feeds the report's trend line (cap 60).
+        let readinessTrend = st.readinessTrend;
+        if (readinessTrend[readinessTrend.length - 1]?.day !== today) {
+          readinessTrend = [...readinessTrend, { day: today, value: readinessForRole(st.role, progress, now) }].slice(-60);
         }
 
         // Daily-goal crossing — fires at most once per day (cardsToday is monotonic within a day).
@@ -689,6 +873,10 @@ export const useStore = create<State>()(
           weeklyXpWeek: wk,
           streak,
           freezes,
+          freezeGrantMonth,
+          streakBrokenValue,
+          streakBrokenDay,
+          readinessTrend,
           lastActiveDay,
           cardsToday,
           reviewedTodayIds,
@@ -711,6 +899,11 @@ export const useStore = create<State>()(
         }
 
         if (done) {
+          // Autopilot: the finished session fulfills the plan item it was started from.
+          if (st.pendingAutopilotItem) {
+            get().markAutopilotItem(today, st.pendingAutopilotItem);
+            set({ pendingAutopilotItem: null });
+          }
           // Daily quest credit for completing a diag/fresh/lesson session.
           const metric = questMetricForSession(st.sessionKind, deck);
           if (metric === 'diag' || metric === 'fresh' || metric === 'lesson') get().bumpQuest(metric);
@@ -841,7 +1034,7 @@ export const useStore = create<State>()(
     }),
     {
       name: 'fieldnotes-v1',
-      version: 13,
+      version: 14,
       storage: createJSONStorage(() => AsyncStorage),
       partialize: (s) => ({
         role: s.role,
@@ -861,6 +1054,15 @@ export const useStore = create<State>()(
         accentKey: s.accentKey,
         themePref: s.themePref,
         restDays: s.restDays,
+        targetCompanyKey: s.targetCompanyKey,
+        jdGapTracks: s.jdGapTracks,
+        autopilotDone: s.autopilotDone,
+        myTracks: s.myTracks,
+        freezeGrantMonth: s.freezeGrantMonth,
+        streakBrokenValue: s.streakBrokenValue,
+        streakBrokenDay: s.streakBrokenDay,
+        lastRepairQuarter: s.lastRepairQuarter,
+        readinessTrend: s.readinessTrend,
         userLevel: s.userLevel,
         weeklyXp: s.weeklyXp,
         weeklyXpWeek: s.weeklyXpWeek,
@@ -957,6 +1159,19 @@ export const useStore = create<State>()(
         if (from < 13) {
           // v13 added the theme preference (Profile row: System → Light → Dark).
           if (p.themePref !== 'light' && p.themePref !== 'dark') p.themePref = 'system';
+        }
+        if (from < 14) {
+          // v14 — the premium layer: company packs, autopilot, My Tracks, streak insurance,
+          // readiness trend. All default to "off"/empty for existing users.
+          if (typeof p.targetCompanyKey !== 'string' || !COMPANY_SETS[p.targetCompanyKey as string]) p.targetCompanyKey = null;
+          if (!Array.isArray(p.jdGapTracks)) p.jdGapTracks = [];
+          if (typeof p.autopilotDone !== 'object' || p.autopilotDone === null) p.autopilotDone = {};
+          if (!Array.isArray(p.myTracks)) p.myTracks = [];
+          if (typeof p.freezeGrantMonth !== 'string') p.freezeGrantMonth = null;
+          if (typeof p.streakBrokenValue !== 'number') p.streakBrokenValue = null;
+          if (typeof p.streakBrokenDay !== 'string') p.streakBrokenDay = null;
+          if (typeof p.lastRepairQuarter !== 'string') p.lastRepairQuarter = null;
+          if (!Array.isArray(p.readinessTrend)) p.readinessTrend = [];
         }
         return p;
       },
