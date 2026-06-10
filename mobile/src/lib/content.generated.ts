@@ -74,6 +74,22 @@ import markdown from './generated/markdown.json';
 // Domain tracks added from the JD backlog: capital-markets/trading + conversational/voice AI.
 import trading from './generated/trading.json';
 import voiceAi from './generated/voice-ai.json';
+// Business & Management tracks
+import programManagement from './generated/program-management.json';
+import agilePm from './generated/agile-pm.json';
+import finops from './generated/finops.json';
+import productManagement from './generated/product-management.json';
+import aiProductMgmt from './generated/ai-product-mgmt.json';
+import businessAnalysis from './generated/business-analysis.json';
+import stakeholderMgmt from './generated/stakeholder-mgmt.json';
+import dataGovernance from './generated/data-governance.json';
+import consultingFrameworks from './generated/consulting-frameworks.json';
+import financeFundamentals from './generated/finance-fundamentals.json';
+import bizops from './generated/bizops.json';
+import supplyChain from './generated/supply-chain.json';
+import preSales from './generated/pre-sales.json';
+import customerSuccess from './generated/customer-success.json';
+import riskCompliance from './generated/risk-compliance.json';
 
 export interface GeneratedCard {
   q: string;
@@ -169,4 +185,20 @@ export const GENERATED: Record<string, GeneratedCard[]> = {
   // Domain tracks (JD backlog)
   trading: trading as unknown as GeneratedCard[],
   'voice-ai': voiceAi as unknown as GeneratedCard[],
+  // Business & Management
+  'program-management': programManagement as unknown as GeneratedCard[],
+  'agile-pm': agilePm as unknown as GeneratedCard[],
+  finops: finops as unknown as GeneratedCard[],
+  'product-management': productManagement as unknown as GeneratedCard[],
+  'ai-product-mgmt': aiProductMgmt as unknown as GeneratedCard[],
+  'business-analysis': businessAnalysis as unknown as GeneratedCard[],
+  'stakeholder-mgmt': stakeholderMgmt as unknown as GeneratedCard[],
+  'data-governance': dataGovernance as unknown as GeneratedCard[],
+  'consulting-frameworks': consultingFrameworks as unknown as GeneratedCard[],
+  'finance-fundamentals': financeFundamentals as unknown as GeneratedCard[],
+  bizops: bizops as unknown as GeneratedCard[],
+  'supply-chain': supplyChain as unknown as GeneratedCard[],
+  'pre-sales': preSales as unknown as GeneratedCard[],
+  'customer-success': customerSuccess as unknown as GeneratedCard[],
+  'risk-compliance': riskCompliance as unknown as GeneratedCard[],
 };

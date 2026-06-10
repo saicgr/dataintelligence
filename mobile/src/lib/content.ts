@@ -327,6 +327,23 @@ const RAW_TRACKS: Track[] = [
   // ── Interview craft lesson units ──
   { slug: 'interview-craft', name: 'Interview Craft', color: 'eval', icon: '🎯', q: 0, domain: 'de', group: 'craft' },
   { slug: 'prompt-lab', name: 'Prompt Lab', color: 'eval', icon: '🧪', q: 0, domain: 'ai', group: 'craft' },
+
+  // ── Business & Management ────────────────────────────────────────────────
+  { slug: 'program-management', name: 'Program & TPM', color: 'sysd', icon: '🗂️', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'agile-pm', name: 'Agile & Project Mgmt', color: 'dbt', icon: '♟️', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'finops', name: 'FinOps & Cloud Cost', color: 'kafka', icon: '💰', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'product-management', name: 'Product Management', color: 'eval', icon: '🎯', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'ai-product-mgmt', name: 'AI Product Management', color: 'rag', icon: '🧠', q: 0, domain: 'ai', group: 'concept' },
+  { slug: 'business-analysis', name: 'Business Analysis', color: 'sql', icon: '📋', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'stakeholder-mgmt', name: 'Stakeholder Management', color: 'dbt', icon: '🤝', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'data-governance', name: 'Data Governance', color: 'eval', icon: '🗺️', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'consulting-frameworks', name: 'Consulting Frameworks', color: 'sysd', icon: '🧩', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'finance-fundamentals', name: 'Finance & FP&A', color: 'sql', icon: '💹', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'bizops', name: 'Strategy & BizOps', color: 'kafka', icon: '🏢', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'supply-chain', name: 'Supply Chain Analytics', color: 'dbt', icon: '⛓️', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'pre-sales', name: 'Pre-Sales & Solutions Eng', color: 'rag', icon: '💼', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'customer-success', name: 'Customer Success (CSM)', color: 'eval', icon: '💚', q: 0, domain: 'de', group: 'concept' },
+  { slug: 'risk-compliance', name: 'Risk & Compliance', color: 'sysd', icon: '⚖️', q: 0, domain: 'de', group: 'concept' },
 ];
 
 export const TRACKS: Track[] = RAW_TRACKS.map((t) => ({

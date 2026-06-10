@@ -112,6 +112,27 @@ export const ROLES: RoleDef[] = [
   { key: 'integration-dev', name: 'Integration Developer', emoji: '🔌', family: 'Vendor', blurb: 'SnapLogic / Informatica / Fivetran' },
   { key: 'aem-dev', name: 'Adobe AEM Developer', emoji: '🅰️', family: 'Vendor', blurb: 'Sling, JCR, Dispatcher, AEMaaCS', tag: 'new' },
   { key: 'workfront-dev', name: 'Workfront Fusion Developer', emoji: '⚙️', family: 'Vendor', blurb: 'Scenarios, modules, integrations', tag: 'new' },
+  // Business & Management
+  { key: 'tpm', name: 'Technical Program Manager', emoji: '🗂️', family: 'Business & Management', blurb: 'Programs, roadmaps, cross-team delivery', tag: 'rising' },
+  { key: 'pm', name: 'Project Manager', emoji: '♟️', family: 'Business & Management', blurb: 'Agile, PMP, delivery, stakeholders' },
+  { key: 'scrum-master', name: 'Scrum Master', emoji: '🏃', family: 'Business & Management', blurb: 'Scrum, sprint ceremonies, team velocity' },
+  { key: 'eng-manager', name: 'Engineering Manager', emoji: '👔', family: 'Business & Management', blurb: 'People, delivery, technical leadership' },
+  { key: 'finops-eng', name: 'FinOps Engineer', emoji: '💰', family: 'Business & Management', blurb: 'Cloud cost optimization, FinOps framework', tag: 'rising' },
+  { key: 'cost-engineer', name: 'Cost Engineer', emoji: '📊', family: 'Business & Management', blurb: 'Cloud cost governance, budgets, allocation' },
+  { key: 'business-analyst', name: 'Business Analyst', emoji: '📋', family: 'Business & Management', blurb: 'Requirements, SQL, stakeholder analysis' },
+  { key: 'data-pm', name: 'Data Product Manager', emoji: '🎯', family: 'Business & Management', blurb: 'Data roadmaps, metrics, SQL', tag: 'rising' },
+  { key: 'ai-pm', name: 'AI Product Manager', emoji: '🤖', family: 'Business & Management', blurb: 'AI/LLM product strategy & roadmaps', tag: 'rising' },
+  { key: 'product-owner', name: 'Product Owner', emoji: '🏷️', family: 'Business & Management', blurb: 'Backlog, user stories, sprint planning' },
+  { key: 'data-governance-mgr', name: 'Data Governance Manager', emoji: '🗺️', family: 'Business & Management', blurb: 'Data quality, lineage, catalog, compliance' },
+  { key: 'data-steward', name: 'Data Steward', emoji: '📌', family: 'Business & Management', blurb: 'Data quality, ownership, GDPR, metadata' },
+  { key: 'solutions-engineer', name: 'Solutions Engineer', emoji: '💼', family: 'Business & Management', blurb: 'Pre-sales, demos, technical discovery', tag: 'new' },
+  { key: 'tech-csm', name: 'Technical Customer Success Mgr', emoji: '💚', family: 'Business & Management', blurb: 'Adoption, NRR, technical onboarding' },
+  { key: 'mgmt-consultant', name: 'Management Consultant', emoji: '🧩', family: 'Business & Management', blurb: 'Case frameworks, MECE, strategy' },
+  { key: 'fpa-analyst', name: 'FP&A Analyst', emoji: '💹', family: 'Business & Management', blurb: 'Financial planning, variance, SQL + Excel' },
+  { key: 'bizops-analyst', name: 'Strategy & Ops Analyst', emoji: '🏢', family: 'Business & Management', blurb: 'BizOps, SQL, cross-functional strategy' },
+  { key: 'supply-chain-analyst', name: 'Supply Chain Analyst', emoji: '⛓️', family: 'Business & Management', blurb: 'Supply chain, SQL, analytics, logistics' },
+  { key: 'revops-analyst', name: 'RevOps / Marketing Analyst', emoji: '📣', family: 'Business & Management', blurb: 'Revenue ops, attribution, SQL, CRM' },
+  { key: 'pricing-analyst', name: 'Pricing Analyst', emoji: '💲', family: 'Business & Management', blurb: 'Price modeling, stats, SQL, Excel' },
   // Everything
   { key: 'all', name: 'Explore all tracks', emoji: '🌐', family: 'All', blurb: 'Every track, unfiltered' },
 ];
@@ -164,10 +185,31 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   'integration-dev': ['data-integration', 'snaplogic', 'sql-coding', 'sql', 'python', 'kafka', 'airflow', 'git', 'cicd', 'data-reliability', ...CRAFT],
   'aem-dev': ['java-coding', 'aem', 'java', 'typescript', 'apis', 'architecture', 'databases', 'sql', ...SHIP, ...CRAFT],
   'workfront-dev': ['workfront', 'apis', 'data-integration', 'snaplogic', 'sql', 'python', ...SHIP, ...CRAFT],
+  // Business & Management
+  tpm: ['program-management', 'agile-pm', 'stakeholder-mgmt', 'sysd', 'architecture', 'sql', ...CRAFT],
+  pm: ['agile-pm', 'program-management', 'stakeholder-mgmt', ...CRAFT],
+  'scrum-master': ['agile-pm', 'stakeholder-mgmt', 'program-management', ...CRAFT],
+  'eng-manager': ['program-management', 'stakeholder-mgmt', 'agile-pm', 'sysd', 'architecture', ...CRAFT],
+  'finops-eng': ['finops', 'aws', 'gcp', 'azure', 'architecture', ...CRAFT],
+  'cost-engineer': ['finops', 'aws', 'gcp', 'azure', 'databricks', 'snowflake', 'sql-coding', 'sql', 'modeling', ...CRAFT],
+  'business-analyst': ['sql-coding', 'business-analysis', 'sql', 'statistics', 'bi', 'modeling', 'stakeholder-mgmt', ...CRAFT],
+  'data-pm': ['sql-coding', 'product-management', 'business-analysis', 'sql', 'bi', 'statistics', 'modeling', 'stakeholder-mgmt', ...CRAFT],
+  'ai-pm': ['ai-product-mgmt', 'product-management', 'llms', 'agents', 'evals', 'stakeholder-mgmt', ...CRAFT],
+  'product-owner': ['agile-pm', 'product-management', 'business-analysis', 'stakeholder-mgmt', ...CRAFT],
+  'data-governance-mgr': ['sql-coding', 'data-governance', 'sql', 'security', 'modeling', 'snowflake', 'databricks', ...CRAFT],
+  'data-steward': ['sql-coding', 'data-governance', 'sql', 'modeling', 'security', ...CRAFT],
+  'solutions-engineer': ['python-drills', 'sql-coding', 'pre-sales', 'sysd', 'architecture', 'sql', 'python', 'stakeholder-mgmt', ...SHIP, ...CRAFT],
+  'tech-csm': ['sql-coding', 'customer-success', 'sql', 'bi', 'stakeholder-mgmt', ...CRAFT],
+  'mgmt-consultant': ['consulting-frameworks', 'business-analysis', 'finance-fundamentals', 'bizops', 'stakeholder-mgmt', ...CRAFT],
+  'fpa-analyst': ['sql-coding', 'finance-fundamentals', 'sql', 'statistics', 'bi', 'modeling', ...CRAFT],
+  'bizops-analyst': ['sql-coding', 'bizops', 'sql', 'statistics', 'business-analysis', 'stakeholder-mgmt', ...CRAFT],
+  'supply-chain-analyst': ['sql-coding', 'supply-chain', 'sql', 'statistics', 'modeling', 'bi', ...CRAFT],
+  'revops-analyst': ['sql-coding', 'sql', 'bi', 'statistics', 'business-analysis', 'customer-success', ...CRAFT],
+  'pricing-analyst': ['sql-coding', 'finance-fundamentals', 'sql', 'statistics', 'modeling', ...CRAFT],
   all: [], // resolved dynamically to every track in content.ts
 };
 
-export const ROLE_FAMILIES = ['All', 'Data & SWE', 'Software Engineering', 'AI & ML', 'BI & Analytics', 'Platform', 'Architect', 'AWS', 'GCP', 'Azure', 'Vendor'];
+export const ROLE_FAMILIES = ['All', 'Data & SWE', 'Software Engineering', 'AI & ML', 'BI & Analytics', 'Platform', 'Architect', 'AWS', 'GCP', 'Azure', 'Vendor', 'Business & Management'];
 
 export function roleByKey(key: RoleKey): RoleDef | undefined {
   return ROLES.find((r) => r.key === key);
