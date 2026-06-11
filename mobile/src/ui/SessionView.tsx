@@ -350,7 +350,7 @@ function CardView() {
                       }}>
                       <T size={11.5} weight="800" color={checkOk ? c.success : c.danger}>
                         {checkOk
-                          ? '✓ You spotted the senior take — suggested: Got it'
+                          ? '✓ You picked the strongest answer — suggested: Got it'
                           : '✗ You picked the trap — it returns at the end of this session'}
                       </T>
                     </View>
@@ -513,11 +513,11 @@ function CardView() {
                               marginTop: 2,
                             }}>
                             <T weight="900" size={13.5} color={checkOk ? c.success : c.danger}>
-                              {checkOk ? '✓ That’s the senior take!' : '✗ That’s the junior trap'}
+                              {checkOk ? '✓ Spot on!' : '✗ That one’s the trap'}
                             </T>
                             {!checkOk && (
                               <T size={11.5} muted style={{ lineHeight: 16 }}>
-                                The senior answer is highlighted green — this card comes back at the end of the session.
+                                The answer that holds up is highlighted green — this card comes back at the end of the session.
                               </T>
                             )}
                             <Btn label="Continue →" variant={checkOk ? 'green' : 'navy'} onPress={doReveal} />

@@ -64,5 +64,7 @@ export function buildRecallCheck(card: SessionCard, pool: SessionCard[]): Recall
   const rot = seed % opts.length;
   const shuffled = [...opts.slice(rot), ...opts.slice(0, rot)];
 
-  return { prompt: 'Spot the senior answer', opts: shuffled };
+  // No role-words ("senior") in the prompt — the gap between the options should speak for
+  // itself; the user just picks the one that holds up.
+  return { prompt: 'Which answer holds up?', opts: shuffled };
 }
