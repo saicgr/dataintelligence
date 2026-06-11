@@ -249,9 +249,14 @@ export function buildAutopilot(inputs: AutopilotInputs): AutopilotPlan {
       }
     } else if (cram) {
       // <3 days: no new material — review + weak spots + (company) only.
-      // Weak spots take the REMAINDER so the rows sum to the day's advertised target.
+      // Weak spots take the REMAINDER so the rows sum to the day's advertised target; the
+      // company drill renders only when the budget has room for it above weak-spots' minimum.
       const reviewCards = Math.max(4, Math.round(d.target * 0.25));
-      const companyCards = companySet && inputs.targetCompanyKey ? Math.max(3, Math.round(d.target * 0.35)) : 0;
+      const companyRoom = d.target - reviewCards - 2;
+      const companyCards =
+        companySet && inputs.targetCompanyKey && companyRoom >= 2
+          ? Math.min(Math.max(3, Math.round(d.target * 0.35)), companyRoom)
+          : 0;
       items.push({
         id: `${d.date}:review`,
         kind: 'review',
@@ -320,8 +325,11 @@ export function buildAutopilot(inputs: AutopilotInputs): AutopilotPlan {
         lessonCards += LESSON_SIZE;
       }
       let companyCards = 0;
-      if (companySet && inputs.targetCompanyKey) {
-        companyCards = Math.max(3, Math.round(budget * 0.15));
+      // The drill renders only when the budget has room above weak-spots' minimum — on tight
+      // days the floors would otherwise overshoot the advertised "~N cards".
+      const companyRoom = budget - reviewCards - lessonCards - 2;
+      if (companySet && inputs.targetCompanyKey && companyRoom >= 2) {
+        companyCards = Math.min(Math.max(3, Math.round(budget * 0.15)), companyRoom);
         items.push({
           id: `${d.date}:company`,
           kind: 'company',
