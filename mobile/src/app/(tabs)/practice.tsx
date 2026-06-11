@@ -13,6 +13,9 @@ import { radius, useTheme } from '../../lib/theme';
 import { CardEnter, PressableScale, Shake } from '../../ui/anim';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
 
+/** Chips shown in "Drill a topic" before the "+N more" fold. */
+const TOPIC_PREVIEW = 12;
+
 export default function Practice() {
   const router = useRouter();
   const { c } = useTheme();
@@ -32,6 +35,8 @@ export default function Practice() {
   const startMistakes = useStore((s) => s.startMistakes);
   // Mistakes notebook badge: every card you've ever lapsed (auto-collected, zero upkeep).
   const mistakesCount = Object.keys(progress).filter((id) => (progress[id]?.lapses ?? 0) > 0).length;
+  // "Drill a topic" folds past the first dozen chips (some roles carry 25+ tracks).
+  const [showAllTopics, setShowAllTopics] = useState(false);
 
   const exportMyTrack = (name: string, cardIds: string[]) => {
     if (!unlocked) return router.push('/paywall');
@@ -83,7 +88,9 @@ export default function Practice() {
             </View>
           </Row>
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
-            {tracks.map((t) => (
+            {/* Long roles have ~25+ tracks — show the first dozen (registry order = role priority)
+                and fold the tail behind "show all" so this card isn't a wall of chips. */}
+            {(showAllTopics ? tracks : tracks.slice(0, TOPIC_PREVIEW)).map((t) => (
               <PressableScale key={t.slug} onPress={() => drill(t.slug)} hapticStyle="selection" scaleTo={0.93}>
                 <Row
                   style={{
@@ -100,6 +107,24 @@ export default function Practice() {
                 </Row>
               </PressableScale>
             ))}
+            {tracks.length > TOPIC_PREVIEW && (
+              <PressableScale onPress={() => setShowAllTopics((v) => !v)} hapticStyle="selection" scaleTo={0.93}>
+                <Row
+                  style={{
+                    gap: 5,
+                    borderWidth: 1.5,
+                    borderColor: c.accent,
+                    backgroundColor: c.accent + '14',
+                    borderRadius: 999,
+                    paddingVertical: 7,
+                    paddingHorizontal: 11,
+                  }}>
+                  <T weight="800" size={12} color={c.accentInk}>
+                    {showAllTopics ? 'Show fewer ▴' : `+${tracks.length - TOPIC_PREVIEW} more ▾`}
+                  </T>
+                </Row>
+              </PressableScale>
+            )}
             {tracks.length === 0 && <T muted size={12}>No tracks for this role yet.</T>}
           </View>
         </Card>
@@ -262,7 +287,9 @@ export default function Practice() {
             <T size={22}>🏢</T>
             <View style={{ flex: 1 }}>
               <T weight="800" size={15}>Company packs</T>
-              <T muted size={12}>What each company actually asks, ranked — tap one</T>
+              {/* "asked-frequency" oversold it: ranking is curated until a company crosses the
+                  20-debrief crowd threshold — say so. */}
+              <T muted size={12}>Each company&apos;s emphasis, curated — tap one</T>
             </View>
           </Row>
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>

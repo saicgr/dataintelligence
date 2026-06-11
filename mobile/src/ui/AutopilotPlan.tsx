@@ -113,7 +113,15 @@ function dayLabel(offset: number, date: string, isMockDay: boolean, isWarmUp: bo
   return base;
 }
 
-export function AutopilotPlanCard({ plan }: { plan: Plan }) {
+export function AutopilotPlanCard({
+  plan,
+  /** Plan item already promoted to the ContinueHero — hidden from today's rows so the same
+   *  action ("Clear your due cards") never renders as both the hero AND plan row #1. */
+  heroItemId,
+}: {
+  plan: Plan;
+  heroItemId?: string;
+}) {
   const { c, track: trackColor } = useTheme();
   const router = useRouter();
   const pro = useStore(isProActive);
@@ -177,9 +185,14 @@ export function AutopilotPlanCard({ plan }: { plan: Plan }) {
             <T muted weight="800" size={10.5} style={{ letterSpacing: 0.4 }}>
               {dayLabel(0, plan.today.date, plan.today.isMockDay, plan.today.isWarmUp)} · ~{plan.today.target} cards
             </T>
-            {plan.today.items.map((item) => (
-              <ItemRow key={item.id} item={item} onPress={() => startItem(item)} accent={trackColor(item.isGap ? 'dbt' : 'sql')} />
-            ))}
+            {plan.today.items
+              .filter((item) => item.id !== heroItemId)
+              .map((item) => (
+                <ItemRow key={item.id} item={item} onPress={() => startItem(item)} accent={trackColor(item.isGap ? 'dbt' : 'sql')} />
+              ))}
+            {plan.today.items.some((item) => item.id === heroItemId) && (
+              <T muted size={10.5}>▲ Up next is the big card above</T>
+            )}
           </>
         )}
 

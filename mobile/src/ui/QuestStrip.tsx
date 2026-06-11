@@ -8,6 +8,7 @@
  * daily and is identical across devices. The store gates `questProgress` per day (questDay); this
  * component is a pure view — it never writes. Optionally accept already-completed ids via props.
  */
+import { useState } from 'react';
 import { View } from 'react-native';
 
 import {
@@ -24,7 +25,7 @@ import {
 import { useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
 import { AnimatedProgressBar, CardEnter, PressableScale } from './anim';
-import { H2, Row, T } from './kit';
+import { Row, T } from './kit';
 
 export function QuestStrip({
   completedIds,
@@ -55,26 +56,38 @@ export function QuestStrip({
   const override = completedIds ? new Set(completedIds) : null;
   const isDone = (q: Quest) => (override ? override.has(q.id) : questDone(q.id, inputs));
   const doneCount = override ? quests.filter((q) => override.has(q.id)).length : questsCompleted(today, inputs);
+  // Collapsed by default — the home feed already stacks the plan, hero, and pills; three more
+  // full quest rows above the fold made the first screen CTA-heavy. One line expands on demand.
+  const [open, setOpen] = useState(false);
 
   return (
     <View style={{ gap: space.sm }}>
-      <Row style={{ justifyContent: 'space-between' }}>
-        <H2>Daily Quests</H2>
-        <T weight="800" size={11} color={doneCount === quests.length ? c.success : c.muted}>
-          {doneCount}/{quests.length}
-        </T>
-      </Row>
-      {quests.map((q, i) => (
-        <CardEnter key={q.id} delay={i * 50}>
-          <QuestRow
-            quest={q}
-            done={isDone(q)}
-            frac={override ? (override.has(q.id) ? 1 : 0) : questFraction(q.id, inputs)}
-            value={override ? (override.has(q.id) ? q.goal : 0) : questProgressValue(q.id, inputs)}
-            onPress={onPressQuest}
-          />
-        </CardEnter>
-      ))}
+      <PressableScale
+        onPress={() => setOpen((o) => !o)}
+        hapticStyle="selection"
+        scaleTo={0.99}
+        accessibilityLabel={`Daily quests — ${doneCount} of ${quests.length} done. ${open ? 'Collapse' : 'Expand'}`}>
+        <Row style={{ backgroundColor: c.card, borderWidth: 1, borderColor: c.border, borderRadius: radius.md, padding: 12, gap: 10 }}>
+          <T size={16}>🏅</T>
+          <T weight="800" size={13.5} style={{ flex: 1 }}>Daily Quests</T>
+          <T weight="800" size={11.5} color={doneCount === quests.length ? c.success : c.muted}>
+            {doneCount}/{quests.length}
+          </T>
+          <T weight="900" size={13} color={c.muted}>{open ? '▾' : '▸'}</T>
+        </Row>
+      </PressableScale>
+      {open &&
+        quests.map((q, i) => (
+          <CardEnter key={q.id} delay={i * 50}>
+            <QuestRow
+              quest={q}
+              done={isDone(q)}
+              frac={override ? (override.has(q.id) ? 1 : 0) : questFraction(q.id, inputs)}
+              value={override ? (override.has(q.id) ? q.goal : 0) : questProgressValue(q.id, inputs)}
+              onPress={onPressQuest}
+            />
+          </CardEnter>
+        ))}
     </View>
   );
 }

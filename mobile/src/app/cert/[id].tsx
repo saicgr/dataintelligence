@@ -1,5 +1,5 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { Alert, Linking, Pressable, View } from 'react-native';
+import { Linking, Pressable, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import {
@@ -8,6 +8,7 @@ import {
   certTotalCards,
   CertDomain,
 } from '../../lib/certs';
+import { alertInfo } from '../../lib/dialog';
 import { safeBack } from '../../lib/nav';
 import { useStore } from '../../lib/store';
 import { radius, space, useTheme } from '../../lib/theme';
@@ -38,7 +39,7 @@ export default function CertDetail() {
 
   const handleStudyAll = () => {
     if (totalCards === 0) {
-      Alert.alert('Content coming soon', 'Cards for this certification are being prepared — check back soon.');
+      alertInfo('Content coming soon', 'Cards for this certification are being prepared — check back soon.');
       return;
     }
     startTrack(cert.id);

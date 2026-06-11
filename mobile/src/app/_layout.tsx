@@ -14,6 +14,7 @@ import { initIAP } from '../lib/iap';
 import { setDailyReminder } from '../lib/reminders';
 import { useStore } from '../lib/store';
 import { useResolvedScheme } from '../lib/theme';
+import { DialogHost } from '../ui/DialogHost';
 
 function useBootstrap() {
   const setUserId = useStore((s) => s.setUserId);
@@ -104,6 +105,8 @@ export default function RootLayout() {
             <Stack.Screen name="incidents" />
           </Stack>
           <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
+          {/* Web-only in-app confirm/alert renderer (see lib/dialog.ts) — native is a no-op. */}
+          <DialogHost />
         </ThemeProvider>
       </View>
     </GestureHandlerRootView>

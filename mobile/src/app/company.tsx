@@ -149,7 +149,9 @@ export default function CompanyPack() {
         }}
       />
 
-      <H2>Ranked by asked-frequency</H2>
+      {/* Honest label: ranking is curated until the 20-debrief crowd threshold unlocks real
+          asked-frequency data (the bars' footnote says the same). */}
+      <H2>{remote.length > 0 ? 'Ranked by asked-frequency' : 'Ranked by curated emphasis'}</H2>
       {ranked.map((r, i) => {
         const open = unlocked || i < 2; // free taste: top 2 cards
         return (

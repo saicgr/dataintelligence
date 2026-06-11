@@ -256,7 +256,7 @@ function LearnPath() {
                 {/* Autopilot owns the interview surface while a date is set; the old static
                     countdown card covers the dormant case (it renders null without a date). */}
                 {autopilotOn ? (
-                  <AutopilotPlanCard plan={plan} />
+                  <AutopilotPlanCard plan={plan} heroItemId={action.kind === 'autopilot' ? action.item?.id : undefined} />
                 ) : (
                   <InterviewPlanCard dateIso={interviewDate} onStart={startDaily} />
                 )}

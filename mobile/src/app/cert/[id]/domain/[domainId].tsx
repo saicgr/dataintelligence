@@ -1,8 +1,9 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { Alert, Pressable, View } from 'react-native';
+import { Pressable, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { certById } from '../../../../lib/certs';
+import { alertInfo } from '../../../../lib/dialog';
 import { trackBySlug } from '../../../../lib/content';
 import { safeBack } from '../../../../lib/nav';
 import { radius, space, useTheme } from '../../../../lib/theme';
@@ -47,10 +48,7 @@ export default function DomainDetail() {
   const col = track(cert.color);
 
   const handleStudyDomain = () => {
-    Alert.alert(
-      'Content pipeline running',
-      'Cards for this domain are being prepared — check back soon.'
-    );
+    alertInfo('Content pipeline running', 'Cards for this domain are being prepared — check back soon.');
   };
 
   const relatedTracks = domain.trackSlugs
