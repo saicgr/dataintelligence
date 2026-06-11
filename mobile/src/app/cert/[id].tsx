@@ -5,6 +5,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   CERT_PROVIDER_LABEL,
   certById,
+  certDomainCards,
   certTotalCards,
   CertDomain,
 } from '../../lib/certs';
@@ -42,7 +43,10 @@ export default function CertDetail() {
       alertInfo('Content coming soon', 'Cards for this certification are being prepared — check back soon.');
       return;
     }
-    startTrack(cert.id);
+    // Cert banks live under the `cert-` prefixed GENERATED key (same key certTotalCards
+    // counts). The bare cert id is NOT a track slug — passing it built an empty deck that
+    // opened straight into "Session complete · 0 cards".
+    startTrack(`cert-${cert.id}`);
     router.push('/');
   };
 
@@ -172,12 +176,11 @@ function DomainRow({
   onPress: () => void;
 }) {
   const { c } = useTheme();
-  const totalCards = certTotalCards(certId);
-  const approxCards = domain.weight > 0 && totalCards > 0
-    ? Math.round((domain.weight / 100) * totalCards)
-    : 0;
-  const cardLabel = approxCards > 0
-    ? `${approxCards} card${approxCards === 1 ? '' : 's'}`
+  // Real per-domain count (cards carry certDomain) — the old weight-share estimate rounded
+  // each row independently, so rows summed to ≠ the cert's total card count.
+  const domainCards = certDomainCards(certId, domain.id);
+  const cardLabel = domainCards > 0
+    ? `${domainCards} card${domainCards === 1 ? '' : 's'}`
     : '–';
 
   return (

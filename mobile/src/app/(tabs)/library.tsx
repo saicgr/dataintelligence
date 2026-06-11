@@ -58,11 +58,18 @@ export default function Library() {
         <T size={22} weight="900" accessibilityRole="header">Library</T>
         <Segmented
           value={tab}
-          onChange={(v) => setTab(v as Tab)}
+          // Clear a leftover search when actually changing tabs — a residual Skills query was
+          // silently filtering the cert grid, so "Certify · 38" rendered only ~36 tiles.
+          // (Segmented fires onChange on re-taps too; the guard keeps an active search alive.)
+          onChange={(v) => {
+            if (v !== tab) setQ('');
+            setTab(v as Tab);
+          }}
           options={[
-            { label: `Tracks · ${ROLES.length}`, value: 'tracks' },
-            { label: `Skills · ${TRACKS.length}`, value: 'skills' },
-            { label: `Certify · ${CERTS.length}`, value: 'certifications' },
+            // While searching, each label shows the FILTERED count so it always matches the grid.
+            { label: `Tracks · ${query ? roleHits : ROLES.length}`, value: 'tracks' },
+            { label: `Skills · ${query ? skills.length : TRACKS.length}`, value: 'skills' },
+            { label: `Certify · ${query ? certHits.length : CERTS.length}`, value: 'certifications' },
           ]}
         />
       </View>

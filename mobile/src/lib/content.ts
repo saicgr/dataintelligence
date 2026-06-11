@@ -1,3 +1,4 @@
+import { certById } from './certs';
 import { GENERATED, GeneratedCard } from './content.generated';
 import lessonTitlesData from './lesson-titles.json';
 import { freshCount, freshForTrack, freshForTracks, freshPackCards, freshPackCount, freshSessionCards } from './fresh';
@@ -585,9 +586,22 @@ export function bankForTrack(slug: string): SessionCard[] {
   // appended after and intentionally skip the re-id.
   const lessons = lessonsForTrack(slug, now);
   if (lessons.length) return [...lessons.map((c, i) => ({ ...c, id: `${slug}-${i}`, level: c.level ?? ('Mid' as Level) })), ...fresh];
-  const t = trackBySlug(slug);
+  const t = trackBySlug(slug) ?? certPseudoTrack(slug);
   if (!t) return fresh;
   return [...(GENERATED[slug] ?? []).map((c, i) => cardFromGenerated(t, c, i)), ...fresh];
+}
+
+/**
+ * Certification banks live under `cert-<certId>` GENERATED keys with NO RAW_TRACKS entry —
+ * deliberately, so they never leak into the Skills tab / search / role pools (those iterate
+ * TRACKS). This synthesizes a Track from the cert catalog so "Study all" can run the bank as
+ * a normal track session (cardFromGenerated needs a Track for color/tool/id).
+ */
+function certPseudoTrack(slug: string): Track | undefined {
+  if (!slug.startsWith('cert-')) return undefined;
+  const cert = certById(slug.slice(5));
+  if (!cert) return undefined;
+  return { slug, name: cert.shortName, color: cert.color, icon: cert.icon, q: GENERATED[slug]?.length ?? 0, domain: 'de', group: 'concept' };
 }
 
 /** Card count for a track's bank (lesson-aware; OTA may grow it). */
@@ -606,6 +620,13 @@ export function findCardById(id: string): SessionCard | undefined {
   if (daily) return daily;
   for (const t of TRACKS) {
     const hit = bankForTrack(t.slug).find((c) => c.id === id);
+    if (hit) return hit;
+  }
+  // Cert-bank cards (`cert-<certId>-<i>`) aren't in TRACKS — resolve them too so Save /
+  // Mistakes / deep links keep working for cards studied inside a cert session.
+  if (id.startsWith('cert-')) {
+    const key = id.replace(/-\d+$/, '');
+    const hit = bankForTrack(key).find((c) => c.id === id);
     if (hit) return hit;
   }
   return undefined;

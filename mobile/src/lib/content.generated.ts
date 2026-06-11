@@ -161,6 +161,8 @@ export interface GeneratedCard {
   tradeoff?: boolean;
   /** Optional code shown above the options (choice cards). */
   lines?: string[];
+  /** Cert banks only: which exam domain this card teaches (matches CertDomain.id). */
+  certDomain?: string;
 }
 
 export const GENERATED: Record<string, GeneratedCard[]> = {

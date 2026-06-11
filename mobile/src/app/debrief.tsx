@@ -1,7 +1,7 @@
 import { useRouter } from 'expo-router';
 import { safeBack } from '../lib/nav';
 import { useState } from 'react';
-import { Pressable, TextInput, View } from 'react-native';
+import { Pressable, TextInput } from 'react-native';
 
 import { useStore } from '../lib/store';
 import { radius, useTheme } from '../lib/theme';
@@ -79,9 +79,13 @@ export default function Debrief() {
         autoCapitalize="words"
         style={{ borderWidth: 2, borderColor: c.border, borderRadius: radius.md, padding: 12, color: c.fg, backgroundColor: c.surface }}
       />
-      {company.trim().length === 0 && (
-        <T muted size={11.5}>Required — debriefs power the “most-asked at &lt;company&gt;” list.</T>
-      )}
+      {/* Always mounted, fixed height: unmounting this line on the first keystroke shifted the
+          whole form up and mis-landed taps on the outcome chips below. */}
+      <T muted size={11.5} numberOfLines={1}>
+        {company.trim().length === 0
+          ? 'Required — debriefs power the “most-asked at <company>” list.'
+          : `✓ Counts toward “most-asked at ${company.trim()}”.`}
+      </T>
 
       <H2>Level</H2>
       <Row style={{ flexWrap: 'wrap' }}>

@@ -5522,3 +5522,11 @@ export function certById(id: string): CertDef | undefined {
 export function certTotalCards(certId: string): number {
   return GENERATED[`cert-${certId}`]?.length ?? 0;
 }
+
+/** REAL card count for one exam domain (cards carry `certDomain`). Replaces the old
+ *  weight-share estimate, whose independent rounding made domain rows sum to ≠ the total
+ *  (e.g. DE Professional: rows 57 vs tile 56) and misstated domains badly (a 22% domain
+ *  showed "12 cards" while holding 3). Rows now always sum to certTotalCards. */
+export function certDomainCards(certId: string, domainId: string): number {
+  return (GENERATED[`cert-${certId}`] ?? []).filter((c) => c.certDomain === domainId).length;
+}
