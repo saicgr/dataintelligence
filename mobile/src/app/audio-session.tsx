@@ -39,6 +39,8 @@ const MOCK_PAUSE_MS = 12_000;
 const GRADE_TIMEOUT_MS = 8000;
 /** Voice mock length (Pro). */
 const MOCK_CARDS = 10;
+/** Commute deck length — a hands-free session is "quick reps", not the 40-card Pro daily queue. */
+const COMMUTE_CARDS = 15;
 
 type Phase = 'idle' | 'question' | 'thinking' | 'answer' | 'grade' | 'done';
 
@@ -94,12 +96,7 @@ function AudioInner({ mockMode, company }: { mockMode: boolean; company?: string
         : dailyPoolForRole(role, now);
       deckRef.current = pool.filter((cd) => extractKeyPoints(cd, 5).length >= 2).slice(0, MOCK_CARDS);
     } else {
-      deckRef.current = buildSessionDeck(
-        dailyPoolForRole(role, now),
-        progress,
-        now,
-        unlocked ? 40 : 15
-      );
+      deckRef.current = buildSessionDeck(dailyPoolForRole(role, now), progress, now, COMMUTE_CARDS);
     }
   }
   const deck = deckRef.current;

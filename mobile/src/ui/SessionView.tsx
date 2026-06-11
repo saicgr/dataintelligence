@@ -28,22 +28,89 @@ import { QueryBuildView } from './QueryBuildView';
 import { RichAnswer } from './RichAnswer';
 import { ScenarioView } from './ScenarioView';
 
+/** Cards between "good stopping point" checkpoints in long sessions. */
+const CHECKPOINT_EVERY = 10;
+
 export function SessionView() {
   const deck = useActiveDeck();
   const idx = useStore((s) => s.idx);
   const len = deck.length;
+  // Long sessions need a sense of "almost done": every 10 cards a checkpoint offers a
+  // graceful early finish (with the full summary) instead of a 40-card slog or a bare ✕.
+  // Local state on purpose — the deck reference changes on every new session, which resets it.
+  const [finishedAt, setFinishedAt] = useState<number | null>(null);
+  const [skippedCp, setSkippedCp] = useState(0);
+  useEffect(() => {
+    setFinishedAt(null);
+    setSkippedCp(0);
+  }, [deck]);
+  const done = finishedAt != null || idx >= len;
+  const atCheckpoint =
+    !done && idx > 0 && idx % CHECKPOINT_EVERY === 0 && skippedCp !== idx && len - idx > 2;
 
   return (
     <View style={{ gap: space.md }}>
-      <ProgressBar value={len ? Math.min(idx, len) / len : 0} label={idx >= len ? 'Done' : `${idx + 1} / ${len}`} />
-      {idx >= len ? (
-        <Done />
+      <ProgressBar value={len ? Math.min(finishedAt ?? idx, len) / len : 0} label={done ? 'Done' : `${idx + 1} / ${len}`} />
+      {done ? (
+        <Done cardsDone={finishedAt ?? len} />
+      ) : atCheckpoint ? (
+        <CheckpointCard
+          done={idx}
+          left={len - idx}
+          onFinish={() => setFinishedAt(idx)}
+          onContinue={() => setSkippedCp(idx)}
+        />
       ) : (
         <CardEnter key={idx}>
           <CardView />
         </CardEnter>
       )}
     </View>
+  );
+}
+
+/** Mid-session breather: stop on a win (full summary) or keep rolling. */
+function CheckpointCard({
+  done,
+  left,
+  onFinish,
+  onContinue,
+}: {
+  done: number;
+  left: number;
+  onFinish: () => void;
+  onContinue: () => void;
+}) {
+  const { c } = useTheme();
+  return (
+    <CardEnter>
+      <Card style={{ alignItems: 'center', padding: 22, gap: 6 }}>
+        <T size={34}>✨</T>
+        <T size={18} weight="900">{done} cards down — solid.</T>
+        <T muted size={12.5} style={{ textAlign: 'center', lineHeight: 18 }}>
+          {left} more in this deck. Stopping here still counts — your progress and streak are saved.
+        </T>
+        <View style={{ alignSelf: 'stretch', gap: 9, marginTop: 12 }}>
+          <Btn
+            label="Keep going ▶"
+            variant="primary"
+            onPress={() => {
+              haptic.light();
+              onContinue();
+            }}
+          />
+          <Btn
+            label="Finish with the win ✓"
+            variant="ghost"
+            onPress={() => {
+              haptic.success();
+              onFinish();
+            }}
+          />
+        </View>
+        <T muted size={10.5} style={{ marginTop: 2 }} color={c.muted}>Next checkpoint in {CHECKPOINT_EVERY} cards</T>
+      </Card>
+    </CardEnter>
   );
 }
 
@@ -972,8 +1039,9 @@ function NotifPrime() {
   );
 }
 
-/** End-of-session summary (#12): what you earned, how you did, and tomorrow's hook. */
-function Done() {
+/** End-of-session summary (#12): what you earned, how you did, and tomorrow's hook.
+ *  `cardsDone` < deck.length when the user took a checkpoint's early finish. */
+function Done({ cardsDone }: { cardsDone?: number }) {
   const router = useRouter();
   const { c } = useTheme();
   const deck = useActiveDeck();
@@ -1011,7 +1079,7 @@ function Done() {
           </StatTile>
         </Pop>
         <StatTile label="Cards" color="#1c7ed6">
-          <T weight="900" size={20} color="#1c7ed6">{deck.length}</T>
+          <T weight="900" size={20} color="#1c7ed6">{cardsDone ?? deck.length}</T>
         </StatTile>
         {accuracy != null && (
           <StatTile label="Accuracy" color={accuracy >= 70 ? c.success : c.warn}>

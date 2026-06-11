@@ -21,7 +21,7 @@ import { safeBack } from '../lib/nav';
 import { type MostAskedTopic, mostAskedAtCompany } from '../lib/peerAnswers';
 import { roleByKey } from '../lib/roles';
 import { isProActive, useStore } from '../lib/store';
-import { radius, useTheme } from '../lib/theme';
+import { useTheme } from '../lib/theme';
 import { Btn, Card, Chip, H2, Row, Screen, T } from '../ui/kit';
 
 export default function CompanyPack() {
@@ -50,7 +50,7 @@ export default function CompanyPack() {
   );
 
   if (!key || !set) return null;
-  const bars = packTopicBars(key, remote);
+  const bars = packTopicBars(key, role, remote);
   const isTarget = targetCompanyKey === key;
   const roleName = roleByKey(role)?.name ?? 'your role';
 

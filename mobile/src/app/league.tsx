@@ -13,6 +13,7 @@ import {
   weekKey,
   zoneForRank,
 } from '../lib/leagues';
+import { hasMockDeck } from '../lib/mock';
 import { useStore } from '../lib/store';
 import { radius, useTheme } from '../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../ui/kit';
@@ -24,6 +25,7 @@ export default function League() {
   const week = weekKey();
   // THIS week's XP (resets each ISO week) — total xp on a weekly board overstated everyone.
   const weeklyXp = useStore((s) => (s.weeklyXpWeek === week ? s.weeklyXp : 0));
+  const role = useStore((s) => s.role);
   const userId = useStore((s) => s.userId);
   const recordLeagueSnapshot = useStore((s) => s.recordLeagueSnapshot);
 
@@ -172,7 +174,10 @@ export default function League() {
         )}
       </Card>
 
-      <Btn label="⚡ Enter the weekly contest" variant="navy" onPress={() => router.push('/contest')} />
+      {/* The contest reuses the mock deck — only advertise it to roles that can actually enter. */}
+      {hasMockDeck(role) && (
+        <Btn label="⚡ Enter the weekly contest" variant="navy" onPress={() => router.push('/contest')} />
+      )}
       <Btn label="Keep studying →" variant="primary" onPress={() => safeBack(router)} />
     </Screen>
   );

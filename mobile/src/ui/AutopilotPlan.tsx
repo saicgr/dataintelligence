@@ -59,6 +59,9 @@ export function useStartPlanItem(): (item: PlanItem) => void {
 
   return (item: PlanItem) => {
     haptic.light();
+    // Plan items carry a card budget — the launched session must honor it. "TODAY · ~10 cards"
+    // followed by a 40-card session is a broken promise (the Pro default deck size is 40).
+    const cap = item.cards > 0 ? item.cards : undefined;
     switch (item.kind) {
       case 'lesson':
         beginAutopilotItem(item.id);
@@ -67,15 +70,15 @@ export function useStartPlanItem(): (item: PlanItem) => void {
       case 'weakspot':
       case 'warmup':
         beginAutopilotItem(item.id);
-        startWeakspot();
+        startWeakspot(cap);
         return;
       case 'company':
         beginAutopilotItem(item.id);
-        startCompany(item.companyKey!);
+        startCompany(item.companyKey!, cap);
         return;
       case 'review':
         beginAutopilotItem(item.id);
-        startDaily();
+        startDaily(cap);
         return;
       case 'mock':
         // The mock screen self-marks via recordMock (separate route, not a SessionView session).

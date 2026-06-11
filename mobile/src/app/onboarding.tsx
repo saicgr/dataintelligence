@@ -1,12 +1,10 @@
 import { useRouter } from 'expo-router';
 import { ReactNode, useEffect, useRef, useState } from 'react';
-import { type LayoutChangeEvent, type NativeScrollEvent, type NativeSyntheticEvent, Platform, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import { Animated as RNAnimated, type LayoutChangeEvent, type NativeScrollEvent, type NativeSyntheticEvent, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import Animated, {
   Easing,
   FadeIn,
-  FadeInDown,
   FadeOut,
-  FadeOutUp,
   useAnimatedStyle,
   useReducedMotion,
   useSharedValue,
@@ -177,35 +175,52 @@ function FloatBadge() {
 /** Vertically-scrolling word carousel — cycles motivations so non-interviewers feel seen. */
 function RotatingPhrase({ items, color }: { items: string[]; color: string }) {
   const reduced = useReducedMotion();
-  const [i, setI] = useState(0);
+  const [displayed, setDisplayed] = useState(0);
+  const translateY = useRef(new RNAnimated.Value(0)).current;
+  const opacity = useRef(new RNAnimated.Value(1)).current;
+
   useEffect(() => {
     if (reduced) return;
-    const id = setInterval(() => setI((p) => (p + 1) % items.length), 2400);
+    const id = setInterval(() => {
+      // Slide current phrase up and out
+      RNAnimated.parallel([
+        RNAnimated.timing(translateY, { toValue: -28, duration: 220, useNativeDriver: true }),
+        RNAnimated.timing(opacity, { toValue: 0, duration: 180, useNativeDriver: true }),
+      ]).start(() => {
+        setDisplayed((p) => (p + 1) % items.length);
+        translateY.setValue(28); // snap below
+        opacity.setValue(0);
+        // Slide next phrase up into position
+        RNAnimated.parallel([
+          RNAnimated.timing(translateY, { toValue: 0, duration: 260, useNativeDriver: true }),
+          RNAnimated.timing(opacity, { toValue: 1, duration: 220, useNativeDriver: true }),
+        ]).start();
+      });
+    }, 2600);
     return () => clearInterval(id);
   }, [reduced, items.length]);
-  // Web: reanimated entering/exiting on a key-swapped absolute Text can fail to paint,
-  // leaving the 30px box EMPTY under "WHETHER YOU'RE" (shipped that way once). A static
-  // in-flow Text still rotates via the interval and can never render blank.
-  if (Platform.OS === 'web' || reduced) {
-    return (
-      <View style={{ height: 30, justifyContent: 'center', alignSelf: 'stretch' }}>
-        <Text numberOfLines={1} style={{ width: '100%', textAlign: 'center', fontSize: 19, fontWeight: '900', color }}>
-          {items[i]}
-        </Text>
-      </View>
-    );
-  }
+
   return (
     <View style={{ height: 30, overflow: 'hidden', justifyContent: 'center', alignSelf: 'stretch' }}>
-      <Animated.Text
-        key={i}
-        entering={FadeInDown.duration(320).easing(Easing.out(Easing.cubic))}
-        exiting={FadeOutUp.duration(320).easing(Easing.in(Easing.cubic))}
-        numberOfLines={1}
-        adjustsFontSizeToFit
-        style={{ position: 'absolute', width: '100%', textAlign: 'center', fontSize: 21, fontWeight: '900', color }}>
-        {items[i]}
-      </Animated.Text>
+      {reduced ? (
+        <Text numberOfLines={1} style={{ width: '100%', textAlign: 'center', fontSize: 19, fontWeight: '900', color }}>
+          {items[displayed]}
+        </Text>
+      ) : (
+        <RNAnimated.Text
+          numberOfLines={1}
+          style={{
+            width: '100%',
+            textAlign: 'center',
+            fontSize: 19,
+            fontWeight: '900',
+            color,
+            opacity,
+            transform: [{ translateY }],
+          }}>
+          {items[displayed]}
+        </RNAnimated.Text>
+      )}
     </View>
   );
 }

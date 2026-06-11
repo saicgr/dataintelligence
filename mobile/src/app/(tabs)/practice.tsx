@@ -67,6 +67,11 @@ export default function Practice() {
         Practising here doesn&apos;t touch your review dates.
       </T>
 
+      {/* IA: four labeled sections instead of a 12-card wall — each answers ONE question
+          ("drill what?", "fix what?", "whose questions?", "am I ready?") so the next action
+          is a scan, not a read-everything decision. */}
+      <SectionHeader label="Drill now" />
+
       {/* Free + in-place: pick any topic and drill it right now (no detour through Library). */}
       <CardEnter>
         <Card style={{ padding: 14, gap: 11 }}>
@@ -99,6 +104,155 @@ export default function Practice() {
           </View>
         </Card>
       </CardEnter>
+
+      {/* Free quick mix — genuinely different from Home's scheduled review. The sub states the
+          card count up front: "quick reps" must never open into a 40-card surprise. */}
+      <CardEnter delay={30}>
+        <Mode
+          icon="🎲"
+          title="Surprise me"
+          sub="12 quick cards from a random topic in your prep"
+          cta="Go ▶"
+          onPress={surprise}
+        />
+      </CardEnter>
+
+      {/* Free, hands-free — answer out loud on a walk/commute. */}
+      <CardEnter delay={40}>
+        <Mode
+          icon="🎧"
+          title="Commute mode"
+          sub="Hands-free: questions read aloud, answer out loud"
+          cta="Listen ▶"
+          onPress={() => router.push('/audio-session' as Href)}
+        />
+      </CardEnter>
+
+      <SectionHeader label="Fix what's weak" />
+
+      {/* Mistakes notebook — auto-deck of every lapsed card. Free: first 10 · Pro: all + export. */}
+      {mistakesCount > 0 && (
+        <CardEnter delay={30}>
+          <Mode
+            icon="📕"
+            title={`Mistakes notebook · ${mistakesCount}`}
+            sub={unlocked ? 'Every card you’ve missed, weakest first' : `Your missed cards (first 10 free · Pro = all ${mistakesCount})`}
+            cta="Fix ▶"
+            onPress={() => {
+              haptic.light();
+              sfx.tap();
+              startMistakes();
+              router.push('/');
+            }}
+          />
+        </CardEnter>
+      )}
+      <CardEnter delay={40}>
+        <LockedMode
+          icon="🧠"
+          title="Weak-spots drill"
+          sub="Adaptive: the cards you keep missing, weakest first"
+          unlocked={unlocked}
+          unlockedCta="Drill ▶"
+          onUnlocked={() => {
+            startWeakspot();
+            router.push('/');
+          }}
+          onLocked={() => router.push('/paywall')}
+        />
+      </CardEnter>
+      {/* Free — review the cards you bookmarked (also surfaced in Library). Hidden until you save one. */}
+      {savedCount > 0 && (
+        <CardEnter delay={50}>
+          <Mode
+            icon="🔖"
+            title="Saved cards"
+            sub={`${savedCount} card${savedCount === 1 ? '' : 's'} you bookmarked — review them`}
+            cta="Review ▶"
+            onPress={() => {
+              haptic.light();
+              sfx.tap();
+              startSaved();
+              router.push('/');
+            }}
+          />
+        </CardEnter>
+      )}
+
+      {/* My Tracks — user-assembled decks (built here from Saved, or from a JD in the analyzer).
+          Free: 1 deck of 20 · Pro: unlimited + cheat-sheet export. */}
+      <CardEnter delay={118}>
+        <Card style={{ padding: 14, gap: 11 }}>
+          <Row style={{ gap: 9 }}>
+            <T size={22}>🗂️</T>
+            <View style={{ flex: 1 }}>
+              <T weight="800" size={15}>My Tracks</T>
+              <T muted size={12}>Your own decks — from saved cards or a pasted JD</T>
+            </View>
+          </Row>
+          {myTracks.map((mt) => (
+            <View key={mt.id} style={{ gap: 9, borderWidth: 1, borderColor: c.border, borderRadius: radius.md, paddingVertical: 10, paddingHorizontal: 11 }}>
+              <View>
+                <T weight="700" size={13}>{mt.name}</T>
+                <T muted size={10.5}>{mt.cardIds.length} card{mt.cardIds.length === 1 ? '' : 's'} · {mt.source === 'jd' ? 'from a JD' : mt.source === 'mistakes' ? 'from mistakes' : 'hand-picked'}</T>
+              </View>
+              {/* Labeled, well-spaced actions — the old bare ▶/📄/🗑 glyphs were tiny, ambiguous
+                  and adjacent (easy to mis-tap; users couldn't tell what 📄 did until tapping). */}
+              <Row style={{ gap: 7 }}>
+                <DeckAction
+                  label="▶ Drill"
+                  accent
+                  a11y={`Drill ${mt.name}`}
+                  onPress={() => {
+                    haptic.light();
+                    startMyTrack(mt.id);
+                    router.push('/');
+                  }}
+                />
+                <DeckAction label="📄 Cheat sheet" a11y={`Export ${mt.name} cheat sheet (PDF)`} onPress={() => exportMyTrack(mt.name, mt.cardIds)} />
+                <DeckAction
+                  label="🗑 Delete"
+                  a11y={`Delete ${mt.name}`}
+                  onPress={() =>
+                    void confirmAsync(
+                      'Delete this deck?',
+                      `“${mt.name}” (${mt.cardIds.length} card${mt.cardIds.length === 1 ? '' : 's'}) — your card progress is kept.`,
+                      'Delete'
+                    ).then((ok) => ok && deleteMyTrack(mt.id))
+                  }
+                />
+              </Row>
+            </View>
+          ))}
+          {savedCount > 0 && (
+            <Btn
+              label={`➕ New deck from Saved (${savedCount})`}
+              variant="ghost"
+              onPress={() => {
+                // State-changing → confirm first; before this, one tap silently created a deck.
+                void confirmAsync(
+                  'Create a deck from Saved?',
+                  `“From saved cards” · ${savedCount} card${savedCount === 1 ? '' : 's'}. It lands under My Tracks.`,
+                  'Create deck'
+                ).then((ok) => {
+                  if (!ok) return;
+                  const id = createMyTrack('From saved cards', savedIds, 'manual');
+                  if (!id) return router.push('/paywall'); // free cap: 1 deck
+                  haptic.success();
+                });
+              }}
+            />
+          )}
+          {myTracks.length === 0 && savedCount === 0 && (
+            <T muted size={11.5} style={{ lineHeight: 16 }}>
+              Bookmark a few cards (🔖) or paste a JD in the analyzer to build your first deck.
+            </T>
+          )}
+          {!unlocked && <T muted size={10.5}>Free: 1 deck of up to 20 cards · Pro: unlimited + PDF export</T>}
+        </Card>
+      </CardEnter>
+
+      <SectionHeader label="Target a job or company" />
 
       {/* Company Packs — role-aware, asked-frequency ranked. Tapping opens the pack screen
           (free: overview + top 2 cards; Pro: full drill + company mock + cheat sheet). */}
@@ -136,9 +290,22 @@ export default function Practice() {
           </View>
         </Card>
       </CardEnter>
+      <CardEnter delay={40}>
+        <LockedMode
+          icon="📝"
+          title="Interview Autopilot · JD analyzer"
+          sub="Paste a JD — match it to tracks, find gaps, build your plan"
+          unlocked={unlocked}
+          unlockedCta="Analyze ▶"
+          onUnlocked={() => router.push('/jd' as unknown as Href)}
+          onLocked={() => router.push('/paywall')}
+        />
+      </CardEnter>
+
+      <SectionHeader label="Test yourself" />
 
       {/* Interactive code judge — write & run real SQL/Python/PySpark, graded by output. */}
-      <CardEnter delay={35}>
+      <CardEnter delay={30}>
         <Card style={{ padding: 14, gap: 11 }}>
           <Row style={{ gap: 9 }}>
             <T size={22}>💻</T>
@@ -178,143 +345,7 @@ export default function Practice() {
           </Row>
         </Card>
       </CardEnter>
-
-      {/* Free quick mix — genuinely different from Home's scheduled review. */}
       <CardEnter delay={40}>
-        <Mode
-          icon="🎲"
-          title="Surprise me"
-          sub="A random topic from your prep — quick off-schedule reps"
-          cta="Go ▶"
-          onPress={surprise}
-        />
-      </CardEnter>
-
-      {/* Free, hands-free — answer out loud on a walk/commute. */}
-      <CardEnter delay={80}>
-        <Mode
-          icon="🎧"
-          title="Commute mode"
-          sub="Hands-free: questions read aloud, answer out loud"
-          cta="Listen ▶"
-          onPress={() => router.push('/audio-session' as Href)}
-        />
-      </CardEnter>
-
-      {/* Free — review the cards you bookmarked (also surfaced in Library). Hidden until you save one. */}
-      {savedCount > 0 && (
-        <CardEnter delay={110}>
-          <Mode
-            icon="🔖"
-            title="Saved cards"
-            sub={`${savedCount} card${savedCount === 1 ? '' : 's'} you bookmarked — review them`}
-            cta="Review ▶"
-            onPress={() => {
-              haptic.light();
-              sfx.tap();
-              startSaved();
-              router.push('/');
-            }}
-          />
-        </CardEnter>
-      )}
-
-      {/* Mistakes notebook — auto-deck of every lapsed card. Free: first 10 · Pro: all + export. */}
-      {mistakesCount > 0 && (
-        <CardEnter delay={115}>
-          <Mode
-            icon="📕"
-            title={`Mistakes notebook · ${mistakesCount}`}
-            sub={unlocked ? 'Every card you’ve missed, weakest first' : `Your missed cards (first 10 free · Pro = all ${mistakesCount})`}
-            cta="Fix ▶"
-            onPress={() => {
-              haptic.light();
-              sfx.tap();
-              startMistakes();
-              router.push('/');
-            }}
-          />
-        </CardEnter>
-      )}
-
-      {/* My Tracks — user-assembled decks (built here from Saved, or from a JD in the analyzer).
-          Free: 1 deck of 20 · Pro: unlimited + cheat-sheet export. */}
-      <CardEnter delay={118}>
-        <Card style={{ padding: 14, gap: 11 }}>
-          <Row style={{ gap: 9 }}>
-            <T size={22}>🗂️</T>
-            <View style={{ flex: 1 }}>
-              <T weight="800" size={15}>My Tracks</T>
-              <T muted size={12}>Your own decks — from saved cards or a pasted JD</T>
-            </View>
-          </Row>
-          {myTracks.map((mt) => (
-            <Row key={mt.id} style={{ gap: 8, borderWidth: 1, borderColor: c.border, borderRadius: radius.md, paddingVertical: 9, paddingHorizontal: 11 }}>
-              <View style={{ flex: 1 }}>
-                <T weight="700" size={13}>{mt.name}</T>
-                <T muted size={10.5}>{mt.cardIds.length} cards · {mt.source === 'jd' ? 'from a JD' : mt.source === 'mistakes' ? 'from mistakes' : 'hand-picked'}</T>
-              </View>
-              <Pressable hitSlop={6} accessibilityRole="button" accessibilityLabel={`Drill ${mt.name}`}
-                onPress={() => {
-                  haptic.light();
-                  startMyTrack(mt.id);
-                  router.push('/');
-                }}>
-                <T weight="800" size={12.5} color={c.accentInk}>▶</T>
-              </Pressable>
-              <Pressable hitSlop={6} accessibilityRole="button" accessibilityLabel={`Export ${mt.name} cheat sheet`}
-                onPress={() => exportMyTrack(mt.name, mt.cardIds)}>
-                <T size={13}>📄</T>
-              </Pressable>
-              <Pressable hitSlop={6} accessibilityRole="button" accessibilityLabel={`Delete ${mt.name}`}
-                onPress={() =>
-                  void confirmAsync('Delete this deck?', `“${mt.name}” (${mt.cardIds.length} cards) — your card progress is kept.`, 'Delete').then(
-                    (ok) => ok && deleteMyTrack(mt.id)
-                  )
-                }>
-                <T size={13} color={c.muted}>🗑</T>
-              </Pressable>
-            </Row>
-          ))}
-          {savedCount > 0 && (
-            <Btn
-              label={`➕ New deck from Saved (${savedCount})`}
-              variant="ghost"
-              onPress={() => {
-                const id = createMyTrack('From saved cards', savedIds, 'manual');
-                if (!id) return router.push('/paywall'); // free cap: 1 deck
-                haptic.success();
-              }}
-            />
-          )}
-          {myTracks.length === 0 && savedCount === 0 && (
-            <T muted size={11.5} style={{ lineHeight: 16 }}>
-              Bookmark a few cards (🔖) or paste a JD in the analyzer to build your first deck.
-            </T>
-          )}
-          {!unlocked && <T muted size={10.5}>Free: 1 deck of up to 20 cards · Pro: unlimited + PDF export</T>}
-        </Card>
-      </CardEnter>
-
-      {/* Pro tier, clearly fenced below the free value. */}
-      <Row style={{ gap: 10, marginTop: 6, marginBottom: 2 }}>
-        <View style={{ flex: 1, height: 1, backgroundColor: c.border }} />
-        <T size={10.5} weight="900" color={c.muted} style={{ letterSpacing: 1 }}>PRO</T>
-        <View style={{ flex: 1, height: 1, backgroundColor: c.border }} />
-      </Row>
-
-      <CardEnter delay={70}>
-        <LockedMode
-          icon="🚨"
-          title="Production incidents"
-          sub="Pick a real on-call scenario — inspect → fix → verify"
-          unlocked={unlocked}
-          unlockedCta="Browse ▶"
-          onUnlocked={() => router.push('/incidents' as Href)}
-          onLocked={() => router.push('/paywall')}
-        />
-      </CardEnter>
-      <CardEnter delay={80}>
         <LockedMode
           icon="⏱️"
           title="Mock interview"
@@ -325,32 +356,29 @@ export default function Practice() {
           onLocked={() => router.push('/paywall')}
         />
       </CardEnter>
-      <CardEnter delay={90}>
+      <CardEnter delay={50}>
         <LockedMode
-          icon="📝"
-          title="Paste a job description"
-          sub="Match it to your prep tracks + see what you're missing"
+          icon="🚨"
+          title="Production incidents"
+          sub="Pick a real on-call scenario — inspect → fix → verify"
           unlocked={unlocked}
-          unlockedCta="Analyze ▶"
-          onUnlocked={() => router.push('/jd' as unknown as Href)}
-          onLocked={() => router.push('/paywall')}
-        />
-      </CardEnter>
-      <CardEnter delay={120}>
-        <LockedMode
-          icon="🧠"
-          title="Weak-spots drill"
-          sub="The cards you keep missing — weakest first (adaptive)"
-          unlocked={unlocked}
-          unlockedCta="Drill ▶"
-          onUnlocked={() => {
-            startWeakspot();
-            router.push('/');
-          }}
+          unlockedCta="Browse ▶"
+          onUnlocked={() => router.push('/incidents' as Href)}
           onLocked={() => router.push('/paywall')}
         />
       </CardEnter>
     </Screen>
+  );
+}
+
+/** Slim section divider — groups the practice modes so the list scans instead of shouting. */
+function SectionHeader({ label }: { label: string }) {
+  const { c } = useTheme();
+  return (
+    <Row style={{ gap: 10, marginTop: 10, marginBottom: 2 }}>
+      <T size={11.5} weight="900" color={c.muted} style={{ letterSpacing: 0.6, textTransform: 'uppercase' }}>{label}</T>
+      <View style={{ flex: 1, height: 1, backgroundColor: c.border }} />
+    </Row>
   );
 }
 
@@ -367,7 +395,7 @@ function Mode({
   cta: string;
   onPress: () => void;
 }) {
-  const { track } = useTheme();
+  const { c } = useTheme();
   return (
     <PressableScale onPress={onPress} sound>
       <Card style={{ padding: 16 }}>
@@ -377,10 +405,35 @@ function Mode({
             <T weight="800" size={15}>{title}</T>
             <T muted size={12}>{sub}</T>
           </Row>
-          <T weight="800" color={track('spark')}>{cta}</T>
+          {/* Quiet CTA on purpose: when every row's CTA is the orange accent, nothing stands out
+              and the accent stops meaning "primary action" — the rows are tappable cards anyway. */}
+          <T weight="800" size={12.5} color={c.muted}>{cta}</T>
         </Row>
       </Card>
     </PressableScale>
+  );
+}
+
+/** A labeled deck-row action — generous tap target, text + glyph (never a bare icon). */
+function DeckAction({ label, a11y, accent, onPress }: { label: string; a11y: string; accent?: boolean; onPress: () => void }) {
+  const { c } = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={a11y}
+      style={{
+        flexGrow: accent ? 1 : 0,
+        borderWidth: 1,
+        borderColor: accent ? c.accent : c.border,
+        backgroundColor: accent ? c.accent + '14' : 'transparent',
+        borderRadius: 999,
+        paddingVertical: 7,
+        paddingHorizontal: 12,
+        alignItems: 'center',
+      }}>
+      <T weight="800" size={11.5} color={accent ? c.accentInk : c.muted}>{label}</T>
+    </Pressable>
   );
 }
 

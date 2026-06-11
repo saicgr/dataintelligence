@@ -55,6 +55,25 @@ export const TRACK_KEYWORDS: Record<string, string[]> = {
   terraform: ['terraform', 'infrastructure as code', 'iac', 'pulumi'],
   cicd: ['ci/cd', 'cicd', 'continuous integration', 'continuous deployment', 'github actions', 'jenkins'],
   observability: ['observability', 'monitoring', 'prometheus', 'grafana', 'datadog', 'slo', 'opentelemetry'],
+  // Business & management tracks — without these, a PM/TPM/BA job description matched almost
+  // nothing (Agile, roadmapping, risk management were silently ignored).
+  'agile-pm': ['agile', 'scrum', 'kanban', 'sprint planning', 'sprints', 'pmp', 'project management', 'project manager', 'jira', 'waterfall'],
+  'program-management': ['program management', 'program manager', 'roadmap', 'roadmapping', 'risk management', 'milestones', 'cross-functional', 'delivery', 'dependencies'],
+  'stakeholder-mgmt': ['stakeholder', 'stakeholders', 'stakeholder management', 'executive communication', 'alignment', 'escalation'],
+  'product-management': ['product management', 'product manager', 'product strategy', 'backlog', 'user stories', 'prioritization', 'okrs', 'product roadmap'],
+  'ai-product-mgmt': ['ai product', 'llm product', 'ai product manager'],
+  'business-analysis': ['business analyst', 'business analysis', 'requirements gathering', 'requirements', 'process mapping', 'brd', 'gap analysis'],
+  'data-governance': ['data governance', 'data quality', 'lineage', 'data catalog', 'gdpr', 'metadata', 'data steward', 'mdm'],
+  finops: ['finops', 'cloud cost', 'cost optimization', 'cost allocation', 'showback', 'chargeback'],
+  'finance-fundamentals': ['fp&a', 'financial planning', 'variance analysis', 'forecasting', 'budgeting', 'financial modeling'],
+  'consulting-frameworks': ['mece', 'case interview', 'consulting', 'market sizing'],
+  'pre-sales': ['pre-sales', 'presales', 'solutions engineer', 'sales engineer', 'proof of concept', 'technical discovery', 'demos'],
+  'customer-success': ['customer success', 'nrr', 'churn', 'renewals', 'adoption', 'onboarding'],
+  bizops: ['bizops', 'business operations', 'strategy and operations', 'strategy & operations'],
+  'supply-chain': ['supply chain', 'logistics', 'inventory', 'demand planning', 'procurement'],
+  'risk-compliance': ['risk and compliance', 'regulatory', 'audit', 'sox', 'compliance'],
+  leadership: ['leadership', 'mentoring', 'people management', 'team leadership'],
+  behavioral: ['behavioral interview', 'star method'],
 };
 
 export interface JdResult {
@@ -84,13 +103,19 @@ export function analyzeJd(text: string, progress: Record<string, CardState>): Jd
   }
   matched.sort((a, b) => b.hits - a.hits);
 
-  // Best-fit role = the role whose tracks accumulate the most JD hits.
+  // Best-fit role = the role whose tracks accumulate the most JD hits — but a LITERAL job-title
+  // mention trumps keyword overlap. A JD that says "Senior Project Manager" must come back
+  // Project Manager, not whichever adjacent role shares more tracks. Longer titles add more,
+  // so "AWS Data Engineer" outranks its "Data Engineer" substring when both match.
   let bestRole: RoleKey = 'de';
   let best = -1;
   for (const r of ROLES) {
     if (r.key === 'all') continue;
     const slugs = new Set(ROLE_TRACKS[r.key] ?? []);
-    const score = matched.reduce((s, m) => s + (slugs.has(m.slug) ? m.hits : 0), 0);
+    const trackScore = matched.reduce((s, m) => s + (slugs.has(m.slug) ? m.hits : 0), 0);
+    const title = r.name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const titled = new RegExp(`(^|[^a-z0-9])${title}([^a-z0-9]|$)`).test(jd);
+    const score = trackScore + (titled ? 1000 + r.name.length : 0);
     if (score > best) {
       best = score;
       bestRole = r.key;

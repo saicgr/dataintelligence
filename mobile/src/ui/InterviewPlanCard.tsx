@@ -19,11 +19,12 @@ import { Btn, Card, Row, T } from './kit';
 export function InterviewPlanCard({
   /** Interview date as ISO (`YYYY-MM-DD`); null/empty → renders nothing. */
   dateIso,
-  /** Fired by "Start today's prep" — wire to startDaily() or a focused session. */
+  /** Fired by "Start today's prep" with today's card target — wire to startDaily(target)
+   *  so the launched session matches the number the card just promised. */
   onStart,
 }: {
   dateIso: string | null;
-  onStart?: () => void;
+  onStart?: (todayTarget: number) => void;
 }) {
   const { c } = useTheme();
   const role = useStore((s) => s.role);
@@ -85,7 +86,7 @@ export function InterviewPlanCard({
       <Btn
         label={plan.warmUpToday ? '☀️ Start warm-up' : "Start today's prep →"}
         variant={plan.warmUpToday ? 'navy' : 'primary'}
-        onPress={onStart}
+        onPress={() => onStart?.(plan.todayTarget)}
       />
     </Card>
   );

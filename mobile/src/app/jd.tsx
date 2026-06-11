@@ -5,7 +5,7 @@ import { Linking, Pressable, TextInput, View } from 'react-native';
 
 import { buildCheatSheetFromCards } from '../lib/cheatsheet';
 import { matchCompanyKey } from '../lib/companySets';
-import { findCardById, type SessionCard } from '../lib/content';
+import { findCardById, type SessionCard, tracksForRole } from '../lib/content';
 import { daysUntil } from '../lib/cramPlan';
 import { alertInfo } from '../lib/dialog';
 import { exportSheet } from '../lib/exportPdf';
@@ -23,6 +23,7 @@ export default function JD() {
   const { c, track } = useTheme();
   const unlocked = useStore(isProActive);
   const progress = useStore((s) => s.progress);
+  const role = useStore((s) => s.role);
   const setRole = useStore((s) => s.setRole);
   const interviewDate = useStore((s) => s.interviewDate);
   const setInterviewDate = useStore((s) => s.setInterviewDate);
@@ -61,7 +62,8 @@ export default function JD() {
     const name = `${company ? company[0].toUpperCase() + company.slice(1) : result.bestRoleName} JD · gaps`;
     const id = createMyTrack(name, ids, 'jd');
     if (!id) return router.push('/paywall'); // free cap (1 deck) reached
-    alertInfo('My Track created', `“${name}” is in your Library → My Tracks (${Math.min(ids.length, 200)} cards).`);
+    const n = Math.min(ids.length, 200);
+    alertInfo('My Track created', `“${name}” is in your Library → My Tracks (${n} card${n === 1 ? '' : 's'}).`);
   };
 
   const exportJdSheet = () => {
@@ -87,6 +89,14 @@ export default function JD() {
         <T muted weight="700" size={13}>‹ Close</T>
       </Pressable>
 
+      {/* One screen, one name. Two entry points land here ("Interview Autopilot" on the role
+          sheet, "Paste a job description" on Practice) — the header makes clear they're the
+          same feature: date → plan, JD → tracks/gaps. */}
+      <T size={22} weight="900">⚡ Interview Autopilot</T>
+      <T muted size={12.5} style={{ lineHeight: 18 }}>
+        Set your interview date for a day-by-day plan, and paste the job description to aim it.
+      </T>
+
       <H2>When&apos;s your interview?</H2>
       <Card style={{ gap: 10 }}>
         <T muted size={12.5} style={{ lineHeight: 18 }}>
@@ -109,7 +119,7 @@ export default function JD() {
           }}
         />
       </Card>
-      <InterviewPlanCard dateIso={interviewDate} onStart={() => { startDaily(); router.replace('/'); }} />
+      <InterviewPlanCard dateIso={interviewDate} onStart={(target) => { startDaily(target); router.replace('/'); }} />
 
       <H2>Paste a job description</H2>
       <T muted size={12.5} style={{ lineHeight: 18 }}>
@@ -210,23 +220,31 @@ export default function JD() {
 
           {unlocked ? (
             <>
-              {result.gaps.length > 0 && (
-                <Card style={{ borderColor: c.danger, gap: 8 }}>
-                  <T weight="800" size={14} color={c.danger}>⚠️ You&apos;re missing</T>
-                  <T muted size={12} style={{ lineHeight: 17 }}>
-                    These matter for this JD and you haven&apos;t studied them yet — start here:
-                  </T>
-                  <Row style={{ flexWrap: 'wrap', gap: 7 }}>
-                    {result.gaps.map((t) => (
-                      <Pressable key={t.slug} onPress={() => router.push(`/track/${t.slug}`)}>
-                        <View style={{ borderWidth: 1.5, borderColor: c.danger, borderRadius: 999, paddingVertical: 6, paddingHorizontal: 11 }}>
-                          <T weight="700" size={12} color={c.danger}>{t.icon} {t.name}</T>
-                        </View>
-                      </Pressable>
-                    ))}
-                  </Row>
-                </Card>
-              )}
+              {result.gaps.length > 0 && (() => {
+                // A "gap" = matters for this JD, zero cards studied. Some gaps are ALREADY in the
+                // user's role plan (e.g. an untouched FOCUS track) — without the chip suffix that
+                // read as a contradiction with the home screen.
+                const planSlugs = new Set(tracksForRole(role).map((t) => t.slug));
+                return (
+                  <Card style={{ borderColor: c.danger, gap: 8 }}>
+                    <T weight="800" size={14} color={c.danger}>⚠️ Not studied yet</T>
+                    <T muted size={12} style={{ lineHeight: 17 }}>
+                      These matter for this JD and you haven&apos;t drilled a single card in them — start here:
+                    </T>
+                    <Row style={{ flexWrap: 'wrap', gap: 7 }}>
+                      {result.gaps.map((t) => (
+                        <Pressable key={t.slug} onPress={() => router.push(`/track/${t.slug}`)}>
+                          <View style={{ borderWidth: 1.5, borderColor: c.danger, borderRadius: 999, paddingVertical: 6, paddingHorizontal: 11 }}>
+                            <T weight="700" size={12} color={c.danger}>
+                              {t.icon} {t.name}{planSlugs.has(t.slug) ? ' · in your plan' : ''}
+                            </T>
+                          </View>
+                        </Pressable>
+                      ))}
+                    </Row>
+                  </Card>
+                );
+              })()}
               {/* The Pro loop: JD → plan → deck → sheet. buildPlan feeds Interview Autopilot. */}
               <Btn label="⚡ Build my Autopilot plan →" variant="navy" onPress={buildPlan} />
               <Row style={{ gap: 9 }}>

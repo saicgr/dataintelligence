@@ -119,8 +119,9 @@ export default function Contest() {
             <T size={46}>⚡</T>
             <T size={22} weight="900">Weekly contest</T>
             <T muted size={13} style={{ textAlign: 'center', lineHeight: 20 }}>
-              One ranked timed round against everyone this week. {deck.length} questions,
-              {` ${MOCK_SECONDS_PER_Q}s`} each — your best score counts. Board resets when the week rolls over.
+              {deck.length > 0
+                ? `One ranked timed round against everyone this week. ${deck.length} questions, ${MOCK_SECONDS_PER_Q}s each — your best score counts. Board resets when the week rolls over.`
+                : 'One ranked timed round against everyone this week — your best score counts. Board resets when the week rolls over.'}
             </T>
             <Row style={{ marginTop: 6, gap: 8 }}>
               <Stat label="Closes in" value={`${daysLeft}d`} color={track('spark')} />
@@ -131,10 +132,13 @@ export default function Contest() {
         </CardEnter>
 
         {deck.length === 0 ? (
-          <Card style={{ padding: 16 }}>
-            <T muted size={13} style={{ textAlign: 'center' }}>
-              No quiz-ready questions for this role yet. Drill a few topics first, then enter the contest.
+          <Card style={{ padding: 16, gap: 12 }}>
+            <T muted size={13} style={{ textAlign: 'center', lineHeight: 19 }}>
+              Your current role has no quiz-ready (multiple-choice) questions, so there&apos;s nothing to
+              enter this round with yet. Drill your role&apos;s topics instead — they count toward your streak.
             </T>
+            {/* Never dead-end: hand the user the path the copy describes (mirrors mock.tsx). */}
+            <Btn label="Drill topics →" variant="navy" onPress={() => router.replace('/(tabs)/practice')} />
           </Card>
         ) : (
           <Btn

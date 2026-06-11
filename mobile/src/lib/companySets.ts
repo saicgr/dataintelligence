@@ -207,15 +207,28 @@ export function rankCompanyCards(
     .sort((a, b) => b.score - a.score || (a.card.id < b.card.id ? -1 : 1));
 }
 
-/** The pack's topics with curated weight + (optional) crowd share, for the frequency bars. */
+/**
+ * The pack's topics with curated weight + (optional) crowd share, for the frequency bars.
+ * `role` filters the bars through the same lens the deck uses: a topic shows only if one of
+ * its teaching tracks is in the user's role — an Amazon pack "for Project Manager" must not
+ * lead with System design / SQL / Spark emphasis bars. Falls back to the full curated set
+ * when the overlap is empty (mirrors companyCardsForRole's fallback).
+ */
 export function packTopicBars(
   key: string,
+  role?: string,
   remote?: MostAskedTopic[]
 ): { topic: string; weight: number; share?: number; recent?: number }[] {
   const set = COMPANY_SETS[key];
   if (!set) return [];
   const remoteBy = new Map((remote ?? []).map((t) => [t.topic, t]));
-  return Object.entries(set.topicWeights)
+  let entries = Object.entries(set.topicWeights);
+  if (role && role !== 'all') {
+    const roleSlugs = new Set(tracksForRole(role).map((t) => t.slug));
+    const scoped = entries.filter(([topic]) => (TOPIC_TO_TRACKS[topic] ?? []).some((s) => roleSlugs.has(s)));
+    if (scoped.length) entries = scoped;
+  }
+  return entries
     .map(([topic, weight]) => {
       const r = remoteBy.get(topic);
       return { topic, weight, share: r?.share, recent: r?.recent };

@@ -10,7 +10,7 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { safeBack } from '../lib/nav';
 import { useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, TextInput, View } from 'react-native';
+import { ActivityIndicator, Platform, Pressable, ScrollView, TextInput, View } from 'react-native';
 
 import { type CodeLang, type CodeProblem, problemsForLang, CODE_PROBLEMS } from '../lib/codeProblems';
 import { type JudgeResult } from '../lib/judge';
@@ -54,7 +54,11 @@ export default function CodeLab() {
           <H2>{LANG_LABEL[lang]} code drills</H2>
           <T muted size={12} style={{ lineHeight: 18 }}>
             Write real code and Run it — graded by output, not multiple choice.
-            {lang === 'sql' ? ' Runs fully offline.' : ' Python runtime loads on first run, then works offline.'}
+            {lang === 'sql'
+              ? Platform.OS === 'web'
+                ? ' The SQL runtime loads on first run.'
+                : ' Runs fully offline.'
+              : ' Python runtime loads on first run, then works offline.'}
           </T>
           {list.map((p) => (
             <Pressable key={p.id} onPress={() => setProblem(p)}>

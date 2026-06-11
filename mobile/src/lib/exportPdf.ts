@@ -9,13 +9,21 @@ import { Platform } from 'react-native';
 
 export async function exportSheet(html: string): Promise<{ ok: boolean; error?: string }> {
   if (Platform.OS === 'web') {
-    const w = window.open('', '_blank');
-    if (!w) return { ok: false, error: 'Pop-up blocked — allow pop-ups for this site to export.' };
-    w.document.write(html);
-    w.document.close();
-    w.focus();
-    // Give the new window a beat to lay out before the print dialog freezes it.
-    setTimeout(() => w.print(), 250);
+    // NO auto-print. `noopener` severs the window reference but NOT the renderer process — a
+    // same-origin blob: child shares this tab's process, so a load-time window.print() blocks
+    // the synchronous print dialog across BOTH tabs (the app hard-freezes; indefinitely under
+    // automation). Instead the child gets a fixed "Save as PDF" button: print only ever runs
+    // from a user gesture inside the child tab, where the dialog is expected and recoverable.
+    const printBtn =
+      '<button onclick="window.print()" style="position:fixed;top:14px;right:14px;z-index:9;' +
+      'background:#f76707;color:#fff;border:0;border-radius:8px;padding:10px 16px;' +
+      'font:700 13px -apple-system,sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)">' +
+      '🖨 Save as PDF</button>' +
+      '<style>@media print{button{display:none}}</style>';
+    const doc = html.includes('</body>') ? html.replace('</body>', `${printBtn}</body>`) : html + printBtn;
+    const url = URL.createObjectURL(new Blob([doc], { type: 'text/html' }));
+    window.open(url, '_blank', 'noopener'); // returns null with noopener even on success
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
     return { ok: true };
   }
   try {

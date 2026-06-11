@@ -9,11 +9,10 @@ import {
   dailyPoolForRole,
   deckCounts,
   findCardById,
-  freshSessionCards,
+  freshSessionCardsForRole,
   isStaffPlus,
   type Level,
   lessonDeck,
-  roleDomain,
   SessionCard,
   trackBySlug,
   weakSpotDeck,
@@ -297,13 +296,14 @@ interface State {
   setReminders: (v: boolean) => void;
   setDailyGoal: (n: number) => void;
   applyHintCost: (n: number) => void;
-  startDaily: () => void;
+  /** `cap` bounds the deck (autopilot plan items carry a card budget); omitted = normal sizing. */
+  startDaily: (cap?: number) => void;
   startTrack: (slug: string, level?: Level, cap?: number) => void;
   startFresh: () => void;
   startSaved: () => void;
-  startWeakspot: () => void;
+  startWeakspot: (cap?: number) => void;
   startBasics: () => void;
-  startCompany: (key: string) => void;
+  startCompany: (key: string, cap?: number) => void;
   startIncident: (id: string) => void;
   startDiagnostic: () => void;
   startSingle: (cardId: string) => void;
@@ -349,11 +349,11 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
   const down = dislikedSet(s.feedback);
   let deck: SessionCard[];
   if (s.sessionKind === 'weakspot') {
-    deck = weakSpotDeck(dailyPoolForRole(s.role, now), s.progress, now, unlockAll ? 30 : 10);
+    deck = weakSpotDeck(dailyPoolForRole(s.role, now), s.progress, now, s.sessionCap ?? (unlockAll ? 30 : 10));
     // Brand-new user has no weak cards yet → don't show an empty session; fall back to a SHORT
     // warm-up (12 cards), not a full daily-size session — "weakest first" promised quick reps.
     if (deck.length === 0) {
-      deck = buildSessionDeck(dailyPoolForRole(s.role, now), s.progress, now, 12, adaptive, down);
+      deck = buildSessionDeck(dailyPoolForRole(s.role, now), s.progress, now, s.sessionCap ?? 12, adaptive, down);
     }
   } else if (s.sessionKind === 'lesson' && s.trackSlug && s.lessonIdx != null) {
     deck = lessonDeck(s.trackSlug, s.lessonIdx);
@@ -376,7 +376,7 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
     // Company pack: role-aware, asked-frequency ranked (curated weights + weakness — offline;
     // the crowd signal layers on in the pack UI only). Free tier gets a 2-card taste of the pack.
     const ranked = rankCompanyCards(s.companyKey, s.role, s.progress, now).map((r) => r.card);
-    deck = unlockAll ? ranked : ranked.slice(0, 2);
+    deck = unlockAll ? (s.sessionCap != null ? ranked.slice(0, s.sessionCap) : ranked) : ranked.slice(0, 2);
   } else if (s.sessionKind === 'mytrack' && s.myTrackId) {
     // Custom deck: resolve saved ids, silently skipping any that rotted away in an OTA update.
     const mt = s.myTracks.find((m) => m.id === s.myTrackId);
@@ -402,7 +402,7 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
     // Free users still taste it (the daily fresh trickle + a short preview here so the screen
     // never dead-ends); Pro unlocks the full stream. The home pill routes locked users to the
     // paywall, so this cap is mainly a safety net for deep links / dev.
-    deck = freshSessionCards(now, roleDomain(s.role), unlockAll ? Infinity : FREE_FRESH_PREVIEW);
+    deck = freshSessionCardsForRole(s.role, now, unlockAll ? Infinity : FREE_FRESH_PREVIEW);
   } else if (s.sessionKind === 'single' && s.singleId) {
     // One card opened directly from search — just that card (free/Pro gating is enforced at tap time).
     const card = findCardById(s.singleId);
@@ -421,7 +421,7 @@ function buildDeck(s: DeckInputs): { deck: SessionCard[]; meta: { due: number; f
       pool,
       s.progress,
       now,
-      unlockAll ? 40 : 15,
+      s.sessionCap ?? (unlockAll ? 40 : 15),
       adaptive,
       down,
       s.userLevel,
@@ -698,9 +698,9 @@ export const useStore = create<State>()(
       setDailyGoal: (dailyGoal) => set({ dailyGoal }),
       applyHintCost: (n) => set((s) => ({ xp: Math.max(0, s.xp - n) })),
 
-      startDaily: () => {
+      startDaily: (cap) => {
         track('session_started', { kind: 'daily' });
-        set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
+        set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, ...FRESH_SESSION, sessionCap: cap ?? null });
         get().rebuildSession();
       },
       startTrack: (slug, level, cap) => {
@@ -718,9 +718,9 @@ export const useStore = create<State>()(
         set({ sessionKind: 'saved', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
-      startWeakspot: () => {
+      startWeakspot: (cap) => {
         track('session_started', { kind: 'weakspot' });
-        set({ sessionKind: 'weakspot', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
+        set({ sessionKind: 'weakspot', trackSlug: null, lessonIdx: null, ...FRESH_SESSION, sessionCap: cap ?? null });
         get().rebuildSession();
       },
       startBasics: () => {
@@ -728,9 +728,9 @@ export const useStore = create<State>()(
         set({ sessionKind: 'basics', trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
         get().rebuildSession();
       },
-      startCompany: (key) => {
+      startCompany: (key, cap) => {
         track('session_started', { kind: 'company', company: key });
-        set({ sessionKind: 'company', companyKey: key, trackSlug: null, lessonIdx: null, ...FRESH_SESSION });
+        set({ sessionKind: 'company', companyKey: key, trackSlug: null, lessonIdx: null, ...FRESH_SESSION, sessionCap: cap ?? null });
         get().rebuildSession();
       },
       startIncident: (id) => {
@@ -754,12 +754,14 @@ export const useStore = create<State>()(
         get().rebuildSession();
       },
       exitTrack: () => {
-        set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null });
+        // sessionCap must clear here: the daily deck honors it now, and a leftover quick-rep cap
+        // would silently shrink the home queue.
+        set({ sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, sessionCap: null });
         get().rebuildSession();
       },
       endSession: () => {
         // Abandoned ≠ done — drop any autopilot tag so the plan item stays open.
-        set({ inSession: false, sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, pendingAutopilotItem: null });
+        set({ inSession: false, sessionKind: 'daily', trackSlug: null, lessonIdx: null, idx: 0, reveal: false, lastChoice: null, pendingAutopilotItem: null, sessionCap: null });
         get().rebuildSession();
       },
       completeOnboarding: (role, mode, level) => {

@@ -13,6 +13,7 @@
 import { COMPANY_SETS } from './companySets';
 import { bankForTrack, firstLessonAtLevel, type Level, lessonCount, lessonDeck, trackBySlug, tracksForRole } from './content';
 import { buildCramPlan, daysUntil } from './cramPlan';
+import { hasMockDeck } from './mock';
 import { axisForTrack, readinessAxes } from './readiness';
 import type { RoleKey } from './roles';
 import { spineForRole } from './spine';
@@ -205,6 +206,10 @@ export function buildAutopilot(inputs: AutopilotInputs): AutopilotPlan {
     return null;
   };
 
+  // A Mock Day needs a runnable mock — roles whose banks hold no auto-gradable MCQs
+  // (e.g. Project Manager) must not be scheduled an activity that opens to "0 questions".
+  const mockable = hasMockDeck(inputs.role);
+
   const days: AutopilotDay[] = [];
   const lastOffset = Math.min(raw, HORIZON_DAYS);
   for (const d of cramPlan.schedule) {
@@ -212,7 +217,7 @@ export function buildAutopilot(inputs: AutopilotInputs): AutopilotPlan {
     const isWarmUp = d.warmUp;
     // Mocks count backward from the day BEFORE the interview, every MOCK_INTERVAL days.
     const isMockDay =
-      !isWarmUp && raw >= 1 && d.offset <= raw - 1 && (raw - 1 - d.offset) % MOCK_INTERVAL === 0 && (d.offset >= 1 || raw === 1);
+      mockable && !isWarmUp && raw >= 1 && d.offset <= raw - 1 && (raw - 1 - d.offset) % MOCK_INTERVAL === 0 && (d.offset >= 1 || raw === 1);
 
     const items: PlanItem[] = [];
     const dn = (id: string) => (d.offset === 0 ? doneSet.has(id) : false);
@@ -244,13 +249,16 @@ export function buildAutopilot(inputs: AutopilotInputs): AutopilotPlan {
       }
     } else if (cram) {
       // <3 days: no new material — review + weak spots + (company) only.
+      // Weak spots take the REMAINDER so the rows sum to the day's advertised target.
+      const reviewCards = Math.max(4, Math.round(d.target * 0.25));
+      const companyCards = companySet && inputs.targetCompanyKey ? Math.max(3, Math.round(d.target * 0.35)) : 0;
       items.push({
         id: `${d.date}:review`,
         kind: 'review',
         title: 'Clear your due cards',
         sub: 'The scheduled queue first',
         icon: '📚',
-        cards: Math.max(4, Math.round(d.target * 0.25)),
+        cards: reviewCards,
         done: dn(`${d.date}:review`),
       });
       items.push({
@@ -259,34 +267,37 @@ export function buildAutopilot(inputs: AutopilotInputs): AutopilotPlan {
         title: 'Weak-spots drill',
         sub: 'Your most-missed cards, weakest first',
         icon: '🎯',
-        cards: Math.round(d.target * (companySet ? 0.4 : 0.75)),
+        cards: Math.max(2, d.target - reviewCards - companyCards),
         done: dn(`${d.date}:weakspot`),
       });
-      if (companySet && inputs.targetCompanyKey) {
+      if (companyCards > 0 && inputs.targetCompanyKey) {
         items.push({
           id: `${d.date}:company`,
           kind: 'company',
-          title: `${companySet.label} drill`,
+          title: `${companySet!.label} drill`,
           sub: 'Your target company’s ranked pack',
-          icon: companySet.emoji,
-          cards: Math.round(d.target * 0.35),
+          icon: companySet!.emoji,
+          cards: companyCards,
           companyKey: inputs.targetCompanyKey,
           done: dn(`${d.date}:company`),
         });
       }
     } else {
-      // Normal day: review ~20% → lessons ~50% → company ~15% → weak spots remainder.
+      // Normal day: review ~20% → lessons ~50% → company ~15% → weak spots take the REMAINDER,
+      // so the day's rows sum to the advertised "~N cards" target instead of drifting under it.
       const mockCost = isMockDay ? 8 : 0;
       const budget = Math.max(8, d.target - mockCost);
+      const reviewCards = Math.max(2, Math.round(budget * 0.2));
       items.push({
         id: `${d.date}:review`,
         kind: 'review',
         title: 'Clear your due cards',
         sub: 'The scheduled queue first',
         icon: '📚',
-        cards: Math.max(2, Math.round(budget * 0.2)),
+        cards: reviewCards,
         done: dn(`${d.date}:review`),
       });
+      let lessonCards = 0;
       const nLessons = Math.max(1, Math.round((budget * 0.5) / LESSON_SIZE));
       for (let i = 0; i < nLessons; i++) {
         const l = takeLesson();
@@ -306,15 +317,18 @@ export function buildAutopilot(inputs: AutopilotInputs): AutopilotPlan {
           // future days are projections and always open).
           done: d.offset === 0 ? lessonDone(l.slug, l.lessonIdx, inputs.progress) : false,
         });
+        lessonCards += LESSON_SIZE;
       }
+      let companyCards = 0;
       if (companySet && inputs.targetCompanyKey) {
+        companyCards = Math.max(3, Math.round(budget * 0.15));
         items.push({
           id: `${d.date}:company`,
           kind: 'company',
           title: `${companySet.label} drill`,
           sub: 'Your target company’s ranked pack',
           icon: companySet.emoji,
-          cards: Math.max(3, Math.round(budget * 0.15)),
+          cards: companyCards,
           companyKey: inputs.targetCompanyKey,
           done: dn(`${d.date}:company`),
         });
@@ -325,7 +339,7 @@ export function buildAutopilot(inputs: AutopilotInputs): AutopilotPlan {
         title: 'Weak-spots drill',
         sub: 'Your most-missed cards, weakest first',
         icon: '🎯',
-        cards: Math.max(3, Math.round(budget * 0.15)),
+        cards: Math.max(2, budget - reviewCards - lessonCards - companyCards),
         done: dn(`${d.date}:weakspot`),
       });
     }

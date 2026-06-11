@@ -1,6 +1,6 @@
 import { GENERATED, GeneratedCard } from './content.generated';
 import lessonTitlesData from './lesson-titles.json';
-import { freshCount, freshForTrack, freshPackCards, freshPackCount, freshSessionCards } from './fresh';
+import { freshCount, freshForTrack, freshForTracks, freshPackCards, freshPackCount, freshSessionCards } from './fresh';
 import { lessonsForTrack, seedLessonCount } from './lessons';
 import { Group, ROLE_TRACKS } from './roles';
 import { SCENARIOS } from './scenarios';
@@ -1031,16 +1031,36 @@ export function dailyPool(domain: DomainFilter, now: number): SessionCard[] {
   ];
 }
 
-/** Role-precise daily pool: scenarios + fresh trickle + curated highlights + the role's own bank. */
+/**
+ * Role-precise daily pool: scenarios + fresh trickle + curated highlights + the role's own bank.
+ * Every extra stream is filtered to the ROLE'S TRACKS, not just the de/ai domain — domain-only
+ * filtering fed a Project Manager Spark-OOM scenarios and Databricks release cards because their
+ * tracks happen to share the 'de' domain. Scenario/DAILY cards carry the track NAME in `tool`,
+ * fresh cards carry the track SLUG, so both can be matched against the role registry.
+ */
 export function dailyPoolForRole(roleKey: string, now: number): SessionCard[] {
-  const domain = roleDomain(roleKey);
-  const daily = DAILY.filter((c) => domain === 'all' || tkDomain(c.tk) === domain);
+  if (roleKey === 'all') return dailyPool('all', now);
+  const tracks = tracksForRole(roleKey);
+  const names = new Set(tracks.map((t) => t.name));
+  const slugs = new Set(tracks.map((t) => t.slug));
   return [
-    ...scenarioCards(domain),
-    ...freshSessionCards(now, domain, 2),
-    ...daily,
+    ...scenarioCards('all').filter((c) => names.has(c.tool)),
+    ...freshForTracks(now, slugs, 2),
+    ...DAILY.filter((c) => names.has(c.tool)),
     ...bankForRole(roleKey),
   ];
+}
+
+/**
+ * The "Stay current" stream through the role lens: fresh cards bound to the role's own tracks.
+ * Falls back to the role-domain stream when the role has no track-bound fresh cards (so the
+ * screen never dead-ends), and to everything for 'all'.
+ */
+export function freshSessionCardsForRole(roleKey: string, now: number, limit = Number.POSITIVE_INFINITY): SessionCard[] {
+  if (roleKey === 'all') return freshSessionCards(now, 'all', limit);
+  const slugs = new Set(tracksForRole(roleKey).map((t) => t.slug));
+  const scoped = freshForTracks(now, slugs, limit);
+  return scoped.length ? scoped : freshSessionCards(now, roleDomain(roleKey), limit);
 }
 
 /**

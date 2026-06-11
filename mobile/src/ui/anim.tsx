@@ -3,7 +3,7 @@
  * reanimated. Every component honors the OS "reduce motion" setting.
  */
 import { ReactNode, useEffect, useRef, useState } from 'react';
-import { type AccessibilityRole, Pressable, StyleProp, Text, TextStyle, View, ViewStyle } from 'react-native';
+import { type AccessibilityRole, Platform, Pressable, StyleProp, Text, TextStyle, View, ViewStyle } from 'react-native';
 import Animated, {
   Easing,
   FadeInDown,
@@ -186,12 +186,16 @@ export function Shake({ trigger, children, style }: { trigger: unknown; children
 }
 
 /** Slide+fade entrance — key this on the card index so it re-mounts and replays per card.
- *  Pass `delay` (ms) to stagger a list of entering cards. */
+ *  Pass `delay` (ms) to stagger a list of entering cards.
+ *  Web renders WITHOUT the entrance: reanimated entering-animations on web mount the node
+ *  invisible/translated for a beat (screens read as dimmed/blank) and the resulting layout
+ *  shift can swallow the first click. Native keeps the Duolingo feel. */
 export function CardEnter({ children, style, delay = 0 }: { children: ReactNode; style?: StyleProp<ViewStyle>; delay?: number }) {
   const reduced = useReducedMotion();
+  const skip = reduced || Platform.OS === 'web';
   return (
     <Animated.View
-      entering={reduced ? undefined : FadeInDown.duration(240).delay(delay).easing(Easing.out(Easing.cubic))}
+      entering={skip ? undefined : FadeInDown.duration(240).delay(delay).easing(Easing.out(Easing.cubic))}
       style={style}>
       {children}
     </Animated.View>

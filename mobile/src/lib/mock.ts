@@ -30,6 +30,18 @@ export function correctIndex(card: SessionCard): number {
 }
 
 /**
+ * Whether `role` has ANY auto-gradable (timed-round) cards. Gates every "enter a timed round"
+ * surface — the mock screen, the weekly-contest banner, and Autopilot's scheduled Mock Days —
+ * so roles whose banks hold no MCQs (e.g. Project Manager) aren't sold a feature that
+ * dead-ends at "0 questions".
+ */
+export function hasMockDeck(role: string): boolean {
+  return tracksForRole(role)
+    .filter((t) => t.group === 'concept' || t.group === 'coding')
+    .some((t) => bankForTrack(t.slug).some(isGradable));
+}
+
+/**
  * Build a 6–8 card mock round for `role`.
  *
  * Strategy: gather every unique card across the role's tracks, keep only auto-gradable MCQs

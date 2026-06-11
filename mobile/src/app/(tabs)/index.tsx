@@ -1,6 +1,6 @@
 import { BlurView } from 'expo-blur';
-import { type Href, router } from 'expo-router';
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { type Href, router, useFocusEffect } from 'expo-router';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Modal, Platform, Pressable, ScrollView, TextInput, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
@@ -21,7 +21,7 @@ import {
   checkpointCount,
   checkpointKey,
   firstLessonAtLevel,
-  freshSessionCards,
+  freshSessionCardsForRole,
   lessonDeck,
   lessonCount,
   lessonTitle,
@@ -29,7 +29,6 @@ import {
   LEVEL_OPTIONS,
   levelIndex,
   levelLabel,
-  roleDomain,
   searchCards,
   Track,
   trackBySlug,
@@ -40,6 +39,7 @@ import {
 import { basicsForRole } from '../../lib/basics';
 import { nextSpineStep, spineDays } from '../../lib/spine';
 import { daysLeftInWeek } from '../../lib/leagues';
+import { hasMockDeck } from '../../lib/mock';
 import { coreTracksForRole, GROUP_LABEL, groupOrderForRole, roleByKey } from '../../lib/roles';
 import { CardState } from '../../lib/srs';
 import { isDev, isProActive, level, useStore, xpInLevel } from '../../lib/store';
@@ -264,7 +264,12 @@ function LearnPath() {
                   <ContinueHero action={action} />
                 </CardEnter>
                 <CardEnter>
-                  <DailyStrip heroKind={action.kind} />
+                  {/* When the Autopilot hero IS the review item, treat it as 'review' so the strip
+                      drops its Review pill — otherwise "Clear your due cards" shows three times
+                      (hero + plan row + pill), three buttons for one action. */}
+                  <DailyStrip
+                    heroKind={action.kind === 'autopilot' && action.item?.kind === 'review' ? 'review' : action.kind}
+                  />
                 </CardEnter>
                 <CardEnter delay={50}>
                   {/* Each quest opens the session that actually advances it: fresh stream for "review a
@@ -859,6 +864,15 @@ function PlanList() {
 /** Weekly contest entry — a ranked, timed round; the countdown is days left this week. */
 function ContestBanner() {
   const { c, track } = useTheme();
+  const role = useStore((s) => s.role);
+  // Recompute the countdown when the tab regains focus — this banner can stay mounted across a
+  // UTC week-boundary, and a stale number here disagreed with the contest page's fresh one.
+  const [, setTick] = useState(0);
+  useFocusEffect(useCallback(() => setTick((n) => n + 1), []));
+  // The contest reuses the mock deck — a role with no auto-gradable cards (e.g. Project Manager)
+  // can't enter, so don't advertise "Enter ▶" into a dead-end.
+  const canEnter = useMemo(() => hasMockDeck(role), [role]);
+  if (!canEnter) return null;
   const days = daysLeftInWeek();
   return (
     <PressableScale onPress={() => router.push('/contest')} sound>
@@ -885,7 +899,7 @@ function DailyStrip({ heroKind }: { heroKind: NextAction['kind'] }) {
   const unlocked = useStore(isProActive);
   // "Stay current" stays VISIBLE whenever the role has any live fresh cards — it's a permanent place to
   // review what shipped (manual or auto adds land here). The badge counts only the NEW (unseen) ones.
-  const freshDeck = freshSessionCards(Date.now(), roleDomain(role));
+  const freshDeck = freshSessionCardsForRole(role, Date.now());
   const freshUnseen = freshDeck.filter((cd) => (progress[cd.id]?.reps ?? 0) === 0).length;
   const pills: { key: string; icon: string; label: string; n: number; onPress: () => void; color: string; pro?: boolean; a11y?: string }[] = [];
   if (heroKind !== 'review') pills.push({ key: 'review', icon: '📚', label: 'Review', n: due, onPress: startDaily, color: c.navy });

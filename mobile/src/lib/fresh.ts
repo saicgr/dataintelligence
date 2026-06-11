@@ -334,6 +334,15 @@ export function freshSessionCards(
   return capped.map((c) => toCard(c, now));
 }
 
+/** Free fresh cards bound to ANY of the given track slugs — the role-precise stream/trickle.
+ *  Domain filtering alone is too coarse: a Project Manager's tracks live in 'de', but Spark or
+ *  Databricks release cards are not their prep. */
+export function freshForTracks(now: number, slugs: ReadonlySet<string>, limit = Number.POSITIVE_INFINITY): SessionCard[] {
+  const live = liveFresh(now).filter((c) => !c.packId && !!c.track && slugs.has(c.track!));
+  const capped = Number.isFinite(limit) ? live.slice(0, limit) : live;
+  return capped.map((c) => toCard(c, now));
+}
+
 /** Free fresh cards bound to a specific track slug — appended to that track's bank so stay-current
  *  items live INSIDE the track (lessons/Path), not only in the aggregate "Stay current" session. */
 export function freshForTrack(now: number, slug: string): SessionCard[] {
