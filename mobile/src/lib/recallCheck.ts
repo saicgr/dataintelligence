@@ -27,7 +27,19 @@ function hashSeed(seed: string): number {
   return h >>> 0;
 }
 
-const usable = (s: string | undefined): s is string => !!s && s.trim().length > 0 && s.length <= MAX_LEN;
+/**
+ * Grader-rubric tells ("Explains X…", "Describes Y without mentioning Z…") read as a rubric,
+ * not as something a candidate would SAY — rendering them as quiz options looks broken.
+ * Conservative opener list on purpose: noun-led tells that happen to look like verbs
+ * ("References are syntactic sugar…", "Maps in Go are iterated…") must stay usable, and a
+ * missed rubric tell merely degrades to the plain Reveal button. The content itself is being
+ * rewritten to spoken style; this guard covers stragglers and future OTA cards.
+ */
+const RUBRIC_OPENER =
+  /^(Explains|Describes|Distinguishes|Mentions|Identifies|Lists|Demonstrates|Recognizes|Articulates|Highlights|Recommends|Proposes|Compares|Contrasts|Cites|Outlines|Quantifies|Acknowledges|Anticipates|Discusses|Emphasizes|Evaluates|Glosses|Ignores|Justifies|Leverages|Misses|Omits|Overlooks|Prioritizes|Summarizes|Vaguely|Correctly|Confuses|Walks through|Calls out|Fails to|Says ['"‘“])/;
+
+const usable = (s: string | undefined): s is string =>
+  !!s && s.trim().length > 0 && s.length <= MAX_LEN && !RUBRIC_OPENER.test(s.trim());
 
 /**
  * Build the pre-reveal check for a flip card, or null when the card's tells don't
