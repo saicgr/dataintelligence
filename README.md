@@ -1,45 +1,68 @@
-# ByteShards
+# ByteShards 👋
 
-A paid interview-prep platform for **Data Engineers and AI Engineers** — built around real questions saved from interview loops, not researched study guides.
+ByteShards is an [Expo](https://expo.dev) app (iOS / Android / web). This `main` branch is
+**mobile-only**: the native app plus its web export hosted on Vercel. The previous full web
+platform (Next.js site, Stripe, SEO pages) lives on the `full-platform` branch.
 
-- **Two tracks, 10 tools, 3 levels (30 sheets):** Data Engineering (Snowflake, dbt, Airflow, Kafka, Spark, Databricks) and AI Engineering (LLMs & Prompting, RAG & Retrieval, Vector Databases, Agents & Evals).
-- **Pricing:** $12 per (tool + level) sheet, $59 full-access bundle (one-time).
-- **Differentiators:** the Interviewer's Lens, Red/Green Zone risk ratings, Tool Comparison questions, Simulation Mode with AI grading, a tool×level Switcher (upsell surface), Interview Countdown, Weak-Spot Detection, "I got asked this" social proof, confidence ratings, free-preview questions.
-- **Free funnel:** Daily Drill (PWA), multi-tool Job Board with live Greenhouse/Lever/RSS ingestion, Readiness & What-Tool quizzes, Salary Benchmarks.
-- **SEO:** 30 programmatic tool×level landing pages, X-vs-Y compare pages, glossary, MDX field-notes blog, Question of the Day, Most-Asked, sitemap/robots/JSON-LD/dynamic OG images.
+## Web hosting (Vercel)
 
-## Stack
-
-Next.js 14 (App Router) · TypeScript · Tailwind (light default + dark toggle) · Supabase (Auth + Postgres) · Stripe (one-time payments) · Anthropic (simulation grading) · deploy on Vercel.
-
-## Run it locally
-
-The app **builds and runs with zero keys** ("seed mode"): content ships in the bundle, a mock user owns every sheet, and progress persists in `localStorage`. Adding `.env.local` flips each subsystem to live with no code change.
+The web build is the Expo static export. Vercel is configured via `vercel.json`:
 
 ```bash
-npm install
-npm run dev          # keyless seed mode, http://localhost:3000
-# or, to also boot local Supabase (Postgres + Auth) if the Supabase CLI is installed:
-npm run dev:full
+expo export --platform web   # → ./dist (served by Vercel)
 ```
 
-`npm run build` · `npm run typecheck` · `npm run lint`.
+Vercel build command: `expo export --platform web`, output directory: `dist`.
 
-## Going live
+## Get started
 
-Copy `.env.example` → `.env.local` and fill in any subset:
+1. Install dependencies
 
-- **Supabase** (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`) — auth + persisted progress/entitlements. Apply `supabase/schema.sql` then `supabase/seed.sql`.
-- **Stripe** (`STRIPE_SECRET_KEY`, `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`) — checkout + the webhook that grants entitlements.
-- **Anthropic** (`ANTHROPIC_API_KEY`) — Simulation Mode AI grading (falls back to self-rate without it).
-- **Jobs** (`JOBS_GREENHOUSE_BOARDS`, `JOBS_LEVER_COMPANIES`, `CRON_SECRET`) — live job ingestion via the daily cron at `/api/jobs/ingest` (configured in `vercel.json`).
+   ```bash
+   npm install
+   ```
 
-## Layout
+2. Start the app
 
-- `app/(marketing)` — homepage, pricing
-- `app/(tools)` — free funnel tools (quizzes, salaries, jobs, daily drill)
-- `app/(seo)` — programmatic landing pages, compare, glossary, blog, QotD, most-asked
-- `app/(auth)` — magic-link login, paywall
-- `app/(dashboard)` — protected cheat-sheet dashboard, question detail, simulation
-- `lib/data` — content catalog + seed (source of truth, shipped in bundle)
-- `lib/catalog.ts`, `lib/entitlements.ts`, `middleware.ts` — tools/pricing, ownership, paywall
+   ```bash
+   npx expo start
+   ```
+
+In the output, you'll find options to open the app in a
+
+- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
+- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
+- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
+- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+
+You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+
+## Get a fresh project
+
+When you're ready, run:
+
+```bash
+npm run reset-project
+```
+
+This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+
+### Other setup steps
+
+- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
+- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
+- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+
+## Learn more
+
+To learn more about developing your project with Expo, look at the following resources:
+
+- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
+- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+
+## Join the community
+
+Join our community of developers creating universal apps.
+
+- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
+- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.

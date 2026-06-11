@@ -6,7 +6,6 @@ The app runs **with zero config** (offline store, mock purchase, no-op analytics
 > Toolchain needs **Node 20+**. This machine defaults to Node 18 — run `nvm use 24` first.
 
 ```bash
-cd mobile
 nvm use 24
 cp .env.example .env     # then edit .env (it's gitignored)
 npm install
