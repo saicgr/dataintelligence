@@ -64,5 +64,5 @@ export function buildRecallCheck(card: SessionCard, pool: SessionCard[]): Recall
   const rot = seed % opts.length;
   const shuffled = [...opts.slice(rot), ...opts.slice(0, rot)];
 
-  return { prompt: 'Before you reveal — which is the senior take?', opts: shuffled };
+  return { prompt: 'Spot the senior answer', opts: shuffled };
 }

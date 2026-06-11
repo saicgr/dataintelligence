@@ -50,7 +50,12 @@ export function SessionView() {
 
   return (
     <View style={{ gap: space.md }}>
-      <ProgressBar value={len ? Math.min(finishedAt ?? idx, len) / len : 0} label={done ? 'Done' : `${idx + 1} / ${len}`} />
+      <Row style={{ gap: 10 }}>
+        <View style={{ flex: 1 }}>
+          <ProgressBar value={len ? Math.min(finishedAt ?? idx, len) / len : 0} label={done ? 'Done' : `${idx + 1} / ${len}`} />
+        </View>
+        <SessionVitals />
+      </Row>
       {done ? (
         <Done cardsDone={finishedAt ?? len} />
       ) : atCheckpoint ? (
@@ -126,6 +131,51 @@ function ProgressBar({ value, label }: { value: number; label: string }) {
   );
 }
 
+/** Live in-session feedback (Duolingo juice): ⚡XP counts up per card, 🔥 combo grows on
+ *  consecutive correct, and a miss flashes 💔 where the combo was. Feedback only — no
+ *  hearts GATE: punishing "Again" would teach users to stop grading themselves honestly,
+ *  which is the one behavior spaced repetition depends on. */
+function SessionVitals() {
+  const { c } = useTheme();
+  const sessionXp = useStore((s) => s.sessionXp);
+  const combo = useStore((s) => s.sessionCombo);
+  const agains = useStore((s) => s.sessionAgains);
+  const [broke, setBroke] = useState(false);
+  const prevAgains = useRef(agains);
+  useEffect(() => {
+    if (agains > prevAgains.current) {
+      setBroke(true);
+      const t = setTimeout(() => setBroke(false), 1200);
+      prevAgains.current = agains;
+      return () => clearTimeout(t);
+    }
+    prevAgains.current = agains;
+  }, [agains]);
+  return (
+    <Row style={{ gap: 8 }}>
+      {broke ? (
+        <Pop trigger={agains}>
+          <T size={13} weight="900">💔</T>
+        </Pop>
+      ) : combo >= 2 ? (
+        <Pop trigger={combo}>
+          <Row style={{ gap: 2 }}>
+            <T size={12} weight="900" color="#f76707">🔥</T>
+            <T size={12} weight="900" color="#f76707">x{combo}</T>
+          </Row>
+        </Pop>
+      ) : null}
+      <Pop trigger={sessionXp}>
+        <Row style={{ gap: 2, backgroundColor: c.navy + '1f', borderRadius: 999, paddingVertical: 3, paddingHorizontal: 9 }}>
+          <T size={11.5} weight="900" color={c.navy}>⚡</T>
+          <CountUp to={sessionXp} style={{ fontSize: 11.5, fontWeight: '900', color: c.navy }} />
+          <T size={11.5} weight="900" color={c.navy}> XP</T>
+        </Row>
+      </Pop>
+    </Row>
+  );
+}
+
 function CardView() {
   const { c, track } = useTheme();
   const router = useRouter();
@@ -153,7 +203,6 @@ function CardView() {
   const [checkOk, setCheckOk] = useState<boolean | null>(null);
   // Jot coverage (#16): when you typed/dictated a recall attempt, score it against the key points.
   const [jotTicks, setJotTicks] = useState<boolean[] | null>(null);
-  const revealTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const jotRef = useRef<TextInput>(null);
   const tx = useSharedValue(0);
   useEffect(() => {
@@ -163,18 +212,8 @@ function CardView() {
     setCheckOk(null);
     setJotTicks(null);
   }, [idx, tx]);
-  useEffect(() => () => {
-    if (revealTimer.current) clearTimeout(revealTimer.current);
-  }, []);
-  // Auto-reveal after a recall-check pick. Effect-driven (not a timer set inside onPress) so a
-  // re-render between pick and fire can't strand the user on an answered-but-unrevealed card.
-  useEffect(() => {
-    if (checkPick == null || reveal) return;
-    revealTimer.current = setTimeout(doReveal, 550);
-    return () => {
-      if (revealTimer.current) clearTimeout(revealTimer.current);
-    };
-  }, [checkPick, reveal, doReveal]);
+  // NO auto-reveal after a recall-check pick (it used to fire after 550ms — too fast to read
+  // which option was right). The verdict banner + Continue button make it self-paced instead.
   const flipPoints = card && card.kind === 'flip' ? extractKeyPoints(card, 5) : [];
   useEffect(() => {
     if (reveal && jot.trim().length > 0 && flipPoints.length >= 2 && jotTicks == null) {
@@ -300,9 +339,21 @@ function CardView() {
                   sourceLabel={card.sourceLabel}
                   publishedAt={card.publishedAt}>
                   {checkOk != null && (
-                    <T muted size={11.5} weight="800" style={{ marginTop: 12 }}>
-                      {checkOk ? '✓ You spotted the senior take — suggested: Got it' : '✗ You picked the trap — suggested: Again'}
-                    </T>
+                    <View
+                      style={{
+                        marginTop: 12,
+                        backgroundColor: (checkOk ? c.success : c.danger) + '14',
+                        borderLeftWidth: 3,
+                        borderLeftColor: checkOk ? c.success : c.danger,
+                        borderRadius: 8,
+                        padding: 9,
+                      }}>
+                      <T size={11.5} weight="800" color={checkOk ? c.success : c.danger}>
+                        {checkOk
+                          ? '✓ You spotted the senior take — suggested: Got it'
+                          : '✗ You picked the trap — it returns at the end of this session'}
+                      </T>
+                    </View>
                   )}
                   {jotTicks != null && (
                     <View style={{ marginTop: 12, gap: 7 }}>
@@ -333,10 +384,12 @@ function CardView() {
                       </Row>
                     </View>
                   )}
+                  {/* A wrong recall pick re-queues the card this session no matter how kindly
+                      it's self-graded — the in-session retry promise must hold. */}
                   <Row style={{ gap: 9, marginTop: checkOk != null || jotTicks != null ? 8 : 14 }}>
                     <RateBtn label="🔁 Again" sub={dueLabel('again')} kind="again" suggested={suggestedGrade === 'again'} onPress={() => { answerFeedback(false); rate('again'); }} />
-                    <RateBtn label="✅ Got it" sub={dueLabel('good')} kind="good" suggested={suggestedGrade === 'good'} onPress={() => { answerFeedback(true); rate('good'); }} />
-                    <RateBtn label="⚡ Easy" sub={dueLabel('easy')} kind="easy" suggested={suggestedGrade === 'easy'} onPress={() => { sfx.correct(); haptic.success(); rate('easy'); }} />
+                    <RateBtn label="✅ Got it" sub={dueLabel('good')} kind="good" suggested={suggestedGrade === 'good'} onPress={() => { answerFeedback(true); rate('good', { retry: checkOk === false }); }} />
+                    <RateBtn label="⚡ Easy" sub={dueLabel('easy')} kind="easy" suggested={suggestedGrade === 'easy'} onPress={() => { sfx.correct(); haptic.success(); rate('easy', { retry: checkOk === false }); }} />
                   </Row>
                   <Row style={{ justifyContent: 'space-between', marginTop: 12 }}>
                     <T muted size={11.5} weight="800">← swipe: Again</T>
@@ -411,6 +464,8 @@ function CardView() {
                         {check.opts.map((o, i) => {
                           const picked = checkPick === i;
                           const showState = checkPick != null;
+                          // Picked-and-right gets the green treatment on YOUR option (not just the
+                          // answer key) — the tester couldn't tell which one they'd selected.
                           const bd = showState && o.ok ? c.success : picked ? c.danger : c.border;
                           return (
                             <Pressable
@@ -421,7 +476,6 @@ function CardView() {
                                 setCheckOk(o.ok);
                                 noteCheck(o.ok);
                                 answerFeedback(o.ok);
-                                // Reveal is scheduled by the checkPick effect above.
                               }}
                               style={{
                                 borderWidth: 2,
@@ -431,13 +485,44 @@ function CardView() {
                                 backgroundColor: showState && o.ok ? c.success + '14' : picked ? c.danger + '12' : c.surface,
                                 opacity: showState && !o.ok && !picked ? 0.55 : 1,
                               }}>
-                              <T size={12.5} style={{ lineHeight: 18 }}>{o.t}</T>
+                              <Row style={{ gap: 7, alignItems: 'flex-start' }}>
+                                {showState && (o.ok || picked) ? (
+                                  <T size={12.5} weight="900" color={o.ok ? c.success : c.danger}>{o.ok ? '✓' : '✗'}</T>
+                                ) : null}
+                                <T size={12.5} style={{ lineHeight: 18, flex: 1 }}>{o.t}</T>
+                                {picked ? <T size={10} weight="800" color={o.ok ? c.success : c.danger}>your pick</T> : null}
+                              </Row>
                             </Pressable>
                           );
                         })}
-                        <Pressable onPress={doReveal} hitSlop={6} style={{ alignSelf: 'center', marginTop: 2 }}>
-                          <T muted size={11.5} weight="800">skip → just reveal</T>
-                        </Pressable>
+                        {checkPick == null ? (
+                          <Pressable onPress={doReveal} hitSlop={6} style={{ alignSelf: 'center', marginTop: 2 }}>
+                            <T muted size={11.5} weight="800">skip → just reveal</T>
+                          </Pressable>
+                        ) : (
+                          // Duolingo moment: a verdict banner + self-paced Continue (the old 550ms
+                          // auto-reveal yanked the colors away before they could be read).
+                          <View
+                            style={{
+                              backgroundColor: (checkOk ? c.success : c.danger) + '18',
+                              borderColor: checkOk ? c.success : c.danger,
+                              borderWidth: 1.5,
+                              borderRadius: radius.md,
+                              padding: 12,
+                              gap: 9,
+                              marginTop: 2,
+                            }}>
+                            <T weight="900" size={13.5} color={checkOk ? c.success : c.danger}>
+                              {checkOk ? '✓ That’s the senior take!' : '✗ That’s the junior trap'}
+                            </T>
+                            {!checkOk && (
+                              <T size={11.5} muted style={{ lineHeight: 16 }}>
+                                The senior answer is highlighted green — this card comes back at the end of the session.
+                              </T>
+                            )}
+                            <Btn label="Continue →" variant={checkOk ? 'green' : 'navy'} onPress={doReveal} />
+                          </View>
+                        )}
                       </View>
                     );
                   })()}
@@ -459,7 +544,9 @@ function CardView() {
                     }
                     const correctIdx = card.opts?.findIndex((o) => o.ok) ?? -1;
                     const wrong = lastChoice != null && lastChoice !== correctIdx;
-                    rate(card.strict && wrong ? 'again' : 'good');
+                    // Non-strict wrong picks keep the gentle 'good' SRS grade but still re-queue
+                    // this session — a missed MCQ should come back, Duolingo-style.
+                    rate(card.strict && wrong ? 'again' : 'good', { retry: wrong });
                   }}
                 />
                 {reveal && (
@@ -1054,6 +1141,7 @@ function Done({ cardsDone }: { cardsDone?: number }) {
   const sessionXp = useStore((s) => s.sessionXp);
   const sessionHits = useStore((s) => s.sessionHits);
   const sessionMisses = useStore((s) => s.sessionMisses);
+  const bestCombo = useStore((s) => s.sessionBestCombo);
   const progress = useStore((s) => s.progress);
   const goalMet = cardsToday >= dailyGoal;
   const checks = sessionHits + sessionMisses;
@@ -1089,6 +1177,9 @@ function Done({ cardsDone }: { cardsDone?: number }) {
       </Row>
       <Row style={{ marginTop: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
         <Chip label={`📈 ${Math.min(cardsToday, dailyGoal)}/${dailyGoal} today`} kind="amber" />
+        {bestCombo >= 3 && (
+          <Chip label={`🔥 best run x${bestCombo} · +${Math.min(5, Math.ceil(bestCombo / 3))} XP combo`} kind="amber" />
+        )}
         {freezes > 0 && <Chip label={`🧊 ${freezes} freeze${freezes > 1 ? 's' : ''}`} kind="amber" />}
       </Row>
       <T muted size={12.5} style={{ marginTop: 12, textAlign: 'center', lineHeight: 19 }}>

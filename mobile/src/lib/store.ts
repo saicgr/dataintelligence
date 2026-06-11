@@ -244,6 +244,12 @@ interface State {
   sessionXp: number;
   sessionHits: number;
   sessionMisses: number;
+  /** Consecutive non-Again ratings this session (Duolingo combo); Again resets it. */
+  sessionCombo: number;
+  /** Count of Again ratings this session — drives the 💔 moment in SessionVitals. */
+  sessionAgains: number;
+  /** Best consecutive-correct run this session — pays the Duolingo-style combo bonus at the end. */
+  sessionBestCombo: number;
   // One-shot halo on the ContinueHero right after onboarding (cleared on first press).
   heroPulse: boolean;
 
@@ -316,7 +322,9 @@ interface State {
   rebuildSession: () => void;
   doReveal: () => void;
   choose: (i: number) => void;
-  rate: (r: Rating) => void;
+  /** `retry` marks an objectively-missed card (wrong recall pick / wrong MCQ) so it re-queues
+   *  at the end of this session even when the user self-grades it kindly. */
+  rate: (r: Rating, o?: { retry?: boolean }) => void;
   /** Schedule-only grade for a card outside the live session (audio recall #16). No idx/streak side effects. */
   rateById: (cardId: string, r: Rating) => void;
   toggleSave: (id: string) => void;
@@ -440,6 +448,9 @@ const FRESH_SESSION = {
   sessionXp: 0,
   sessionHits: 0,
   sessionMisses: 0,
+  sessionCombo: 0,
+  sessionAgains: 0,
+  sessionBestCombo: 0,
   sessionCap: null,
 } as const;
 
@@ -541,6 +552,9 @@ export const useStore = create<State>()(
       sessionXp: 0,
       sessionHits: 0,
       sessionMisses: 0,
+      sessionCombo: 0,
+      sessionAgains: 0,
+      sessionBestCombo: 0,
       heroPulse: false,
 
       rebuildSession: () => {
@@ -788,7 +802,7 @@ export const useStore = create<State>()(
         if (st.userId) void pushProgress(st.userId, progress);
       },
 
-      rate: (r) => {
+      rate: (r, o) => {
         const st = get();
         const deck = st.sessionDeck;
         const card = deck[st.idx];
@@ -798,8 +812,29 @@ export const useStore = create<State>()(
         const firstEver = !!card && Object.keys(st.progress).length === 0;
         const progress = { ...st.progress };
         if (card) progress[card.id] = schedule(progress[card.id], r, now);
+        // Duolingo-style in-session retry: a card rated Again comes back at the END of this
+        // same session (re-tagged so the re-encounter explains itself). SRS scheduling above is
+        // untouched — this is the within-session loop, not the calendar. At most one pending
+        // copy; single-card sessions skip it (they would loop forever).
+        let sessionDeck = deck;
+        const missed = r === 'again' || !!o?.retry;
+        if (
+          missed &&
+          card &&
+          st.sessionKind !== 'single' &&
+          deck.length > 1 &&
+          !deck.slice(st.idx + 1).some((cd) => cd.id === card.id)
+        ) {
+          sessionDeck = [...deck, { ...card, tag: '↻ Missed earlier — round 2' }];
+        }
         const nextIdx = st.idx + 1;
-        const gain = xpFor(card?.kind, r);
+        const nextCombo = missed ? 0 : st.sessionCombo + 1;
+        const bestCombo = Math.max(st.sessionBestCombo, nextCombo);
+        const sessionDone = nextIdx >= sessionDeck.length;
+        // Duolingo combo bonus, paid once at session end and banded on the BEST run
+        // (streak 1-3 → +1 … 13+ → +5) — rewards sustained accuracy, never punishes a miss.
+        const comboBonus = sessionDone && bestCombo > 0 ? Math.min(5, Math.ceil(bestCombo / 3)) : 0;
+        const gain = xpFor(card?.kind, r) + comboBonus;
         const xp = st.xp + gain;
         // Session accuracy counts only OBJECTIVE formats (MCQ/production kinds, where the rating is
         // derived from correctness) — flip self-grades feed it via noteCheck() instead.
@@ -830,7 +865,7 @@ export const useStore = create<State>()(
         }
         let streakBrokenValue = st.streakBrokenValue;
         let streakBrokenDay = st.streakBrokenDay;
-        const done = nextIdx >= deck.length;
+        const done = sessionDone;
         if (done && lastActiveDay !== today) {
           if (lastActiveDay === dayKey(now - DAY)) {
             streak += 1;
@@ -868,9 +903,13 @@ export const useStore = create<State>()(
           reveal: false,
           lastChoice: null,
           xp,
+          sessionDeck,
           sessionXp: st.sessionXp + gain,
           sessionHits,
           sessionMisses,
+          sessionCombo: nextCombo,
+          sessionAgains: st.sessionAgains + (missed ? 1 : 0),
+          sessionBestCombo: bestCombo,
           weeklyXp,
           weeklyXpWeek: wk,
           streak,
@@ -883,7 +922,7 @@ export const useStore = create<State>()(
           cardsToday,
           reviewedTodayIds,
           goalDay,
-          sessionMeta: deckCounts(deck, progress, now),
+          sessionMeta: deckCounts(sessionDeck, progress, now),
         });
 
         // Duolingo feedback events → FeedbackBridge plays sound/haptic + level-up overlay.
@@ -912,7 +951,7 @@ export const useStore = create<State>()(
           // Re-engagement: reschedule the streak-at-risk nudge (no-op without notif permission).
           void scheduleStreakReminder(streak, st.restDays);
           if (st.userId) void touchFriendActivity(st.userId);
-          track('session_completed', { kind: st.sessionKind, count: deck.length });
+          track('session_completed', { kind: st.sessionKind, count: sessionDeck.length });
         }
 
         if (st.userId) {
