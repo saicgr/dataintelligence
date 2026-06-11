@@ -47,7 +47,7 @@ export const CERTS: CertDef[] = [
   {
     id: 'databricks-de-associate',
     name: 'Databricks Certified Data Engineer Associate',
-    shortName: 'DE Associate',
+    shortName: 'Databricks DE Associate',
     provider: 'databricks',
     level: 'associate',
     icon: '🏗️',
@@ -207,7 +207,7 @@ export const CERTS: CertDef[] = [
   {
     id: 'databricks-de-professional',
     name: 'Databricks Certified Data Engineer Professional',
-    shortName: 'DE Pro',
+    shortName: 'Databricks DE Pro',
     provider: 'databricks',
     level: 'professional',
     icon: '🏗️',
@@ -450,7 +450,7 @@ export const CERTS: CertDef[] = [
   {
     id: 'databricks-genai-associate',
     name: 'Databricks Certified Generative AI Engineer Associate',
-    shortName: 'GenAI Associate',
+    shortName: 'Databricks GenAI Eng',
     provider: 'databricks',
     level: 'associate',
     icon: '🤖',
@@ -636,7 +636,7 @@ export const CERTS: CertDef[] = [
   {
     id: 'databricks-context-engineer',
     name: 'Databricks Certified Context Engineer Associate',
-    shortName: 'Context Engineer',
+    shortName: 'Databricks Context Eng',
     provider: 'databricks',
     level: 'associate',
     icon: '🧠',
@@ -813,7 +813,7 @@ export const CERTS: CertDef[] = [
   {
     id: 'databricks-spark-developer',
     name: 'Databricks Certified Associate Developer for Apache Spark',
-    shortName: 'Spark Associate Dev',
+    shortName: 'Databricks Spark Dev',
     provider: 'databricks',
     level: 'associate',
     icon: '⚡',
@@ -1018,7 +1018,7 @@ export const CERTS: CertDef[] = [
   {
     id: 'databricks-data-analyst',
     name: 'Databricks Certified Data Analyst Associate',
-    shortName: 'DA Associate',
+    shortName: 'Databricks DA Associate',
     provider: 'databricks',
     level: 'associate',
     icon: '📊',
@@ -1239,7 +1239,7 @@ export const CERTS: CertDef[] = [
   {
     id: 'databricks-ml-associate',
     name: 'Databricks Certified Machine Learning Associate',
-    shortName: 'ML Associate',
+    shortName: 'Databricks ML Associate',
     provider: 'databricks',
     level: 'associate',
     icon: '🔬',
@@ -1381,7 +1381,7 @@ export const CERTS: CertDef[] = [
   {
     id: 'databricks-ml-professional',
     name: 'Databricks Certified Machine Learning Professional',
-    shortName: 'ML Pro',
+    shortName: 'Databricks ML Pro',
     provider: 'databricks',
     level: 'professional',
     icon: '🔬',
