@@ -1,4 +1,4 @@
--- FieldNotes mobile — 0002: per-card reactions (save / like / dislike).
+-- ByteShards mobile — 0002: per-card reactions (save / like / dislike).
 -- Local AsyncStorage is the source of truth for signed-out users; this table is the
 -- signed-in cross-device backup. Mirrors the card_progress shape + RLS exactly.
 

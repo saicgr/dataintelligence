@@ -1,4 +1,4 @@
-# FieldNotes
+# ByteShards
 
 A paid interview-prep platform for **Data Engineers and AI Engineers** — built around real questions saved from interview loops, not researched study guides.
 

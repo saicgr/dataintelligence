@@ -74,7 +74,7 @@ export function buildReadinessReport(inp: ReadinessReportInputs): string {
     : '';
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
-  <title>${esc(roleName)} readiness — FieldNotes</title>
+  <title>${esc(roleName)} readiness — ByteShards</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; color: #1a1d23; margin: 28px; max-width: 560px; }
@@ -94,7 +94,7 @@ export function buildReadinessReport(inp: ReadinessReportInputs): string {
   </style></head><body>
   <header>
     <h1>${esc(roleName)} — interview readiness</h1>
-    <div class="meta">exported ${date} · FieldNotes</div>
+    <div class="meta">exported ${date} · ByteShards</div>
   </header>
   <div class="score">${pct}%</div>
   <div class="label">${esc(readinessLabel(r))}</div>

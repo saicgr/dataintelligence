@@ -66,7 +66,7 @@ export default function RootLayout() {
       {/* Runtime <title> for web — the router's head manager otherwise overrides the
           +html.tsx shell title with an empty one. No-op on native. */}
       <Head>
-        <title>FieldNotes — Data & AI interview prep</title>
+        <title>ByteShards — Data & AI interview prep</title>
       </Head>
       <View
         style={

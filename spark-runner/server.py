@@ -1,5 +1,5 @@
 """
-FieldNotes Spark runner — executes candidate PySpark against sample data in
+ByteShards Spark runner — executes candidate PySpark against sample data in
 local mode and diffs vs a reference, mirroring the SQL/DuckDB correctness model.
 
 This is how platforms like Spark Playground / CodeInterview run PySpark: a
@@ -120,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "4000"))
-    print(f"▸ FieldNotes Spark runner on http://localhost:{port}  (warming up Spark...)")
+    print(f"▸ ByteShards Spark runner on http://localhost:{port}  (warming up Spark...)")
     try:
         get_spark()
         print("▸ Spark ready.")

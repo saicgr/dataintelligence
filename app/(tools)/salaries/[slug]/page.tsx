@@ -39,12 +39,12 @@ export function generateMetadata({
   params: Params;
 }): Metadata {
   const resolved = resolveSlug(params.slug);
-  if (!resolved) return { title: "Salary | FieldNotes" };
+  if (!resolved) return { title: "Salary | ByteShards" };
   const tool = TOOL_BY_SLUG[resolved.tool];
   const levelName = LEVEL_NAMES[resolved.level];
   const title = `What does a ${levelName} ${tool?.name ?? resolved.tool} Engineer earn in 2026?`;
   return {
-    title: `${title} | FieldNotes`,
+    title: `${title} | ByteShards`,
     description: `2026 salary benchmark for ${levelName} ${
       tool?.name ?? resolved.tool
     } Engineers — min, median and max total compensation across regions.`,

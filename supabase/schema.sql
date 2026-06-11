@@ -1,4 +1,4 @@
--- FieldNotes schema. Content is also shipped in lib/data/seed.ts (identical),
+-- ByteShards schema. Content is also shipped in lib/data/seed.ts (identical),
 -- so the app runs keyless; this DB holds the live copy + user state.
 
 -- ── enums ────────────────────────────────────────────────────────────────────

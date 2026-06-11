@@ -1,4 +1,4 @@
--- FieldNotes mobile — 0004: "most asked at <company>" community moat.
+-- ByteShards mobile — 0004: "most asked at <company>" community moat.
 -- Builds on the existing public.debriefs table (created in 0001) and complements the
 -- existing public.most_asked(text) RPC. This adds:
 --   1. company_most_asked(company_in, lim) — richer rows (topic, n, debriefs, share)

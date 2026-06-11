@@ -1,4 +1,4 @@
--- FieldNotes mobile — 0005: weekly leagues + leaderboard.
+-- ByteShards mobile — 0005: weekly leagues + leaderboard.
 -- (Spec called this "0001_leagues.sql"; renamed to 0005 so it sequences AFTER the existing
 --  0001_init … 0004 migrations — a second 0001 would never apply on an initialized DB.)
 --

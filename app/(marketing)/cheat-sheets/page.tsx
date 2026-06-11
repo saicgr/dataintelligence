@@ -6,7 +6,7 @@ import { BUNDLE_PRICE, TOOLS } from "@/lib/catalog";
 export const metadata: Metadata = {
   title: "Cheat Sheets — real interview questions for every data & AI tool",
   description:
-    "Browse all FieldNotes cheat sheets: Snowflake, dbt, Airflow, Kafka, Spark, Databricks, LLMs, RAG, vector DBs, agents, SQL, Python and more — across Junior, Mid and Senior. One-time price unlocks them all.",
+    "Browse all ByteShards cheat sheets: Snowflake, dbt, Airflow, Kafka, Spark, Databricks, LLMs, RAG, vector DBs, agents, SQL, Python and more — across Junior, Mid and Senior. One-time price unlocks them all.",
 };
 
 export default function CheatSheetsPage() {

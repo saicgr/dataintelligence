@@ -1,4 +1,4 @@
-# FieldNotes mobile — setup
+# ByteShards mobile — setup
 
 The app runs **with zero config** (offline store, mock purchase, no-op analytics). Fill in
 `.env` to light up each service. Every block is independent and optional.

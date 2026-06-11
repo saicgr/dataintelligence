@@ -63,7 +63,7 @@ export async function setDailyReminder(enabled: boolean, hour = 19): Promise<voi
     const body = TEASERS[new Date().getDate() % TEASERS.length];
     await N.scheduleNotificationAsync({
       identifier: REMINDER_ID,
-      content: { title: 'FieldNotes', body },
+      content: { title: 'ByteShards', body },
       trigger: {
         type: N.SchedulableTriggerInputTypes?.DAILY ?? 'daily',
         hour,

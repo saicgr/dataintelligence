@@ -22,7 +22,7 @@ export async function initAttribution(
 export async function createInviteLink(_userId: string | null): Promise<string | null> {
   if (!hasBranch) return null;
   // const branch = (await import('react-native-branch')).default;
-  // const buo = await branch.createBranchUniversalObject('invite', { title: 'FieldNotes' });
+  // const buo = await branch.createBranchUniversalObject('invite', { title: 'ByteShards' });
   // const { url } = await buo.generateShortUrl({ feature: 'invite', channel: 'share-card' });
   // return url;
   return null;

@@ -7,7 +7,7 @@ import { Card } from "@/components/ui/Card";
 import { fmtMoney } from "@/lib/utils";
 
 export const metadata: Metadata = {
-  title: "Data & AI Engineering Salaries (2026) | FieldNotes",
+  title: "Data & AI Engineering Salaries (2026) | ByteShards",
   description:
     "2026 salary benchmarks for Data & AI Engineers by tool and level — Snowflake, dbt, Airflow, Kafka, Spark, Databricks, LLMs, RAG, vector DBs and agents.",
 };

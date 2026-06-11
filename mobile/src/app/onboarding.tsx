@@ -265,7 +265,7 @@ function Showcase({ c }: { c: C }) {
         </T>
         <T size={11.5} weight="900" color={c.muted} style={{ letterSpacing: 1, marginTop: 2 }}>WHETHER YOU&apos;RE</T>
         <RotatingPhrase color={c.accentInk} items={['interviewing soon', 'breaking into Data/AI', 'staying current']} />
-        <T size={14.5} weight="800" style={{ marginTop: 1 }}>FieldNotes gets you sharp.</T>
+        <T size={14.5} weight="800" style={{ marginTop: 1 }}>ByteShards gets you sharp.</T>
         <Row style={{ gap: 7, backgroundColor: c.card, borderWidth: 1, borderColor: c.border, borderRadius: 999, paddingVertical: 6, paddingHorizontal: 13, marginTop: 6 }}>
           <T size={11.5} weight="900" color={c.accentInk}>senior-level reasoning</T>
           <T size={11.5} weight="900" color={c.border}>•</T>
@@ -1062,7 +1062,7 @@ function FounderNote({ c, mode }: { c: C; mode?: Mode }) {
         <T size={14} style={{ lineHeight: 22 }} color={c.fg}>
           So I built the prep I wish I&apos;d had: <T weight="800">real questions, the reasoning behind them,</T> and the stuff that shipped last week. Free to start. {closing}
         </T>
-        <T size={13.5} weight="900" color={c.accentInk}>— Chetan, FieldNotes</T>
+        <T size={13.5} weight="900" color={c.accentInk}>— Chetan, ByteShards</T>
       </View>
 
       <T muted size={12} style={{ textAlign: 'center', lineHeight: 18 }}>

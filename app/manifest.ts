@@ -2,8 +2,8 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "FieldNotes",
-    short_name: "FieldNotes",
+    name: "ByteShards",
+    short_name: "ByteShards",
     start_url: "/drill",
     display: "standalone",
     background_color: "#ffffff",

@@ -91,7 +91,7 @@ function LoginForm() {
     <Card className="w-full max-w-md">
       <form onSubmit={onSubmit} className="space-y-5">
         <div className="space-y-1">
-          <h1 className="text-xl font-bold text-fg">Sign in to FieldNotes</h1>
+          <h1 className="text-xl font-bold text-fg">Sign in to ByteShards</h1>
           <p className="text-sm text-muted">
             Enter your email and password.
           </p>

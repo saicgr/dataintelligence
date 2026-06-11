@@ -1,6 +1,6 @@
 # Home / Lock-Screen Widget + Live Activity — Setup Guide (plan #18)
 
-FieldNotes is a **managed Expo app (SDK 56)**. A native iOS widget cannot be
+ByteShards is a **managed Expo app (SDK 56)**. A native iOS widget cannot be
 built or run in Expo Go — it requires a Swift WidgetKit target compiled into a
 **custom dev/prod build via EAS**. This guide is the precise, current recipe to
 add that target. The JS half (`src/lib/widget.ts`) already exists and no-ops
@@ -97,8 +97,8 @@ If using **both** libraries:
       "frequentUpdates": true,
       "widgetsFolder": "widgets",
       "deploymentTarget": "16.2",
-      "groupIdentifier": "group.com.fieldnotes.app",
-      "keychainAccessGroup": "YOUR_TEAM_ID.com.fieldnotes.app"
+      "groupIdentifier": "group.com.byteshards.app",
+      "keychainAccessGroup": "YOUR_TEAM_ID.com.byteshards.app"
     }
   ]
 ]
@@ -116,9 +116,9 @@ but declare it explicitly so EAS provisioning picks it up:
 ```jsonc
 "ios": {
   "icon": "./assets/expo.icon",
-  "bundleIdentifier": "com.fieldnotes.app",
+  "bundleIdentifier": "com.byteshards.app",
   "entitlements": {
-    "com.apple.security.application-groups": ["group.com.fieldnotes.app"]
+    "com.apple.security.application-groups": ["group.com.byteshards.app"]
   },
   "infoPlist": {
     // required only if the Live Activity does frequent server/local updates
@@ -128,7 +128,7 @@ but declare it explicitly so EAS provisioning picks it up:
 }
 ```
 
-> Use a single canonical App Group id everywhere: **`group.com.fieldnotes.app`**.
+> Use a single canonical App Group id everywhere: **`group.com.byteshards.app`**.
 > It must match in: main-app entitlements, the widget target entitlements, the
 > `groupIdentifier` plugin option, and the Swift `UserDefaults(suiteName:)` call.
 
@@ -144,23 +144,23 @@ target name). Files:
 /** @type {import('@bacons/apple-targets/app.plugin').Config} */
 module.exports = {
   type: 'widget',
-  name: 'FieldNotesWidget',
+  name: 'ByteShardsWidget',
   // SwiftUI for the views, WidgetKit for the home/lock widget,
   // ActivityKit only if this target also hosts the Live Activity.
   frameworks: ['SwiftUI', 'WidgetKit', 'ActivityKit'],
   entitlements: {
-    'com.apple.security.application-groups': ['group.com.fieldnotes.app'],
+    'com.apple.security.application-groups': ['group.com.byteshards.app'],
   },
   deploymentTarget: '16.2',
 };
 ```
 
-### `targets/widget/FieldNotesWidget.swift` (outline)
+### `targets/widget/ByteShardsWidget.swift` (outline)
 ```swift
 import WidgetKit
 import SwiftUI
 
-private let appGroup = "group.com.fieldnotes.app"
+private let appGroup = "group.com.byteshards.app"
 private let dataKey  = "fieldnotes.widget.data"   // matches the JS writer (§4)
 
 // Mirror of WidgetData in src/lib/widget.ts (keep field names in sync).
@@ -193,7 +193,7 @@ struct Provider: TimelineProvider {
   }
 }
 
-struct FieldNotesWidgetView: View {
+struct ByteShardsWidgetView: View {
   let entry: Entry
   var body: some View {
     let d = entry.data
@@ -212,19 +212,19 @@ struct FieldNotesWidgetView: View {
 }
 
 @main
-struct FieldNotesWidget: Widget {
+struct ByteShardsWidget: Widget {
   var body: some WidgetConfiguration {
-    StaticConfiguration(kind: "FieldNotesWidget", provider: Provider()) { e in
-      FieldNotesWidgetView(entry: e)
+    StaticConfiguration(kind: "ByteShardsWidget", provider: Provider()) { e in
+      ByteShardsWidgetView(entry: e)
     }
-    .configurationDisplayName("FieldNotes")
+    .configurationDisplayName("ByteShards")
     .description("Your streak, due reviews, and card of the day.")
     .supportedFamilies([.systemSmall, .systemMedium, .accessoryRectangular])
   }
 }
 ```
 
-### `targets/widget/FieldNotesActivity.swift` (only if hosting the Live Activity here)
+### `targets/widget/ByteShardsActivity.swift` (only if hosting the Live Activity here)
 ```swift
 import ActivityKit
 import WidgetKit
@@ -283,7 +283,7 @@ import WidgetKit
 @objc(WidgetData)
 class WidgetData: NSObject {
   @objc func setWidgetData(_ json: String) {
-    UserDefaults(suiteName: "group.com.fieldnotes.app")?
+    UserDefaults(suiteName: "group.com.byteshards.app")?
       .set(json.data(using: .utf8), forKey: "fieldnotes.widget.data")
   }
   @objc func reloadAllTimelines() {
@@ -337,7 +337,7 @@ eas build --profile development --platform ios
 1. Run a dev build on a device (simulator works for the home widget; Dynamic
    Island needs iPhone 14 Pro+ sim or device).
 2. In the app, complete a review (this fires `pushWidgetUpdate`, §INTEGRATION).
-3. Add the **FieldNotes** widget to the home screen → confirm streak/due/card.
+3. Add the **ByteShards** widget to the home screen → confirm streak/due/card.
 4. Tap the widget → it deep-links to `mobile://daily` (the app's `scheme`).
 5. For Live Activities: start a session, confirm the lock-screen banner / Dynamic
    Island ring updates as you answer, and ends when the session ends.
@@ -348,7 +348,7 @@ eas build --profile development --platform ios
 
 - **Field-name parity:** the Swift `WidgetData` struct must match `WidgetData` in
   `src/lib/widget.ts` exactly (names + optionality). Update both together.
-- **One App Group id everywhere** (`group.com.fieldnotes.app`).
+- **One App Group id everywhere** (`group.com.byteshards.app`).
 - **iOS 16.2 guard** all ActivityKit code with `@available(iOS 16.2, *)`.
 - **No secrets in the App Group** unless you also set `keychainAccessGroup`.
 - Android home widgets are out of scope here (would need Glance/`react-native-android-widget`);

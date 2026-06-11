@@ -5,7 +5,7 @@ import { SITE_NAME, BUNDLE_PRICE } from "@/lib/catalog";
 export const metadata: Metadata = {
   title: "How these are made — methodology",
   description:
-    "How FieldNotes builds its interview questions: researched from how real loops run, written with the interviewer's lens, and fact-checked against the official docs.",
+    "How ByteShards builds its interview questions: researched from how real loops run, written with the interviewer's lens, and fact-checked against the official docs.",
 };
 
 const STEPS = [

@@ -1,6 +1,6 @@
 import type { Level, Track } from "./types";
 
-export const SITE_NAME = "FieldNotes";
+export const SITE_NAME = "ByteShards";
 export const SITE_DESC =
   "Real Data & AI Engineering interview questions — researched from how real loops run and fact-checked against the official docs.";
 export const SITE_TAGLINE =

@@ -1,4 +1,4 @@
-# FieldNotes Mobile — Pricing (single source of truth)
+# ByteShards Mobile — Pricing (single source of truth)
 
 > This is the **canonical** mobile pricing doc. Anything about mobile prices, SKUs, or the
 > paywall lives here. Other docs (`SETUP.md`, `../mockups/mobile-build-plan.md`, `../PRODUCT.md`)
@@ -51,7 +51,7 @@ in prose — this table is documentation, the device shows real store prices.
 
 ## Store setup
 
-1. **App Store Connect** — create one **subscription group** (e.g. "FieldNotes Pro") with two
+1. **App Store Connect** — create one **subscription group** (e.g. "ByteShards Pro") with two
    auto-renewable products (`_monthly`, `_yearly`), plus one **Non-Consumable** (`_lifetime`).
 2. **Play Console** — two **subscriptions** (`_monthly`, `_yearly`) + one **one-time product**
    (`_lifetime`).

@@ -120,7 +120,7 @@ export default function Paywall() {
       </Pressable>
 
       <View style={{ borderRadius: radius.xl, padding: 22, backgroundColor: '#3b2da8', alignItems: 'center' }}>
-        <T color="#dcd7ff" weight="800" size={13} style={{ letterSpacing: 1 }}>FIELDNOTES PRO</T>
+        <T color="#dcd7ff" weight="800" size={13} style={{ letterSpacing: 1 }}>BYTESHARDS PRO</T>
         <T color="#fff" size={18} weight="900" style={{ marginTop: 6, textAlign: 'center' }}>
           Stay current. Every week.
         </T>

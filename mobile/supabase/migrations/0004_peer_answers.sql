@@ -1,4 +1,4 @@
--- FieldNotes mobile — 0003: anonymized peer answers (community data moat).
+-- ByteShards mobile — 0003: anonymized peer answers (community data moat).
 -- Players write their scenario answer; a few highly-rated anonymized answers are
 -- shown back to everyone after they submit. NO user identity is stored on the row —
 -- we deliberately omit any user_id/auth.uid() column so a leaked read can never be

@@ -6,7 +6,7 @@ import { JobFilters } from "@/components/tools/JobFilters";
 import { JobCard } from "@/components/tools/JobCard";
 
 export const metadata: Metadata = {
-  title: "Data & AI Engineering jobs | FieldNotes",
+  title: "Data & AI Engineering jobs | ByteShards",
   description:
     "Open Data & AI Engineering roles tagged by tool and level — Snowflake, dbt, Airflow, Kafka, Spark, Databricks, LLMs, RAG and more. Refreshed daily.",
 };

@@ -1,6 +1,6 @@
-# FieldNotes Mobile — Build Plan (lean v1)
+# ByteShards Mobile — Build Plan (lean v1)
 
-Companion app to the FieldNotes web platform. **Free core, Pro subscription (monthly/yearly) for the weekly "stay current" stream + a lifetime unlock, no runtime AI.** Pricing model + rationale: **[`mobile/PRICING.md`](../mobile/PRICING.md) (single source of truth).** Reference prototype: `mockups/mobile-app.html` (v8).
+Companion app to the ByteShards web platform. **Free core, Pro subscription (monthly/yearly) for the weekly "stay current" stream + a lifetime unlock, no runtime AI.** Pricing model + rationale: **[`mobile/PRICING.md`](../mobile/PRICING.md) (single source of truth).** Reference prototype: `mockups/mobile-app.html` (v8).
 
 Positioning: the web app is where you *train* (workbench + coach); the mobile app is where you *stay sharp and show up ready* — spaced recall + the interview-week companion. See `~/.claude/.../memory/mobile-app-plan.md` for the full decision record.
 

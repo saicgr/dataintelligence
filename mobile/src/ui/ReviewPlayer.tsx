@@ -188,7 +188,7 @@ export function ReviewPlayer({ track, cards, onClose }: { track: Track; cards: S
             <View style={{ alignItems: 'center', gap: 8, paddingVertical: 14 }}>
               <T size={30}>🔇</T>
               <T muted size={13} style={{ textAlign: 'center', lineHeight: 19 }}>
-                Voice isn’t available on web — open FieldNotes on your phone to listen hands-free.
+                Voice isn’t available on web — open ByteShards on your phone to listen hands-free.
               </T>
             </View>
           ) : (

@@ -1,4 +1,4 @@
-# FieldNotes content tooling — "stay current"
+# ByteShards content tooling — "stay current"
 
 Manual-first. You author cards by hand and publish on your schedule; automation is optional and never auto-publishes.
 

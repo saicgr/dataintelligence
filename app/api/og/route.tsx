@@ -32,7 +32,7 @@ export function GET(req: Request) {
             color: "#f5a623",
           }}
         >
-          FieldNotes
+          ByteShards
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>

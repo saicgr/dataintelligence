@@ -1,4 +1,4 @@
--- FieldNotes mobile — 0008: per-card issue reports (#7).
+-- ByteShards mobile — 0008: per-card issue reports (#7).
 -- Manual-first content-quality loop: users flag inaccurate/outdated/typo/unclear cards
 -- (or offer a better answer); the founder reviews rows in Studio. Insert-only from the
 -- app; no statuses, no triage UI.

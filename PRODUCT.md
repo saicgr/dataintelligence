@@ -1,4 +1,4 @@
-# FieldNotes — Product Clarification
+# ByteShards — Product Clarification
 
 A single brand, two surfaces, one job: **help senior AI & Data Engineers walk into interview loops ready.**
 This doc exists to make the web idea, the mobile idea, and the line between them explicit — so every
@@ -9,7 +9,7 @@ that *keeps you sharp*?"
 
 ## 0. One-sentence positioning
 
-> **FieldNotes is interview prep for senior AI & Data Engineering — the web app is where you _train_
+> **ByteShards is interview prep for senior AI & Data Engineering — the web app is where you _train_
 > (hands-on, graded, coached); the mobile app is where you _stay sharp and show up ready_ (recall,
 > calibration, the interview-week companion).**
 

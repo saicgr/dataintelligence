@@ -19,7 +19,7 @@ export const ENV = {
   contentManifestUrl: process.env.EXPO_PUBLIC_CONTENT_MANIFEST_URL ?? '',
   // Web app base URL — diagnostic/querybuild cards deep-link here for the live
   // "type & Run / AI-graded" rep (the honest boundary). See ui/WebCrossSell.tsx.
-  webUrl: process.env.EXPO_PUBLIC_WEB_URL || 'https://fieldnotes.dev',
+  webUrl: process.env.EXPO_PUBLIC_WEB_URL || 'https://byteshards.dev',
 };
 
 export const hasSupabase = Boolean(ENV.supabaseUrl && ENV.supabaseAnonKey);

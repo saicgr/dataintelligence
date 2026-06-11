@@ -1,4 +1,4 @@
--- FieldNotes mobile — 0003: friend streaks.
+-- ByteShards mobile — 0003: friend streaks.
 -- NOTE: the task brief named this 0002_friends.sql, but 0002_feedback.sql already exists, so this
 -- ships as 0003 to preserve ordering. Apply with `supabase db push` (or paste into the SQL editor).
 --

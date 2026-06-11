@@ -41,7 +41,7 @@ export async function POST(req: Request) {
           {
             price_data: {
               currency: "usd",
-              product_data: { name: `FieldNotes — Practice Pro (${annual ? "annual" : "monthly"})` },
+              product_data: { name: `ByteShards — Practice Pro (${annual ? "annual" : "monthly"})` },
               unit_amount: annual ? PRACTICE_PRO_ANNUAL_CENTS : PRACTICE_PRO_PRICE_CENTS,
               recurring: { interval: annual ? "year" : "month" },
             },
@@ -69,15 +69,15 @@ export async function POST(req: Request) {
 
     if (isToolPack) {
       const name = TOOLS.find((t) => t.slug === tool)?.name ?? tool!;
-      productName = `FieldNotes — ${name} (all levels)`;
+      productName = `ByteShards — ${name} (all levels)`;
       unitAmount = TOOL_PACK_PRICE_CENTS;
       metadata = { tool: tool!, all_levels: "1" };
     } else if (isBundle) {
-      productName = "FieldNotes — Full Access";
+      productName = "ByteShards — Full Access";
       unitAmount = BUNDLE_PRICE_CENTS;
       metadata = { bundle: "1" };
     } else {
-      productName = `FieldNotes — ${sheetTitle(tool!, level as Level)}`;
+      productName = `ByteShards — ${sheetTitle(tool!, level as Level)}`;
       unitAmount = SHEET_PRICE_CENTS;
       metadata = { tool: tool!, level: level! };
     }

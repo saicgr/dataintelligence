@@ -45,7 +45,7 @@ export default function ShareCard() {
     track('invite_link_clicked');
     const link = await createInviteLink(userId);
     await Share.share({
-      message: `I'm on a ${streak}-day senior-correct streak prepping AI & Data-Engineering interviews on FieldNotes.${
+      message: `I'm on a ${streak}-day senior-correct streak prepping AI & Data-Engineering interviews on ByteShards.${
         link ? ' ' + link : ''
       }`,
     });

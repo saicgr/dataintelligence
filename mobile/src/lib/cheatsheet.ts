@@ -54,7 +54,7 @@ export function buildCheatSheetFromCards(
 
   const date = new Date().toISOString().slice(0, 10);
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
-  <title>${esc(title)} — FieldNotes cheat sheet</title>
+  <title>${esc(title)} — ByteShards cheat sheet</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; color: #1a1d23; margin: 28px; }
@@ -73,7 +73,7 @@ export function buildCheatSheetFromCards(
   </style></head><body>
   <header>
     <h1>${esc(title)} — interview cheat sheet</h1>
-    <div class="meta">${seen.length} of ${bank.length} cards studied · exported ${date} · FieldNotes</div>
+    <div class="meta">${seen.length} of ${bank.length} cards studied · exported ${date} · ByteShards</div>
   </header>
   ${items}
   <footer>Key points &amp; senior tells from your studied cards — full answers live in the app.</footer>

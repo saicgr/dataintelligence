@@ -15,7 +15,7 @@ import { radius, useTheme } from '../lib/theme';
 import { InterviewPlanCard } from '../ui/InterviewPlanCard';
 import { Btn, Card, H2, Row, Screen, T } from '../ui/kit';
 
-const WEB_URL = 'https://fieldnotes.dev/jd';
+const WEB_URL = 'https://byteshards.dev/jd';
 
 /** Paste a JD → recommended tracks ranked by fit + coverage gaps. Free teaser, Pro full plan. */
 export default function JD() {

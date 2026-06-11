@@ -1,4 +1,4 @@
-// FieldNotes service worker — minimal, no aggressive caching.
+// ByteShards service worker — minimal, no aggressive caching.
 self.addEventListener("install", (event) => {
   self.skipWaiting();
 });

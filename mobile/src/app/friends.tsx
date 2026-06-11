@@ -45,7 +45,7 @@ export default function Friends() {
     if (!myCode) return;
     try {
       await Share.share({
-        message: `Add me on FieldNotes — we’ll keep a study streak going. My invite code: ${myCode}`,
+        message: `Add me on ByteShards — we’ll keep a study streak going. My invite code: ${myCode}`,
       });
     } catch {
       // user dismissed the share sheet — no-op

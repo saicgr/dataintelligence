@@ -1,4 +1,4 @@
--- FieldNotes mobile — 0009: recency for "most asked at <company>" (Company Packs).
+-- ByteShards mobile — 0009: recency for "most asked at <company>" (Company Packs).
 -- Extends company_most_asked with `recent` — how many of a topic's mentions landed in the
 -- last 90 days — so the pack screen can badge "asked recently". Same k-anonymity gate (>= 20
 -- total debriefs); aggregate counts only, never row-level data.

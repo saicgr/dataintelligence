@@ -73,7 +73,7 @@ export default function Profile() {
       <Card style={{ backgroundColor: '#3b2da8', borderColor: 'transparent' }}>
         <Row>
           <T size={20}>💎</T>
-          <T color="#fff" weight="800" size={15}>FieldNotes Pro</T>
+          <T color="#fff" weight="800" size={15}>ByteShards Pro</T>
           <View style={{ flex: 1 }} />
           <T color="#dcd7ff" weight="800" size={11}>{unlocked ? 'Active ✓' : 'Free'}</T>
         </Row>
@@ -253,8 +253,8 @@ function AccentSection() {
       void confirmAsync(
         'Pro accent themes',
         signedIn
-          ? 'Unlock every accent color with FieldNotes Pro.'
-          : 'Accent themes need FieldNotes Pro and a signed-in account.',
+          ? 'Unlock every accent color with ByteShards Pro.'
+          : 'Accent themes need ByteShards Pro and a signed-in account.',
         'See plans'
       ).then((go) => {
         if (go) router.push('/paywall');

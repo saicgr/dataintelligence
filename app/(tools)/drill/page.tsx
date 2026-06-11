@@ -9,7 +9,7 @@ import { StreakWidget } from "@/components/tools/StreakWidget";
 import { ServiceWorkerRegister } from "@/components/tools/ServiceWorkerRegister";
 
 export const metadata: Metadata = {
-  title: "The Daily Drill | FieldNotes",
+  title: "The Daily Drill | ByteShards",
   description:
     "Five Data & AI Engineering interview questions a day. Build the streak, earn XP, and stay sharp across every tool.",
 };

@@ -1,4 +1,4 @@
--- FieldNotes mobile — 0007: live weekly contest.
+-- ByteShards mobile — 0007: live weekly contest.
 --
 -- A synchronous event the async leagues lack: each ISO week IS one contest (no separate scheduler).
 -- The contest runs all week; the board finalizes when the week rolls over (Mon 00:00 UTC) and a new

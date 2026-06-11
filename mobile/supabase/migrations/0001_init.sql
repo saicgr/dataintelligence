@@ -1,4 +1,4 @@
--- FieldNotes mobile — initial schema.
+-- ByteShards mobile — initial schema.
 -- Apply with:  supabase db push   (or paste into the SQL editor in the dashboard)
 -- Every per-user table is RLS-scoped to auth.uid(). Account is optional; rows only
 -- exist for signed-in users (signed-out state lives on-device in AsyncStorage).
