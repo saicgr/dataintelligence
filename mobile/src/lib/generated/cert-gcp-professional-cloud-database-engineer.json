@@ -1,0 +1,278 @@
+[
+  {
+    "q": "A startup is choosing between running PostgreSQL on a Compute Engine VM versus using Cloud SQL for PostgreSQL. What are the concrete operational differences, and when is each approach the right choice?",
+    "a": "Cloud SQL for PostgreSQL is a fully managed service: Google handles OS patching, storage scaling, automated backups, HA failover, read replica provisioning, and security updates. You interact with the database engine itself but never SSH into a VM or manage a filesystem. Running PostgreSQL on Compute Engine gives you full control — you choose the kernel, tune kernel parameters like vm.dirty_ratio, install extensions unavailable on Cloud SQL (e.g., PostGIS versions beyond what Cloud SQL supports, TimescaleDB), and configure custom replication topologies. The tradeoff is that you own all operational work: patching, backup tooling (pg_dump / pgBackRest / WAL-G), HA setup with Pacemaker or Patroni, and monitoring instrumentation. Choose Cloud SQL when you want low operational overhead, the feature set covers your needs, and your team's time is better spent on application logic. Choose Compute Engine self-managed when you need unsupported extensions, custom PostgreSQL build flags, specific network topologies, or when licensing cost models require it. A third option, AlloyDB for PostgreSQL, is fully managed but offers higher performance (4× faster OLTP than Cloud SQL, 100× faster analytics) and is optimized for PostgreSQL-compatible workloads that outgrow standard Cloud SQL.",
+    "fj": "Cloud SQL is always cheaper than self-managed PostgreSQL on Compute Engine because Google manages the resources.",
+    "fs": "Cloud SQL carries a service premium over equivalent Compute Engine resources — you pay for the managed service layer on top of the VM cost. Self-managed on GCE is cheaper in raw hourly compute but requires engineering effort to operate. The right choice depends on TCO (total cost of ownership) including labor, not just infrastructure price.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Create Cloud SQL vs self-managed (gcloud vs manual)",
+        "lines": [
+          "# --- Managed: Cloud SQL ---",
+          "# One command; Google handles HA, backups, patches",
+          "gcloud sql instances create prod-pg \\",
+          "  --database-version=POSTGRES_15 \\",
+          "  --tier=db-custom-4-16384 \\",
+          "  --region=us-central1 \\",
+          "  --availability-type=REGIONAL \\",
+          "  --backup-start-time=02:00",
+          "",
+          "# --- Unmanaged: Compute Engine ---",
+          "# You provision the VM ...",
+          "gcloud compute instances create pg-vm \\",
+          "  --machine-type=n2-standard-4 --zone=us-central1-a",
+          "# ... then SSH in and install PostgreSQL yourself",
+          "# apt install postgresql-15",
+          "# pgbackrest init; patronictl init ...  (all on you)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "design-scalable-cloud-db-solutions"
+  },
+  {
+    "q": "Your team needs application services running on GKE to connect to Cloud SQL without exposing the database to the public internet and without managing long-lived credentials. Which IAM and connectivity mechanism should you use, and how does it work end to end?",
+    "a": "The canonical GCP pattern is IAM database authentication combined with the Cloud SQL Auth Proxy. First, create a dedicated GCP service account and grant it the roles/cloudsql.client IAM role (which gives the cloudsql.instances.connect permission) and the Cloud SQL IAM login role on the database (cloudsql.instanceUser). Enable IAM database authentication on the Cloud SQL instance. Add the service account email as an IAM user on the instance; Cloud SQL auto-creates a corresponding database user. Deploy the Cloud SQL Auth Proxy as a sidecar container in the GKE pod or as a cluster-wide DaemonSet; it handles TLS, IAM token refresh, and proxies traffic over a Unix socket or localhost TCP port. Applications connect to 127.0.0.1:5432 — no passwords stored in environment variables. On GKE with Workload Identity, bind the Kubernetes service account to the GCP service account so no key file is ever downloaded. This satisfies zero-static-credential requirements, enables centralized IAM audit logs for every connection, and allows fine-grained per-service-account access at the database instance level. For AlloyDB, an equivalent AlloyDB Auth Proxy and IAM authentication pattern exists.",
+    "fj": "To avoid managing credentials, store the database password in a Kubernetes Secret and mount it as an environment variable — Kubernetes Secrets are encrypted and secure.",
+    "fs": "Kubernetes Secrets are base64-encoded by default and are not encrypted at rest unless etcd encryption is explicitly configured. More critically, they are still static credentials that must be rotated manually and can be leaked. IAM database authentication with Workload Identity eliminates static credentials entirely — the identity token is automatically generated and has a short TTL (1 hour), making credential leakage far less dangerous.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Wire up IAM auth + Auth Proxy for Cloud SQL on GKE",
+        "lines": [
+          "# 1. Create service account",
+          "gcloud iam service-accounts create app-db-sa \\",
+          "  --display-name='App DB Service Account'",
+          "",
+          "# 2. Grant Cloud SQL client role",
+          "gcloud projects add-iam-policy-binding PROJECT_ID \\",
+          "  --member='serviceAccount:app-db-sa@PROJECT_ID.iam.gserviceaccount.com' \\",
+          "  --role='roles/cloudsql.client'",
+          "",
+          "# 3. Add IAM user to the Cloud SQL instance",
+          "gcloud sql users create app-db-sa@PROJECT_ID.iam \\",
+          "  --instance=prod-pg \\",
+          "  --type=CLOUD_IAM_SERVICE_ACCOUNT",
+          "",
+          "# 4. Enable IAM auth on instance",
+          "gcloud sql instances patch prod-pg \\",
+          "  --database-flags=cloudsql.iam_authentication=on",
+          "",
+          "# 5. Bind K8s SA to GCP SA (Workload Identity)",
+          "gcloud iam service-accounts add-iam-policy-binding app-db-sa@PROJECT_ID.iam.gserviceaccount.com \\",
+          "  --role='roles/iam.workloadIdentityUser' \\",
+          "  --member='serviceAccount:PROJECT_ID.svc.id.goog[namespace/ksa-name]'"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "manage-multi-db-solutions"
+  },
+  {
+    "q": "You are designing the backup and recovery strategy for a Cloud SQL for PostgreSQL production instance. Walk through the full set of backup options available, their default retention, and when you would choose each to meet specific RTO/RPO targets.",
+    "a": "Cloud SQL offers three complementary backup mechanisms. Automated backups take one full backup per day during a configurable backup window; they are stored in Cloud Storage and replicated across two regions by default. The default retention is 7 backups but can be extended up to 365. On-demand backups let you capture a snapshot at any time and persist until you explicitly delete them — useful before schema changes or major releases. Point-in-time recovery (PITR) uses WAL (write-ahead log) archiving on PostgreSQL: once automated backups are enabled, WAL segments are continuously archived, letting you restore to any second within the log retention window (default 7 days, configurable up to 35 days). PITR achieves the lowest RPO — theoretically seconds before the failure. For a tight RPO (< 1 minute) and RTO measured in minutes, enable PITR plus cross-region read replicas; you can promote the replica (RTO ~1-2 minutes) while PITR covers any remaining gap. For a compliance requirement to retain backups 7 years, export to Cloud Storage as pg_dump files and manage lifecycle policies there, because Cloud SQL's native retention tops out at 365 days. Cloud SQL Enterprise Plus edition enables PITR by default. For AlloyDB, continuous WAL archiving and a similar PITR mechanism apply, with the added benefit of instant backups via storage layer copy-on-write snapshots.",
+    "fj": "To achieve the lowest RPO, enable automated backups and rely on the daily backup; Cloud SQL automatically saves all changes between backups.",
+    "fs": "Automated backups alone create a recovery window of up to ~24 hours since the last backup — far from the lowest possible RPO. PITR is what closes that gap by continuously archiving WAL segments. Without PITR you cannot restore to a point between backups, meaning you can lose up to one full day of transactions.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Configure PITR and backup retention on Cloud SQL",
+        "lines": [
+          "# Enable automated backups + PITR with 14-day log retention",
+          "gcloud sql instances patch prod-pg \\",
+          "  --backup-start-time=03:00 \\",
+          "  --retained-backups-count=14 \\",
+          "  --retained-transaction-log-days=14 \\",
+          "  --enable-bin-log",
+          "  # --enable-bin-log is required for MySQL; for PostgreSQL,",
+          "  # WAL archiving auto-starts when backups are enabled",
+          "",
+          "# Restore to a specific point in time (PostgreSQL)",
+          "gcloud sql instances clone prod-pg prod-pg-pitr \\",
+          "  --point-in-time='2026-06-09T14:32:00.000Z'"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "manage-multi-db-solutions"
+  },
+  {
+    "q": "How should a team monitor database SLOs on Google Cloud, and what specific metrics and alerting constructs should be set up for a Cloud SQL instance to detect SLA-threatening conditions before users are impacted?",
+    "a": "GCP's Cloud Monitoring provides the observability stack for database SLOs. Start by defining an SLI — a measurable signal like query latency p99, availability (uptime check passing), or replication lag — and then set an SLO threshold, for example 99.95% of requests under 200 ms over a 30-day rolling window. Cloud Monitoring's Service Monitoring feature lets you encode these as formal SLOs and automatically computes error budget burn rate. For Cloud SQL specifically, the critical metrics to alert on are: cloudsql.googleapis.com/database/cpu/utilization (alert above 80% sustained for 5 min), cloudsql.googleapis.com/database/memory/utilization (above 90%), cloudsql.googleapis.com/database/disk/utilization (above 85%), cloudsql.googleapis.com/database/network/connections (approaching max_connections), and cloudsql.googleapis.com/database/replication/replica_lag for read replicas. Create alerting policies with notification channels (PagerDuty, Slack, email) and set multi-condition policies that trigger only when both CPU and connection count spike together to reduce noise. Note: Cloud SQL's own SLA covers only REGIONAL (HA) instances with dedicated CPU — shared-core or single-zone instances are explicitly excluded from the Google SLA. For Spanner, track spanner.googleapis.com/api/request_latencies and spanner.googleapis.com/instance/cpu/utilization, and keep utilization below 65% for single-region and 45% per region for multi-region to stay within Spanner's own performance SLO.",
+    "fj": "You can fully rely on Cloud SQL's built-in SLA; as long as the instance is running, Google guarantees uptime and you do not need to set up any additional monitoring.",
+    "fs": "The Cloud SQL SLA only applies to REGIONAL high-availability instances with dedicated CPUs. Shared-core and single-zone instances are not covered. Moreover, the SLA defines a credit mechanism for downtime — it does not proactively alert your team or catch slow degradation like replication lag or disk saturation before they cause incidents. Monitoring and alerting are your responsibility.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Create a Cloud Monitoring alerting policy for Cloud SQL CPU via gcloud",
+        "lines": [
+          "gcloud alpha monitoring policies create \\",
+          "  --display-name='Cloud SQL CPU > 80%' \\",
+          "  --condition-display-name='CPU utilization' \\",
+          "  --condition-filter='resource.type=\"cloudsql_database\" AND metric.type=\"cloudsql.googleapis.com/database/cpu/utilization\"' \\",
+          "  --condition-threshold-value=0.8 \\",
+          "  --condition-threshold-duration=300s \\",
+          "  --condition-comparison=COMPARISON_GT \\",
+          "  --notification-channels=CHANNEL_ID \\",
+          "  --severity=WARNING"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "manage-multi-db-solutions"
+  },
+  {
+    "q": "You need to migrate a 2 TB Oracle 19c production database to AlloyDB for PostgreSQL with less than 30 seconds of application downtime. Describe the end-to-end migration strategy, including the phases, tooling, and fallback plan.",
+    "a": "This is a near-zero-downtime heterogeneous migration. Phase 1 — Assessment: Use the Database Migration Service (DMS) Conversion Workspace or the Migration Assessment report to scan the Oracle schema for incompatible DDL (e.g., Oracle sequences, synonyms, PL/SQL stored procedures) and get an automated conversion score. Phase 2 — Schema Conversion: Fix DDL issues using DMS's interactive conversion editor (backed by Ora2Pg-compatible logic) or Gemini in DMS (preview) for stored procedure translation to PL/pgSQL. Apply the converted schema to the AlloyDB target. Phase 3 — Initial Load + CDC: Create a DMS migration job pointing at Oracle as source and AlloyDB as destination. DMS takes a full snapshot (bulk load), then activates Change Data Capture via Oracle LogMiner to stream all subsequent DML changes to AlloyDB, keeping it continuously in sync with sub-second lag. Phase 4 — Validation: Run Datastream Data Validation Tool or a row-count/hash comparison to verify data fidelity. Phase 5 — Cutover: During a brief maintenance window, stop writes to Oracle, wait for replication lag to hit zero, update application connection strings to AlloyDB endpoint, and re-enable traffic. The window is typically under 30 seconds. Fallback: Before cutover, enable DMS reverse replication (in preview for Oracle→PostgreSQL) or keep Oracle LogMiner running in reverse so that if AlloyDB has a defect post-cutover, you can flip connection strings back and Oracle catches up via CDC from AlloyDB binlog. This is the key risk mitigation the exam tests.",
+    "fj": "The fastest approach is to take Oracle offline, run a full pg_dump/pg_restore with ora2pg, then bring AlloyDB online — this is simpler than CDC and avoids replication complexity.",
+    "fs": "A full offline dump-and-restore on a 2 TB database takes hours, making the downtime window far exceed the 30-second requirement. CDC via DMS is precisely designed to reduce downtime to the cutover moment only. Using pg_dump also misses continuous DML changes arriving during the bulk load; CDC captures them. The offline approach is only acceptable when extended downtime is tolerated.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Create a DMS migration job for Oracle → AlloyDB",
+        "lines": [
+          "# 1. Create connection profile for Oracle source",
+          "gcloud database-migration connection-profiles create oracle-source \\",
+          "  --region=us-central1 \\",
+          "  --type=ORACLE \\",
+          "  --host=10.0.0.5 --port=1521 \\",
+          "  --username=dms_user --password=SECRET \\",
+          "  --database-service=ORCL",
+          "",
+          "# 2. Create connection profile for AlloyDB destination",
+          "gcloud database-migration connection-profiles create alloydb-dest \\",
+          "  --region=us-central1 \\",
+          "  --type=ALLOYDB \\",
+          "  --alloydb-cluster=projects/P/locations/us-central1/clusters/prod-cluster \\",
+          "  --alloydb-instance=projects/P/locations/us-central1/clusters/prod-cluster/instances/primary",
+          "",
+          "# 3. Create migration job with CDC",
+          "gcloud database-migration migration-jobs create oracle-to-alloydb \\",
+          "  --region=us-central1 \\",
+          "  --type=CONTINUOUS \\",
+          "  --source=oracle-source \\",
+          "  --destination=alloydb-dest",
+          "",
+          "# 4. Start migration (snapshot + CDC begin)",
+          "gcloud database-migration migration-jobs start oracle-to-alloydb \\",
+          "  --region=us-central1"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "migrate-data-solutions"
+  },
+  {
+    "q": "After completing a migration from an on-premises MySQL database to Cloud SQL for MySQL, the team wants to maintain a live reverse replication channel back to the on-premises server as a fallback. How does reverse replication work in DMS, and what are its limitations?",
+    "a": "Reverse replication (also called failback replication) in Database Migration Service allows you to stream changes from the GCP destination database back to the original on-premises source after the initial migration completes. The mechanism uses CDC in reverse: once the forward DMS job reaches CDC phase (fully in sync), you create a separate failback migration job that treats Cloud SQL as the source and the on-premises server as the destination, using MySQL binlog-based replication. This keeps the on-premises database live and up-to-date so that if a critical defect is discovered in the GCP environment after cutover, you can redirect application connections back to on-premises with minimal data loss. Limitations to know for the exam: Reverse replication in DMS is available as a preview feature, primarily for heterogeneous SQL Server→PostgreSQL migrations; MySQL homogeneous reverse replication may require configuring a standard MySQL external replication channel rather than using DMS. The on-premises server must allow inbound replication connections from GCP (firewall rules, VPN or Cloud Interconnect required). Schema divergence (DDL changes made on Cloud SQL post-cutover) can break the reverse channel. Reverse replication adds latency and cost, so it is typically kept running only during a defined fallback window (e.g., 30 days post-cutover) and then terminated. For Spanner migrations, there is no DMS reverse replication — teams use Datastream to stream Spanner change records back to an on-premises source if needed.",
+    "fj": "Once you promote the DMS migration job and cut over to Cloud SQL, the original database is automatically kept in sync by DMS in reverse without any additional configuration.",
+    "fs": "DMS does not automatically set up reverse replication after cutover. Forward and reverse replication are two separate migration jobs. After promoting the destination, you must explicitly create a new failback job (or configure MySQL external replication) pointing from Cloud SQL back to the source. Assuming it is automatic is a common misunderstanding that could leave a team without a fallback path.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "migrate-data-solutions"
+  },
+  {
+    "q": "You are migrating a 500 GB SQL Server 2019 database to Cloud SQL for PostgreSQL. Describe the DDL and DML conversion challenges you will face and the tools available to resolve them.",
+    "a": "SQL Server to PostgreSQL is a heterogeneous migration with significant dialect differences. DDL challenges include: data type mismatches (SQL Server DATETIME2 maps to PostgreSQL TIMESTAMP, NVARCHAR(MAX) to TEXT, UNIQUEIDENTIFIER to UUID, IMAGE/VARBINARY(MAX) to BYTEA); SQL Server identity columns must become PostgreSQL sequences or GENERATED ALWAYS AS IDENTITY; computed columns become generated columns (GENERATED ALWAYS AS expr STORED) which have expression syntax differences. DML/stored procedure challenges: T-SQL syntax (TOP N, ISNULL, GETDATE(), +string concatenation) must become PostgreSQL equivalents (LIMIT, COALESCE, NOW(), ||); SQL Server cursors, temporary tables (#temp vs pg temp schema), and TRY/CATCH blocks all need rewriting; CLR objects have no PostgreSQL equivalent. Tools: DMS Conversion Workspace runs an automated assessment scoring convertibility by object type — it auto-converts straightforward DDL and flags stored procedures needing manual review. Gemini in DMS (preview) applies LLM-based suggestions to stored procedure bodies. For objects DMS cannot auto-convert, the interactive editor lets you write the converted SQL inline. SSMA (SQL Server Migration Assistant, Microsoft) is an alternative that also handles DDL conversion with a wizard UI. After DDL is applied to the Cloud SQL target, DMS handles the DML data migration via CDC over the homogeneous SQL Server source connector. The exam expects you to know that stored procedures requiring manual review represent the largest migration risk and that an assessment report should quantify this effort before committing to a timeline.",
+    "fj": "Since both SQL Server and PostgreSQL use SQL, you can use the same DDL scripts directly on Cloud SQL for PostgreSQL without conversion.",
+    "fs": "SQL Server T-SQL and PostgreSQL have substantial syntax and type-system differences. Running SQL Server DDL verbatim on PostgreSQL will fail on data types (e.g., DATETIME2, NVARCHAR(MAX)), stored procedure syntax (T-SQL vs PL/pgSQL), identity column syntax, and many built-in function names. Schema conversion is a required step in every SQL Server to PostgreSQL migration.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "T-SQL vs PostgreSQL DDL — common conversion examples",
+        "lines": [
+          "-- SQL Server (source)",
+          "CREATE TABLE orders (",
+          "    order_id    INT IDENTITY(1,1) PRIMARY KEY,",
+          "    order_guid  UNIQUEIDENTIFIER DEFAULT NEWID(),",
+          "    order_ts    DATETIME2(3)     NOT NULL DEFAULT GETDATE(),",
+          "    total       MONEY            NOT NULL,",
+          "    notes       NVARCHAR(MAX)",
+          ");",
+          "",
+          "-- PostgreSQL equivalent (post-conversion)",
+          "CREATE TABLE orders (",
+          "    order_id    INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,",
+          "    order_guid  UUID             DEFAULT gen_random_uuid(),",
+          "    order_ts    TIMESTAMP(3)     NOT NULL DEFAULT NOW(),",
+          "    total       NUMERIC(19,4)    NOT NULL,",
+          "    notes       TEXT",
+          ");"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "migrate-data-solutions"
+  },
+  {
+    "q": "A team is evaluating migration tools for three different scenarios: (A) lift-and-shift MySQL on-premises to Cloud SQL for MySQL, (B) Oracle 12c to AlloyDB for PostgreSQL, and (C) an on-premises data warehouse (Teradata) to BigQuery. Which GCP migration tool is correct for each, and what are the key differentiators?",
+    "a": "Scenario A — MySQL to Cloud SQL for MySQL (homogeneous): Database Migration Service (DMS) is the right tool. DMS supports MySQL-to-Cloud-SQL as a homogeneous migration at no additional charge. It uses MySQL binlog CDC for continuous replication and handles networking via Cloud SQL Auth Proxy or VPN. No schema conversion is needed since source and target engines match. Scenario B — Oracle to AlloyDB for PostgreSQL (heterogeneous): DMS with a Conversion Workspace is the tool. DMS's heterogeneous path uses Ora2Pg-compatible DDL conversion plus LogMiner-based CDC for continuous data sync. Gemini in DMS assists with stored procedure translation. This is GCP's recommended path for Oracle modernization as of 2025. Scenario C — Teradata to BigQuery (data warehouse migration): BigQuery Migration Service (BQMS) is the correct tool — not DMS. BQMS is specifically built for data warehouse migrations: it uses the Interactive SQL Translator to convert Teradata SQL (BTEQ, FastExport) to BigQuery GoogleSQL, handles batch scheduling translation (Teradata BTEQ scripts → scheduled queries), and integrates with Dataflow for bulk data movement. Using DMS for a Teradata-to-BigQuery migration would be incorrect because DMS targets OLTP databases (Cloud SQL, AlloyDB, Spanner) not analytical warehouses. The exam frequently tests this boundary between DMS (OLTP) and BQMS (OLAP/DW).",
+    "fj": "Database Migration Service can handle all three scenarios since it is Google's general-purpose migration tool for any database to any GCP target.",
+    "fs": "DMS is purpose-built for OLTP database migrations to Cloud SQL, AlloyDB, and Spanner. It has no support for data warehouse sources like Teradata, Netezza, or Redshift, and no BigQuery target. Data warehouse migrations to BigQuery require BigQuery Migration Service, which is a completely separate product with its own SQL translation engine and data movement toolchain.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "migrate-data-solutions"
+  },
+  {
+    "q": "Your organization needs to automate Cloud SQL instance provisioning across dev, staging, and production environments so that all three are always in a known, reproducible state. Describe the recommended IaC approach and any Cloud SQL-specific Terraform considerations.",
+    "a": "The recommended approach is Terraform with the Google Cloud Provider, using the google_sql_database_instance resource. Store configurations in a version-controlled repository with separate Terraform workspaces (or separate .tfvars files) for dev, staging, and prod — this ensures environment parity and makes drift visible in code review. Key Cloud SQL Terraform considerations: The deletion_protection attribute should be set to true for production instances to prevent accidental terraform destroy from dropping the database. The settings block controls tier (machine type), backup_configuration (automated backups, binary_log_enabled for MySQL PITR, transaction_log_retention_days for PostgreSQL PITR), ip_configuration (private_network for VPC peering, require_ssl), and database_flags for engine parameters. Use Terraform modules (the official GoogleCloudPlatform/sql-db/google module from the Terraform Registry) to enforce organizational standards across teams. For CI/CD, a GitHub Actions or Cloud Build pipeline can run terraform plan on PRs and terraform apply on merge to main, with OIDC Workload Identity Federation for keyless GCP authentication — no service account JSON keys stored in CI. Sensitive values (passwords) should be sourced from Secret Manager via the google_secret_manager_secret_version data source, never hardcoded in .tf files. For Spanner, use google_spanner_instance and google_spanner_database resources; note that Spanner instance config (regional vs multi-region) cannot be changed after creation, so this decision must be encoded in the IaC from day one.",
+    "fj": "You can use Cloud Deployment Manager to provision Cloud SQL since it is Google's native IaC tool and has full parity with Terraform for database resources.",
+    "fs": "While Cloud Deployment Manager is Google's native IaC service, it has narrower community support, fewer pre-built modules, and less active development than Terraform for database resources. Google's own documentation and reference architectures predominantly use Terraform for Cloud SQL and AlloyDB provisioning. Deployment Manager is not deprecated but is rarely recommended for new workloads; the exam expects Terraform as the standard IaC answer for automated GCP database provisioning.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "hcl",
+        "label": "Terraform: Cloud SQL PostgreSQL instance with HA + PITR",
+        "lines": [
+          "resource \"google_sql_database_instance\" \"prod\" {",
+          "  name             = \"prod-pg-${var.env}\"",
+          "  database_version = \"POSTGRES_15\"",
+          "  region           = \"us-central1\"",
+          "  deletion_protection = true",
+          "",
+          "  settings {",
+          "    tier              = \"db-custom-4-16384\"",
+          "    availability_type = \"REGIONAL\"   # HA failover",
+          "",
+          "    backup_configuration {",
+          "      enabled                        = true",
+          "      start_time                     = \"03:00\"",
+          "      point_in_time_recovery_enabled = true",
+          "      transaction_log_retention_days = 14",
+          "      backup_retention_settings {",
+          "        retained_backups = 14",
+          "      }",
+          "    }",
+          "",
+          "    ip_configuration {",
+          "      ipv4_enabled    = false",
+          "      private_network = var.vpc_self_link",
+          "      require_ssl     = true",
+          "    }",
+          "  }",
+          "}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "deploy-highly-available-databases"
+  }
+]

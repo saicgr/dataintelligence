@@ -1,0 +1,285 @@
+[
+  {
+    "q": "How do you use Session methods and attributes in Snowpark Python, and how does AsyncJob enable non-blocking query execution?",
+    "a": "The Snowpark `Session` is the central entry point for all operations against Snowflake. Key attributes include `session.sql_simplifier_enabled` to control SQL generation, `session.query_tag` to tag queries for monitoring, and `session.default_schema`/`session.default_database` to inspect the active context. To execute a DataFrame action asynchronously, every action method (collect, to_pandas, count, first, save_as_table, copy_into_location) accepts a `block=False` keyword argument, or you can call the `_nowait` variant (e.g., `collect_nowait()`). Both patterns return an `AsyncJob` object immediately without blocking. You can then submit additional work, poll `async_job.is_done()` to check status, or call `async_job.result()` to block and retrieve results when you are ready. `Session.create_async_job(query_id)` also lets you reconstruct an `AsyncJob` for a query submitted outside the current session by providing its query ID.",
+    "fj": "You must always call `session.close()` and open a new session to run a second query while the first is still executing.",
+    "fs": "Snowpark Python sessions are thread-safe and support concurrent query submission. You submit the first query with `collect_nowait()` (getting an AsyncJob), then immediately submit more queries on the same session — no need to close or re-open the session.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "AsyncJob: fire-and-forget then collect",
+        "lines": [
+          "from snowflake.snowpark import Session",
+          "",
+          "session = Session.builder.configs(connection_params).create()",
+          "",
+          "df_orders  = session.table('orders')",
+          "df_returns = session.table('returns')",
+          "",
+          "# Submit both queries asynchronously — neither blocks",
+          "job1 = df_orders.filter(df_orders['status'] == 'PENDING').collect_nowait()",
+          "job2 = df_returns.select('order_id', 'reason').collect_nowait()",
+          "",
+          "# Do other work here ...",
+          "",
+          "# Block only when you need the results",
+          "pending_orders = job1.result()   # blocks until done",
+          "return_rows    = job2.result()",
+          "",
+          "print(f'Pending: {len(pending_orders)}, Returns: {len(return_rows)}')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "snowpark-api-python"
+  },
+  {
+    "q": "What attributes and methods on the Snowpark Session object give you visibility into the current Snowflake context, and how do you reuse an AsyncJob from a prior session?",
+    "a": "Session exposes `session.get_current_database()`, `session.get_current_schema()`, `session.get_current_warehouse()`, and `session.get_current_role()` to inspect the active execution context. `session.query_tag` can be set to a string so all queries from that session appear tagged in the Query History UI for cost attribution. When a query is submitted asynchronously, Snowflake assigns it a query ID. You can obtain this ID from `async_job.query_id`. If that query was started in a different session or process, `Session.create_async_job(query_id)` reconstructs an `AsyncJob` object so you can poll or collect results from the new session. This is useful in distributed or multi-process workflows where one worker submits a long-running query and another worker later harvests the result.",
+    "fj": "Query IDs are only valid within the same session; you cannot use a query ID from Session A to retrieve results in Session B.",
+    "fs": "Snowflake query IDs are global identifiers assigned by the Snowflake service, not session-scoped. `Session.create_async_job(query_id)` explicitly supports cross-session result retrieval, making distributed async patterns possible.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "snowpark-api-python"
+  },
+  {
+    "q": "How do you traverse VARIANT columns in Snowpark Python and flatten nested arrays or objects for tabular analysis?",
+    "a": "In Snowpark Python, VARIANT columns store JSON, Avro, and Parquet data natively. To access nested fields you use square-bracket or dot notation on a Column: `col('payload')['user']['id']` retrieves a nested key. Casting is done with `.cast(IntegerType())` or the `astype()` alias to convert VARIANT values to typed columns. To explode repeated structures you call `DataFrame.flatten(input=col('items'))`, which is the Snowpark equivalent of SQL's `LATERAL FLATTEN`; it returns a new DataFrame with one row per element and helper columns `SEQ`, `KEY`, `PATH`, `INDEX`, `VALUE`, and `THIS`. For loading, you point a `DataFrameReader` at a stage using `session.read.json()`, `session.read.avro()`, or `session.read.parquet()` with the stage path; Snowflake ingests the raw bytes and exposes the top-level document as a single VARIANT column named `$1` which you then traverse with the above operators.",
+    "fj": "You must convert JSON to a string and use `from_json` from `pyspark.sql.functions` to parse it inside Snowpark.",
+    "fs": "Snowpark is not Spark. It runs inside Snowflake and uses its own `snowflake.snowpark.functions` module. Snowflake stores JSON natively as VARIANT, so you traverse it with bracket/dot notation and `DataFrame.flatten()`, not PySpark's `from_json`.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Traverse VARIANT and flatten nested array",
+        "lines": [
+          "from snowflake.snowpark.functions import col",
+          "from snowflake.snowpark.types import IntegerType, StringType",
+          "",
+          "# Load JSON from an internal stage",
+          "raw = session.read.json('@my_stage/events/')",
+          "",
+          "# Traverse nested fields and cast",
+          "typed = raw.select(",
+          "    col('$1')['event_id'].cast(StringType()).alias('event_id'),",
+          "    col('$1')['user']['age'].cast(IntegerType()).alias('user_age'),",
+          "    col('$1')['tags'].alias('tags_variant')  # still VARIANT array",
+          ")",
+          "",
+          "# Flatten the tags array into individual rows",
+          "flattened = typed.flatten(col('tags_variant'))",
+          "flattened.select('event_id', 'user_age', col('VALUE').cast(StringType()).alias('tag')).show()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "snowpark-data-transformations"
+  },
+  {
+    "q": "What is the difference between `DataFrame.flatten()` and SQL's LATERAL FLATTEN in Snowpark, and when would you load Parquet data directly through a Snowpark DataFrameReader?",
+    "a": "`DataFrame.flatten()` is the Snowpark Python API wrapper for Snowflake's LATERAL FLATTEN table function. It accepts an `input` Column (of type VARIANT, OBJECT, or ARRAY), an optional `path` to target a nested sub-element, and boolean flags `outer` (keep rows where input is empty/null) and `recursive` (descend into all sub-elements). The result DataFrame contains the originating columns plus the FLATTEN output columns: `SEQ`, `KEY`, `PATH`, `INDEX`, `VALUE`, and `THIS`. For loading Parquet or Avro files, `session.read.parquet('@stage/path/')` reads them directly without COPY INTO; Snowflake infers the schema and exposes each row's fields as VARIANT columns under `$1`. This is useful for ad-hoc exploration or lightweight ELT where you want to combine Snowpark transformations with semi-structured payloads before writing to a permanent table. For production loads at scale, COPY INTO with a named file format is generally preferred for throughput and error handling.",
+    "fj": "Parquet files must first be loaded into a Snowflake table using COPY INTO before Snowpark can read them.",
+    "fs": "Snowpark's `DataFrameReader` can read Parquet, Avro, JSON, CSV, and ORC files directly from a stage without a prior COPY INTO step, making it convenient for exploratory pipelines and transformations that run before permanent ingestion.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "snowpark-data-transformations"
+  },
+  {
+    "q": "How does `cache_result()` work in Snowpark, and when should you use it to improve pipeline performance?",
+    "a": "Snowpark DataFrames are lazily evaluated: each time you call an action (collect, count, to_pandas) on a DataFrame that was built from a chain of transformations, Snowflake re-executes the full logical plan. `cache_result()` breaks this cycle by materializing the DataFrame into a session-scoped temporary table and returning a new DataFrame backed by that table. All subsequent operations on the returned DataFrame read from the cached data rather than re-running the upstream query. You should use `cache_result()` when (1) a costly transformation or join is used as input to multiple downstream paths, (2) you call actions on the same intermediate DataFrame more than once in a single script, or (3) you want to isolate a checkpoint for debugging. The temporary table is automatically dropped when the session ends. Note that `cache_result()` itself is a blocking action — it materializes immediately and consumes warehouse compute — so use it only when the cost of one materialization is less than the cumulative cost of repeated recomputation.",
+    "fj": "Calling `cache_result()` stores data in the client's memory like Spark's `persist(MEMORY_ONLY)`, so you need enough RAM on the machine running the Python script.",
+    "fs": "Snowpark's `cache_result()` materializes data into a Snowflake-side temporary table, not into client memory. All compute and storage remain inside Snowflake, which is a key architectural difference from Spark's in-memory caching.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "cache_result to avoid recomputing an expensive join",
+        "lines": [
+          "from snowflake.snowpark.functions import col, sum as sum_",
+          "",
+          "# Expensive join computed once and cached",
+          "enriched = (",
+          "    session.table('orders')",
+          "    .join(session.table('customers'), 'customer_id')",
+          "    .filter(col('region') == 'EMEA')",
+          "    .cache_result()   # materializes to a temp table immediately",
+          ")",
+          "",
+          "# Both downstream paths read from the cached temp table",
+          "revenue = enriched.agg(sum_(col('amount')).alias('total_revenue')).collect()",
+          "top_customers = enriched.sort(col('amount').desc()).limit(10).collect()",
+          "",
+          "print(revenue, top_customers)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "snowpark-performance-optimization"
+  },
+  {
+    "q": "How does Snowpark's lazy evaluation model interact with Snowflake's query optimizer, and how do you inspect the generated SQL execution plan?",
+    "a": "Snowpark DataFrames build a logical plan tree in Python without executing anything. When you call an action, Snowpark compiles the entire plan into a single SQL query and submits it to Snowflake in one round trip. This lazy-compilation model allows the Snowflake optimizer to see the full transformation graph — filters, joins, projections, aggregations — and apply push-downs, pruning, and join reordering across all steps simultaneously, just as it would for a hand-written SQL query. If you had executed each step eagerly, intermediate results would force materialization, preventing cross-step optimization. To inspect the generated SQL and the query plan before running, use `df.queries` which returns a dictionary with key `'queries'` containing the list of SQL statements that would be executed, and key `'post_actions'` for cleanup. For a human-readable query plan, `df.explain()` prints the logical and physical plan to stdout, similar to Spark's `explain()`. Reviewing `df.queries` in development lets you catch unexpected full-table scans or missing predicate push-downs before they hit production.",
+    "fj": "Snowpark executes each DataFrame transformation step immediately on Snowflake as you chain operations, similar to how pandas evaluates operations eagerly.",
+    "fs": "Snowpark is fundamentally lazy: no query is sent to Snowflake until you call an action. This is a deliberate design choice to enable the Snowflake optimizer to receive the complete logical plan and apply cross-step push-downs that would be impossible with eager per-step execution.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Inspect generated SQL before executing",
+        "lines": [
+          "df = (",
+          "    session.table('sales')",
+          "    .filter(col('year') == 2024)",
+          "    .join(session.table('products'), 'product_id')",
+          "    .group_by('category')",
+          "    .agg(sum_(col('revenue')).alias('total'))",
+          ")",
+          "",
+          "# No query sent yet — inspect the plan first",
+          "print(df.queries)     # shows generated SQL string(s)",
+          "df.explain()          # prints logical + physical plan",
+          "",
+          "# Only now does Snowflake execute",
+          "results = df.collect()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "snowpark-performance-optimization"
+  },
+  {
+    "q": "How do you apply column transformations using `snowflake.snowpark.functions`, and what is the difference between `col()`, `lit()`, and `sql_expr()`?",
+    "a": "The `snowflake.snowpark.functions` module is the primary toolkit for column-level transformations in Snowpark. `col('name')` converts a column name string into a `Column` object that can be passed to DataFrame methods. `lit(value)` wraps a Python literal (integer, string, boolean, None) into a constant Column for use in expressions like `col('price') * lit(1.1)`. `sql_expr('CURRENT_TIMESTAMP()')` converts any arbitrary Snowflake SQL expression string into a Column, useful when no Python wrapper exists for a Snowflake-specific function. The module also provides hundreds of SQL-equivalent functions: string functions (`upper`, `trim`, `regexp_replace`), date functions (`date_add`, `datediff`, `to_date`), aggregate functions (`sum_`, `avg`, `count`), conditional functions (`when`, `coalesce`, `iff`), and type conversion (`cast`). If a Snowflake function has no Python wrapper, use `call_function('function_name', col('arg'))` to invoke it directly. All functions return `Column` objects, making them chainable and composable inside `select`, `filter`, `withColumn`, and `agg` calls.",
+    "fj": "You should import functions from `pyspark.sql.functions` when writing Snowpark transformations because the two APIs are compatible.",
+    "fs": "Snowpark and PySpark are separate libraries with incompatible Column objects and function signatures. Always import from `snowflake.snowpark.functions`; mixing with `pyspark.sql.functions` will raise type errors at runtime.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Common column transformations with snowpark.functions",
+        "lines": [
+          "from snowflake.snowpark.functions import (",
+          "    col, lit, upper, trim, coalesce, when,",
+          "    to_date, datediff, sql_expr",
+          ")",
+          "",
+          "result = (",
+          "    session.table('customers')",
+          "    .select(",
+          "        upper(trim(col('name'))).alias('clean_name'),",
+          "        coalesce(col('email'), lit('unknown')).alias('email'),",
+          "        to_date(col('signup_ts')).alias('signup_date'),",
+          "        datediff('day', col('signup_ts'), sql_expr('CURRENT_DATE()')).alias('days_active'),",
+          "        when(col('tier') == lit('gold'), lit(True)).otherwise(lit(False)).alias('is_gold')",
+          "    )",
+          ")",
+          "result.show()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "snowpark-data-transformations"
+  },
+  {
+    "q": "How do you chain DataFrame operations in Snowpark to build readable and optimized transformation pipelines?",
+    "a": "Snowpark DataFrames support method chaining because every transformation method returns a new DataFrame, preserving immutability. A well-structured pipeline reads from a source with `session.table()` or `session.read`, then chains filter (predicate push-down), select (column pruning), join, group_by + agg, sort, and limit calls before a terminal action. Because all chained steps compile to a single SQL query, the optimizer can push filters and column projections as deep as possible — avoiding the cost of scanning columns that are later dropped. Readability best practices: break long chains across lines with parentheses, assign meaningful names to intermediate DataFrames only at natural checkpoints (not after every step), and avoid collecting intermediate results unless you explicitly need them in Python. Using `withColumn` to add or replace a single column mid-chain keeps expressions focused. Keeping transformations as pure DataFrame chains (rather than converting to Pandas mid-pipeline) ensures all processing stays inside Snowflake, maintaining the no-data-movement guarantee.",
+    "fj": "You should call `.collect()` after each transformation to confirm the intermediate results before adding more steps.",
+    "fs": "Collecting after each step defeats lazy evaluation: every `.collect()` triggers a separate round-trip to Snowflake, and intermediate data is pulled to the client only to be discarded. Chain all transformations and call `.collect()` once at the end to let the optimizer see the full query.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Chained transformation pipeline",
+        "lines": [
+          "from snowflake.snowpark.functions import col, sum as sum_, avg, to_date",
+          "",
+          "report = (",
+          "    session.table('raw_events')",
+          "    .filter(col('event_type') == 'purchase')",
+          "    .filter(col('event_ts') >= lit('2024-01-01'))",
+          "    .select(",
+          "        col('user_id'),",
+          "        col('product_id'),",
+          "        col('amount').cast('double').alias('amount'),",
+          "        to_date(col('event_ts')).alias('event_date')",
+          "    )",
+          "    .join(session.table('products').select('product_id', 'category'), 'product_id')",
+          "    .group_by('category', 'event_date')",
+          "    .agg(",
+          "        sum_(col('amount')).alias('daily_revenue'),",
+          "        avg(col('amount')).alias('avg_order_value')",
+          "    )",
+          "    .sort(col('event_date').desc(), col('daily_revenue').desc())",
+          ")",
+          "",
+          "# Single Snowflake query submitted here",
+          "report.show()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "snowpark-data-transformations"
+  },
+  {
+    "q": "When should you choose synchronous versus asynchronous execution in Snowpark, and what are the architectural patterns for each?",
+    "a": "Use synchronous execution (the default, where action methods block until the query returns) for sequential pipelines where each step depends on the output of the previous one, for short-running queries where the overhead of async management exceeds the benefit, and when calling Snowpark from a simple script or notebook where simplicity matters. Use asynchronous execution when you have independent long-running operations that can overlap — for example, loading multiple large staging tables simultaneously, or submitting several aggregation queries in parallel and merging results. The async pattern with `collect_nowait()` or `block=False` lets you submit N queries in a loop and then iterate over the resulting AsyncJob objects to call `.result()` when each is needed. For orchestration pipelines (Airflow, Prefect, Dagster), you can submit a Snowpark async job, store the `query_id`, release the worker, and have a downstream task reconstruct the AsyncJob with `session.create_async_job(query_id)` to collect results — enabling truly decoupled producer/consumer patterns. Synchronous is simpler and safer for correctness; async is a deliberate performance optimization that adds complexity to error handling since failures surface at `.result()` time, not at submission time.",
+    "fj": "Asynchronous Snowpark execution runs queries on a separate Snowflake warehouse so they do not consume credits on the primary warehouse.",
+    "fs": "Async execution does not change which warehouse executes the queries — it only changes whether the Python thread blocks waiting for the result. The same active warehouse runs all queries regardless of `block=True/False`.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Parallel async pattern for independent loads",
+        "lines": [
+          "tables = ['events', 'clicks', 'impressions', 'conversions']",
+          "",
+          "# Submit all four aggregations without waiting",
+          "jobs = {",
+          "    tbl: session.table(tbl).count(block=False)",
+          "    for tbl in tables",
+          "}",
+          "",
+          "# Collect results as each finishes",
+          "for tbl, job in jobs.items():",
+          "    print(f'{tbl}: {job.result()} rows')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "snowpark-performance-optimization"
+  },
+  {
+    "q": "What library types are available in Snowpark Python, and how do Anaconda packages differ from third-party libraries uploaded to a stage?",
+    "a": "Snowpark Python supports three categories of libraries. First, Anaconda packages: Snowflake maintains a curated channel of Anaconda-distributed packages (numpy, pandas, scikit-learn, scipy, xgboost, and hundreds more) that are pre-installed on the Snowflake execution environment. You reference them in UDF or stored procedure registration via the `packages` parameter (e.g., `['scikit-learn', 'pandas']`) with no upload required. Second, third-party or custom packages: if a package is not in the Anaconda channel, you bundle it as a zip file, upload it to a named stage, and reference the stage path in the `imports` parameter. Third, local Python files: you can import your own `.py` modules or `.zip` archives from a stage using `session.add_import()` or the `imports` parameter during registration. Using Anaconda packages is preferred because Snowflake manages versioning, security scanning, and availability; custom stage imports add operational overhead and require you to ensure the Python runtime version on Snowflake matches your local build. When working locally, the `snowflake-snowpark-python[pandas]` conda channel ensures your local environment mirrors the Snowflake runtime exactly.",
+    "fj": "You can import any pip-installable package in a Snowpark UDF simply by listing it in the `packages` parameter, even if it is not in the Snowflake Anaconda channel.",
+    "fs": "Only packages published to the Snowflake Anaconda channel can be used via the `packages` parameter. Packages outside that channel must be manually zipped, uploaded to a stage, and referenced via `imports` — they are not auto-installed from PyPI.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "snowpark-concepts"
+  },
+  {
+    "q": "When should you choose Snowpark over standard SQL for data processing in Snowflake?",
+    "a": "Standard SQL remains the best choice for straightforward declarative transformations — aggregations, joins, window functions, MERGE operations — where SQL's readability and the optimizer's native path are unbeatable. Choose Snowpark when: (1) you need imperative logic that is difficult to express in SQL, such as complex iteration, branching, or stateful processing across rows; (2) you want to use a Python data science library (scikit-learn, XGBoost, pandas) alongside data that lives in Snowflake, avoiding a data-movement step out to an external compute cluster; (3) you are building a stored procedure pipeline that orchestrates multi-step workflows with Python control flow, error handling, and conditional branching; (4) you want to package and deploy ML model inference as a vectorized UDF or UDTF running directly on Snowflake compute; or (5) your team's primary language is Python or Java/Scala and SQL's imperative limitations reduce productivity. Snowpark does not replace SQL; it complements it by letting Python engineers work inside Snowflake without moving data, preserving governance, lineage, and the push-down performance of Snowflake's execution engine.",
+    "fj": "Snowpark always outperforms SQL for data transformations because Python DataFrames are more optimized than Snowflake's SQL engine.",
+    "fs": "Snowpark compiles DataFrame operations to SQL and submits them to the same Snowflake engine. For pure data transformation work, hand-written SQL is often equally or more performant because the optimizer has full visibility. Snowpark's advantage is expressiveness for ML and complex logic, not raw transformation speed.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "snowpark-concepts"
+  }
+]

@@ -1,0 +1,594 @@
+[
+  {
+    "q": "How do you use Cortex Code to automate a feature exploration and engineering workflow for a churn prediction model inside Snowflake Notebooks?",
+    "a": "Cortex Code (CoCo) is Snowflake's AI coding agent embedded in Snowsight that understands your data context — schemas, column distributions, and sample values. To automate feature engineering, you open a Notebook, describe your objective in natural language (e.g., 'explore the CUSTOMER table and engineer features for churn prediction'), and Cortex Code generates executable cells that profile distributions, compute candidate features, and rank them. The agent can run SNOWFLAKE.ML.TOP_INSIGHTS or custom Snowpark Python transformations, iteratively refining based on your feedback. Under the hood it reads metadata from INFORMATION_SCHEMA and issues DESCRIBE TABLE queries before proposing transformations like log-scaling skewed columns, encoding cyclical time features, or computing rolling aggregates via Snowpark DataFrames. Once approved, the generated notebook cells become the reproducible feature pipeline you version and promote. This keeps all computation within Snowflake's governance perimeter — no data leaves the platform during exploration.",
+    "fj": "Cortex Code generates Python code that runs locally on your laptop after downloading data from Snowflake, then you paste the results back in.",
+    "fs": "Cortex Code executes entirely server-side inside Snowflake's Container Runtime. Data never leaves the platform perimeter — the agent issues Snowpark queries against your Snowflake tables directly, which is the core governance and security advantage.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Cortex Code prompt + resulting Snowpark feature pipeline",
+        "lines": [
+          "# --- In a Snowflake Notebook cell, Cortex Code generates something like this ---",
+          "from snowflake.snowpark.functions import col, log1p, datediff, current_date, lag",
+          "from snowflake.snowpark.window import Window",
+          "",
+          "df = session.table('PROD.MARKETING.CUSTOMER_EVENTS')",
+          "",
+          "# Cortex Code-generated candidate features",
+          "df_feat = df.with_column('log_lifetime_value', log1p(col('LIFETIME_VALUE'))) \\",
+          "             .with_column('days_since_last_login',",
+          "                         datediff('day', col('LAST_LOGIN_DATE'), current_date())) \\",
+          "             .with_column('event_count_30d',",
+          "                         col('EVENTS_LAST_30_DAYS'))",
+          "",
+          "# Evaluate feature correlation with label",
+          "df_feat.select('log_lifetime_value','days_since_last_login',",
+          "               'event_count_30d','CHURNED').describe().show()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-prep-feature-engineering"
+  },
+  {
+    "q": "Describe how you would use Cortex Code's agentic loop to iteratively engineer and validate features without leaving Snowsight.",
+    "a": "Cortex Code operates as an agentic loop: you provide a high-level goal, it plans subtasks, executes them as Notebook cells, inspects outputs, and revises the plan before presenting results. For feature engineering this means the agent first profiles the dataset (nulls, cardinality, skew), proposes a ranked feature list as structured JSON, generates Snowpark transformation code, runs a quick mutual information or correlation check against the target variable, then optionally triggers a lightweight baseline model fit via Snowflake ML modeling APIs. Each iteration's intermediate results are captured in the Notebook as versioned cells so you can review or roll back any step. The workflow never requires exporting data: the agent queries INFORMATION_SCHEMA, runs SQL/Python inside the runtime, and persists candidate feature tables back to Snowflake as named objects. You can steer the agent mid-loop via chat ('drop the correlated features, add a ratio of A over B') and it will regenerate only the affected cells.",
+    "fj": "Each Cortex Code agent run starts from scratch; there is no memory across cells so you must restart the notebook entirely for each iteration.",
+    "fs": "Cortex Code maintains conversational context across cells within a session. The agent tracks which objects it created and which results it observed, enabling iterative refinement without re-running unaffected pipeline steps.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-prep-feature-engineering"
+  },
+  {
+    "q": "How do you apply large-scale data preprocessing and normalization pipelines using Snowflake Container Runtime, and what serialization strategy should you use to persist the fitted scalers?",
+    "a": "Container Runtime lets Snowflake Notebooks run full-Python workloads on CPU or GPU warehouse compute with preinstalled ML libraries — pandas, scikit-learn, PyTorch, etc. — without packaging Docker images yourself. For large-scale preprocessing you load data via the Snowpark DataFrame API (which pushes computation into the warehouse), then collect only the sample needed for scaler fitting, fit sklearn transformers (StandardScaler, MinMaxScaler, ColumnTransformer) server-side inside the notebook, and persist them with joblib or pickle to a Snowflake internal stage using session.file.put(). The fitted scaler is then registered in the Snowflake Model Registry as a custom model artifact so every downstream scoring job retrieves the same versioned transformer. For distributed normalization at scale you use Snowpark ML's Preprocessing module (snowflake.ml.preprocessing.StandardScaler) which runs the full fit/transform inside Snowflake SQL execution, avoiding the pandas collect step entirely and scaling to billions of rows. Always pair preprocessing with Snowflake Feature Store feature views so the same transform logic is re-applied consistently at training and serving time.",
+    "fj": "You should fit the scaler on the full production dataset every time a scoring job runs to ensure normalization is always fresh.",
+    "fs": "Re-fitting scalers on production data at scoring time introduces data leakage (the scaler sees future data) and non-deterministic results across runs. The correct pattern is to fit once on training data, version and register the scaler, and reuse the same artifact for all scoring.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Snowpark ML StandardScaler — distributed normalization",
+        "lines": [
+          "from snowflake.ml.preprocessing import StandardScaler",
+          "from snowflake.ml.modeling.pipeline import Pipeline",
+          "",
+          "train_df = session.table('PROD.ML.TRAIN_FEATURES')",
+          "",
+          "scaler = StandardScaler(input_cols=['REVENUE','AGE','TENURE'],",
+          "                        output_cols=['REVENUE_SCALED','AGE_SCALED','TENURE_SCALED'])",
+          "pipeline = Pipeline(steps=[('scaler', scaler)])",
+          "",
+          "# Fit runs entirely inside Snowflake — no data collected to driver",
+          "fitted = pipeline.fit(train_df)",
+          "scaled_train = fitted.transform(train_df)",
+          "",
+          "# Persist fitted pipeline to Model Registry",
+          "from snowflake.ml.registry import Registry",
+          "reg = Registry(session=session, database_name='PROD', schema_name='ML')",
+          "reg.log_model(fitted, model_name='FEATURE_SCALER', version_name='v1')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-prep-feature-engineering"
+  },
+  {
+    "q": "Walk through how you configure a Snowflake Notebook to use Container Runtime with GPU-backed compute and verify that PyTorch and XGBoost are available without manual installation.",
+    "a": "Container Runtime is activated by setting the Notebook's compute pool to a GPU-capable pool (e.g., GPU_NV_S or GPU_NV_M) and toggling 'Run on Container Runtime' in the Notebook settings. Snowflake provides two pre-built runtime images: a CPU image and a GPU image. Both come with the latest versions of PyTorch, XGBoost, LightGBM, scikit-learn, pandas, NumPy, and Hugging Face transformers already installed — you do not write a Dockerfile or pull from a registry. To verify GPU availability you run torch.cuda.is_available() and torch.cuda.get_device_name(0). For XGBoost GPU training you pass device='cuda' (XGBoost ≥ 2.0 syntax) or tree_method='gpu_hist' on older versions. Additional packages not in the default image can be installed via !pip install in a cell, but core ML packages require no extra steps. The compute pool is billed by node-hours while the notebook is running, so best practice is to suspend the pool when idle using ALTER COMPUTE POOL <name> SUSPEND.",
+    "fj": "Container Runtime requires you to build a custom Docker image with your ML dependencies and push it to a container registry before using it in a Notebook.",
+    "fs": "Snowflake manages the runtime images internally. For the standard ML stack (PyTorch, XGBoost, scikit-learn, etc.) you simply select the GPU runtime and all packages are pre-installed. Custom Docker images are only needed for SPCS (Snowpark Container Services) services, not for Notebooks using Container Runtime.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Verify GPU + pre-installed packages in Container Runtime",
+        "lines": [
+          "import torch, xgboost, sklearn, lightgbm",
+          "",
+          "print(f'PyTorch   : {torch.__version__}')",
+          "print(f'XGBoost   : {xgboost.__version__}')",
+          "print(f'Scikit-learn: {sklearn.__version__}')",
+          "print(f'LightGBM  : {lightgbm.__version__}')",
+          "print(f'CUDA available: {torch.cuda.is_available()}')",
+          "if torch.cuda.is_available():",
+          "    print(f'GPU: {torch.cuda.get_device_name(0)}')",
+          "",
+          "# XGBoost GPU training (XGBoost >= 2.0)",
+          "params = {'tree_method': 'hist', 'device': 'cuda', 'max_depth': 6}",
+          "dtrain = xgboost.DMatrix(X_train, label=y_train)",
+          "model = xgboost.train(params, dtrain, num_boost_round=100)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure-management"
+  },
+  {
+    "q": "How do you create and submit an ML Job in Snowflake to run a training script from an external IDE, and how does it integrate with Snowflake Tasks for scheduled execution?",
+    "a": "ML Jobs allow you to submit Python workloads to Snowflake's Container Runtime from any external IDE (VS Code, PyCharm, SageMaker Studio) using the Snowflake Python SDK. You call MLJob.submit() or MLJob.submit_directory() with a reference to a local Python file or package directory, credentials, and the target compute pool. Snowflake packages your code, uploads it to an internal stage, and runs it inside the Container Runtime — the same GPU/CPU-backed environment used by Notebooks. The job returns a handle so you can poll status, stream logs, and retrieve artifacts. For pipeline automation you embed ML Jobs inside Snowflake Task DAGs: a parent Task calls a stored procedure that submits the ML Job, and child Tasks downstream can pick up the registered model version as input. CI/CD systems like GitHub Actions or Azure Pipelines can also trigger ML Jobs via the Python SDK or CLI, making the entire train→register→deploy cycle fully automated without manual Notebook interaction.",
+    "fj": "ML Jobs can only be triggered from inside a Snowflake Notebook; there is no way to submit them programmatically from an external script.",
+    "fs": "ML Jobs are specifically designed for external IDE workflows. The Snowflake Python SDK exposes MLJob.submit() and MLJob.submit_directory() which can be called from any Python environment with network access to Snowflake, enabling headless CI/CD automation.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Submit ML Job from external IDE",
+        "lines": [
+          "from snowflake.ml.jobs import MLJob",
+          "from snowflake.snowpark import Session",
+          "",
+          "session = Session.builder.configs({",
+          "    'account': 'myorg-myaccount',",
+          "    'user': 'ML_SERVICE_USER',",
+          "    'authenticator': 'snowflake_jwt',",
+          "    'private_key_file': '/secrets/rsa_key.p8',",
+          "    'database': 'PROD',",
+          "    'schema': 'ML',",
+          "    'warehouse': 'ML_WH'",
+          "}).create()",
+          "",
+          "job = MLJob.submit(",
+          "    session=session,",
+          "    entrypoint='train.py',          # local file or package dir",
+          "    compute_pool='GPU_NV_S_POOL',",
+          "    stage_name='@PROD.ML.ML_JOBS_STAGE',",
+          "    args=['--epochs', '50', '--lr', '0.001']",
+          ")",
+          "",
+          "job.wait()   # blocks until complete; use job.status() for async",
+          "print(job.get_logs())"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure-management"
+  },
+  {
+    "q": "How do you configure distributed multi-node training in Snowflake Container Runtime using the snowflake.ml.modeling.distributors API, and what hyperparameter tuning options are available?",
+    "a": "Snowflake's Container Runtime for ML supports multi-node clusters (generally available as of April 2025) where you request a cluster of N nodes in a compute pool spec. For distributed training you use the snowflake.ml.modeling.distributors namespace which provides drop-in distributed wrappers: PyTorchDistributor for DDP-style PyTorch training, XGBoostDistributor, and LightGBMDistributor. These wrappers handle worker discovery, communication ring setup (NCCL for GPUs), and result collection automatically — you write standard single-node training code and the distributor handles parallelism. For hyperparameter tuning you can use GridSearchCV or RandomizedSearchCV from Snowpark ML's distributed modeling API, or integrate Ray Tune / Optuna inside the container runtime since those packages are pip-installable. A typical pattern is to run coarse hyperparameter search on a single-node GPU pool, then promote the best config to a multi-node training job. All training runs, parameters, and metrics should be logged to the Snowflake Model Registry using the log_model() call with custom metadata dictionaries.",
+    "fj": "Distributed training in Snowflake requires manually configuring Horovod, setting MASTER_ADDR environment variables, and writing MPI launch scripts.",
+    "fs": "The snowflake.ml.modeling.distributors abstraction handles all cluster topology, worker communication, and process spawning automatically. You use PyTorchDistributor or XGBoostDistributor as high-level wrappers — no manual Horovod/MPI setup is required.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Distributed XGBoost training on multi-node cluster",
+        "lines": [
+          "from snowflake.ml.modeling.distributors.xgboost import XGBoostDistributor",
+          "",
+          "distributor = XGBoostDistributor(",
+          "    session=session,",
+          "    n_nodes=4,              # number of cluster nodes",
+          "    n_workers_per_node=2,   # GPUs per node",
+          "    compute_pool='GPU_NV_M_POOL',",
+          "    params={",
+          "        'objective': 'binary:logistic',",
+          "        'max_depth': 8,",
+          "        'learning_rate': 0.05,",
+          "        'n_estimators': 500,",
+          "        'device': 'cuda'",
+          "    }",
+          ")",
+          "",
+          "model = distributor.fit(",
+          "    train_data='@PROD.ML.TRAIN_PARQUET',",
+          "    label_col='CHURN'",
+          ")",
+          "",
+          "# Register result",
+          "from snowflake.ml.registry import Registry",
+          "reg = Registry(session=session, database_name='PROD', schema_name='ML')",
+          "reg.log_model(model, model_name='CHURN_XGB_DIST', version_name='v1',",
+          "              comment='4-node GPU distributed training')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure-management"
+  },
+  {
+    "q": "How do you import a model trained in AWS SageMaker into the Snowflake Model Registry for batch inference, and what are the key integration steps?",
+    "a": "To move a SageMaker-trained model into Snowflake's Model Registry you serialize the model artifact from SageMaker (e.g., download from S3 as model.tar.gz, extract the pickle/joblib/ONNX file), then use the Snowflake Python SDK's Registry.log_model() with a custom model class that wraps the loaded artifact. You implement a SnowflakeCustomModel subclass defining predict() and optionally explain(). The model object is serialized, staged to an internal Snowflake stage, and registered with schema-level RBAC. Once registered you call model_version.run(test_df, function_name='predict') for batch inference directly inside Snowflake — data never leaves the platform for scoring. For AzureML the workflow is identical: export the model from the AzureML registry, wrap it in a SnowflakeCustomModel, and log to Snowflake. Vertex AI models typically export to ONNX or SavedModel format which are also supported. The benefit is unified governance: one RBAC-controlled registry manages models regardless of which platform trained them, and Snowflake's audit trail captures every inference call.",
+    "fj": "You must retrain the SageMaker model from scratch inside Snowflake because external model artifacts cannot be imported into the Snowflake Model Registry.",
+    "fs": "Snowflake's Model Registry explicitly supports importing externally trained models via the SnowflakeCustomModel interface. Quickstarts document the exact pattern for SageMaker and AzureML, and ONNX models export from virtually every major framework.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Import SageMaker model into Snowflake Model Registry",
+        "lines": [
+          "import joblib",
+          "from snowflake.ml.model import custom_model",
+          "from snowflake.ml.registry import Registry",
+          "import pandas as pd",
+          "",
+          "# 1. Load artifact downloaded from SageMaker S3",
+          "sk_model = joblib.load('model.joblib')",
+          "",
+          "# 2. Wrap in SnowflakeCustomModel",
+          "class ChurnModel(custom_model.CustomModel):",
+          "    def __init__(self):",
+          "        super().__init__()",
+          "        self.sk_model = sk_model",
+          "",
+          "    @custom_model.inference_api",
+          "    def predict(self, X: pd.DataFrame) -> pd.DataFrame:",
+          "        return pd.DataFrame(",
+          "            self.sk_model.predict_proba(X)[:, 1],",
+          "            columns=['CHURN_PROB']",
+          "        )",
+          "",
+          "# 3. Register in Snowflake",
+          "reg = Registry(session=session, database_name='PROD', schema_name='ML')",
+          "mv = reg.log_model(",
+          "    ChurnModel(),",
+          "    model_name='SAGEMAKER_CHURN',",
+          "    version_name='v1',",
+          "    sample_input_data=sample_df,",
+          "    comment='Imported from SageMaker training run 2026-05-20'",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure-management"
+  },
+  {
+    "q": "Explain the three deployment surfaces available for a registered model in the Snowflake Model Registry and when you would choose each one.",
+    "a": "The Snowflake Model Registry exposes three deployment surfaces for a logged model version. First, SQL table functions / Python UDFs: calling model_version.run(df) generates a SQL vectorized UDF that other analysts can invoke in standard SELECT queries — best for batch scoring integrated into data pipelines. Second, a REST API managed service: you call model_version.create_service() with ingress_enabled=True which provisions a Snowpark Container Services endpoint at a public HTTPS URL (format: unique-id.snowflakecomputing.app). This is best for real-time, latency-sensitive inference from external apps where callers authenticate via JWT and POST JSON payloads. Third, a stored procedure wrapper: the model function is callable from Snowflake Tasks, Streams-driven pipelines, or third-party orchestrators via the Snowflake JDBC/ODBC driver. Choosing between them depends on latency requirements (REST < 100 ms SLA vs. batch UDF for throughput), caller identity (external HTTP clients vs. Snowflake-internal queries), and cost profile (managed services have always-on container billing vs. serverless UDFs billed per query).",
+    "fj": "You must choose a deployment target (UDF or REST endpoint) at model registration time and cannot switch later without re-registering.",
+    "fs": "Deployment surface is decoupled from registration. A single registered model version can simultaneously have a SQL UDF surface and a REST managed service. You create additional deployment surfaces after registration by calling the appropriate method on the model version object.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Deploy same model as SQL UDF and REST endpoint",
+        "lines": [
+          "from snowflake.ml.registry import Registry",
+          "",
+          "reg = Registry(session=session, database_name='PROD', schema_name='ML')",
+          "mv = reg.get_model('CHURN_MODEL').version('v2')",
+          "",
+          "# Surface 1: SQL UDF — batch scoring inside Snowflake queries",
+          "result_df = mv.run(test_df, function_name='predict')",
+          "result_df.write.save_as_table('PROD.ML.BATCH_SCORES', mode='overwrite')",
+          "",
+          "# Surface 2: REST managed service — real-time external inference",
+          "mv.create_service(",
+          "    service_name='CHURN_REALTIME_SVC',",
+          "    compute_pool='CPU_X64_XS',",
+          "    ingress_enabled=True,         # creates public HTTPS endpoint",
+          "    min_instances=1,",
+          "    max_instances=5              # autoscales",
+          ")",
+          "# Endpoint: https://<id>-<account>.snowflakecomputing.app/predict"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-serving-deployment"
+  },
+  {
+    "q": "How do you use Cortex COMPLETE and Cortex ML Functions together to serve both LLM inference and structured-data prediction workloads from within a Snowflake SQL pipeline?",
+    "a": "Cortex COMPLETE (SNOWFLAKE.CORTEX.COMPLETE) is the SQL/Python function for LLM text generation inference — you pass a model name (e.g., 'mistral-large2', 'llama3.3-70b', 'claude-sonnet-4-5') and a prompt string, and receive generated text back as a VARCHAR column. This runs on Snowflake-managed GPU infrastructure and scales automatically. Cortex ML Functions are a separate family of no-code, auto-ML SQL functions for structured tabular data: FORECAST for time-series predictions, ANOMALY_DETECTION for outlier detection, CLASSIFICATION for supervised classification, and REGRESSION for numeric targets. These functions accept Snowflake table references and return prediction tables without requiring any Python or model training code. A combined pipeline might use FORECAST to predict demand, then pipe the forecast deltas into CORTEX.COMPLETE to generate a natural-language commentary for a business dashboard — all in one SQL procedure. The key operational difference is that Cortex ML Functions manage their own model state internally (no Model Registry required), while COMPLETE routes to foundation LLMs. Both families respect Snowflake RBAC and data governance, and all inference stays within the Snowflake perimeter.",
+    "fj": "Cortex COMPLETE and Cortex ML Functions are the same thing — COMPLETE handles all ML tasks including forecasting and anomaly detection.",
+    "fs": "They are distinct product families. COMPLETE is an LLM text-generation function routing to foundation models. Cortex ML Functions (FORECAST, ANOMALY_DETECTION, CLASSIFICATION, REGRESSION) are structured tabular ML functions with their own auto-training internals. They solve different problems and are used differently in SQL.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Cortex ML FORECAST + COMPLETE commentary pipeline",
+        "lines": [
+          "-- Step 1: Train a time-series forecast model",
+          "CREATE OR REPLACE SNOWFLAKE.ML.FORECAST demand_model (",
+          "    INPUT_DATA => SYSTEM$REFERENCE('VIEW', 'PROD.SALES.DAILY_SALES'),",
+          "    TIMESTAMP_COLNAME => 'SALE_DATE',",
+          "    TARGET_COLNAME => 'UNITS_SOLD'",
+          ");",
+          "",
+          "-- Step 2: Generate 7-day forecast",
+          "CALL demand_model!FORECAST(",
+          "    FORECASTING_PERIODS => 7,",
+          "    CONFIG_OBJECT => {'prediction_interval': 0.9}",
+          ");",
+          "",
+          "-- Step 3: Use COMPLETE to narrate forecast deltas",
+          "SELECT",
+          "    TS AS forecast_date,",
+          "    FORECAST AS predicted_units,",
+          "    SNOWFLAKE.CORTEX.COMPLETE(",
+          "        'mistral-large2',",
+          "        CONCAT('Demand is forecast at ', FORECAST::VARCHAR,",
+          "               ' units on ', TS::VARCHAR,",
+          "               '. Write a 1-sentence business insight.')",
+          "    ) AS insight",
+          "FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "model-serving-deployment"
+  },
+  {
+    "q": "How do you wire a Snowflake Stream and a Task DAG to automatically retrain a churn model when cumulative new training rows exceed a threshold?",
+    "a": "You create a Snowflake Stream on the feature table (or a staging/bronze table) to capture CDC (change data capture) — inserts, updates, deletes. A Stream has a STALE_AFTER property and exposes a SYSTEM$STREAM_HAS_DATA() function. You then define a Task with a WHEN clause that evaluates SYSTEM$STREAM_HAS_DATA('CHURN_FEATURES_STREAM'), ensuring the task only fires when there is unconsumed CDC data. Inside the task's stored procedure you count accumulated rows; if row count exceeds the retraining threshold (e.g., 50,000 new rows) you call a second task that submits the ML Job for retraining. This forms a Task DAG: Stream-triggered root task → row-count check task → conditional branch to ML Job submission task → model registration task. Snowflake Tasks support branching via CASE logic in the procedure body. The stream is consumed atomically when the root task commits, preventing double-processing. For schedule-based triggers (e.g., weekly retraining) you skip the Stream and use a CRON schedule on the Task directly.",
+    "fj": "You should use Snowflake Dynamic Tables to detect new data and trigger retraining, because Streams are only for data warehousing ETL, not ML pipelines.",
+    "fs": "Streams with Tasks are the canonical event-driven trigger mechanism for ML retraining in Snowflake. Dynamic Tables auto-refresh derived data but do not expose programmatic hooks to call ML Jobs or stored procedures. Streams + Tasks are the correct pattern for conditional, threshold-based pipeline execution.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Stream + Task DAG for threshold-triggered retraining",
+        "lines": [
+          "-- 1. Stream on feature table",
+          "CREATE OR REPLACE STREAM PROD.ML.CHURN_FEATURES_STREAM",
+          "  ON TABLE PROD.ML.CHURN_FEATURES APPEND_ONLY = TRUE;",
+          "",
+          "-- 2. Root task: fires only when stream has new data",
+          "CREATE OR REPLACE TASK PROD.ML.CHECK_RETRAIN_THRESHOLD",
+          "  WAREHOUSE = ML_WH",
+          "  SCHEDULE = '5 MINUTES'",
+          "  WHEN SYSTEM$STREAM_HAS_DATA('PROD.ML.CHURN_FEATURES_STREAM')",
+          "AS",
+          "DECLARE",
+          "  new_rows INTEGER;",
+          "BEGIN",
+          "  SELECT COUNT(*) INTO :new_rows FROM PROD.ML.CHURN_FEATURES_STREAM",
+          "  WHERE METADATA$ACTION = 'INSERT';",
+          "  IF (:new_rows >= 50000) THEN",
+          "    EXECUTE TASK PROD.ML.SUBMIT_RETRAIN_JOB;",
+          "  END IF;",
+          "END;",
+          "",
+          "-- 3. Child task: submits ML Job via stored procedure",
+          "CREATE OR REPLACE TASK PROD.ML.SUBMIT_RETRAIN_JOB",
+          "  WAREHOUSE = ML_WH",
+          "AS",
+          "CALL PROD.ML.RETRAIN_CHURN_MODEL_PROC();",
+          "",
+          "ALTER TASK PROD.ML.CHECK_RETRAIN_THRESHOLD RESUME;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "pipeline-orchestration-cicd"
+  },
+  {
+    "q": "What is the role of Snowflake Streams in event-driven ML data pipelines, and how do you handle stream staleness and exactly-once consumption guarantees?",
+    "a": "A Snowflake Stream tracks DML changes (inserts, updates, deletes) on a source table or view and exposes them as a queryable delta table. When a Task reads and commits against a Stream, all rows seen in that transaction are atomically consumed and removed from the stream's pending set — this is the exactly-once guarantee. Staleness becomes a concern when a Stream is not consumed within its data retention window (default 14 days; configurable via DATA_RETENTION_TIME_IN_DAYS on the source table). A stale stream raises an error on read. To prevent staleness in ML pipelines: either consume the stream frequently via scheduled Tasks, or set up monitoring on INFORMATION_SCHEMA.STREAMS to alert when STALE_AFTER is approaching. For ML data pipelines the typical pattern is an append-only stream on a feature staging table — append-only streams are more efficient than standard streams because they skip tracking updates/deletes. For multi-consumer patterns (e.g., both a retraining pipeline and a monitoring pipeline need the same new rows) you create separate streams on the same source table; each has its own independent offset pointer and consumption lifecycle.",
+    "fj": "A single Snowflake Stream can be consumed by multiple Tasks simultaneously and each Task sees the same rows in the same transaction.",
+    "fs": "Each Task that reads a stream within a transaction advances that stream's offset for itself. If you need multiple independent consumers of the same source data, you must create separate streams per consumer — each stream maintains its own change-tracking offset independently.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "pipeline-orchestration-cicd"
+  },
+  {
+    "q": "Describe the multi-schema alias pattern for promoting ML artifacts from dev to staging to prod in Snowflake Model Registry without downtime.",
+    "a": "The standard Snowflake pattern uses three database schemas — ML_DEV, ML_STAGING, ML_PROD — each holding their own Registry. A model version is first logged to ML_DEV, runs automated evaluation tests (accuracy, bias checks), and if it passes, is cloned (using COPY MODEL or re-logged) into ML_STAGING for integration testing. Promotion to production uses model version aliases: a string label like 'champion' or 'production' is applied to the approved version in ML_PROD. Application code always resolves predictions by alias, not by version number, so swapping the alias from the old version to the new version is an atomic operation with zero downtime. The previous champion version is tagged with a 'challenger' or 'deprecated' alias and retained for rollback. Snowflake also supports schema-level cloning (CREATE DATABASE ML_STAGING CLONE ML_DEV) to promote entire environments rapidly. CI/CD pipelines (GitHub Actions, Azure Pipelines) automate the evaluation gate: a pipeline step calls the Registry API, runs a hold-out evaluation, and only advances the alias if the metric threshold passes.",
+    "fj": "Each environment (dev/staging/prod) requires a separate Snowflake account, making cross-environment promotion a complex data migration.",
+    "fs": "Multiple environments coexist within a single Snowflake account as separate schemas or databases. Model promotion is an alias reassignment operation within the same account, which is atomic and requires no data migration. Separate accounts are an option for strict network isolation but not a requirement.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Model alias-based promotion dev → staging → prod",
+        "lines": [
+          "from snowflake.ml.registry import Registry",
+          "",
+          "# Dev: log new candidate version",
+          "dev_reg = Registry(session=session, database_name='ML_DEV', schema_name='MODELS')",
+          "mv = dev_reg.log_model(trained_model, model_name='CHURN', version_name='v5')",
+          "mv.set_alias('candidate')",
+          "",
+          "# --- CI gate: run evaluation ---",
+          "# accuracy = evaluate(mv, holdout_df)",
+          "# assert accuracy >= 0.85",
+          "",
+          "# Staging: copy artifact and tag for integration test",
+          "stg_reg = Registry(session=session, database_name='ML_STAGING', schema_name='MODELS')",
+          "# (re-log the same serialized artifact to staging registry)",
+          "mv_stg = stg_reg.log_model(trained_model, model_name='CHURN', version_name='v5')",
+          "mv_stg.set_alias('pending')",
+          "",
+          "# Prod: atomic champion swap — zero downtime",
+          "prod_reg = Registry(session=session, database_name='ML_PROD', schema_name='MODELS')",
+          "prod_model = prod_reg.get_model('CHURN')",
+          "old_champ = prod_model.default  # current champion version",
+          "new_mv = prod_reg.log_model(trained_model, model_name='CHURN', version_name='v5')",
+          "new_mv.set_alias('champion')   # alias is atomic — no downtime",
+          "old_champ.set_alias('deprecated')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "pipeline-orchestration-cicd"
+  },
+  {
+    "q": "How do you apply RBAC to control access to Snowflake Model Registry models, Feature Store feature views, and datasets used in ML training?",
+    "a": "All Snowflake ML artifacts live as schema-level objects so standard RBAC applies. For the Model Registry, you grant USAGE on the schema and OWNERSHIP or READ privilege on individual model objects to specific roles. A typical pattern creates three roles: ML_ENGINEER (can log and manage all versions), ML_ANALYST (can run inference via model functions, no write access), and ML_OPS (can promote aliases and deploy services, no training access). For the Feature Store, Snowflake defines a Producer role (can CREATE FEATURE VIEW, write feature data) and a Consumer role (can read feature views and entities, cannot modify them). You grant database roles for Feature Store access: producer_role gets USAGE on the feature view schema; consumer_role gets SELECT. Datasets (training data tables, staged parquet files) use standard table-level grants. For Cortex LLM RBAC (GA April 2025) you can restrict which roles can call specific foundation models via GRANT SNOWFLAKE.CORTEX.USER privilege on the model to a role. Tag-based data governance via object tags and masking policies can additionally ensure PII columns are masked when accessed by consumer roles during inference without modifying the model itself.",
+    "fj": "Model Registry objects bypass standard RBAC and are accessible to any role with USAGE on the database — you secure them separately via network policies, not GRANT statements.",
+    "fs": "Model Registry objects are schema-level objects governed by the same GRANT/REVOKE system as tables and views. USAGE on the parent schema plus object-level privileges control access. Network policies are a separate, complementary control at the account/session layer, not a substitute for RBAC.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "RBAC grants for Model Registry and Feature Store",
+        "lines": [
+          "-- Model Registry grants",
+          "GRANT USAGE ON DATABASE ML_PROD TO ROLE ML_ANALYST;",
+          "GRANT USAGE ON SCHEMA ML_PROD.MODELS TO ROLE ML_ANALYST;",
+          "-- Allow inference calls only",
+          "GRANT USAGE ON MODEL ML_PROD.MODELS.CHURN_MODEL TO ROLE ML_ANALYST;",
+          "",
+          "-- Cortex LLM RBAC (GA April 2025)",
+          "GRANT SNOWFLAKE.CORTEX.USER ON MODEL 'mistral-large2' TO ROLE ML_ANALYST;",
+          "REVOKE SNOWFLAKE.CORTEX.USER ON MODEL 'claude-sonnet-4-5' FROM ROLE ML_ANALYST;",
+          "",
+          "-- Feature Store: producer vs consumer",
+          "-- (Snowflake Feature Store uses database roles)",
+          "GRANT DATABASE ROLE ML_PROD.FEATURE_STORE_PRODUCER TO ROLE ML_ENGINEER;",
+          "GRANT DATABASE ROLE ML_PROD.FEATURE_STORE_CONSUMER TO ROLE ML_ANALYST;",
+          "",
+          "-- Masking policy on PII column applied at table level",
+          "ALTER TABLE ML_PROD.FEATURES.CUSTOMER_FEATURES",
+          "  MODIFY COLUMN EMAIL",
+          "  SET MASKING POLICY PROD.GOVERNANCE.PII_MASK;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "governance-security-monitoring"
+  },
+  {
+    "q": "How does Snowflake Model Registry's explainability API use Shapley values to produce SHAP-based feature attributions, and how do you use the output for compliance reporting?",
+    "a": "The Snowflake Model Registry includes an explainability function backed by Shapley (SHAP) values, available via model_version.explain(input_df). Under the hood Snowflake uses the shap library's TreeExplainer (for tree-based models like XGBoost/LightGBM) or KernelExplainer (for black-box models) running inside the Container Runtime. The function returns a DataFrame with one SHAP value column per input feature, quantifying each feature's marginal contribution to the prediction for that row — positive values push the prediction higher, negative values lower. For compliance reporting you aggregate SHAP values at the cohort level: mean absolute SHAP per feature gives a global feature importance ranking auditors can review. You can detect if a protected attribute (e.g., ZIP_CODE as a proxy for race) carries disproportionate SHAP magnitude, which surfaces fairness concerns. Snowflake stores explainability results as a versioned artifact in the Model Registry alongside the model, so audit trails are durable and version-linked. The Snowsight Model Registry UI displays a SHAP summary bar chart without any Python code, enabling non-technical compliance teams to review model behavior.",
+    "fj": "Shapley values tell you which features have the highest training correlation with the target variable — they are equivalent to Pearson correlation coefficients.",
+    "fs": "SHAP values are game-theoretic attribution scores measuring each feature's marginal contribution to a specific prediction, accounting for feature interactions. They are NOT correlation coefficients. A feature with low overall correlation can have high SHAP values in specific prediction regions due to non-linear interactions — SHAP is far more informative for model transparency than correlation alone.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Snowflake Model Registry SHAP explainability",
+        "lines": [
+          "from snowflake.ml.registry import Registry",
+          "import pandas as pd",
+          "",
+          "reg = Registry(session=session, database_name='PROD', schema_name='ML')",
+          "mv = reg.get_model('CHURN_XGB').version('v3')",
+          "",
+          "# Generate SHAP explanations for a batch",
+          "test_df = session.table('PROD.ML.HOLDOUT_FEATURES')",
+          "shap_df = mv.explain(test_df)   # returns DataFrame with SHAP columns",
+          "",
+          "# Convert to pandas for compliance report",
+          "shap_pd = shap_df.to_pandas()",
+          "",
+          "# Global feature importance (mean |SHAP|)",
+          "feature_cols = [c for c in shap_pd.columns if c.endswith('_explanation')]",
+          "importance = shap_pd[feature_cols].abs().mean().sort_values(ascending=False)",
+          "print('Top features by SHAP magnitude:')",
+          "print(importance.head(10))",
+          "",
+          "# Flag protected-attribute leakage",
+          "if 'ZIP_CODE_explanation' in importance.index[:5].tolist():",
+          "    print('WARNING: ZIP_CODE is a top-5 driver — review for proxy fairness issues')"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "governance-security-monitoring"
+  },
+  {
+    "q": "How do you configure network policies and private connectivity for Snowpark Container Services (SPCS) hosting ML inference workloads?",
+    "a": "For SPCS-hosted ML services you control network access at two layers. First, Snowflake network policies restrict which IP ranges or private-link endpoints can initiate connections to your Snowflake account (and therefore to SPCS service endpoints). You create a network rule with mode INGRESS specifying allowed IP ranges or AWSVPCEID/AZURELINKID identifiers for private link, then attach it to a network policy assigned to the service's account or to a specific role. Private-link rules take precedence over IP-based rules, blocking all public-internet traffic automatically when present. Second, for outbound traffic from the SPCS container (e.g., calling an external scoring API or pulling model artifacts from S3) you configure an external access integration: an ALLOWED_NETWORK_RULE referencing the external endpoint's IP, attached to the service spec. The service spec YAML additionally controls which compute pool the service runs on and exposes ingress endpoints. As of December 2025, GCP Private Service Connect IDs are also supported in network rules (GA). Best practice for regulated environments: set BLOCK_ALL_PUBLIC as the default network policy, allowlist only corporate VPN or cloud-provider private-link IDs, and attach a dedicated service role with minimal privileges to the SPCS service.",
+    "fj": "SPCS service networking is fully handled by Snowflake automatically — you cannot configure network policies for individual container services.",
+    "fs": "SPCS service networking is configurable at multiple layers: account-level network policies, service-level external access integrations, and compute pool placement. You have explicit control over both inbound and outbound traffic for each service, which is required for regulated workloads.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Network policy + private link for SPCS ML service",
+        "lines": [
+          "-- 1. Create a private-link network rule (AWS PrivateLink)",
+          "CREATE OR REPLACE NETWORK RULE CORP_PRIVATE_LINK_RULE",
+          "  TYPE = AWSVPCEID",
+          "  VALUE_LIST = ('vpce-0abc1234def56789a')",
+          "  MODE = INGRESS",
+          "  COMMENT = 'Allow traffic only from corporate VPC via PrivateLink';",
+          "",
+          "-- 2. Attach to network policy",
+          "CREATE OR REPLACE NETWORK POLICY ML_SERVICES_POLICY",
+          "  ALLOWED_NETWORK_RULE_LIST = ('PROD.SECURITY.CORP_PRIVATE_LINK_RULE');",
+          "",
+          "-- 3. External access integration for outbound calls from SPCS",
+          "CREATE OR REPLACE NETWORK RULE S3_ARTIFACTS_RULE",
+          "  TYPE = IPV4",
+          "  VALUE_LIST = ('52.92.0.0/20')  -- S3 IP range example",
+          "  MODE = EGRESS;",
+          "",
+          "CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION S3_ACCESS",
+          "  ALLOWED_NETWORK_RULES = (S3_ARTIFACTS_RULE)",
+          "  ENABLED = TRUE;",
+          "",
+          "-- 4. Reference in service spec (YAML excerpt)",
+          "-- external_access_integrations:",
+          "--   - S3_ACCESS"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "governance-security-monitoring"
+  },
+  {
+    "q": "How do you build a monitoring dashboard in Snowflake to detect model performance degradation and data drift, and what alerting mechanism should you configure for production ML services?",
+    "a": "Production ML monitoring in Snowflake is built as a pipeline, not a built-in turnkey service. You create a Task that runs on a schedule (e.g., daily or hourly) to compute monitoring metrics: prediction distribution statistics (PSI — Population Stability Index), feature distribution statistics (KS test, Jensen-Shannon divergence), and accuracy/F1 if ground-truth labels arrive with a lag. These metrics are written to a monitoring table. A Snowflake Alert (CREATE ALERT) polls that table and fires a notification action (via a notification integration to PagerDuty, Slack, or email) when a metric crosses a threshold — e.g., PSI > 0.2 signals significant drift. The monitoring table feeds a Streamlit-in-Snowflake dashboard with time-series charts of metric trends. For reference distribution you store a BASELINE table capturing the training data's feature statistics at model registration time (mean, stddev, percentiles), and the monitoring task compares live scoring input distributions against the baseline. For teams using Snowflake's ML Observability (in preview) you can additionally log prediction scores alongside ground-truth labels and call the built-in performance tracking functions.",
+    "fj": "Snowflake automatically monitors model accuracy and sends alerts through Snowsight without any additional configuration once a model is deployed.",
+    "fs": "There is no fully automatic model monitoring in Snowflake out of the box. You must build monitoring pipelines using Snowflake Tasks, Alerts, and custom metric tables. Snowflake provides the infrastructure primitives (Alerts, notification integrations, Streamlit dashboards) but the drift detection logic is your responsibility.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Drift monitoring task + alert",
+        "lines": [
+          "-- 1. Monitoring metrics task (runs hourly)",
+          "CREATE OR REPLACE TASK PROD.ML.COMPUTE_DRIFT_METRICS",
+          "  WAREHOUSE = ML_WH",
+          "  SCHEDULE = 'USING CRON 0 * * * * UTC'",
+          "AS",
+          "INSERT INTO PROD.ML.MODEL_METRICS (model_name, metric_name, metric_value, ts)",
+          "SELECT",
+          "  'CHURN_V3'                         AS model_name,",
+          "  'avg_prediction_score'             AS metric_name,",
+          "  AVG(CHURN_PROB)                    AS metric_value,",
+          "  CURRENT_TIMESTAMP()                AS ts",
+          "FROM PROD.ML.LIVE_SCORES",
+          "WHERE SCORE_TS >= DATEADD(hour, -1, CURRENT_TIMESTAMP());",
+          "",
+          "-- 2. Alert fires when avg score drifts > 15% from baseline",
+          "CREATE OR REPLACE ALERT PROD.ML.SCORE_DRIFT_ALERT",
+          "  WAREHOUSE = ML_WH",
+          "  SCHEDULE = '30 MINUTES'",
+          "  IF (EXISTS (",
+          "    SELECT 1 FROM PROD.ML.MODEL_METRICS m",
+          "    JOIN PROD.ML.MODEL_BASELINES b ON m.model_name = b.model_name",
+          "    WHERE m.metric_name = 'avg_prediction_score'",
+          "      AND ABS(m.metric_value - b.baseline_value) / b.baseline_value > 0.15",
+          "      AND m.ts >= DATEADD(minute, -30, CURRENT_TIMESTAMP())",
+          "  ))",
+          "  THEN CALL SYSTEM$SEND_EMAIL(",
+          "    'ML_OPS_NOTIFICATION_INT',",
+          "    'mlops-team@company.com',",
+          "    'Model Drift Alert: CHURN_V3',",
+          "    'Score distribution has drifted > 15% from baseline. Investigate.'",
+          "  );",
+          "",
+          "ALTER TASK PROD.ML.COMPUTE_DRIFT_METRICS RESUME;",
+          "ALTER ALERT PROD.ML.SCORE_DRIFT_ALERT RESUME;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "governance-security-monitoring"
+  }
+]

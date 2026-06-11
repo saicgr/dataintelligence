@@ -1,0 +1,406 @@
+[
+  {
+    "q": "An interviewer asks you to design a unified compliance posture for a healthcare payments platform that stores PCI, PII, and PHI data in Snowflake. Walk through how you layer RBAC, masking policies, network controls, and audit logging into a coherent architecture.",
+    "a": "The foundation is a role hierarchy where functional roles (ANALYST_PCI, NURSE_PHI, etc.) inherit from object-scoped access roles, never granting broad system roles like SYSADMIN to end users. Column-level sensitivity is expressed through Snowflake tags — tag PII, PHI, and PAN columns using the SNOWFLAKE.TAG schema or custom tags, then attach dynamic data masking policies to those tags so masking propagates automatically as new columns inherit the tag. For PCI cardholder data, masking policies return SHA2-hashed or truncated values to roles below PAYMENT_ANALYST; for PHI, full-tokenized values are shown only to roles holding a HIPAA_ACCESS grant. Row access policies restrict scope further: a row access policy on the CLAIMS table limits analysts to rows matching their org_id, enforced transparently at query time. Network policies add a perimeter layer: restrict account-level inbound traffic to known corporate IP ranges, then pair with AWS PrivateLink or Azure Private Link so no traffic traverses the public internet. Audit logging is handled via ACCOUNT_USAGE.ACCESS_HISTORY (records every column touched per query), ACCOUNT_USAGE.POLICY_REFERENCES (shows every masking and row policy assignment), and ACCOUNT_USAGE.LOGIN_HISTORY. For PCI DSS compliance, schedule a weekly INFORMATION_SCHEMA-based report that checks all sensitive tables have both a masking policy and a row access policy attached; for HIPAA, produce audit trail exports from ACCESS_HISTORY to your SIEM on a daily cadence.",
+    "fj": "Create a single ANALYST role and use view definitions with CASE WHEN to redact sensitive columns for all users.",
+    "fs": "View-based redaction is fragile: a SYSADMIN can bypass the view, there is no centralized policy registry, and policies do not travel with the underlying table when it is cloned or shared. Snowflake masking and row access policies are enforced in the query engine and cannot be bypassed by direct table access, making them audit-defensible for PCI and HIPAA examiners.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Tag-based masking + row access policy wiring",
+        "lines": [
+          "-- 1. Create sensitivity tags",
+          "CREATE TAG governance.PII;",
+          "CREATE TAG governance.PHI;",
+          "",
+          "-- 2. Tag a column",
+          "ALTER TABLE payments.customers",
+          "  MODIFY COLUMN ssn SET TAG governance.PII = 'true';",
+          "",
+          "-- 3. Create masking policy",
+          "CREATE MASKING POLICY mask_ssn AS (val STRING) RETURNS STRING ->",
+          "  CASE",
+          "    WHEN CURRENT_ROLE() IN ('PAYMENT_ANALYST') THEN val",
+          "    ELSE '***-**-' || RIGHT(val, 4)",
+          "  END;",
+          "",
+          "-- 4. Attach policy to tag",
+          "ALTER TAG governance.PII SET MASKING POLICY mask_ssn;",
+          "",
+          "-- 5. Row access policy for PHI",
+          "CREATE ROW ACCESS POLICY rap_claims AS (org_id STRING) RETURNS BOOLEAN ->",
+          "  org_id = CURRENT_USER_ATTRIBUTE('ORG_ID')",
+          "  OR CURRENT_ROLE() = 'HIPAA_ADMIN';",
+          "",
+          "ALTER TABLE claims ADD ROW ACCESS POLICY rap_claims ON (org_id);"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "accounts-and-security"
+  },
+  {
+    "q": "A security architect insists that Snowflake data must be protected even if Snowflake's own infrastructure is compromised. What Snowflake feature addresses this, how does it work mechanically, and what are the operational requirements?",
+    "a": "Tri-Secret Secure (TSS) addresses this threat model. By default Snowflake uses a hierarchy of Snowflake-managed keys: a root key encrypts account master keys (AMKs), AMKs encrypt table master keys (TMKs), and TMKs derive file encryption keys. Tri-Secret Secure replaces the root key with a composite key formed by XOR-combining a Snowflake-maintained AMK half with a customer-managed key (CMK) stored in your cloud KMS (AWS KMS, Azure Key Vault, or GCP Cloud KMS). Because both halves are required, Snowflake cannot decrypt your data without your CMK being active — revoking or disabling your CMK renders all data inaccessible immediately, even to Snowflake staff. Operationally: the account must be Business Critical edition or higher; you provision a KMS key and grant Snowflake a service principal or IAM role with Decrypt/Encrypt permissions; Snowflake refreshes the composite key every 30 days aligned to its internal AMK rotation cycle. If your CMK is rotated in the KMS, Snowflake incorporates the new version on the next 30-day AMK rotation — it does not immediately re-encrypt. TLS 1.2+ encrypts all data in transit; there is no configuration required since it is enforced by default. VPN or Private Link is layered on top for network isolation, but it is independent of TSS.",
+    "fj": "You can achieve the same protection by enabling Snowflake's built-in Automatic Key Rotation, which rotates keys every 30 days.",
+    "fs": "Snowflake's Automatic Key Rotation rotates Snowflake-managed keys, but Snowflake still holds all key material. TSS is architecturally different: it requires your external CMK to be present for any decryption, so key revocation in your KMS immediately halts access. Automatic rotation alone does not remove Snowflake from the trust boundary.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "accounts-and-security"
+  },
+  {
+    "q": "Your company is entering a PCI DSS audit and legal is asking whether you need Business Critical or VPS edition. Describe the security feature delta between Enterprise, Business Critical, and VPS editions relevant to this decision.",
+    "a": "Enterprise edition adds Multi-Cluster Warehouses and time travel up to 90 days but has no compliance-specific features. Business Critical adds the full compliance stack: Tri-Secret Secure (customer-managed keys), HIPAA BAA eligibility, PCI DSS attestation, dedicated metadata encryption, PHI and PAN data support, enhanced encryption key rotation, private connectivity (PrivateLink on all clouds), and AWS GovCloud support. A HIPAA Business Associate Agreement (BAA) must be signed with Snowflake before storing PHI, and this is only available on Business Critical or higher. For PCI DSS scope, Business Critical accounts are covered under Snowflake's PCI AOC. Virtual Private Snowflake (VPS) provides everything in Business Critical but deploys your account in a fully dedicated Snowflake environment: separate metadata stores, separate compute fleet, no shared virtual warehouses with other tenants, and dedicated cryptographic hardware. VPS is appropriate when your compliance posture requires verifiable physical or logical isolation from other Snowflake tenants — commonly required by Tier 1 financial institutions, defense contractors, or any audit requiring dedicated infrastructure attestation. VPS is custom-priced and requires a separate contract negotiation. For most PCI DSS use cases, Business Critical with PrivateLink is sufficient; choose VPS only when the auditor explicitly requires tenant isolation documentation.",
+    "fj": "Enterprise edition with TLS and strong passwords satisfies PCI DSS because encryption in transit is the primary PCI control.",
+    "fs": "PCI DSS requires encryption at rest, detailed audit logging, access controls, and often a signed responsibility matrix from the cloud provider. Snowflake's PCI AOC attestation is only issued for Business Critical and VPS editions. Enterprise edition is not covered by Snowflake's compliance certifications for PCI or HIPAA.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "accounts-and-security"
+  },
+  {
+    "q": "Describe how you would configure AWS PrivateLink for a Snowflake account, and explain the key limitations that differentiate it from public endpoint access.",
+    "a": "To configure AWS PrivateLink: first, contact Snowflake Support (or use SYSTEM$AUTHORIZE_PRIVATELINK on Business Critical) to authorize your AWS account ID for the Snowflake account's VPC endpoint service. Next, in your AWS console, create a VPC Interface Endpoint pointing to the Snowflake regional endpoint service (e.g., com.amazonaws.vpce.us-east-1.vpce-svc-...). Then update your Snowflake network policy to allow the VPC endpoint's private IP ranges or, preferably, create a network rule of type AWSVPCEID referencing the VPCE ID with MODE = INGRESS, and add that rule to a network policy applied to the account. Finally, configure your DNS — typically a Route53 private hosted zone resolving your Snowflake account URL (account.snowflakecomputing.com) to the VPCE private DNS entry — so all client traffic routes through the endpoint without leaving the AWS backbone. Key limitations versus public endpoint: PrivateLink is cloud-provider local — you cannot use an AWS PrivateLink endpoint to reach a Snowflake account hosted on Azure or GCP; both Snowflake account and client VPC must be in the same cloud and region. PrivateLink does not eliminate the need for a network policy; without a network policy restricting to the VPCE, users could still reach the account from the public internet. PrivateLink also requires Business Critical or higher edition.",
+    "fj": "After enabling PrivateLink, the Snowflake public endpoint is automatically disabled so there is no need for a network policy.",
+    "fs": "Enabling PrivateLink does not disable the public endpoint by default. You must explicitly create and apply a network policy that restricts inbound access to the VPCE endpoint ID (or associated private IP ranges). Without that policy, the account remains reachable from the public internet alongside the private endpoint.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Network rule + policy for PrivateLink",
+        "lines": [
+          "-- Create network rule scoped to the VPC endpoint ID",
+          "CREATE NETWORK RULE vpce_rule",
+          "  TYPE = AWSVPCEID",
+          "  VALUE_LIST = ('vpce-0abc123def456')  -- your VPC endpoint ID",
+          "  MODE = INGRESS;",
+          "",
+          "-- Create a network policy and apply the rule",
+          "CREATE NETWORK POLICY allow_privatelink_only",
+          "  ALLOWED_NETWORK_RULE_LIST = ('vpce_rule');",
+          "",
+          "-- Apply at account level (blocks public internet)",
+          "ALTER ACCOUNT SET NETWORK_POLICY = allow_privatelink_only;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "accounts-and-security"
+  },
+  {
+    "q": "Your organization uses Okta as the IdP. Describe how you configure SCIM provisioning for Snowflake, what it automates, and what it does not handle.",
+    "a": "SCIM (System for Cross-domain Identity Management) 2.0 integration between Okta and Snowflake automates the user lifecycle: creating users when they are assigned to the Snowflake app in Okta, deactivating users when they are removed or deprovisioned, and syncing Okta groups to Snowflake roles using Okta's Push Groups feature. Configuration steps: in Snowflake create a SCIM security integration and generate a SCIM token (SELECT SYSTEM$GENERATE_SCIM_ACCESS_TOKEN('OKTA_PROVISIONER')); in Okta configure the Snowflake provisioning app with the Snowflake SCIM base URL and the bearer token. Okta group push creates roles in Snowflake with matching names and manages membership, enabling just-in-time role assignment. Limitations: the SCIM token expires every six months and requires manual rotation (Snowflake does not auto-rotate it); Okta does not support nested AD group imports through SCIM, so complex group hierarchies must be flattened in Okta before pushing; SCIM handles user presence and group membership but not privilege grants — you still need Snowflake RBAC setup (GRANT ROLE to ROLE) for the actual privileges; and network policies must whitelist Okta's dynamic IP ranges or the SCIM calls will fail. SCIM works alongside SSO/SAML: SCIM handles provisioning while SAML handles authentication, and both are typically configured together.",
+    "fj": "SCIM provisioning fully replaces the need to manage Snowflake roles and grants, since Okta groups map directly to Snowflake privileges.",
+    "fs": "SCIM manages user existence and role membership but does not create or grant privileges. A Snowflake role pushed from Okta still needs GRANT SELECT ON SCHEMA x TO ROLE y executed in Snowflake. The provisioner role (AAD_PROVISIONER or OKTA_PROVISIONER) is intentionally scoped-down and cannot grant arbitrary privileges.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Create Okta SCIM integration and token",
+        "lines": [
+          "-- Create SCIM security integration",
+          "CREATE SECURITY INTEGRATION okta_scim",
+          "  TYPE = SCIM",
+          "  SCIM_CLIENT = 'OKTA'",
+          "  RUN_AS_ROLE = OKTA_PROVISIONER;",
+          "",
+          "-- Generate bearer token for Okta",
+          "SELECT SYSTEM$GENERATE_SCIM_ACCESS_TOKEN('OKTA_SCIM');",
+          "",
+          "-- Token expires in 6 months — calendar a rotation reminder",
+          "-- Network policy must allow Okta IP ranges",
+          "ALTER ACCOUNT SET NETWORK_POLICY = allow_corporate_and_okta;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "accounts-and-security"
+  },
+  {
+    "q": "A product team wants to model a denormalized 'One Big Table' for their analytics layer instead of a Star Schema. As the Snowflake architect, when would you approve OBT and when would you push back?",
+    "a": "OBT (One Big Table) collapses all fact and dimension attributes into a single wide table, eliminating JOIN overhead at query time by moving that cost to load/refresh time. Snowflake's columnar storage and micro-partition pruning handle wide tables well, so OBT can deliver 25–50% query speed improvements versus a star schema for simple aggregation workloads. Approve OBT when: the grain is fixed and well understood (one fact row per user-event, for example); dimensions are low-cardinality and change infrequently (avoiding expensive full-refresh churn on slowly-changing attributes); query patterns are known and narrow (a specific BI dashboard, not ad-hoc exploration); and the domain is one team's reporting layer, not a shared enterprise asset. Push back when: dimensions change frequently — renaming a product in an OBT means updating millions of rows, while a Star Schema dim update is a single row; the table will be shared across multiple teams with divergent query patterns, because OBT offers no logical separation for governance (PII can't be isolated to a dimension table); the data model will evolve — OBT is brittle to schema changes; or at very large scale (tens of billions of rows) full-refresh OBT loads become compute-prohibitive. In Snowflake, the hybrid approach is common: Data Vault or normalized source-of-truth in the Silver layer, with OBT or wide fact tables materialized as Dynamic Tables in the Gold/serving layer for specific high-traffic dashboards.",
+    "fj": "OBT is always faster in Snowflake because Snowflake's columnar engine eliminates any advantage of separating fact and dimension tables.",
+    "fs": "OBT is faster for simple scans and aggregations, but Star Schema wins when queries touch only a subset of dimensions (pruning is more selective per table) and when Slowly Changing Dimensions require historical accuracy. The storage cost of OBT also grows multiplicatively when high-cardinality dimensions are repeated across millions of fact rows.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "snowflake-architecture"
+  },
+  {
+    "q": "Describe Snowflake's organization-level account model — specifically the GLOBALORGADMIN role, what it can do that ORGADMIN could not, and when you would architect a multi-account organization versus independent accounts.",
+    "a": "As of January 2025, Snowflake introduced the Organization Account (generally available), a dedicated account that hosts the GLOBALORGADMIN role and provides a unified control plane for all member accounts. GLOBALORGADMIN supersedes the legacy ORGADMIN role (which will be phased out): it can create and delete accounts, accept Snowflake Marketplace terms on behalf of the entire org, manage replication and failover topologies across accounts, view org-level credit usage and storage aggregated across all accounts, and govern organization users — a new identity type (in Preview as of May 2025) that represents a single human identity importable into multiple accounts without duplicate provisioning. ORGADMIN in the old model required a designated account with org-level privileges grafted on, limiting visibility. Multi-account organizations are appropriate when: regulatory requirements mandate data residency separation (e.g., EU data must not commingle with US data); business units have independent cost centers and chargeback models; blast radius isolation is required (a warehouse runaway in one account cannot impact another); or different editions are needed per workload (Business Critical for PCI data, Enterprise for internal analytics). Independent accounts make sense when the org is small, no data sharing is planned, and centralized governance overhead is not justified. The architect trade-off: multi-account adds complexity in SCIM/SSO duplication, cross-account data sharing setup, and replication configuration, but GLOBALORGADMIN and organization users significantly reduce that overhead in 2025+.",
+    "fj": "Multi-account organizations mainly add cost because Snowflake charges separately per account, so single-account with strict RBAC is always better.",
+    "fs": "Multi-account adds costs in management overhead, but regulatory data residency requirements, edition differences, and blast radius isolation are architectural needs that a single account cannot satisfy with RBAC alone — RBAC cannot enforce cloud-region data residency or prevent one warehouse's runaway cost from consuming another business unit's credits.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "snowflake-architecture"
+  },
+  {
+    "q": "Design a Snowflake CI/CD pipeline that promotes changes from dev through staging to production using Git-backed objects, zero-copy clones, and environment-isolated roles.",
+    "a": "The architecture has three layers: source control, promotion gates, and Snowflake environment isolation. Source control: store all Snowflake DDL (tables, views, procedures, tasks, dynamic tables) in a Git repository. Connect it to Snowflake via a Git Repository integration (CREATE GIT REPOSITORY) so objects can be executed directly from a branch reference without manual file copying. Schema migration tooling — either schemachange (imperative, Flyway-style versioned scripts) or Snowflake DCM Projects (declarative, desired-state diffing) — handles ordered, idempotent changes. Promotion gates: on pull request, run EXECUTE IMMEDIATE FROM the feature branch against a zero-copy clone of production (CREATE DATABASE dev_pr_123 CLONE prod_db) — the clone shares micro-partitions so it is instant and storage-cheap, giving a production-shaped dataset for integration tests. Drop the clone on PR close. On merge to main, deploy to a staging account (or schema) and run dbt tests or expectation checks. On tag/release, deploy to production. Environment role isolation: each environment has its own DEPLOYER role with USAGE on the target database only; the CI service principal is granted DEPLOYER, never SYSADMIN. Warehouse names are environment-prefixed (DEV_TRANSFORM_WH, PROD_TRANSFORM_WH) to prevent cross-environment compute bleed. Secrets (service principal credentials) live in the CI platform (GitHub Actions secrets, Azure DevOps variable groups) and are injected at runtime.",
+    "fj": "Copy the SQL scripts from the dev schema to production manually after testing in dev, and use Time Travel to roll back if something goes wrong.",
+    "fs": "Manual promotion is error-prone, non-repeatable, and has no audit trail. Time Travel rollback works for data but not for DDL object structure — if you add a column in production and it breaks queries, Time Travel cannot remove that column. Version-controlled, automated promotion with zero-copy clone testing is the correct pattern.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Git integration + zero-copy clone for CI",
+        "lines": [
+          "-- Wire up Git repository in Snowflake",
+          "CREATE SECRET git_cred",
+          "  TYPE = PASSWORD",
+          "  USERNAME = 'ci-bot'",
+          "  PASSWORD = '{{GH_PAT}}';",
+          "",
+          "CREATE API INTEGRATION github_api",
+          "  API_PROVIDER = git_https_api",
+          "  API_ALLOWED_PREFIXES = ('https://github.com/myorg/')",
+          "  ENABLED = TRUE;",
+          "",
+          "CREATE GIT REPOSITORY my_repo",
+          "  API_INTEGRATION = github_api",
+          "  GIT_CREDENTIALS = git_cred",
+          "  ORIGIN = 'https://github.com/myorg/snowflake-ddl.git';",
+          "",
+          "-- Clone prod for PR test environment",
+          "CREATE DATABASE pr_123_db CLONE prod_db;",
+          "",
+          "-- Execute migration from branch",
+          "EXECUTE IMMEDIATE FROM @my_repo/branches/feature-x/migrations/V012__add_col.sql;",
+          "",
+          "-- Drop clone after tests pass",
+          "DROP DATABASE pr_123_db;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "snowflake-architecture"
+  },
+  {
+    "q": "You need to export 500 GB of Snowflake data to S3 daily for a downstream ML training job. Describe the COPY INTO <location> command, how to parallelize it, and what compression/format choices matter.",
+    "a": "COPY INTO <location> unloads data from a Snowflake table or query result to an external stage (S3, Azure Blob, GCS) or a named external stage object. Parallelism: Snowflake automatically parallelizes the unload across the warehouse's compute nodes — each node writes a separate set of part files (e.g., data_0_0_0.csv.gz, data_0_1_0.csv.gz). The number of part files scales with warehouse size; a larger warehouse produces more parallel writers and more output files. To control file size, use MAX_FILE_SIZE (bytes) to cap part file size — the default is 16 MB uncompressed, but for ML pipelines targeting S3 + Spark readers, 256 MB compressed is a better target. Format choices: Parquet with Snappy compression is ideal for ML training — columnar, splittable, schema-embedded, and readable by PyArrow/Spark natively. Use FILE_FORMAT = (TYPE = PARQUET SNAPPY_COMPRESSION = TRUE). For CSV exports consumed by legacy tools, GZIP is the default and preferred compression. HEADER = TRUE in CSV exports embeds column names. The SINGLE = TRUE option forces a single output file — only use this for small result sets since it serializes all writes through one node. Storage integration (STORAGE INTEGRATION) is the recommended auth method over credentials in the COPY command because it uses IAM role assumption rather than embedding access keys. The GET command downloads files from internal (not external) stages to a local filesystem — it is not applicable for S3 exports.",
+    "fj": "Set SINGLE = TRUE to ensure the downstream Spark job reads one clean file instead of many part files.",
+    "fs": "SINGLE = TRUE serializes the unload through a single compute thread, destroying all parallelism and making a 500 GB export extremely slow. Spark natively handles multi-part S3 reads in parallel; many smaller part files are preferable for distributed reads. Only use SINGLE for small diagnostic exports.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Parallel Parquet unload to S3",
+        "lines": [
+          "-- Named external stage with storage integration",
+          "CREATE STAGE ml_export_stage",
+          "  URL = 's3://my-bucket/training-data/'",
+          "  STORAGE_INTEGRATION = s3_int;",
+          "",
+          "-- Parallel unload: Parquet + Snappy, 256 MB part files",
+          "COPY INTO @ml_export_stage/daily/2026-06-10/",
+          "FROM (",
+          "  SELECT user_id, event_type, ts, features",
+          "  FROM events",
+          "  WHERE event_date = '2026-06-10'",
+          ")",
+          "FILE_FORMAT = (",
+          "  TYPE = PARQUET",
+          "  SNAPPY_COMPRESSION = TRUE",
+          ")",
+          "MAX_FILE_SIZE = 268435456  -- 256 MB",
+          "HEADER = TRUE",
+          "OVERWRITE = TRUE;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-engineering"
+  },
+  {
+    "q": "Design a Snowflake-native ELT architecture for three different pipeline patterns — append-only event ingest, incremental merge for slowly-changing customer records, and a daily full-refresh aggregate table — and justify your tool choice for each.",
+    "a": "Pattern 1 — Append-only event ingest: use Snowpipe (or Snowpipe Streaming for sub-minute latency). Snowpipe auto-ingest triggers on S3/Azure/GCS event notifications and loads new files into the target table without manual orchestration. Since events are immutable once written, no merge is needed — pure INSERT. Dynamic Tables can sit downstream of the raw events table to compute running aggregates declaratively. Pattern 2 — Incremental merge for SCD (customer records): Streams + Tasks is the right choice. A Stream on the source/staging table captures INSERT, UPDATE, and DELETE metadata (METADATA$ACTION, METADATA$ISUPDATE). A Task runs on a schedule or after a preceding task, consuming the stream rows in a MERGE INTO the target table with compound key matching. Dynamic Tables explicitly do not support MERGE semantics, so Streams+Tasks is the only native option for upsert logic. Pattern 3 — Daily full-refresh aggregate: Dynamic Table with TARGET_LAG = '1 day' is ideal. You write the aggregation SQL once (SELECT date, region, SUM(revenue) FROM orders GROUP BY 1, 2), set the lag, and Snowflake handles refresh scheduling and incremental computation where possible (INCREMENTAL refresh mode uses change tracking on the base tables). External orchestration with Airflow or dbt is appropriate when you need cross-system dependencies (trigger Snowflake after an upstream API call), complex retry logic, alerting integrations, or when the team already operates an Airflow/dbt stack and rewriting to native features provides insufficient ROI. Snowpark is appropriate for pipeline logic that requires Python UDFs, ML inference inside the pipeline, or custom data transformation that cannot be expressed in SQL.",
+    "fj": "Use Dynamic Tables for all three patterns because Snowflake recommends them as the modern replacement for Streams and Tasks.",
+    "fs": "Dynamic Tables are the preferred choice for declarative SQL transformations, but they explicitly do not support MERGE operations. Incremental customer record merge requires Streams+Tasks. Snowflake's own documentation states: 'If your pipeline relies on stored procedures, MERGE operations, or explicit CRON scheduling, use streams and tasks.' Choosing Dynamic Tables for upsert logic will produce incorrect results or errors.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Stream + Task incremental MERGE pattern",
+        "lines": [
+          "-- Stream captures CDC on staging table",
+          "CREATE STREAM customer_stream ON TABLE staging.customers;",
+          "",
+          "-- Task fires every 5 min, consumes stream",
+          "CREATE TASK merge_customers",
+          "  WAREHOUSE = TRANSFORM_WH",
+          "  SCHEDULE = '5 MINUTE'",
+          "  WHEN SYSTEM$STREAM_HAS_DATA('customer_stream')",
+          "AS",
+          "MERGE INTO prod.customers t",
+          "USING (",
+          "  SELECT * FROM customer_stream",
+          "  WHERE METADATA$ACTION != 'DELETE'",
+          "    OR METADATA$ISUPDATE = FALSE",
+          ") s ON t.customer_id = s.customer_id",
+          "WHEN MATCHED AND s.METADATA$ACTION = 'DELETE'",
+          "  THEN DELETE",
+          "WHEN MATCHED",
+          "  THEN UPDATE SET t.name = s.name, t.email = s.email",
+          "WHEN NOT MATCHED",
+          "  THEN INSERT (customer_id, name, email) VALUES (s.customer_id, s.name, s.email);",
+          "",
+          "ALTER TASK merge_customers RESUME;"
+        ]
+      },
+      {
+        "lang": "sql",
+        "label": "Dynamic Table for daily full-refresh aggregate",
+        "lines": [
+          "CREATE DYNAMIC TABLE daily_revenue_by_region",
+          "  TARGET_LAG = '1 day'",
+          "  WAREHOUSE = TRANSFORM_WH",
+          "AS",
+          "SELECT",
+          "  event_date,",
+          "  region,",
+          "  SUM(revenue)    AS total_revenue,",
+          "  COUNT(DISTINCT user_id) AS unique_users",
+          "FROM prod.orders",
+          "GROUP BY 1, 2;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-engineering"
+  },
+  {
+    "q": "An architect must choose between the Snowflake Spark Connector, JDBC driver, and Python Connector for three different integration scenarios. How would you decide, and what are the key behavioral differences?",
+    "a": "Scenario 1 — Legacy BI tool (Tableau, PowerBI) or SQL-based ETL tool: use the JDBC (or ODBC) driver. It exposes standard JDBC/ODBC interfaces that BI tools consume natively, supports connection pooling at the driver level, and is the only option when the tool has no Snowflake-native integration. Configure JDBC with jdbc:snowflake://account.snowflakecomputing.com/?warehouse=BI_WH&role=BI_ROLE. Scenario 2 — Spark-based data lakehouse integration (Databricks, EMR): use the Spark Connector. It supports query pushdown by default (since version 2.1.0) — Spark logical plans are translated into Snowflake SQL and executed on Snowflake compute rather than Spark executors, avoiding data movement for filter/aggregate-heavy queries. Write modes: append, overwrite, and merge (via Snowpark merge API). Data type mapping is automatic but watch for timestamp precision differences (Snowflake TIMESTAMP_NTZ vs Spark TimestampType). The Spark Connector communicates via JDBC internally. In 2025, Snowpark Connect for Spark extends this further by running Spark DataFrames directly on Snowflake's engine. Scenario 3 — Python-based pipeline, data science workflow, or async batch: use the Python Connector. It supports synchronous and asynchronous execution (execute_async() submits a query and returns a query ID immediately; poll with get_results_from_sfqid(query_id)). Connection pooling is the application's responsibility — use a connection pool library or manage a pool of connector objects, since the connector itself is not thread-safe for shared cursor objects. The Python Connector also supports DictCursor and pandas integration (fetch_pandas_all()).",
+    "fj": "Always use the Python Connector because it is the most flexible and modern option; Spark Connector and JDBC are legacy.",
+    "fs": "Each connector is optimized for its integration layer. The Spark Connector's query pushdown moves compute to Snowflake and avoids shipping large intermediate datasets to the Spark cluster — replacing it with the Python Connector in a Spark pipeline would serialize all reads through a single Python process, eliminating Spark's distributed parallelism entirely.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Python Connector async execution",
+        "lines": [
+          "import snowflake.connector",
+          "",
+          "conn = snowflake.connector.connect(",
+          "    account='myorg-myaccount',",
+          "    user='svc_etl',",
+          "    private_key=load_private_key(),",
+          "    warehouse='TRANSFORM_WH',",
+          "    database='PROD',",
+          "    schema='PUBLIC'",
+          ")",
+          "",
+          "cur = conn.cursor()",
+          "",
+          "# Submit without blocking",
+          "cur.execute_async(",
+          "    'INSERT INTO events SELECT * FROM staging.raw_events'",
+          ")",
+          "query_id = cur.sfqid",
+          "",
+          "# Poll for completion",
+          "from snowflake.connector import ProgrammingError",
+          "import time",
+          "while conn.is_still_running(conn.get_query_status(query_id)):",
+          "    time.sleep(2)",
+          "",
+          "cur.get_results_from_sfqid(query_id)",
+          "rows = cur.fetchall()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-engineering"
+  },
+  {
+    "q": "Production queries against a Snowflake fact table are running 3–5x slower than expected. Walk through your diagnostic process using Query Profile and ACCOUNT_USAGE.QUERY_HISTORY to identify JOIN explosion, GROUP BY skew, and concurrency contention.",
+    "a": "Step 1 — Isolate the query class. Query SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY for the past 7 days filtering on warehouse_name and order by execution_time DESC. Columns to review: rows_produced, bytes_scanned, partitions_scanned vs partitions_total (low ratio = good pruning), queued_provisioning_time and queued_overload_time (non-zero = concurrency contention), compilation_time. Step 2 — Open Query Profile in Snowsight for the slowest query ID. Look for JOIN nodes where the output row count vastly exceeds both input row counts — this signals a JOIN explosion (cartesian or fan-out). The Profile shows 'Rows produced' per operator node; if a JOIN node produces 100x more rows than its left input, there is likely a missing or incorrect join key, or duplicate rows on one side. Fix: add deduplication (SELECT DISTINCT or ROW_NUMBER() CTE) upstream of the join, or validate join key uniqueness. Step 3 — GROUP BY skew. In the Profile, inspect the 'GroupBy' operator and look for uneven partition processing times across nodes (one node takes 10x longer). This indicates a skewed grouping key — e.g., a status column with 90% of rows in one value. Fix: if the skewed key is unavoidable, add a secondary high-cardinality column to the GROUP BY and aggregate in two passes (partial group + final reduce), or use a larger warehouse to increase node count and dilute skew. Step 4 — Concurrency contention. Non-zero QUEUED_OVERLOAD_TIME in QUERY_HISTORY means the warehouse had no free slots when the query arrived. Fix: enable Multi-Cluster Warehouse (min 1, max N) with AUTO_SCALE policy so additional clusters start under load, or route read-heavy analytics to a dedicated warehouse separate from ingestion.",
+    "fj": "Just scale up the warehouse to XL or 2XL; larger warehouses fix all Snowflake performance problems.",
+    "fs": "Warehouse scaling increases parallelism and per-query speed but does not fix JOIN explosion or GROUP BY skew — those are logical query problems that produce the wrong (or massively inflated) intermediate data regardless of compute size. Scaling up an XL warehouse on a cartesian JOIN just makes the wrong answer arrive faster while consuming 8x the credits.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Identify slow queries + concurrency contention",
+        "lines": [
+          "-- Top 20 slowest queries last 7 days on prod warehouse",
+          "SELECT",
+          "  query_id,",
+          "  query_text,",
+          "  execution_time / 1000           AS exec_sec,",
+          "  rows_produced,",
+          "  partitions_scanned,",
+          "  partitions_total,",
+          "  queued_overload_time / 1000     AS queued_overload_sec,",
+          "  compilation_time / 1000         AS compile_sec",
+          "FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY",
+          "WHERE start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP)",
+          "  AND warehouse_name = 'PROD_TRANSFORM_WH'",
+          "  AND execution_status = 'SUCCESS'",
+          "ORDER BY execution_time DESC",
+          "LIMIT 20;",
+          "",
+          "-- Detect JOIN fan-out: rows_produced >> bytes_scanned ratio",
+          "SELECT query_id, rows_produced, bytes_scanned,",
+          "  ROUND(rows_produced / NULLIF(bytes_scanned / 1000, 0), 2) AS rows_per_kb",
+          "FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY",
+          "WHERE rows_produced > 1e9",
+          "ORDER BY rows_produced DESC",
+          "LIMIT 10;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "performance-optimization"
+  },
+  {
+    "q": "A Snowflake warehouse shows high QUEUED_OVERLOAD_TIME in QUERY_HISTORY during business hours. What is your remediation strategy and how do Multi-Cluster Warehouses factor in?",
+    "a": "QUEUED_OVERLOAD_TIME is the duration a query spent waiting for an available execution slot on the warehouse — it indicates the warehouse's active slots are saturated and new queries are being queued. First, confirm scope: if queuing is isolated to a single large query consuming all slots, that is a resource-intensive query issue (see Query Profile). If queuing is systemic across many small queries, it is concurrency contention. Remediation options: (1) Multi-Cluster Warehouse (MCW) with AUTO_SCALE policy — set MIN_CLUSTER_COUNT = 1 and MAX_CLUSTER_COUNT = N (typically 3–5 for analytics workloads). When Snowflake detects queued queries, it spins up additional clusters within seconds; each cluster has the same number of servers as the warehouse size (e.g., a Large warehouse with MAX 3 can run 3 clusters of Large, tripling concurrency). Set SCALING_POLICY = ECONOMY to delay scale-out until queuing is sustained, or STANDARD for aggressive scale-out. (2) Workload isolation: separate OLAP reads (long-running analytics) from ETL writes into dedicated warehouses so heavy transforms don't starve BI queries. (3) Query tagging: use QUERY_TAG and MAX_CONCURRENCY_LEVEL at the warehouse level to limit concurrent queries per warehouse slot. (4) Resource Monitors: set credit quotas per warehouse to surface cost anomalies caused by MCW scale-out. MCW is not available on Standard edition — it requires Enterprise or higher.",
+    "fj": "Increase the warehouse size from Large to X-Large to fix queuing; bigger warehouses process queries faster so the queue clears.",
+    "fs": "Increasing warehouse size speeds up each individual query but does not increase concurrency — a 2XL warehouse still has the same maximum concurrent query slots as a Large. Multi-Cluster is the correct solution for concurrency contention because it adds parallel clusters rather than bigger clusters.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Enable Multi-Cluster Warehouse with AUTO_SCALE",
+        "lines": [
+          "ALTER WAREHOUSE analytics_wh SET",
+          "  MIN_CLUSTER_COUNT = 1",
+          "  MAX_CLUSTER_COUNT = 4",
+          "  SCALING_POLICY = STANDARD;  -- or ECONOMY to reduce credit burn",
+          "",
+          "-- Monitor cluster usage",
+          "SELECT",
+          "  start_time,",
+          "  warehouse_name,",
+          "  cluster_number,",
+          "  avg_running,",
+          "  avg_queued_load",
+          "FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY",
+          "WHERE warehouse_name = 'ANALYTICS_WH'",
+          "  AND start_time >= DATEADD(hour, -24, CURRENT_TIMESTAMP)",
+          "ORDER BY start_time;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "performance-optimization"
+  }
+]

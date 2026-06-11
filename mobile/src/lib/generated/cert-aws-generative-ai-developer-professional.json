@@ -1,0 +1,502 @@
+[
+  {
+    "q": "Your team is starting a new Amazon Bedrock-based application. A solutions architect says you should apply the AWS Well-Architected Generative AI Lens review before launch. What are the six pillars this lens maps to, and name two GenAI-specific design principles it introduces?",
+    "a": "The Well-Architected Generative AI Lens maps to the same six pillars as the base framework — Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization, and Sustainability — but overlays generative-AI-specific best practices across six lifecycle phases: scoping, model selection, customization, development, deployment, and continuous improvement. Two GenAI-specific design principles introduced are: (1) Responsible AI governance — the lens now includes an eight-dimension responsible AI preamble (fairness, privacy, transparency, verifiability, robustness, safety, controllability, and accuracy) as first-class considerations rather than afterthoughts; and (2) Agentic workflow reliability — explicit guidance on handling agent tool invocation failures, tool permission scoping, and human-in-the-loop checkpoints that do not appear in the base reliability pillar. When AWS Well-Architected Tool is used to run a review against the lens, it generates a prioritized improvement plan with Finding items that can be tracked directly to Bedrock service configurations such as Guardrails, Prompt Management, and Cross-Region Inference profiles.",
+    "fj": "The GenAI Lens is a separate standalone framework that replaces the six-pillar Well-Architected Framework for AI workloads.",
+    "fs": "The GenAI Lens is an additive overlay, not a replacement. It extends the existing six pillars with domain-specific questions and best practices while remaining fully anchored to the core Well-Architected Framework. Running a lens review supplements, not supersedes, the standard review.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "foundation-model-integration-data-management-compliance"
+  },
+  {
+    "q": "You are designing a multi-model Bedrock application and need to switch between Claude Sonnet and Amazon Nova Pro based on task complexity — without redeploying code. How do you implement dynamic model selection and provider switching in Amazon Bedrock?",
+    "a": "Amazon Bedrock's InvokeModel and Converse APIs accept a `modelId` parameter that can be any supported model ARN or inference profile ID, making the model identity a runtime configuration rather than a compile-time constant. To implement dynamic switching without code changes, store the active model ID in a configuration store such as AWS AppConfig or Parameter Store and read it at invocation time; your Lambda or application code always calls the same Bedrock endpoint and only the resolved model ID changes. For cross-provider switching you can use Cross-Region Inference Profiles (system-defined profile IDs like `us.anthropic.claude-sonnet-4-5`) so Bedrock itself handles capacity routing, or you can keep a routing table that maps task complexity tiers to model IDs and evaluates token cost vs. latency SLAs. Amazon Bedrock Prompt Management complements this by versioning prompt templates independently of model selection — the prompt version can be pinned while the model ID rotates. For true zero-code-change rollouts, combine AppConfig feature flags with Lambda Powertools Parameter utility for sub-second config cache refresh.",
+    "fj": "Hard-code the model ARN in the Lambda function environment variable and redeploy for every model change.",
+    "fs": "Hard-coding in an environment variable still requires a redeployment (or at minimum a cold-start after a config update), which breaks auditability and blue/green safety. A dedicated config store with runtime resolution lets you change and roll back model selection with no code artifact change, full audit trail, and instant rollback.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Dynamic model selection via Parameter Store",
+        "lines": [
+          "import boto3",
+          "from aws_lambda_powertools.utilities import parameters",
+          "",
+          "bedrock = boto3.client('bedrock-runtime')",
+          "",
+          "def invoke_model(prompt: str, task_tier: str) -> str:",
+          "    # Resolves at runtime; cached 30 s by default",
+          "    model_id = parameters.get_parameter(",
+          "        f'/genai/model-routing/{task_tier}', max_age=30",
+          "    )",
+          "    response = bedrock.converse(",
+          "        modelId=model_id,",
+          "        messages=[{'role': 'user', 'content': [{'text': prompt}]}]",
+          "    )",
+          "    return response['output']['message']['content'][0]['text']"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "foundation-model-integration-data-management-compliance"
+  },
+  {
+    "q": "Production traffic to a Bedrock-hosted Claude model spikes and causes throttling. Describe how you would combine Amazon Bedrock Cross-Region Inference, a client-side circuit breaker, and graceful degradation into a resilient AI system.",
+    "a": "Amazon Bedrock Cross-Region Inference (CRIS) exposes system-defined inference profile IDs (e.g., `us.anthropic.claude-sonnet-4-5`) that route traffic across multiple AWS regions within a geographic boundary, increasing effective throughput headroom and reducing the probability of per-region throttling. To layer a circuit breaker on top: wrap every Bedrock InvokeModel call with a state machine that tracks per-model consecutive failure counts; when failures exceed a threshold the breaker opens and that model ID is temporarily excluded from the routing pool. The routing layer then selects the next candidate (e.g., fall back to Amazon Nova Pro, or a smaller Claude Haiku model) from a priority-ordered fallback list. Graceful degradation means the application still returns a useful response at degraded quality rather than a hard error — for example, serving a cached semantic-search result or a deterministic rule-based answer while the primary model recovers. Global CRIS profiles offer the widest capacity pool (all commercial regions worldwide) and approximately 10 percent cost savings versus geographic profiles; geographic profiles satisfy data-residency constraints (US-only, EU-only) with a narrower capacity pool. Instrument each path with CloudWatch metrics and set alarms on ThrottlingExceptions to auto-adjust circuit breaker thresholds.",
+    "fj": "Use retry-with-exponential-backoff alone; if it retries enough times it will eventually succeed without needing cross-region routing.",
+    "fs": "Pure exponential backoff serializes retries against the same overloaded endpoint, increasing tail latency and still failing if the region quota is fully exhausted. Cross-region routing distributes load across capacity pools in different regions before throttling is reached, while a circuit breaker prevents retry storms from amplifying the outage.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Circuit breaker + CRIS fallback",
+        "lines": [
+          "MODELS = [",
+          "    'us.anthropic.claude-sonnet-4-5',   # CRIS profile — primary",
+          "    'us.anthropic.claude-haiku-3-5',    # CRIS profile — fallback",
+          "    'us.amazon.nova-pro-v1',             # third-tier fallback",
+          "]",
+          "failures = {m: 0 for m in MODELS}",
+          "OPEN_THRESHOLD = 3",
+          "",
+          "def pick_model():",
+          "    return next(",
+          "        (m for m in MODELS if failures[m] < OPEN_THRESHOLD), None",
+          "    )",
+          "",
+          "def call_with_fallback(prompt):",
+          "    model = pick_model()",
+          "    if model is None:",
+          "        return cached_fallback_response(prompt)   # graceful degrade",
+          "    try:",
+          "        resp = bedrock.converse(modelId=model, messages=[...])",
+          "        failures[model] = 0",
+          "        return resp",
+          "    except bedrock.exceptions.ThrottlingException:",
+          "        failures[model] += 1",
+          "        return call_with_fallback(prompt)  # retry next model"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "foundation-model-integration-data-management-compliance"
+  },
+  {
+    "q": "Explain how Amazon Bedrock Prompt Management and Amazon Bedrock Guardrails work together to provide prompt governance. What is the deployment lifecycle of a managed prompt version?",
+    "a": "Amazon Bedrock Prompt Management lets you create, version, and publish named prompt templates with embedded variable placeholders; each published version gets an immutable ARN (e.g., `arn:aws:bedrock:us-east-1::prompt/ABCD1234/1`). Applications reference the ARN rather than inline text, so prompt changes are a versioned config operation — with history, rollback, and approval workflow — rather than a code push. Amazon Bedrock Guardrails is applied at the API layer: when you invoke a prompt version you also specify a `guardrailIdentifier` and `guardrailVersion`; Bedrock evaluates the prompt and response against configured policies — content filters, denied topics, PII redaction, prompt attack detection, and Automated Reasoning checks — before the response is returned to the caller. Cross-account safeguards (GA April 2026) allow a central security team to define a guardrail in a management account and enforce it across all member accounts via AWS Organizations, eliminating per-account configuration drift. The deployment lifecycle is: Draft → Test (using the Prompt Management console test runner) → Version (immutable snapshot) → Promote to production ARN alias → Monitor with CloudWatch Bedrock metrics; roll back by pointing the alias to a prior version ARN.",
+    "fj": "Guardrails only filter harmful content; they cannot be used to enforce PII redaction or validate factual accuracy.",
+    "fs": "Guardrails provide six distinct policy types including sensitive information filters (PII redaction/masking), topic denial policies, content filters, word filters, prompt attack detection, and Automated Reasoning checks that use formal logic to detect factual errors — making them a broad governance layer, not just a harmful-content filter.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Invoke versioned prompt with guardrail",
+        "lines": [
+          "response = bedrock_runtime.converse(",
+          "    modelId='anthropic.claude-sonnet-4-5-v1:0',",
+          "    promptVariables={",
+          "        'customer_question': {'text': user_input}",
+          "    },",
+          "    # Versioned prompt ARN — no inline prompt text",
+          "    system=[{",
+          "        'promptArn': 'arn:aws:bedrock:us-east-1::prompt/ABCD1234/3'",
+          "    }],",
+          "    guardrailConfig={",
+          "        'guardrailIdentifier': 'my-prod-guardrail',",
+          "        'guardrailVersion': '2',",
+          "        'trace': 'enabled'",
+          "    }",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "foundation-model-integration-data-management-compliance"
+  },
+  {
+    "q": "Your chatbot must maintain per-user conversation history across sessions while also recognizing high-level user intents to route to specialized agents. Which AWS services cover each concern, and how do you wire them together?",
+    "a": "Conversation history management is handled by Amazon DynamoDB: store each turn as an item keyed by `{userId, sessionId, turnIndex}` with TTL for automatic expiry; the application reads the last N turns at invocation time, assembles them into the Bedrock Converse `messages` array, and writes the new turn back after the model responds. This gives durable, low-latency, multi-region history with no server to manage. Intent recognition is handled by Amazon Comprehend: use a custom classifier trained on intent labels (e.g., `BILLING`, `TECH_SUPPORT`, `ACCOUNT_MGMT`) to classify the incoming utterance before routing; Comprehend's `ClassifyDocument` API returns the top intent with a confidence score in milliseconds. A routing Lambda reads the intent label and dispatches to the appropriate downstream Bedrock Agent or Bedrock Flow. Alternatively, for voice channels, Amazon Lex V2 can handle both intent recognition and slot filling natively, then hand off the resolved intent to a Lambda that writes history to DynamoDB and invokes the correct Bedrock flow.",
+    "fj": "Store conversation history in a Lambda in-memory dictionary so it is always fast to read.",
+    "fs": "Lambda execution environments are ephemeral and can be recycled between invocations; in-memory state is lost on cold starts. For production chatbots with multiple concurrent sessions, DynamoDB provides durable, shared, low-latency storage that any Lambda invocation can read regardless of which execution environment handles the request.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "DynamoDB history + Comprehend intent routing",
+        "lines": [
+          "import boto3, time",
+          "dynamodb = boto3.resource('dynamodb')",
+          "comprehend = boto3.client('comprehend')",
+          "table = dynamodb.Table('ChatHistory')",
+          "",
+          "def get_history(user_id, session_id, limit=10):",
+          "    resp = table.query(",
+          "        KeyConditionExpression='userId = :u AND sessionId = :s',",
+          "        ExpressionAttributeValues={':u': user_id, ':s': session_id},",
+          "        ScanIndexForward=False, Limit=limit",
+          "    )",
+          "    return list(reversed(resp['Items']))",
+          "",
+          "def detect_intent(text, endpoint_arn):",
+          "    resp = comprehend.classify_document(",
+          "        Text=text, EndpointArn=endpoint_arn",
+          "    )",
+          "    return resp['Classes'][0]['Name']  # top intent label"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "foundation-model-integration-data-management-compliance"
+  },
+  {
+    "q": "Walk through designing a production Bedrock Prompt Flow that classifies incoming support tickets and routes them to different FM processing branches. What node types are used and how does conditional branching work?",
+    "a": "Amazon Bedrock Flows (formerly Bedrock Prompt Flows) provides a visual DAG-based orchestration engine with typed node connections. For a ticket-routing flow you need: (1) an Input node that receives the ticket text; (2) a Prompt node that calls a classifier FM to return a JSON label (`BILLING`, `TECH`, `GENERAL`); (3) a Condition node that evaluates the label field — in the console, conditional connections are rendered as dotted purple lines and each branch fires when its boolean expression evaluates to true (e.g., `$.label == 'BILLING'`); (4) three parallel downstream Prompt nodes, one per category, each using a specialized prompt template from Bedrock Prompt Management; and (5) an Output node that aggregates whichever branch fired. If multiple conditions match, Bedrock Flows routes to all matching branches and the invocation response contains multiple outputs. The DoWhile loop node (added 2025) can be used to retry the classifier if the returned confidence is below a threshold before proceeding to routing. Each node connection is typed — you map a specific output field of one node to a specific input field of the next — preventing runtime schema mismatches.",
+    "fj": "Use a single large prompt with all three processing instructions and let the model decide which processing path to follow based on context.",
+    "fs": "Embedding all routing logic in a single prompt produces unpredictable behavior when context is long or edge-case tickets match multiple categories. Explicit Condition nodes make branching logic deterministic, auditable, and independently testable; each branch can also have its own Guardrail attached, which is impossible with monolithic prompt routing.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "foundation-model-integration-data-management-compliance"
+  },
+  {
+    "q": "Compare Strands Agents and AWS Agent Squad for building multi-agent systems. When would you choose each, and what are the key primitives each framework provides?",
+    "a": "Strands Agents (open-source Python/TypeScript SDK, v1.0 released May 2026) is a model-driven SDK where you define an agent by giving it a model, a set of tools, and optional system prompt; the agent loop is handled by the SDK via the ReAct pattern. Key primitives in v1.0 include `Agent` (single agent), `SubAgent` (run an agent as a tool callable by a parent agent), `ParallelAgent` (fan-out to multiple agents and collect results), and remote session management with A2A protocol support for cross-agent communication. Strands integrates natively with Amazon Bedrock AgentCore for memory, sessions, and MCP tool registration, and with AWS services via built-in tools (Lambda, DynamoDB, Bedrock Knowledge Base). AWS Agent Squad (aws-labs) is a higher-level routing framework: you register specialized agents and a classifier agent, and Agent Squad automatically routes each incoming message to the most appropriate agent while maintaining shared conversation context. Choose Strands when you need fine-grained control over agent reasoning loops, tool schemas, and multi-agent topology; choose Agent Squad when your primary concern is intent-based routing across pre-built specialized agents without writing a custom dispatcher.",
+    "fj": "AWS Agent Squad builds agent internal reasoning loops, so you should use it when you need custom tool-calling logic.",
+    "fs": "Agent Squad is a routing and context-management layer that dispatches to agents; it does not build reasoning loops. The internal reasoning and tool-calling logic lives inside each individual agent (which can itself be a Strands agent or any callable). Agent Squad's value is in the classifier-based routing, not in agent internals.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Strands multi-agent SubAgent example",
+        "lines": [
+          "from strands import Agent",
+          "from strands.models import BedrockModel",
+          "",
+          "research_agent = Agent(",
+          "    model=BedrockModel(model_id='us.anthropic.claude-sonnet-4-5'),",
+          "    tools=[web_search_tool, kb_lookup_tool],",
+          "    system_prompt='You are a research specialist.',",
+          ")",
+          "",
+          "# Orchestrator uses research_agent as a SubAgent tool",
+          "orchestrator = Agent(",
+          "    model=BedrockModel(model_id='us.anthropic.claude-sonnet-4-5'),",
+          "    tools=[research_agent.as_tool(name='research')],",
+          "    system_prompt='You plan and delegate research tasks.',",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "implementation-and-integration"
+  },
+  {
+    "q": "Describe how you implement a ReAct (Reasoning + Acting) loop and chain-of-thought reasoning for a multi-step data pipeline agent using AWS Step Functions. What state machine constructs map to each phase?",
+    "a": "The ReAct pattern interleaves three generation types — Thought, Action, Observation — in a loop until a final answer is produced. Mapping this to Step Functions: a Think state invokes a Bedrock model call (Lambda task) and parses the model output to identify whether it is a thought or a final answer; if a thought, a Choose state (Choice state) reads the Action field to select the next tool Lambda; the tool Lambda executes and its output is written to the execution context as the Observation. A Map state handles parallel tool invocations for independent sub-tasks. A Loop back to Think re-invokes the model with the accumulated Thought/Action/Observation history appended, implementing chain-of-thought reasoning since each prior reasoning step is visible to the next model call. Step Functions maintains durable execution state, so the reasoning loop survives Lambda timeouts and retries. Express Workflows support loops up to 5 minutes; for longer ReAct loops use Standard Workflows which support up to 1 year. CloudWatch Step Functions execution tracing gives full visibility into each thought-action cycle for debugging.",
+    "fj": "Run the entire ReAct loop inside a single Lambda function with a while loop, passing the model's reasoning chain in memory.",
+    "fs": "A while loop inside Lambda is constrained by Lambda's 15-minute timeout and loses all state on failure, requiring a full restart. Step Functions externalizes state durably, supports retry/catch at each step, provides distributed tracing, and cleanly separates each reasoning phase into observable, independently-retryable states.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "json",
+        "label": "Step Functions ReAct loop skeleton (ASL excerpt)",
+        "lines": [
+          "{",
+          "  \"Think\": {",
+          "    \"Type\": \"Task\",",
+          "    \"Resource\": \"arn:aws:lambda:::function:InvokeBedrock\",",
+          "    \"Next\": \"RouteAction\"",
+          "  },",
+          "  \"RouteAction\": {",
+          "    \"Type\": \"Choice\",",
+          "    \"Choices\": [",
+          "      {\"Variable\": \"$.action\", \"StringEquals\": \"FINAL\", \"Next\": \"Done\"},",
+          "      {\"Variable\": \"$.action\", \"StringEquals\": \"sql_query\", \"Next\": \"RunSQL\"},",
+          "      {\"Variable\": \"$.action\", \"StringEquals\": \"api_call\", \"Next\": \"CallAPI\"}",
+          "    ]",
+          "  },",
+          "  \"RunSQL\": {",
+          "    \"Type\": \"Task\",",
+          "    \"Resource\": \"arn:aws:lambda:::function:ExecuteSQL\",",
+          "    \"Next\": \"Think\"",
+          "  }",
+          "}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "implementation-and-integration"
+  },
+  {
+    "q": "Your generative AI system must write a contract draft, then pause for a human legal reviewer to approve or reject before sending it to the customer. How do you implement this human-in-the-loop gate using Step Functions?",
+    "a": "The canonical pattern in Step Functions for human-in-the-loop is the Callback (Wait for Task Token) pattern. The workflow pauses at a Task state configured with `Resource: arn:aws:states:::lambda:invoke.waitForTaskToken`; it passes the unique `$$.Task.Token` to the Lambda function, which stores the token (e.g., in DynamoDB) and sends an approval request to the reviewer via Amazon SES or SNS. The state machine suspends — no polling, no cost beyond storage — until someone calls `SendTaskSuccess` (approve) or `SendTaskFailure` (reject) on the task token via the Step Functions API, a web app, or an API Gateway endpoint. On approval the workflow transitions to the Send state; on rejection it transitions to a Revision or Abort state. Heartbeat timeouts (`HeartbeatSeconds`) ensure the task token expires if no human responds within an SLA window, triggering a catch handler. This pattern scales to any approval fanout: send the same token to multiple reviewers and resolve on first response, or use a Map state to fan out and aggregate multiple approvals before proceeding.",
+    "fj": "Poll the reviewer's decision by having a Lambda check a DynamoDB flag every 30 seconds in a loop inside the state machine.",
+    "fs": "Polling burns Lambda compute and execution ticks against Step Functions pricing. The WaitForTaskToken callback pattern suspends the execution for zero cost until the human completes the review — no polling required. Polling also introduces latency proportional to the poll interval, while the callback is near-instant once the human acts.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "json",
+        "label": "WaitForTaskToken approval state (ASL)",
+        "lines": [
+          "{",
+          "  \"AwaitLegalApproval\": {",
+          "    \"Type\": \"Task\",",
+          "    \"Resource\": \"arn:aws:states:::lambda:invoke.waitForTaskToken\",",
+          "    \"Parameters\": {",
+          "      \"FunctionName\": \"send-approval-email\",",
+          "      \"Payload\": {",
+          "        \"taskToken.$\": \"$$.Task.Token\",",
+          "        \"draftArn.$\": \"$.draftArn\"",
+          "      }",
+          "    },",
+          "    \"HeartbeatSeconds\": 86400,",
+          "    \"Catch\": [{",
+          "      \"ErrorEquals\": [\"States.HeartbeatTimeout\"],",
+          "      \"Next\": \"EscalateOverdue\"",
+          "    }],",
+          "    \"Next\": \"SendToCustomer\"",
+          "  }",
+          "}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "implementation-and-integration"
+  },
+  {
+    "q": "What is the key architectural difference between deploying an MCP server on AWS Lambda versus Amazon ECS, and which should you choose for a multi-turn agentic session that requires sampling and elicitation?",
+    "a": "Lambda MCP servers use the Streamable HTTP transport in stateless mode: each tool call is an independent HTTP request with no server-side session, the function initializes cold, executes, and is potentially recycled between calls. This works well for simple, bursty, read-only tools with no session memory. Amazon ECS (Fargate) runs the MCP server as a long-lived service with warm caches, persistent TCP/HTTP connections, sidecars, and any language runtime, making it suitable for tools that hold in-memory state across a conversation. Amazon Bedrock AgentCore Runtime extends this further: in stateful mode (`stateless_http=False`) it provisions a dedicated microVM per user session (up to 8 hours, 15-minute idle timeout) with CPU, memory, and filesystem isolation, enabling multi-turn MCP features — elicitation (the server can pause a tool call and ask the LLM for more information), sampling (the server can invoke an LLM on its own), and progress notifications over a persistent SSE stream. For a multi-turn agentic session requiring sampling and elicitation you must use ECS or AgentCore Runtime in stateful mode; Lambda's stateless execution model cannot maintain the server-side session required by these features.",
+    "fj": "Deploy the MCP server on Lambda and pass session state in each tool call payload to simulate statefulness.",
+    "fs": "Passing session state in every payload works for simple context forwarding but cannot support MCP features that require a persistent server-side connection: elicitation needs a bi-directional channel open during a tool call so the server can prompt the LLM for clarification mid-execution, which is impossible in a stateless request-response model.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "implementation-and-integration"
+  },
+  {
+    "q": "Your GenAI application receives a mix of simple FAQ queries and complex multi-document synthesis requests. Implement a model cascading strategy that minimizes cost while meeting quality targets.",
+    "a": "Model cascading routes each request through a hierarchy of models in order of increasing capability and cost, stopping as soon as quality is sufficient. For this use case: (1) a fast, cheap classifier (e.g., Amazon Comprehend custom classifier or a tiny Bedrock Titan Lite call) scores the query's complexity tier; (2) simple FAQ queries (tier 1) are served by Amazon Nova Micro or Claude Haiku — lowest cost, sub-second latency; (3) moderate multi-step queries (tier 2) fall through to Claude Sonnet; (4) complex synthesis tasks (tier 3) use Claude Sonnet or Nova Pro with a large context window. A confidence gate can also be used without explicit classification: call the fast model and compute an entropy or self-consistency score; if confidence is below threshold, escalate to the next tier. The routing Lambda reads tier thresholds from Parameter Store (tunable without redeployment). Track per-tier cost and quality metrics in CloudWatch to calibrate thresholds over time. On-demand throughput works for tier-2/3 bursty calls; Provisioned Throughput for tier-1 high-volume predictable workloads reduces per-token cost.",
+    "fj": "Always send all queries to the most capable model to avoid quality regressions from routing mistakes.",
+    "fs": "Sending every query to the most capable model ignores cost-quality tradeoffs: at scale, 80+ percent of queries are typically simple and overusing a large model multiplies cost by 5-10x with negligible quality gain. Cascading routes only genuinely complex queries to expensive models, aligning cost with value delivered.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "implementation-and-integration"
+  },
+  {
+    "q": "Design a CI/CD pipeline for a Bedrock-powered application that includes automated GenAI quality testing and safe rollback. Which AWS services are involved and what stages does the pipeline have?",
+    "a": "A production GenAI CI/CD pipeline built on AWS CodePipeline has five stages: (1) Source — CodeCommit or GitHub triggers the pipeline on PR merge; (2) Build — CodeBuild compiles application code, packages Lambda functions, and runs unit tests; (3) GenAI Quality Gate — a second CodeBuild stage invokes a golden evaluation set against the updated prompt versions and model configuration using Amazon Bedrock's batch inference or a custom evaluator Lambda; if hallucination rate, BLEU/ROUGE scores, or Guardrail block rates regress beyond a threshold, the stage fails and the pipeline stops; (4) Staging Deploy — AWS CDK or SAM deploys the new version to a staging environment; a synthetic traffic stage invokes the Bedrock endpoint with canonical queries and asserts response format and latency SLAs; (5) Production Deploy — blue/green deployment via AWS Lambda aliases and weighted traffic shifting (10% → 50% → 100%), with automatic rollback triggered by CloudWatch alarms on error rate or latency P99 breach. Prompt Management version ARNs are promoted from staging to production aliases via a CodeBuild step, giving rollback the ability to revert both application code and prompt versions atomically.",
+    "fj": "Use the same unit tests you write for regular software to validate GenAI pipeline quality — assertion-based tests are sufficient.",
+    "fs": "Standard assertion tests check deterministic code paths but cannot evaluate non-deterministic LLM outputs. GenAI quality gates require probabilistic evaluation: hallucination rate, factuality scores, semantic similarity to golden references, and Guardrail behavior — metrics that need dedicated evaluation infrastructure beyond `assert output == expected`.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "implementation-and-integration"
+  },
+  {
+    "q": "Your Bedrock-integrated Lambda is experiencing intermittent ThrottlingException and ServiceUnavailableException errors. Describe a resilient error handling architecture using exponential backoff, rate limiting, fallback mechanisms, and AWS X-Ray.",
+    "a": "The error handling architecture has four layers. First, per-request retry with exponential backoff and jitter: the AWS SDK for Python (Boto3) has built-in retry logic (standard retry mode with up to 3 retries, exponential backoff) which can be configured via `botocore.config.Config(retries={'max_attempts': 5, 'mode': 'adaptive'})`; adaptive mode automatically adjusts retry rate based on observed throttling. Second, client-side token bucket rate limiter: a Lambda layer implements a sliding-window counter stored in ElastiCache (Redis) so that all concurrently executing Lambda instances share a rate limit budget, preventing the thundering herd that triggers throttling in the first place. Third, fallback mechanism: on repeated failure, route to a cached response, a simpler on-demand model, or a rule-based answer as described in the circuit breaker pattern. Fourth, observability with AWS X-Ray: add the X-Ray SDK to instrument every Bedrock InvokeModel call as a subsegment with metadata including model ID, token counts, and latency; X-Ray Service Map visualizes the call chain and throttling source, and X-Ray Insights alerts on anomalous error spikes. CloudWatch Bedrock metrics (`ThrottlingExceptions`, `InvocationLatency`) feed alarms that auto-scale the upstream rate limiter threshold.",
+    "fj": "Set Lambda's reserved concurrency to 1 to prevent multiple simultaneous Bedrock calls and avoid throttling.",
+    "fs": "Limiting Lambda concurrency to 1 serializes all requests, destroying throughput and causing requests to queue and timeout. The correct approach limits the rate of Bedrock invocations (tokens per minute, requests per minute) while allowing high Lambda concurrency, so multiple Lambda instances share a budget via a distributed rate limiter rather than being serialized at the compute layer.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Boto3 adaptive retry config",
+        "lines": [
+          "import boto3",
+          "from botocore.config import Config",
+          "",
+          "bedrock = boto3.client(",
+          "    'bedrock-runtime',",
+          "    config=Config(",
+          "        retries={",
+          "            'max_attempts': 5,",
+          "            'mode': 'adaptive'   # auto-slows on throttle signals",
+          "        },",
+          "        read_timeout=60",
+          "    )",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "implementation-and-integration"
+  },
+  {
+    "q": "You need to build a custom content moderation workflow for a GenAI application that applies additional organization-specific rules beyond Bedrock Guardrails defaults. How do you compose Lambda and Step Functions for pre- and post-processing moderation?",
+    "a": "The architecture splits moderation into two Lambda-backed Step Functions stages. Pre-processing stage (before model invocation): a Lambda runs the incoming prompt through custom rules — keyword deny-list lookup in DynamoDB, regex patterns for proprietary data formats, Amazon Comprehend PII entity detection, and a custom Bedrock Guardrail policy via `ApplyGuardrail` API. If any check fails the Step Function transitions to a Reject state that returns a policy violation response without ever invoking the FM. Post-processing stage (after model response): a second Lambda evaluates the FM output — running another `ApplyGuardrail` call, checking for domain-specific disallowed content via a Comprehend custom classifier, and validating output schema if structured output is expected. A conditional branch routes outputs flagged as borderline to a human review queue (SQS + SNS notification to moderators) rather than hard-blocking. CloudWatch Logs captures the reasoning for each moderation decision with request IDs for audit trails. Lambda's granular IAM policies ensure neither function has access to the FM credentials or storage beyond what it needs for its specific moderation step, implementing least-privilege moderation.",
+    "fj": "Apply a single Guardrail at the Bedrock API layer — custom rules can be added there without separate Lambda functions.",
+    "fs": "Bedrock Guardrails is a managed policy engine with a fixed set of policy types; it cannot run arbitrary code such as regex against proprietary formats, DynamoDB lookups against a dynamic deny-list, or organization-specific Comprehend classifiers. Lambda composability enables these custom checks while Guardrails handles the standard safeguards — the two are complementary, not interchangeable.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "ai-safety-security-and-governance"
+  },
+  {
+    "q": "Describe the architecture for a VPC-isolated Amazon Bedrock environment suitable for a financial services workload with strict data-residency requirements. Which AWS services are involved and how are they configured?",
+    "a": "A VPC-isolated Bedrock environment prevents all traffic from traversing the public internet by creating Interface VPC Endpoints (AWS PrivateLink) for the `bedrock` and `bedrock-runtime` service endpoints in your VPC; endpoint policies restrict which IAM principals and Bedrock model ARNs can be accessed through each endpoint, enforcing least-privilege at the network layer. All application components (Lambda functions, ECS tasks, SageMaker Notebooks) are placed in private subnets with no NAT gateway; they resolve Bedrock endpoints to private IPs via Route 53 Private Hosted Zones. IAM policies on every execution role use `aws:SourceVpc` and `aws:SourceVpce` condition keys to deny any invocation originating outside the approved VPC, preventing credential exfiltration. AWS Lake Formation governs access to fine-tuning datasets and RAG knowledge-base source data in S3, enforcing column-level and row-level permissions so only approved IAM roles can access PII-containing training data. Amazon CloudWatch Logs and VPC Flow Logs capture all inference traffic metadata and anomalous call patterns; CloudWatch alarms trigger on unexpected cross-region calls. Geographic CRIS profiles constrain inference routing to a single geography (e.g., EU-only) to satisfy GDPR data-residency rules.",
+    "fj": "Use S3 bucket policies with IP-based conditions to restrict Bedrock access to your VPC's NAT gateway IP range.",
+    "fs": "IP-based S3 bucket policies do not restrict Bedrock API access; they restrict S3 object access. Bedrock API access is governed by VPC endpoint policies and IAM `SourceVpce` conditions. Additionally, using a NAT gateway defeats the isolation goal — traffic still traverses the internet; VPC endpoints keep traffic entirely within the AWS network.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "ai-safety-security-and-governance"
+  },
+  {
+    "q": "Your GenAI application must comply with GDPR and HIPAA. Explain how you implement bias drift monitoring and token-level PII redaction to meet regulatory readiness requirements on Amazon Bedrock.",
+    "a": "Token-level PII redaction is implemented via Amazon Bedrock Guardrails' sensitive information filter: configure entity types (SSN, date-of-birth, credit card, email, phone, name, address) and set the action to BLOCK or ANONYMIZE; in ANONYMIZE mode the filter replaces the entity tokens with type-label placeholders (e.g., `[SSN]`) in both the prompt before it reaches the model and in the response before it reaches the caller, ensuring no PII is processed by or returned from the FM. For token-level granularity beyond Guardrails entity types, Amazon Comprehend's `DetectPiiEntities` API runs on the raw text and returns character offsets, enabling a pre-processing Lambda to mask arbitrary spans before the Bedrock call. Bias drift monitoring is an ongoing operational concern: establish a baseline evaluation set with demographic equity labels, run it periodically against the deployed model/prompt version using Bedrock batch inference, and compute demographic parity and equalized odds metrics; store results in S3 and visualize with Amazon QuickSight. If bias metrics drift beyond policy thresholds, trigger a CloudWatch alarm that routes to an on-call SNS topic. For HIPAA workloads, confirm the Bedrock service is within the HIPAA-eligible service list and execute a Business Associate Agreement (BAA) with AWS.",
+    "fj": "GDPR compliance is satisfied by storing all conversation logs in an encrypted S3 bucket with default SSE-S3 encryption.",
+    "fs": "GDPR compliance requires more than encryption at rest: it mandates the right to erasure, data minimization, consent tracking, and restriction on PII processing by third-party model providers. Encrypting logs does not prevent PII from being sent to a model for processing. Token-level redaction before model invocation ensures PII is never part of the FM's input or training signal, which is the correct data minimization control.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "ai-safety-security-and-governance"
+  },
+  {
+    "q": "How do you build a transparent AI system on AWS that shows users the model's reasoning, confidence, and source attribution? Which services and patterns are involved?",
+    "a": "Source attribution is implemented in the RAG layer: Amazon Bedrock Knowledge Bases returns `citations` in the `RetrieveAndGenerate` API response containing the source document metadata (S3 URI, chunk ID, score); the application surfaces these as inline footnotes or expandable references in the UI. Reasoning displays are enabled by using models that support extended thinking (e.g., Claude 3.7 Sonnet with `thinking` blocks enabled in the Bedrock Converse API) — the thinking content block exposes the model's step-by-step reasoning chain, which can be shown in a developer or power-user view. Confidence metrics are derived from the Bedrock Guardrails Automated Reasoning check, which returns a verification status and explanation for factual claims, and from Knowledge Base retrieval scores that proxy response confidence. These are logged as structured JSON to CloudWatch Logs with `modelId`, `retrievalScores`, `thinkingTokenCount`, and `guardrailVerdict` fields; CloudWatch dashboards visualize confidence distributions over time, alerting when average retrieval score or verification pass rate drops below baseline. Confidence trends surface quality degradation before users notice. For regulated industries, the full reasoning trace can be stored in S3 as an audit artifact per inference request.",
+    "fj": "Display the raw model logprobs as the confidence score since lower perplexity means higher confidence.",
+    "fs": "Logprobs measure token-level fluency, not factual accuracy or grounding. A model can produce highly confident (low perplexity) but factually incorrect text. Grounded confidence should come from retrieval scores against verified knowledge sources and Automated Reasoning checks, not from the model's token probability distribution.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "ai-safety-security-and-governance"
+  },
+  {
+    "q": "Your Bedrock application has unpredictable traffic patterns — quiet for hours then sudden bursts. Describe a batching strategy, auto-scaling configuration, and provisioned throughput optimization plan for this workload.",
+    "a": "Bedrock supports asynchronous batch inference via `CreateModelInvocationJob` — submissions are processed as a batch at up to 50 percent discount with up to 24-hour completion SLA — ideal for offline enrichment, nightly document processing, or pre-generating embeddings. For synchronous bursts, on-demand throughput handles intermittent traffic with pay-per-token pricing and no commitments; Provisioned Throughput (PTU) purchases Model Units (MUs) of dedicated capacity for predictable high-volume workloads and removes throttling risk within the provisioned limit. Optimization strategy: analyze 30 days of CloudWatch `EstimatedTPMQuotaUsage` and `InvocationLatency` metrics to identify baseline sustained load vs. peak multiplier. Purchase Provisioned Throughput MUs to cover the P75 sustained load; let on-demand absorb the burst tail above P75. For the Lambda front-end, use SQS as a buffer: ingest burst requests into SQS, then a Lambda consumer reads at a controlled concurrency rate matching the Provisioned Throughput MU limit, preventing over-provisioning. Auto-scaling Provisioned Throughput is not natively supported; instead schedule MU changes via EventBridge Scheduler or use Application Auto Scaling if the model supports it. Use Bedrock batch for any task with >1-hour acceptable latency to maximize cost reduction.",
+    "fj": "Purchase the maximum available Provisioned Throughput MUs to handle peak load at all times.",
+    "fs": "Purchasing max PTU at all times pays for idle capacity during quiet hours and wastes budget. The optimal strategy sizes PTU at sustained load (covering the high-frequency baseline) and allows on-demand to handle infrequent bursts, minimizing total cost while maintaining performance SLAs during peaks.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "operational-efficiency-and-optimization"
+  },
+  {
+    "q": "Describe how to set up anomaly detection for token burst patterns and response drift on an Amazon Bedrock application using CloudWatch. What metrics are most important and what alerting strategy do you use?",
+    "a": "The primary CloudWatch metrics for Bedrock anomaly detection are: `TokensIn` and `TokensOut` (track input/output token consumption per model per minute — sudden spikes indicate prompt injection, runaway agents, or misuse); `EstimatedTPMQuotaUsage` (introduced March 2026, tracks how close you are to TPM quota, accounting for model-specific burndown multipliers — alarm at 80 percent to prevent hard throttling); `InvocationLatency` and `FirstTokenLatency` / `TimeToFirstToken` (TTFT, also introduced March 2026 — P99 latency regression signals model capacity pressure or context-window bloat); `ThrottlingExceptions` (spike indicates sustained burst exceeding quota). For response drift, publish custom metrics from a monitoring Lambda that scores a sample of live responses against a reference set (semantic similarity, Guardrail block rate, response length distribution) — these proxy model behavior changes from upstream updates. Enable CloudWatch Anomaly Detection (`ANOMALY_DETECTION_BAND` math expression) on each metric: it learns a statistical band from historical data and fires alarms when values deviate beyond the expected band without requiring hard thresholds. Route alarm actions to an SNS topic that pages on-call via PagerDuty or triggers a Step Functions escalation workflow. Store all raw metric data in CloudWatch Logs Insights for forensic queries during incidents.",
+    "fj": "Set a static CloudWatch alarm threshold of 1,000 tokens per minute for all models to catch any burst.",
+    "fs": "A static threshold ignores the natural diurnal pattern of token usage (daytime peaks are expected) and model-specific quota limits (different models have different TPM quotas). CloudWatch Anomaly Detection builds a dynamic band based on historical baselines, firing only on statistically unusual deviations rather than expected traffic peaks, dramatically reducing false positives.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Publish custom response-drift metric",
+        "lines": [
+          "import boto3",
+          "from sentence_transformers import SentenceTransformer, util",
+          "",
+          "cw = boto3.client('cloudwatch')",
+          "encoder = SentenceTransformer('all-MiniLM-L6-v2')",
+          "",
+          "def publish_drift(response: str, reference: str, model_id: str):",
+          "    sim = float(util.cos_sim(",
+          "        encoder.encode(response), encoder.encode(reference)",
+          "    ))",
+          "    cw.put_metric_data(",
+          "        Namespace='GenAI/Drift',",
+          "        MetricData=[{",
+          "            'MetricName': 'SemanticSimilarity',",
+          "            'Value': sim,",
+          "            'Unit': 'None',",
+          "            'Dimensions': [{'Name': 'ModelId', 'Value': model_id}]",
+          "        }]",
+          "    )"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "operational-efficiency-and-optimization"
+  },
+  {
+    "q": "Your team is deploying a new version of a Bedrock-powered summarization service. Walk through a deployment validation strategy using synthetic user workflows, hallucination rate checks, and semantic drift detection.",
+    "a": "Deployment validation runs in three sequential gates after staging deploy before production promotion. Gate 1 — Synthetic user workflows: a CodeBuild step replays a library of canonical synthetic requests through the new endpoint (covering happy path, edge-case inputs, adversarial prompts, and multi-turn conversations) and asserts that: response format matches JSON schema, response latency is within SLA, and Bedrock Guardrail block rate has not increased unexpectedly. Gate 2 — Hallucination rate check: for each synthetic prompt that has a ground-truth answer, a secondary Bedrock Automated Reasoning check or an LLM-as-judge Lambda evaluates factual accuracy; if hallucination rate exceeds a baseline threshold (e.g., previous version's rate + 5 percent absolute) the gate fails and the pipeline rolls back the Prompt Management version alias. Gate 3 — Semantic drift detection: encode a sample of new responses and compare cosine similarity to a reference corpus of gold responses from the previous version using a lightweight embedding model; a sharp drop in mean similarity (>0.05 threshold) indicates the new prompt version or model change meaningfully shifted response style or content, which may require further human review before promotion. All gate outputs are written as structured annotations to a DynamoDB evaluation log table and surfaced in a CloudWatch dashboard for release-review sign-off.",
+    "fj": "Run the same end-to-end integration tests used for the API layer — if the API returns 200 the deployment is valid.",
+    "fs": "An HTTP 200 status only confirms that the service responded; it says nothing about the quality, factual accuracy, or behavioral consistency of the generated content. GenAI deployment validation requires semantic and quality evaluation — a model that hallucinates confidently returns 200 every time.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "testing-validation-and-troubleshooting"
+  },
+  {
+    "q": "A Bedrock agent is returning truncated or incoherent responses. Diagnostics suggest context window overflow. How do you diagnose the root cause and implement a fix using dynamic chunking and prompt design optimization?",
+    "a": "Diagnosis starts with CloudWatch Bedrock metrics: check `InputTokenCount` and compare against the model's context window limit (e.g., 200K tokens for Claude Sonnet); if inputs approach the limit, overflow or silent truncation is the cause. For agents, enable Bedrock Agent trace logging to see the full assembled prompt including orchestration instructions, tool schemas, retrieved knowledge-base chunks, and conversation history — the trace often reveals that accumulated conversation history or excessively large tool schemas are the dominant consumers. Fix 1 — Dynamic chunking: reduce Knowledge Base chunk sizes from default 1,000 tokens to 256-512 tokens and increase `numberOfResults` to maintain recall coverage within a smaller per-chunk budget; use overlap-enabled chunking to preserve semantic continuity across chunk boundaries. Fix 2 — Prompt compression: remove redundant boilerplate from system prompts, use token-efficient phrasing, and limit tool schema inclusion to only the tools relevant to the current intent (lazy tool registration). Fix 3 — Conversation history truncation: implement a sliding window that keeps only the last N turns or a summarization step that condenses older history into a compact summary token before appending new turns, preventing unbounded context growth. Fix 4 — Model upgrade: if the workload genuinely requires longer context, switch to a higher context-window model via dynamic model selection without code changes.",
+    "fj": "Increase the `maxTokens` parameter in the model inference configuration to allow longer outputs.",
+    "fs": "`maxTokens` controls the maximum length of the model's output response, not the size of the input context window. Context window overflow is an input-side problem — too many tokens are being sent in — and `maxTokens` has no effect on it. The fix is to reduce input token consumption through chunking, history management, and prompt compression.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Sliding-window conversation history truncation",
+        "lines": [
+          "MAX_HISTORY_TOKENS = 4000",
+          "",
+          "def trim_history(messages: list, tokenizer) -> list:",
+          "    \"\"\"Keep most recent turns within token budget.\"\"\"",
+          "    total = 0",
+          "    trimmed = []",
+          "    for msg in reversed(messages):",
+          "        tokens = len(tokenizer.encode(msg['content']))",
+          "        if total + tokens > MAX_HISTORY_TOKENS:",
+          "            break",
+          "        trimmed.insert(0, msg)",
+          "        total += tokens",
+          "    return trimmed"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "testing-validation-and-troubleshooting"
+  },
+  {
+    "q": "Prompt quality in your Bedrock application has degraded after a recent system prompt update. How do you troubleshoot the issue using prompt version comparison, systematic refinement, and CloudWatch Logs?",
+    "a": "Start with CloudWatch Logs Insights: query the Bedrock invocation logs filtered to the deployment timestamp of the prompt change to correlate the degradation onset with the specific prompt version ARN; look for patterns in Guardrail block rates, response length distribution changes, and user feedback signals (thumbs-down events). Use Bedrock Prompt Management's built-in test runner to run the same golden evaluation prompts against the previous version ARN and the current version ARN side-by-side — the console shows response diffs, token counts, and latency per version. Systematic refinement follows the A/B test structure: hold model ID and temperature constant, change only one prompt variable at a time (e.g., instruction phrasing, few-shot examples, system persona, output format constraint), and evaluate each variant against the metric that regressed (factuality score, format compliance rate, or Guardrail block rate). Register each candidate as a new Draft version in Prompt Management before testing so changes are tracked; never edit the production version alias directly. Once a candidate outperforms the baseline, gate it through the CI/CD quality pipeline (hallucination check, semantic similarity, synthetic workflow validation) before promoting to the production alias. CloudWatch custom metrics for prompt-level quality scores (published by an evaluator Lambda after each test run) create a measurable improvement trendline.",
+    "fj": "Revert to the previous system prompt by editing the production prompt text in place until quality recovers.",
+    "fs": "Editing the production prompt in place creates an unversioned change with no rollback snapshot and corrupts the history of what changed. Prompt Management version immutability is a governance feature: always create a new Draft version, test it, then atomically update the production alias pointer — the previous version ARN remains intact and is instantly accessible for rollback.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "CloudWatch Logs Insights query — prompt version correlation",
+        "lines": [
+          "# Run in CloudWatch Logs Insights against /aws/bedrock/model-invocations",
+          "fields @timestamp, modelId, promptArn, inputTokens, outputTokens,",
+          "       guardrailAction, latencyMs",
+          "| filter @timestamp >= '2026-06-08T00:00:00Z'",
+          "| stats",
+          "    avg(latencyMs) as avgLatency,",
+          "    count_if(guardrailAction='BLOCKED') as blocks,",
+          "    count() as total",
+          "  by promptArn",
+          "| sort blocks desc"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "testing-validation-and-troubleshooting"
+  }
+]

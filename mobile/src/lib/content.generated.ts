@@ -103,6 +103,39 @@ import certDbSparkDeveloper from './generated/cert-databricks-spark-developer.js
 import certDbDataAnalyst from './generated/cert-databricks-data-analyst.json';
 import certDbMlAssociate from './generated/cert-databricks-ml-associate.json';
 import certDbMlProfessional from './generated/cert-databricks-ml-professional.json';
+// Snowflake certification tracks
+import certSnowflakeAssociatePlatform from './generated/cert-snowflake-associate-platform.json';
+import certSnowflakeCore from './generated/cert-snowflake-core.json';
+import certSnowflakeAdvancedDe from './generated/cert-snowflake-advanced-data-engineer.json';
+import certSnowflakeAdvancedArchitect from './generated/cert-snowflake-advanced-architect.json';
+import certSnowflakeAdvancedAnalyst from './generated/cert-snowflake-advanced-data-analyst.json';
+import certSnowflakeAdvancedScientist from './generated/cert-snowflake-advanced-data-scientist.json';
+import certSnowflakeAdvancedMlops from './generated/cert-snowflake-advanced-mlops-engineer.json';
+import certSnowflakeSpecialtyGenAi from './generated/cert-snowflake-specialty-gen-ai.json';
+import certSnowflakeSpecialtySnowpark from './generated/cert-snowflake-specialty-snowpark.json';
+// AWS certification tracks
+import certAwsAiPractitioner from './generated/cert-aws-ai-practitioner.json';
+import certAwsDataEngineer from './generated/cert-aws-data-engineer-associate.json';
+import certAwsMlEngineer from './generated/cert-aws-machine-learning-engineer-associate.json';
+import certAwsGenAiDeveloper from './generated/cert-aws-generative-ai-developer-professional.json';
+// GCP certification tracks
+import certGcpGenAiLeader from './generated/cert-gcp-generative-ai-leader.json';
+import certGcpDataPractitioner from './generated/cert-gcp-associate-data-practitioner.json';
+import certGcpDataEngineer from './generated/cert-gcp-professional-data-engineer.json';
+import certGcpMlEngineer from './generated/cert-gcp-professional-ml-engineer.json';
+import certGcpDatabaseEngineer from './generated/cert-gcp-professional-cloud-database-engineer.json';
+// Azure certification tracks
+import certAzureDp900 from './generated/cert-azure-dp-900.json';
+import certAzureDp700 from './generated/cert-azure-dp-700.json';
+import certAzureDp600 from './generated/cert-azure-dp-600.json';
+import certAzureDp750 from './generated/cert-azure-dp-750.json';
+import certAzureAi900 from './generated/cert-azure-ai-900.json';
+import certAzureAi300 from './generated/cert-azure-ai-300.json';
+import certAzureAi103 from './generated/cert-azure-ai-103.json';
+import certAzureDp800 from './generated/cert-azure-dp-800.json';
+import certAzureDp300 from './generated/cert-azure-dp-300.json';
+import certAzurePl300 from './generated/cert-azure-pl-300.json';
+import certAzureDp420 from './generated/cert-azure-dp-420.json';
 
 export interface GeneratedCard {
   q: string;
@@ -227,4 +260,37 @@ export const GENERATED: Record<string, GeneratedCard[]> = {
   'cert-databricks-data-analyst': certDbDataAnalyst as unknown as GeneratedCard[],
   'cert-databricks-ml-associate': certDbMlAssociate as unknown as GeneratedCard[],
   'cert-databricks-ml-professional': certDbMlProfessional as unknown as GeneratedCard[],
+  // Snowflake cert tracks
+  'cert-snowflake-associate-platform': certSnowflakeAssociatePlatform as unknown as GeneratedCard[],
+  'cert-snowflake-core': certSnowflakeCore as unknown as GeneratedCard[],
+  'cert-snowflake-advanced-data-engineer': certSnowflakeAdvancedDe as unknown as GeneratedCard[],
+  'cert-snowflake-advanced-architect': certSnowflakeAdvancedArchitect as unknown as GeneratedCard[],
+  'cert-snowflake-advanced-data-analyst': certSnowflakeAdvancedAnalyst as unknown as GeneratedCard[],
+  'cert-snowflake-advanced-data-scientist': certSnowflakeAdvancedScientist as unknown as GeneratedCard[],
+  'cert-snowflake-advanced-mlops-engineer': certSnowflakeAdvancedMlops as unknown as GeneratedCard[],
+  'cert-snowflake-specialty-gen-ai': certSnowflakeSpecialtyGenAi as unknown as GeneratedCard[],
+  'cert-snowflake-specialty-snowpark': certSnowflakeSpecialtySnowpark as unknown as GeneratedCard[],
+  // AWS cert tracks
+  'cert-aws-ai-practitioner': certAwsAiPractitioner as unknown as GeneratedCard[],
+  'cert-aws-data-engineer-associate': certAwsDataEngineer as unknown as GeneratedCard[],
+  'cert-aws-machine-learning-engineer-associate': certAwsMlEngineer as unknown as GeneratedCard[],
+  'cert-aws-generative-ai-developer-professional': certAwsGenAiDeveloper as unknown as GeneratedCard[],
+  // GCP cert tracks
+  'cert-gcp-generative-ai-leader': certGcpGenAiLeader as unknown as GeneratedCard[],
+  'cert-gcp-associate-data-practitioner': certGcpDataPractitioner as unknown as GeneratedCard[],
+  'cert-gcp-professional-data-engineer': certGcpDataEngineer as unknown as GeneratedCard[],
+  'cert-gcp-professional-ml-engineer': certGcpMlEngineer as unknown as GeneratedCard[],
+  'cert-gcp-professional-cloud-database-engineer': certGcpDatabaseEngineer as unknown as GeneratedCard[],
+  // Azure cert tracks
+  'cert-azure-ai-900': certAzureAi900 as unknown as GeneratedCard[],
+  'cert-azure-dp-900': certAzureDp900 as unknown as GeneratedCard[],
+  'cert-azure-dp-700': certAzureDp700 as unknown as GeneratedCard[],
+  'cert-azure-dp-600': certAzureDp600 as unknown as GeneratedCard[],
+  'cert-azure-dp-750': certAzureDp750 as unknown as GeneratedCard[],
+  'cert-azure-ai-300': certAzureAi300 as unknown as GeneratedCard[],
+  'cert-azure-ai-103': certAzureAi103 as unknown as GeneratedCard[],
+  'cert-azure-dp-800': certAzureDp800 as unknown as GeneratedCard[],
+  'cert-azure-dp-300': certAzureDp300 as unknown as GeneratedCard[],
+  'cert-azure-pl-300': certAzurePl300 as unknown as GeneratedCard[],
+  'cert-azure-dp-420': certAzureDp420 as unknown as GeneratedCard[],
 };

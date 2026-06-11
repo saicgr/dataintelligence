@@ -1,0 +1,487 @@
+[
+  {
+    "q": "You need to load a CSV file, a Parquet file, and a JSON file from an S3 external stage into separate Snowflake tables in one pipeline. Describe the full workflow and explain what differs between the three formats.",
+    "a": "The workflow starts with creating an external stage pointing to the S3 bucket, using a storage integration or IAM credentials. For CSV, you create a named FILE FORMAT with TYPE = CSV, set FIELD_DELIMITER, SKIP_HEADER, and optionally NULL_IF, then run COPY INTO table FROM @stage FILE_FORMAT = (FORMAT_NAME = my_csv_fmt). For Parquet, set TYPE = PARQUET; Snowflake reads the file metadata schema automatically and you can use INFER_SCHEMA to auto-detect column definitions before loading. Parquet is a columnar binary format so no delimiter/header options apply. For JSON, set TYPE = JSON; Snowflake loads each top-level JSON object as a row into a VARIANT column, after which you use dot-notation (col:field::STRING) or FLATTEN to extract fields into typed columns. The key difference is that CSV is row-oriented flat text, Parquet is columnar binary with embedded schema, and JSON is hierarchical semi-structured — each requires a different FILE FORMAT and different post-load transformation approach. You can also use MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE with Parquet to map file columns to table columns by name rather than by position.",
+    "fj": "Saying Parquet files must be converted to CSV before loading into Snowflake because Snowflake only natively understands flat files.",
+    "fs": "Snowflake natively supports Parquet, Avro, ORC, JSON, and XML via COPY INTO and FILE FORMAT objects. INFER_SCHEMA even auto-detects the schema from Parquet/Avro/ORC files so you can CREATE TABLE using the inferred DDL without writing column definitions manually.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Load CSV, Parquet, and JSON from external stage",
+        "lines": [
+          "-- Create external stage (S3)",
+          "CREATE STAGE my_s3_stage",
+          "  URL = 's3://my-bucket/data/'",
+          "  STORAGE_INTEGRATION = my_s3_int;",
+          "",
+          "-- Load CSV",
+          "CREATE FILE FORMAT csv_fmt TYPE = CSV",
+          "  FIELD_DELIMITER = ',' SKIP_HEADER = 1 NULL_IF = ('NULL','');",
+          "COPY INTO orders FROM @my_s3_stage/orders/",
+          "  FILE_FORMAT = (FORMAT_NAME = csv_fmt);",
+          "",
+          "-- Infer schema from Parquet, then load",
+          "SELECT * FROM TABLE(INFER_SCHEMA(",
+          "  LOCATION => '@my_s3_stage/events/',",
+          "  FILE_FORMAT => 'TYPE=PARQUET'));",
+          "COPY INTO events FROM @my_s3_stage/events/",
+          "  FILE_FORMAT = (TYPE = PARQUET)",
+          "  MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE;",
+          "",
+          "-- Load JSON into VARIANT, then extract",
+          "COPY INTO raw_json FROM @my_s3_stage/logs/",
+          "  FILE_FORMAT = (TYPE = JSON);",
+          "-- Extract fields after load",
+          "SELECT",
+          "  src:user_id::STRING  AS user_id,",
+          "  src:event::STRING    AS event,",
+          "  src:ts::TIMESTAMP    AS ts",
+          "FROM raw_json;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-preparation"
+  },
+  {
+    "q": "Your team receives Avro, ORC, and XML files alongside the usual Parquet. What differences in Snowflake handling should you plan for, and how is synthetic data generation typically done inside Snowflake?",
+    "a": "Avro files are loaded like Parquet — the schema is embedded in the file header, Snowflake reads it automatically, and INFER_SCHEMA supports Avro. ORC (Optimized Row Columnar) is also supported natively: set FILE_FORMAT TYPE = ORC and Snowflake reads the stripe-based layout; INFER_SCHEMA works for ORC too. XML is the most constrained format: Snowflake loads each XML document into a VARIANT column as an OBJECT, but INFER_SCHEMA does not currently support XML, so you must write XMLGET or the bracket syntax (src['element']) to extract values manually. For synthetic data generation inside Snowflake, the standard approach is using SEQ (sequence objects) combined with UNIFORM, NORMAL, or ZIPF random functions (introduced in 2023-2024) to generate controlled distributions. RANDOM() returns a float in [0,1]. You can also use GENERATOR(ROWCOUNT => n) as a table function to produce n synthetic rows without a source table, combining it with IFF, CASE, DATEADD, and RANDOM to simulate realistic datasets for testing pipelines.",
+    "fj": "Saying Avro, ORC, and XML all require a third-party ETL tool to convert to CSV before Snowflake can ingest them.",
+    "fs": "Avro, ORC, and Parquet are all natively supported with INFER_SCHEMA. Only XML lacks INFER_SCHEMA support and requires manual extraction, but it still loads without conversion. Synthetic data is a first-class concern via GENERATOR() and statistical random functions built into Snowflake SQL.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Generate synthetic rows with GENERATOR + UNIFORM",
+        "lines": [
+          "-- 10,000 synthetic user events",
+          "SELECT",
+          "  SEQ4()                            AS event_id,",
+          "  DATEADD('second',",
+          "    UNIFORM(0, 7776000, RANDOM()),",
+          "    '2024-01-01'::TIMESTAMP)        AS event_ts,",
+          "  CASE FLOOR(UNIFORM(1, 4, RANDOM()))",
+          "    WHEN 1 THEN 'click'",
+          "    WHEN 2 THEN 'view'",
+          "    ELSE 'purchase' END             AS event_type,",
+          "  ROUND(UNIFORM(5, 500, RANDOM()), 2) AS amount_usd",
+          "FROM TABLE(GENERATOR(ROWCOUNT => 10000));"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-preparation"
+  },
+  {
+    "q": "You inherit a Snowflake account with dozens of tables but no documentation. Walk through the SQL-based data discovery steps to understand what data is available, assess column-level statistics, and determine the right granularity for a business reporting goal.",
+    "a": "Start with INFORMATION_SCHEMA to enumerate objects: query INFORMATION_SCHEMA.TABLES for table names, row counts, byte sizes, and created/modified dates; query INFORMATION_SCHEMA.COLUMNS for column names, data types, nullability, and default values. Use SHOW TABLES and SHOW COLUMNS to get metadata without needing SELECT grants on the data itself. To profile column-level statistics, run a single-query profiling block against candidate tables using COUNT(*), COUNT(DISTINCT col), MIN, MAX, AVG, STDDEV, and APPROX_PERCENTILE to understand cardinality, range, and distribution. Use SAMPLE (5 PERCENT) to keep the profiling query cheap on large tables. To assess granularity, write a GROUP BY on likely grain columns (e.g., user_id + event_date) and count rows per group — if most groups have exactly one row the table is at that grain; if groups have many rows it is a lower granularity aggregate. Snowflake's Data Lineage feature (GA November 2024) in Snowsight provides a visual DAG showing which tables feed which views, helping you trace upstream sources for a reporting target. Finally, query ACCESS_HISTORY in SNOWFLAKE.ACCOUNT_USAGE to see which tables are actually queried in production, which is a practical signal of which datasets are trusted and maintained.",
+    "fj": "Saying the only way to discover Snowflake tables is to ask the data engineer or look at a separately maintained data dictionary spreadsheet.",
+    "fs": "INFORMATION_SCHEMA, ACCOUNT_USAGE, SHOW commands, and Snowsight's built-in lineage graph provide rich, SQL-accessible data discovery capabilities that are always current and don't depend on external documentation being maintained.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Column-level profiling query",
+        "lines": [
+          "-- Quick statistical profile of a candidate table",
+          "SELECT",
+          "  COUNT(*)                              AS row_count,",
+          "  COUNT(DISTINCT user_id)               AS distinct_users,",
+          "  MIN(event_date)                       AS earliest,",
+          "  MAX(event_date)                       AS latest,",
+          "  ROUND(AVG(order_amount), 2)           AS avg_amount,",
+          "  ROUND(STDDEV(order_amount), 2)        AS stddev_amount,",
+          "  APPROX_PERCENTILE(order_amount, 0.5)  AS p50,",
+          "  APPROX_PERCENTILE(order_amount, 0.95) AS p95,",
+          "  SUM(CASE WHEN order_amount IS NULL THEN 1 ELSE 0 END)",
+          "    AS null_count",
+          "FROM orders",
+          "  SAMPLE (10 PERCENT);"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-preparation"
+  },
+  {
+    "q": "Explain when to normalize vs. denormalize a data model for Snowflake analytics, and describe the star schema pattern with a practical example.",
+    "a": "Normalization (3NF and beyond) eliminates redundancy by splitting data into related tables joined by foreign keys, which is ideal for OLTP systems where write consistency matters. For Snowflake analytical workloads the recommendation is generally to denormalize into a star schema or wide flat table because Snowflake's columnar storage and massively parallel query engine amortize join costs well, but reducing join complexity at query time still improves performance and simplifies analyst SQL. A star schema has a central fact table containing measurable events (orders, clicks, impressions) with foreign keys to surrounding dimension tables (date, customer, product). Each dimension holds descriptive attributes. For example, a sales star schema has FACT_SALES (order_id, customer_key, product_key, date_key, quantity, revenue) joined to DIM_CUSTOMER, DIM_PRODUCT, and DIM_DATE. This is denormalized relative to 3NF because DIM_CUSTOMER may flatten customer address and segment into one row rather than linking to a separate ADDRESSES table. When to normalize: lookup/reference data that changes frequently and is shared across many fact tables (keeps updates to one place). When to denormalize: reporting queries that join many tables repeatedly — wide flat tables reduce query complexity and improve Snowflake cluster pruning. Snowflake micro-partitions prune most efficiently on columns with high cardinality and ordering, so denormalized tables with good clustering keys on common filter columns outperform heavily normalized schemas for typical BI workloads.",
+    "fj": "Saying you should always fully normalize to 3NF in Snowflake to save storage costs because Snowflake charges by storage used.",
+    "fs": "Snowflake uses columnar compression that makes storage cost differences between normalized and denormalized models smaller than in row-based databases. The bigger factor for analytics is query performance and simplicity, where denormalized star schemas typically win. Storage is cheap relative to compute cost for redundant joins.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Star schema example — fact + dimension query",
+        "lines": [
+          "-- Fact table joined to three dimensions",
+          "SELECT",
+          "  d.month_name,",
+          "  c.segment         AS customer_segment,",
+          "  p.category        AS product_category,",
+          "  SUM(f.revenue)    AS total_revenue,",
+          "  SUM(f.quantity)   AS units_sold",
+          "FROM fact_sales f",
+          "JOIN dim_date     d ON f.date_key     = d.date_key",
+          "JOIN dim_customer c ON f.customer_key = c.customer_key",
+          "JOIN dim_product  p ON f.product_key  = p.product_key",
+          "WHERE d.year = 2024",
+          "GROUP BY 1, 2, 3",
+          "ORDER BY total_revenue DESC;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-transformation-modeling"
+  },
+  {
+    "q": "How do you build and call the SNOWFLAKE.ML.FORECAST function to produce a 30-day sales forecast, and what outputs does it return?",
+    "a": "SNOWFLAKE.ML.FORECAST is a Cortex ML built-in function that trains a time-series forecasting model on your data without requiring Python or external ML infrastructure. You create the model with CREATE SNOWFLAKE.ML.FORECAST, passing INPUT_DATA (a reference or query), TIMESTAMP_COLNAME (the column with ordered timestamps), and TARGET_COLNAME (the value to forecast). Optionally, SERIES_COLNAME lets you train a single multi-series model across product IDs, regions, or stores simultaneously. If your INPUT_DATA contains extra columns beyond timestamp/target/series, they are treated as exogenous variables (external regressors) that can improve accuracy. After training, call <model_name>!FORECAST(FORECASTING_PERIODS => 30) to generate 30 future periods. The output is a result set with columns: TS (timestamp of the forecasted period), FORECAST (point estimate), LOWER_BOUND, and UPPER_BOUND at the configured prediction_interval (default 0.95). You can pipe this into a table with CREATE TABLE AS or INSERT INTO for downstream reporting. Use <model_name>!SHOW_EVALUATION_METRICS to get MAPE, WAPE, and SMAPE on hold-out data, and <model_name>!EXPLAIN_FEATURE_IMPORTANCE to see which exogenous variables drove the forecast. The model is stored as a schema-level object and is billed per training run under Snowflake Cortex credits.",
+    "fj": "Calling FORECAST with a SELECT statement directly as a function call like SELECT FORECAST(date, revenue, 30) FROM sales.",
+    "fs": "SNOWFLAKE.ML.FORECAST is an ML class, not a scalar function. You must first CREATE the model object (training step), then CALL model!FORECAST() to generate predictions. The two-step create-then-call pattern is characteristic of all Snowflake Cortex ML classes.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Train FORECAST model and generate 30-day predictions",
+        "lines": [
+          "-- Step 1: Train the model",
+          "CREATE OR REPLACE SNOWFLAKE.ML.FORECAST sales_forecast_model(",
+          "  INPUT_DATA => SYSTEM$REFERENCE('VIEW', 'daily_sales_v'),",
+          "  TIMESTAMP_COLNAME => 'sale_date',",
+          "  TARGET_COLNAME    => 'revenue',",
+          "  CONFIG_OBJECT => {'prediction_interval': 0.9}",
+          ");",
+          "",
+          "-- Step 2: Generate 30-day forecast",
+          "CALL sales_forecast_model!FORECAST(",
+          "  FORECASTING_PERIODS => 30,",
+          "  CONFIG_OBJECT => {'prediction_interval': 0.9}",
+          ");",
+          "",
+          "-- Step 3: Check evaluation metrics",
+          "CALL sales_forecast_model!SHOW_EVALUATION_METRICS();"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-analysis"
+  },
+  {
+    "q": "A product manager asks you to identify which stores have declining weekly sales trends over the past 6 months. How would you use Snowflake ML FORECAST or SQL window functions to surface this?",
+    "a": "There are two complementary approaches. For a SQL-native approach, use LAG and a linear regression proxy: compute weekly totals per store with a GROUP BY, then use REGR_SLOPE(revenue, week_number) as a window function over the past 26 weeks — a negative slope indicates decline. REGR_SLOPE is a built-in Snowflake aggregate that fits a least-squares line over two numeric series, making it a lightweight trend detector without ML. For the ML approach, create a multi-series SNOWFLAKE.ML.FORECAST model with SERIES_COLNAME = 'store_id'; after calling !FORECAST(), compare the forecasted trajectory (lower slope in the forecast vs. historical baseline) or inspect feature importance. A simpler signal is to compute the 13-week vs. 26-week revenue ratio per store — stores where the recent half is meaningfully lower than the earlier half are declining. You can rank stores by this ratio using RANK() or DENSE_RANK() window functions and surface the bottom quintile. Wrapping the logic in a Snowflake Dynamic Table keeps the metric refreshed automatically as new sales data lands, so the product manager always sees a current ranked list without a manual refresh.",
+    "fj": "Saying Snowflake has no way to detect trends and you must export data to Python or R for any time-series analysis.",
+    "fs": "REGR_SLOPE is available as a built-in aggregate/window function in Snowflake SQL, and SNOWFLAKE.ML.FORECAST handles multi-series training natively with SERIES_COLNAME. Both approaches let you detect trends entirely inside Snowflake without exporting data.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Detect declining stores with REGR_SLOPE",
+        "lines": [
+          "WITH weekly AS (",
+          "  SELECT",
+          "    store_id,",
+          "    DATE_TRUNC('week', sale_date)    AS week_start,",
+          "    ROW_NUMBER() OVER (",
+          "      PARTITION BY store_id",
+          "      ORDER BY DATE_TRUNC('week', sale_date)) AS week_num,",
+          "    SUM(revenue) AS weekly_rev",
+          "  FROM sales",
+          "  WHERE sale_date >= DATEADD('month', -6, CURRENT_DATE)",
+          "  GROUP BY 1, 2",
+          ")",
+          "SELECT",
+          "  store_id,",
+          "  ROUND(REGR_SLOPE(weekly_rev, week_num), 2) AS trend_slope,",
+          "  SUM(weekly_rev)                            AS total_rev_6m",
+          "FROM weekly",
+          "GROUP BY store_id",
+          "HAVING trend_slope < 0",
+          "ORDER BY trend_slope ASC;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-analysis"
+  },
+  {
+    "q": "How do you use ST_DISTANCE and ST_WITHIN in Snowflake to answer a location-based business question — for example, finding all stores within 5 km of a customer's home address?",
+    "a": "Snowflake stores geospatial data in GEOGRAPHY (spherical earth model, WGS84) or GEOMETRY (flat plane) columns. For a real-world distance question you use GEOGRAPHY. ST_DISTANCE(geo1, geo2) returns the minimum great-circle distance in meters between two GEOGRAPHY objects. To find stores within 5 km of a customer, you construct each point with ST_MAKEPOINT(longitude, latitude) or TO_GEOGRAPHY('POINT(lon lat)'), then filter WHERE ST_DISTANCE(customer_point, store_point) <= 5000 (5,000 metres). ST_WITHIN(geo_a, geo_b) returns TRUE if geo_a is completely inside geo_b and is more appropriate for polygon containment checks — for example, checking whether a store point lies within a delivery zone polygon stored as a GEOGRAPHY POLYGON. For performance on large tables, Snowflake supports Search Optimization Service for geospatial columns, which maintains an index structure so that ST_DWITHIN, ST_CONTAINS, and ST_INTERSECTS predicates can prune micro-partitions efficiently. ST_DWITHIN(a, b, distance) is often preferred over ST_DISTANCE(...) <= n because the query optimizer can use the spatial index with ST_DWITHIN but may not optimize a post-computed distance comparison equally well.",
+    "fj": "Saying ST_DISTANCE returns results in kilometers and you divide by 1000 to convert to meters.",
+    "fs": "ST_DISTANCE on GEOGRAPHY columns returns distances in meters, not kilometers. Dividing by 1000 would give you kilometers, but the raw result is already in meters. Confusing the unit is a common exam trap that leads to wrong threshold comparisons.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Stores within 5 km of a customer — ST_DISTANCE and ST_WITHIN",
+        "lines": [
+          "-- Find stores within 5 km of a given customer",
+          "WITH customer_loc AS (",
+          "  SELECT",
+          "    customer_id,",
+          "    ST_MAKEPOINT(home_lon, home_lat) AS home_geo",
+          "  FROM customers",
+          "  WHERE customer_id = 12345",
+          ")",
+          "SELECT",
+          "  s.store_id,",
+          "  s.store_name,",
+          "  ROUND(ST_DISTANCE(c.home_geo,",
+          "        ST_MAKEPOINT(s.store_lon, s.store_lat)) / 1000.0, 2)",
+          "    AS distance_km",
+          "FROM stores s",
+          "CROSS JOIN customer_loc c",
+          "WHERE ST_DISTANCE(c.home_geo,",
+          "        ST_MAKEPOINT(s.store_lon, s.store_lat)) <= 5000",
+          "ORDER BY distance_km;",
+          "",
+          "-- Check if a store is inside a delivery zone polygon",
+          "SELECT store_id",
+          "FROM stores",
+          "WHERE ST_WITHIN(",
+          "  ST_MAKEPOINT(store_lon, store_lat),",
+          "  TO_GEOGRAPHY('POLYGON((-122.5 37.7,-122.4 37.7,-122.4 37.8,-122.5 37.8,-122.5 37.7))')",
+          ");"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-analysis"
+  },
+  {
+    "q": "How do you perform customer segmentation using SQL clustering techniques in Snowflake — specifically, walk through an RFM segmentation using NTILE and WIDTH_BUCKET.",
+    "a": "SQL clustering in Snowflake for segmentation typically means using window functions and bucket-assignment functions to group rows into analytically meaningful clusters without running an external ML algorithm. RFM (Recency, Frequency, Monetary) is the canonical example. First, compute each customer's R (days since last purchase), F (total order count), and M (total spend) using GROUP BY aggregates. Then score each dimension independently: use NTILE(5) to divide customers into 5 equal-sized quintiles for each metric — customers in the top recency quintile (most recent) get score 5, and so on. Combine the three NTILE scores into a composite RFM segment string ('555' = best customers, '111' = churned/low-value). WIDTH_BUCKET(value, min, max, num_buckets) is an alternative when you want equal-width (not equal-size) buckets — useful when the business defines fixed monetary thresholds (e.g., $0-100, $100-500, $500+). After assigning buckets you can label segments with CASE expressions and aggregate to measure segment size, average LTV, and churn rate. The result table is typically materialized as a Dynamic Table or refreshed daily via a task so the CRM or marketing platform always has current segment assignments.",
+    "fj": "Saying Snowflake cannot do customer segmentation in SQL and you must use Python with scikit-learn K-Means, then write results back.",
+    "fs": "NTILE, WIDTH_BUCKET, and CASE-based bucketing are fully supported native SQL functions that enable rule-based and quantile-based segmentation entirely in Snowflake without external ML. K-Means is appropriate when cluster boundaries are data-driven and unknown, but for RFM or threshold-based segmentation, SQL is the right tool and avoids pipeline complexity.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "RFM segmentation with NTILE",
+        "lines": [
+          "WITH rfm_base AS (",
+          "  SELECT",
+          "    customer_id,",
+          "    DATEDIFF('day', MAX(order_date), CURRENT_DATE) AS recency_days,",
+          "    COUNT(DISTINCT order_id)                       AS frequency,",
+          "    SUM(order_amount)                              AS monetary",
+          "  FROM orders",
+          "  WHERE order_date >= DATEADD('year', -2, CURRENT_DATE)",
+          "  GROUP BY customer_id",
+          "),",
+          "rfm_scored AS (",
+          "  SELECT",
+          "    customer_id,",
+          "    -- Lower recency_days = more recent = higher score",
+          "    6 - NTILE(5) OVER (ORDER BY recency_days ASC)  AS r_score,",
+          "    NTILE(5) OVER (ORDER BY frequency ASC)         AS f_score,",
+          "    NTILE(5) OVER (ORDER BY monetary ASC)          AS m_score",
+          "  FROM rfm_base",
+          ")",
+          "SELECT",
+          "  customer_id,",
+          "  r_score, f_score, m_score,",
+          "  CONCAT(r_score, f_score, m_score) AS rfm_segment,",
+          "  CASE",
+          "    WHEN r_score >= 4 AND f_score >= 4 THEN 'Champions'",
+          "    WHEN r_score <= 2 AND f_score <= 2 THEN 'At Risk'",
+          "    ELSE 'Developing'",
+          "  END AS segment_label",
+          "FROM rfm_scored;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-analysis"
+  },
+  {
+    "q": "Walk through a complete descriptive statistics analysis in Snowflake SQL for an e-commerce orders table. Which functions would you use and why?",
+    "a": "Descriptive analysis summarises the central tendency, spread, and distribution shape of a dataset. In Snowflake SQL you use COUNT(*) for total rows, COUNT(DISTINCT col) for cardinality, MIN and MAX for range, AVG for mean, MEDIAN or PERCENTILE_CONT(0.5) for the median (which is less sensitive to outliers than the mean), STDDEV (alias STDDEV_SAMP) for spread, and VARIANCE for variance. For percentiles at the tails, APPROX_PERCENTILE(col, p) is efficient on large datasets using the t-Digest algorithm — use PERCENTILE_DISC or PERCENTILE_CONT when you need exact results. MODE is available as an aggregate in Snowflake to find the most frequent value. For frequency distributions on categorical columns, GROUP BY col ORDER BY COUNT(*) DESC with LIMIT reveals the top categories. SKEWNESS and KURTOSIS are native Snowflake aggregate functions that characterize distribution shape — positive skew means a long right tail (common in revenue data). Wrap all of this in a single SELECT to get a one-row statistical summary, or use SAMPLE (10 PERCENT) when the table is very large to keep the profiling query fast. The output should be shared with stakeholders before any modeling to flag skew, outliers, and missing data that will affect downstream analysis quality.",
+    "fj": "Saying MEDIAN is not a native Snowflake function and you must manually compute it using ROW_NUMBER and OFFSET tricks.",
+    "fs": "MEDIAN is a native Snowflake aggregate function. PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) is the ANSI-standard equivalent. Both give the true median. The ROW_NUMBER trick is a legacy workaround from systems that lacked built-in median support.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "One-row descriptive statistics summary",
+        "lines": [
+          "SELECT",
+          "  COUNT(*)                               AS row_count,",
+          "  COUNT(order_id)                        AS non_null_orders,",
+          "  COUNT(DISTINCT customer_id)            AS unique_customers,",
+          "  ROUND(MIN(order_amount), 2)            AS min_amt,",
+          "  ROUND(MAX(order_amount), 2)            AS max_amt,",
+          "  ROUND(AVG(order_amount), 2)            AS mean_amt,",
+          "  ROUND(MEDIAN(order_amount), 2)         AS median_amt,",
+          "  ROUND(STDDEV(order_amount), 2)         AS stddev_amt,",
+          "  ROUND(APPROX_PERCENTILE(order_amount, 0.25), 2) AS p25,",
+          "  ROUND(APPROX_PERCENTILE(order_amount, 0.75), 2) AS p75,",
+          "  ROUND(APPROX_PERCENTILE(order_amount, 0.99), 2) AS p99,",
+          "  ROUND(SKEWNESS(order_amount), 3)       AS skewness,",
+          "  ROUND(KURTOSIS(order_amount), 3)       AS kurtosis",
+          "FROM orders",
+          "  SAMPLE (20 PERCENT);"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-analysis"
+  },
+  {
+    "q": "How do you perform diagnostic analysis in Snowflake SQL to identify why a key metric dropped last Tuesday — what SQL patterns detect outliers, anomalies, and root causes?",
+    "a": "Diagnostic analysis follows the inspect-infer-fix-verify loop. Start by isolating the time window: filter to last Tuesday and compare to the rolling 4-week average for the same day-of-week using LAG or a CTE join. Use PERCENT_CHANGE = (current - baseline) / baseline to quantify the magnitude. To find which dimension drove the drop, break the metric down by every dimension (region, product, channel) using GROUP BY and rank by the delta — this is called dimension-slicing or waterfall decomposition. For outlier detection within a distribution, use Z-score: (value - mean) / stddev; rows where ABS(z_score) > 3 are statistical outliers. The ANOMALY_DETECTION model in SNOWFLAKE.ML (a Cortex built-in, similar to FORECAST) trains on historical data and scores new rows with an IS_ANOMALY flag and anomaly score — this is more robust than a static Z-score threshold. For root-cause diagnosis of NULL spikes or data freshness drops, query INFORMATION_SCHEMA.LOAD_HISTORY or COPY_HISTORY to see if a file failed to load on Tuesday. Check ACCOUNT_USAGE.QUERY_HISTORY for upstream pipeline failures. Correlating the metric drop with pipeline events often reveals whether the cause is a data quality issue upstream versus a genuine business event.",
+    "fj": "Saying the only way to find the root cause of a metric drop is to manually inspect every row visually in a spreadsheet.",
+    "fs": "Snowflake provides structured SQL tools for diagnostic analysis: dimension-slicing GROUP BY comparisons, Z-score window functions, SNOWFLAKE.ML.ANOMALY_DETECTION for automated flagging, and ACCOUNT_USAGE/INFORMATION_SCHEMA system tables for pipeline health — all queryable in SQL without manual row inspection.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Detect anomaly day and slice by dimension",
+        "lines": [
+          "-- Step 1: Flag the anomalous day with rolling average",
+          "WITH daily AS (",
+          "  SELECT",
+          "    order_date,",
+          "    SUM(revenue) AS daily_rev",
+          "  FROM orders",
+          "  WHERE order_date >= DATEADD('week', -5, CURRENT_DATE)",
+          "  GROUP BY order_date",
+          "),",
+          "with_avg AS (",
+          "  SELECT",
+          "    order_date,",
+          "    daily_rev,",
+          "    AVG(daily_rev) OVER (",
+          "      ORDER BY order_date",
+          "      ROWS BETWEEN 27 PRECEDING AND 1 PRECEDING) AS rolling_28d_avg",
+          "  FROM daily",
+          ")",
+          "SELECT *,",
+          "  ROUND((daily_rev - rolling_28d_avg) / NULLIF(rolling_28d_avg, 0) * 100, 1)",
+          "    AS pct_vs_baseline",
+          "FROM with_avg",
+          "ORDER BY order_date;",
+          "",
+          "-- Step 2: Dimension-slice to find root cause on the anomaly date",
+          "SELECT",
+          "  channel,",
+          "  SUM(revenue)                 AS rev_tuesday,",
+          "  LAG(SUM(revenue)) OVER (",
+          "    PARTITION BY channel",
+          "    ORDER BY DATE_TRUNC('week', order_date)) AS rev_prior_week",
+          "FROM orders",
+          "WHERE DAYOFWEEK(order_date) = 3  -- Tuesday",
+          "GROUP BY channel, DATE_TRUNC('week', order_date)",
+          "ORDER BY (rev_tuesday - rev_prior_week) ASC;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-analysis"
+  },
+  {
+    "q": "What does exploratory data analysis (EDA) look like in Snowflake SQL — walk through a structured EDA workflow on a new events table from ingestion to insight-ready.",
+    "a": "An EDA workflow in Snowflake SQL has five stages. First, shape and size: SELECT COUNT(*), MIN(event_ts), MAX(event_ts) to understand row count, date range, and density. Second, missingness: for each column compute SUM(CASE WHEN col IS NULL THEN 1 ELSE 0 END) / COUNT(*) as null_rate — columns with >20% nulls need investigation before use. Third, cardinality and distributions: GROUP BY each categorical column to get value frequencies; for numerics use APPROX_PERCENTILE at [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99] to see the full CDF shape and flag heavy tails or bimodal patterns. Fourth, correlation: use CORR(col_a, col_b) which is a native Snowflake aggregate to measure linear correlation between any two numeric columns — useful to spot multicollinearity before modeling. Fifth, temporal patterns: GROUP BY DATE_TRUNC('hour', event_ts) and COUNT(*) to see intra-day load patterns; GROUP BY DAYOFWEEK to find weekly seasonality. Throughout, use SAMPLE (N PERCENT) to keep interactive EDA queries fast, then remove the SAMPLE clause for final validation. Document findings in comments or a Snowsight notebook before building downstream transformations, because EDA assumptions that are wrong (e.g., a column assumed unique that is not) cause silent errors in production models.",
+    "fj": "Saying EDA requires pandas or a Jupyter notebook and cannot be done in SQL because SQL lacks statistical functions.",
+    "fs": "Snowflake SQL provides CORR, STDDEV, SKEWNESS, KURTOSIS, APPROX_PERCENTILE, MEDIAN, and MODE as native aggregates. Combined with window functions and GROUP BY, SQL is fully capable of a rigorous EDA workflow without Python, though Python in Snowpark can augment it for visualization.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Structured EDA — missingness + correlation + temporal pattern",
+        "lines": [
+          "-- Missingness rates for all key columns",
+          "SELECT",
+          "  ROUND(SUM(CASE WHEN user_id    IS NULL THEN 1 ELSE 0 END) / COUNT(*), 3) AS user_id_null_rate,",
+          "  ROUND(SUM(CASE WHEN event_type IS NULL THEN 1 ELSE 0 END) / COUNT(*), 3) AS event_type_null_rate,",
+          "  ROUND(SUM(CASE WHEN amount     IS NULL THEN 1 ELSE 0 END) / COUNT(*), 3) AS amount_null_rate",
+          "FROM events;",
+          "",
+          "-- Correlation between session_duration and amount",
+          "SELECT ROUND(CORR(session_duration_sec, amount), 4) AS pearson_r",
+          "FROM events;",
+          "",
+          "-- Hourly event volume (temporal pattern)",
+          "SELECT",
+          "  DATE_TRUNC('hour', event_ts) AS hour_bucket,",
+          "  COUNT(*)                     AS event_count",
+          "FROM events",
+          "GROUP BY 1",
+          "ORDER BY 1;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-analysis"
+  },
+  {
+    "q": "How do you share a Snowsight dashboard with colleagues, and what role and permission requirements must be met for them to view it?",
+    "a": "In Snowsight, a dashboard owner or editor shares a dashboard by opening it, clicking the Share button in the top-right corner, and entering the Snowflake username or email of each recipient. Alternatively, you can enable link sharing, which generates a URL that any valid Snowflake user in the account can use to open the dashboard. The critical permission requirement is that the recipient must use the same role as the session context that the dashboard queries use — if a tile queries a table accessible only under the ANALYST role, recipients must have ANALYST granted to their user, and they must switch to ANALYST before viewing the dashboard. Snowflake does not re-execute dashboard tiles under the owner's role on behalf of the viewer; each viewer's own credentials and role are used. This means sharing a dashboard does not bypass object-level access controls. Dashboard ownership and edit rights are separate from Snowflake RBAC: the Share dialog controls who can edit vs. view the dashboard within Snowsight, while Snowflake RBAC controls which underlying data the recipient can query. Tiles on dashboards are backed by worksheets; to edit a tile's query you select Edit query from the tile menu, which opens the underlying worksheet.",
+    "fj": "Saying that sharing a Snowsight dashboard automatically grants the viewer SELECT access to all tables queried by the dashboard tiles.",
+    "fs": "Snowsight dashboard sharing controls who can see the dashboard UI, but it does not grant any Snowflake data privileges. The viewer must independently have the appropriate RBAC roles to execute the underlying queries. If they lack table access the tile will show an error, not the data.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-presentation-visualization"
+  },
+  {
+    "q": "A Snowsight dashboard tile shows a bar chart but stakeholders want to see monthly aggregates instead of daily bars, add a second Y-axis for units sold, and change the color scheme. Walk through the configuration steps.",
+    "a": "In Snowsight, every chart is configured through the chart inspector panel that appears on the right side of the worksheet when you click Chart. To change the time bucketing from daily to monthly, locate the X-axis column under the Data section in the inspector and change the Bucketing setting from Day to Month — Snowsight applies this aggregation visually without modifying the underlying SQL, so the raw query can still return daily data. The aggregate function for each data series (Y-axis columns) is controlled per-column: click the column name in the Data panel and choose from SUM, COUNT, AVG, MIN, or MAX. To add a second Y-axis for units sold, add the units_sold column to the chart's Data section and toggle its Y-axis setting to Secondary axis, which adds a right-side axis with independent scaling. Color scheme is set under the Appearance section of the inspector — you can pick from preset palettes or use custom hex colors per series. If the underlying query does not return the right granularity or columns, select Edit query from the tile menu to modify the SQL, which re-runs and refreshes the chart. Dashboard tile arrangement is done by dragging tiles to new positions; a placement preview shows the drop target before release.",
+    "fj": "Saying you must rewrite the SQL query to use DATE_TRUNC('month', date) every time you want to change the chart bucketing interval.",
+    "fs": "Snowsight's chart inspector applies visual bucketing (day/week/month/year) on top of the query result without requiring SQL changes. You only need to rewrite SQL when you need a different grain for non-date columns or when the data itself must change — not for common time granularity adjustments.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-presentation-visualization"
+  },
+  {
+    "q": "How do you export query results from Snowflake in CSV, Parquet, and JSON formats, and what are the trade-offs between using the Snowsight UI download vs. COPY INTO <location>?",
+    "a": "Snowsight offers a Download results button in any worksheet that exports up to 100,000 rows to a CSV file directly in the browser — quick for ad-hoc analyst use but capped in row count and only supports CSV. For programmatic or large-volume exports, use COPY INTO <location> to write data to an internal or external stage. Specify the output FILE_FORMAT: TYPE = CSV writes delimited text, TYPE = PARQUET writes columnar binary (good for downstream Spark, dbt, or analytics tools because it preserves types and compresses well), and TYPE = JSON writes each row as a JSON object or a full JSON array depending on the option. For Parquet output, Snowflake converts VARIANT columns to JSON strings by default; cast them to ARRAY with TO_ARRAY to get proper Parquet LIST types. After writing to an internal stage, use the GET command in SnowSQL CLI to download files to a local machine. For external stages (S3, Azure Blob, GCS), the files land directly in cloud storage for downstream consumers. HEADER = TRUE adds a column-name header row to CSV exports, which is often required by downstream tools. Parquet is the preferred format for data engineering pipelines because it carries schema metadata and supports predicate pushdown in query engines, while CSV is preferred for human-readable analyst sharing and JSON for REST API consumption.",
+    "fj": "Saying COPY INTO <location> can only export to CSV and you need a third-party tool to export Parquet or JSON from Snowflake.",
+    "fs": "COPY INTO <location> natively supports CSV, JSON, Parquet, Avro, and ORC for export. The COPY command is symmetric: the same FILE_FORMAT types used for ingestion are valid for unloading, making it the primary bulk export mechanism in Snowflake.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Export to CSV, Parquet, and JSON using COPY INTO",
+        "lines": [
+          "-- Export to CSV with header",
+          "COPY INTO @my_export_stage/orders_csv/",
+          "FROM (SELECT * FROM orders WHERE order_date >= '2024-01-01')",
+          "FILE_FORMAT = (TYPE = CSV FIELD_DELIMITER = ',' HEADER = TRUE)",
+          "OVERWRITE = TRUE;",
+          "",
+          "-- Export to Parquet (preserves types, compresses well)",
+          "COPY INTO @my_export_stage/orders_parquet/",
+          "FROM orders",
+          "FILE_FORMAT = (TYPE = PARQUET SNAPPY_COMPRESSION = TRUE);",
+          "",
+          "-- Export to newline-delimited JSON",
+          "COPY INTO @my_export_stage/orders_json/",
+          "FROM orders",
+          "FILE_FORMAT = (TYPE = JSON);",
+          "",
+          "-- Download from internal stage to local disk (SnowSQL CLI)",
+          "-- GET @my_export_stage/orders_csv/ file:///local/path/orders/"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-presentation-visualization"
+  }
+]

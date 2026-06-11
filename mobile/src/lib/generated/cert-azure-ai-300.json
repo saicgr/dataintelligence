@@ -1,0 +1,535 @@
+[
+  {
+    "q": "Your team is onboarding three data science squads onto Azure Machine Learning. Each squad needs isolated experiment tracking, its own compute quota, and access to shared datasets stored in a central Azure Data Lake Storage Gen2 account. How do you architect the workspace layout and wire up the shared storage?",
+    "a": "The standard pattern is to provision one AML workspace per squad using the Azure CLI v2 command `az ml workspace create` with a distinct resource group, or via an ARM/Bicep template for repeatable IaC. Each workspace gets its own Azure Key Vault, Container Registry, Storage Account (for default blob), and Application Insights as associated resources, created automatically in the same resource group. To grant all three workspaces access to the central ADLS Gen2 account you register it as a datastore in each workspace using `az ml datastore create --type azure_data_lake_gen2`, specifying the storage account name, filesystem, and a service principal or managed identity credential. Quota isolation is enforced at the workspace level by assigning a separate compute cluster with a `max_instances` cap. For governance, apply Azure Policy to enforce tagging, restrict VM SKUs allowed for compute, and require private endpoints. The workspace itself stores metadata — runs, models, datasets — in Cosmos DB backing, so the squads never share experiment namespaces.",
+    "fj": "Create a single shared workspace and use experiment naming conventions like 'squad1-' prefixes to keep each team's work separated.",
+    "fs": "A single workspace means shared quota, shared role assignments, and no network isolation between teams. Any user with Contributor access can see and modify all experiments. Workspace-per-team is the Microsoft-recommended pattern for production MLOps precisely because it provides hard quota boundaries, independent RBAC, and separate audit logs in Azure Monitor.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Create AML workspace + register ADLS Gen2 datastore",
+        "lines": [
+          "# Create workspace (also creates Key Vault, ACR, Storage, App Insights)",
+          "az ml workspace create \\",
+          "  --name squad1-aml-ws \\",
+          "  --resource-group rg-squad1 \\",
+          "  --location eastus2",
+          "",
+          "# Register central ADLS Gen2 as a datastore using managed identity",
+          "az ml datastore create \\",
+          "  --workspace-name squad1-aml-ws \\",
+          "  --resource-group rg-squad1 \\",
+          "  --file adls_datastore.yml",
+          "",
+          "# adls_datastore.yml",
+          "# $schema: https://azuremlschemas.azureedge.net/latest/azureDataLakeGen2.schema.json",
+          "# name: central_adls",
+          "# type: azure_data_lake_gen2",
+          "# account_name: centraladls",
+          "# filesystem: data",
+          "# credentials:",
+          "#   account_key: <key>  # or use managed identity"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure"
+  },
+  {
+    "q": "A new Azure Machine Learning workspace was provisioned without a private endpoint, but your security team now requires all traffic to stay on the corporate VNet. Walk through the key workspace settings and CLI steps needed to lock down the workspace network.",
+    "a": "Azure Machine Learning workspaces support two network isolation modes: public access and workspace-managed VNet. To retrofit network isolation you first update the workspace to enable a managed VNet with `az ml workspace update --name <ws> --managed-network allow_internet_outbound` or the stricter `allow_only_approved_outbound` mode. Next, provision a private endpoint into your corporate VNet using `az network private-endpoint create` targeting the workspace's resource ID with the sub-resource `amlworkspace`. You must also create private endpoints for each dependent resource — Storage Account, Key Vault, Container Registry — because traffic to those services also travels over the public internet by default. Update private DNS zones (privatelink.api.azureml.ms and privatelink.notebooks.azure.net) so clients resolve to private IPs. Finally, set `public_network_access: Disabled` on the workspace so no public-IP-based calls are accepted. Compute clusters and compute instances created after this change automatically join the managed VNet and use private link to call the workspace API.",
+    "fj": "Enable a Network Security Group on the subnet where AML compute runs — that is sufficient to restrict workspace traffic to the VNet.",
+    "fs": "An NSG controls traffic at the subnet layer but the workspace API endpoint and its dependent services (Storage, Key Vault, ACR) still have public DNS records resolving to public IPs. Without private endpoints those calls leave the VNet regardless of NSG rules. Private endpoints are the correct mechanism to give each service a NIC inside the VNet so all resolution and traffic stays private.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "mlops-infrastructure"
+  },
+  {
+    "q": "Your AML workspace needs to read training data from an Azure Blob Storage account in a different subscription. The data science team wants to reference data by path (e.g., `azureml://datastores/raw_data/paths/train/`) without embedding connection strings in code. How do you configure this?",
+    "a": "You register the cross-subscription storage account as a named datastore in AML using SDK v2 or CLI v2. For a Blob Storage account you define a YAML spec of type `azure_blob` with the account name, container name, and credentials (service principal, account key, or SAS token). Once registered, AML stores the credential in the workspace's Azure Key Vault and exposes the datastore by name. Data scientists reference data via the URI scheme `azureml://datastores/<datastore-name>/paths/<prefix>/`, which AML resolves at job runtime by fetching the credential from Key Vault and mounting or downloading the blob path. The preferred credential for cross-subscription is a service principal with Storage Blob Data Reader on the target account, because SAS tokens expire and account keys are overly broad. For workspaces using managed identity you can grant the workspace's managed identity the Storage Blob Data Reader role on the remote account and set `credentials: none` in the datastore YAML — AML will authenticate using the identity at runtime.",
+    "fj": "Pass the storage account connection string as an environment variable in the job YAML so the training script can instantiate a BlobServiceClient directly.",
+    "fs": "Hardcoding or passing connection strings as environment variables bypasses AML's secret management, exposes credentials in job run history, and forces every script to include storage-SDK boilerplate. Named datastores centralize credential rotation in Key Vault, keep scripts credential-free, and let ML engineers reference data by logical path rather than raw URLs.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "yaml",
+        "label": "Datastore YAML for cross-subscription Azure Blob",
+        "lines": [
+          "$schema: https://azuremlschemas.azureedge.net/latest/azureBlob.schema.json",
+          "name: raw_data",
+          "type: azure_blob",
+          "account_name: prodstorageacct",
+          "container_name: training-data",
+          "credentials:",
+          "  tenant_id: <tenant-id>",
+          "  client_id: <sp-client-id>",
+          "  client_secret: <sp-secret>"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure"
+  },
+  {
+    "q": "A training pipeline needs a GPU cluster for model training and a separate CPU cluster for data preprocessing. The GPU cluster should scale to zero when idle to minimize cost. How do you create and configure these compute targets in Azure Machine Learning?",
+    "a": "In AML SDK v2, compute clusters are created with `MLClient.compute.begin_create_or_update()` using an `AmlCompute` spec. For the GPU cluster you set `size` to a GPU SKU such as `Standard_NC6s_v3`, `min_instances=0` so it scales to zero when idle, and `max_instances` capped at your budget limit — AML deallocates nodes after the `idle_time_before_scale_down` period (default 120 seconds). For the CPU preprocessing cluster you use a general-purpose SKU like `Standard_DS3_v2` with similar scale-to-zero config. You can also use serverless compute by specifying `compute: serverless` in the job YAML instead of a named cluster, which lets AML manage the cluster lifecycle automatically without pre-provisioning. Compute instances (single-node dev VMs) are separate from clusters and are not auto-scaled. Spot (low-priority) VMs are available on clusters via `tier: low_priority` at significant cost savings but with preemption risk, so they suit non-critical or resumable jobs.",
+    "fj": "Use a single cluster with mixed CPU and GPU nodes, and let AML route preprocessing steps to CPU nodes and training steps to GPU nodes automatically.",
+    "fs": "AML does not automatically route pipeline steps to specific node types within a single heterogeneous cluster. Each pipeline step declares its own `compute` target explicitly. You need separate named clusters (or serverless compute) for steps with different hardware requirements, because a cluster can only have one VM SKU.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Create GPU and CPU compute clusters with SDK v2",
+        "lines": [
+          "from azure.ai.ml import MLClient",
+          "from azure.ai.ml.entities import AmlCompute",
+          "from azure.identity import DefaultAzureCredential",
+          "",
+          "ml_client = MLClient(DefaultAzureCredential(), subscription_id, rg, ws_name)",
+          "",
+          "gpu_cluster = AmlCompute(",
+          "    name='gpu-cluster',",
+          "    type='amlcompute',",
+          "    size='Standard_NC6s_v3',",
+          "    min_instances=0,",
+          "    max_instances=4,",
+          "    idle_time_before_scale_down=120,",
+          "    tier='dedicated'",
+          ")",
+          "ml_client.compute.begin_create_or_update(gpu_cluster).result()",
+          "",
+          "cpu_cluster = AmlCompute(",
+          "    name='cpu-cluster',",
+          "    size='Standard_DS3_v2',",
+          "    min_instances=0,",
+          "    max_instances=10",
+          ")",
+          "ml_client.compute.begin_create_or_update(cpu_cluster).result()"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure"
+  },
+  {
+    "q": "A pipeline step needs to read a versioned snapshot of a training table from Azure Data Lake Storage Gen2 that was registered in AML. How do you create a data asset, version it, and reference it from a pipeline job YAML?",
+    "a": "AML data assets (type `uri_folder`, `uri_file`, or `mltable`) are versioned references to storage locations. You create a data asset with `az ml data create` referencing a datastore path and assigning an explicit version. Each version is immutable — creating a new version points to the latest snapshot without modifying prior versions, which is critical for experiment reproducibility. In an AML job YAML you reference the asset with `azureml:<asset-name>:<version>` or `azureml:<asset-name>@latest`. The `mltable` type is particularly useful for tabular data because it stores schema-aware transformations (column selection, row filter, partition settings) on top of the underlying files, so the training script calls `mltable.load()` rather than raw file parsing. Data asset lineage is tracked in AML — every job run that consumes the asset is linked, so you can audit which models were trained on which data version.",
+    "fj": "Pass the raw ADLS Gen2 path (`abfss://container@account.dfs.core.windows.net/path`) directly to the job as an environment variable.",
+    "fs": "Raw ADLS paths bypass AML's lineage tracking and credential management. If the datastore credential rotates, every job definition that hard-codes the raw path breaks. Named data assets with versions give you reproducibility, lineage, and a single point of credential change.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "yaml",
+        "label": "Create and reference a versioned data asset",
+        "lines": [
+          "# data_asset.yml",
+          "$schema: https://azuremlschemas.azureedge.net/latest/data.schema.json",
+          "name: training_data",
+          "version: '3'",
+          "type: uri_folder",
+          "path: azureml://datastores/central_adls/paths/train/2026-06/",
+          "",
+          "# Register: az ml data create --file data_asset.yml",
+          "",
+          "# Reference in job YAML",
+          "# inputs:",
+          "#   train_data:",
+          "#     type: uri_folder",
+          "#     path: azureml:training_data:3"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure"
+  },
+  {
+    "q": "Your team's training scripts require Python 3.11, scikit-learn 1.4, and a custom C extension that must be compiled at build time. How do you define, build, and pin an AML environment so every job uses the same reproducible runtime?",
+    "a": "AML environments encapsulate the runtime — base Docker image, conda spec or pip requirements, and any custom build steps — and are versioned assets in the workspace. You define a custom environment using a YAML spec that references a `Dockerfile` or a `conda.yml` plus a base image. The environment is built once by AML using Azure Container Registry (the workspace's associated ACR) when first submitted, and cached by image hash. For reproducibility you pin exact package versions in the conda spec and reference a specific base image digest rather than a floating tag. Jobs reference the environment by name and version (`azureml:<env-name>:<version>`). AML also provides curated environments (e.g., `AzureML-sklearn-1.5-ubuntu22.04-py310-cpu`) for common frameworks — these are pre-built and cached globally, so jobs start faster. To update the environment for a dependency bump, increment the version; old jobs retain their pinned version, ensuring reproducibility across the model lineage.",
+    "fj": "Install dependencies in the training script using `pip install` at runtime — this is simpler and avoids environment build overhead.",
+    "fs": "Runtime pip installs are non-reproducible (versions float), slow (every run re-downloads packages), and fail in air-gapped or private network scenarios where PyPI is blocked. AML environments bake dependencies into a Docker image registered in ACR, so compute nodes pull a cached image — faster startup, guaranteed reproducibility, and compatibility with private network deployments.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "yaml",
+        "label": "Custom AML environment YAML with conda spec",
+        "lines": [
+          "$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json",
+          "name: sklearn-custom",
+          "version: '2'",
+          "image: mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04:latest",
+          "conda_file:",
+          "  name: sklearn-env",
+          "  channels:",
+          "    - conda-forge",
+          "    - defaults",
+          "  dependencies:",
+          "    - python=3.11",
+          "    - pip:",
+          "      - scikit-learn==1.4.2",
+          "      - azureml-mlflow==1.55.0",
+          "      - my-custom-pkg @ git+https://github.com/org/pkg.git@v1.2.3"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure"
+  },
+  {
+    "q": "Your ML platform team wants to publish a reusable feature-engineering component that any data science team can drop into their pipelines without copying code. What are AML components and how do you author, register, and consume one?",
+    "a": "AML components are the building blocks of pipelines — self-contained, versioned, and reusable units of code with typed inputs and outputs. A component is defined in a YAML spec that declares its name, version, display name, inputs (with types like `uri_folder`, `string`, `integer`), outputs, the execution environment, and the command to run. The component's source code lives alongside the YAML. You register the component with `az ml component create --file component.yml`, which uploads the code snapshot and stores the spec in the workspace (or registry). In a pipeline YAML you reference the component as `azureml:<component-name>:<version>` and wire its inputs/outputs to data assets or other component outputs. Components enforce interface contracts — if an upstream component's output type doesn't match a downstream component's input type, AML validates and rejects the pipeline at submission time. Versioning means you can upgrade a component in isolation without touching the pipeline definition, then test before promotion.",
+    "fj": "Use inline Python function components decorated with `@command_component` — these are equivalent to registered YAML components and don't need separate versioning.",
+    "fs": "Inline `@command_component` functions are convenient for development but they package the code at notebook-definition time, cannot be shared across workspaces, and have no version history in the workspace registry. Registered YAML components are discoverable in the AML Studio UI, shareable via ML registries, and independently versioned for MLOps governance.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "yaml",
+        "label": "AML component YAML definition",
+        "lines": [
+          "$schema: https://azuremlschemas.azureedge.net/latest/commandComponent.schema.json",
+          "name: feature_engineering",
+          "version: '1'",
+          "display_name: Feature Engineering",
+          "type: command",
+          "inputs:",
+          "  raw_data:",
+          "    type: uri_folder",
+          "  target_column:",
+          "    type: string",
+          "outputs:",
+          "  processed_data:",
+          "    type: uri_folder",
+          "environment: azureml:sklearn-custom:2",
+          "command: >-",
+          "  python feature_eng.py",
+          "  --raw_data ${{inputs.raw_data}}",
+          "  --target ${{inputs.target_column}}",
+          "  --output ${{outputs.processed_data}}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure"
+  },
+  {
+    "q": "Your org runs 15 AML workspaces across dev, staging, and prod environments in different Azure regions. The platform team wants one place to publish approved models, reusable components, and curated environments so any workspace can consume them without copy-pasting. What AML feature addresses this?",
+    "a": "Azure Machine Learning registries are organization-scoped (rather than workspace-scoped) asset catalogs. A registry is a standalone Azure resource you create with `az ml registry create`, specifying the primary region and optional replication regions for low-latency access. Once a model, component, or environment is published to a registry, any workspace in any subscription can reference it with `azureml://registries/<registry-name>/models/<model-name>/versions/<ver>`. This enables a promote-to-registry workflow: a model trained and validated in the dev workspace is published to the central registry, then deployed from the registry to prod endpoints without re-training. Registries support multi-region replication — AML automatically copies assets to replica regions so workspaces in those regions pull locally rather than cross-region. Registries also appear in AML Studio's model catalog UI, enabling discovery alongside Microsoft's own curated model catalog.",
+    "fj": "Export the model artifact to a shared Azure Blob Storage container and have each workspace import it by downloading the blob at pipeline start.",
+    "fs": "Blob-based sharing has no versioning semantics in AML, no lineage — the workspace won't know this model came from a validated training run — and no governance controls like approval gates. Registries are the first-class MLOps mechanism for cross-workspace asset promotion with full lineage, RBAC, and multi-region replication.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Publish model to registry and reference from prod workspace",
+        "lines": [
+          "# Share model from dev workspace to central registry",
+          "az ml model share \\",
+          "  --name fraud-classifier \\",
+          "  --version 7 \\",
+          "  --workspace-name dev-aml-ws \\",
+          "  --resource-group rg-dev \\",
+          "  --registry-name org-ml-registry",
+          "",
+          "# Deploy from registry in prod workspace",
+          "# In managed-online-endpoint YAML:",
+          "# model: azureml://registries/org-ml-registry/models/fraud-classifier/versions/7"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "mlops-infrastructure"
+  },
+  {
+    "q": "A product team wants to find the best classification model for a customer churn dataset without writing training loops. They have a labeled CSV with 50k rows, a target column `churned`, and they want to compare algorithms and receive a leaderboard. How do you configure an AutoML classification job in AML SDK v2?",
+    "a": "In AML SDK v2 you create an AutoML classification job using `automl.classification()`, specifying the `training_data` data asset, `target_column_name`, and `primary_metric`. For classification, supported primary metrics include `accuracy`, `AUC_weighted`, `average_precision_score_weighted`, `norm_macro_recall`, and `precision_score_weighted`. AutoML sweeps over algorithms (LogisticRegression, RandomForest, XGBoost, LightGBM, etc.) and hyperparameters using a combination of algorithm selection, featurization (automatic imputation, encoding, scaling), and early termination policies to stop unpromising runs. You can constrain the search with `set_limits()` — `max_trials`, `max_concurrent_trials`, `timeout_minutes` — and block specific algorithms with `allowed_training_algorithms` or `blocked_training_algorithms`. The job produces a ranked leaderboard of child runs in AML Studio, and the best model is registered automatically when you set `enable_model_explainability=True` to also generate SHAP feature importance. The winning run's fitted model and its full pipeline (including featurization) are logged to MLflow and can be retrieved with `mlflow.sklearn.load_model()`.",
+    "fj": "Set primary_metric to 'loss' for classification — lower loss always means better production performance.",
+    "fs": "'loss' is not a valid AutoML primary metric for classification. For imbalanced datasets, `accuracy` can be misleading (a model predicting the majority class gets high accuracy). `AUC_weighted` or `average_precision_score_weighted` are better choices for churn because they account for class imbalance. Metric selection is a deliberate business decision, not a default.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "AutoML classification job with SDK v2",
+        "lines": [
+          "from azure.ai.ml import automl, Input",
+          "from azure.ai.ml.constants import AssetTypes",
+          "",
+          "classification_job = automl.classification(",
+          "    compute='cpu-cluster',",
+          "    experiment_name='churn-automl',",
+          "    training_data=Input(type=AssetTypes.MLTABLE, path='azureml:churn_data:1'),",
+          "    target_column_name='churned',",
+          "    primary_metric='AUC_weighted',",
+          "    n_cross_validations=5,",
+          ")",
+          "",
+          "classification_job.set_limits(",
+          "    max_trials=40,",
+          "    max_concurrent_trials=4,",
+          "    timeout_minutes=90,",
+          "    trial_timeout_minutes=15,",
+          "    enable_early_termination=True",
+          ")",
+          "",
+          "classification_job.set_training(",
+          "    blocked_training_algorithms=['KNN'],",
+          "    enable_model_explainability=True",
+          ")",
+          "",
+          "returned_job = ml_client.jobs.create_or_update(classification_job)"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "ml-model-lifecycle"
+  },
+  {
+    "q": "An AutoML job completes and you need to select the best model, but the data science lead wants to ensure the model is not just accurate — it must pass fairness and error analysis checks before deployment. What AML tooling supports this and what does the evaluation workflow look like?",
+    "a": "AML's Responsible AI dashboard (RAI dashboard) is the primary surface for post-training model evaluation under responsible AI principles. After registering a model you create an `RAIInsights` object in SDK v2 by attaching components: `AddExplanations` (SHAP-based feature importance), `AddCausalAnalysis` (what-if counterfactuals), `AddCounterfactuals`, `AddErrorAnalysis` (cohort-level error heat maps and decision trees showing where the model fails most), and `AddFairnessInsights` (parity metrics across sensitive features like age or gender). These components run as a pipeline job and produce a RAI insights artifact. In AML Studio the RAI dashboard visualizes error cohorts — subgroups where error rate exceeds a threshold — fairness metrics (demographic parity, equalized odds), and feature attributions side by side. For responsible AI gating you can write a post-training evaluation step in your ML pipeline that reads the RAI metrics JSON artifact and fails the pipeline (blocking model registration) if any fairness metric violates a threshold. This provides an auditable, automated responsible-AI gate rather than a manual inspection.",
+    "fj": "Run AML Model Explainability (SHAP) alone — if you can explain the model's decisions, it satisfies responsible AI requirements.",
+    "fs": "Explainability tells you which features matter but does not detect model errors concentrated in specific demographic subgroups (error analysis) or measure whether prediction rates are equitable across groups (fairness). Responsible AI requires all three lenses — explainability, error analysis, and fairness — because a model can have clean SHAP charts while silently failing for a minority cohort.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "ml-model-lifecycle"
+  },
+  {
+    "q": "Your organization is deploying an Azure AI Foundry hub and three projects for different teams — each project must have its own managed identity, and the hub must block all public internet access. You need this infrastructure to be repeatable across environments. How do you implement this with Bicep?",
+    "a": "Azure AI Foundry hub and project resources are ARM resource types `Microsoft.MachineLearningServices/workspaces` with `kind: Hub` and `kind: Project`. In Bicep you define the hub with `publicNetworkAccess: 'Disabled'`, `managedNetwork: { isolationMode: 'AllowOnlyApprovedOutbound' }`, and a system-assigned or user-assigned managed identity via `identity: { type: 'SystemAssigned' }`. For each project you set `hubResourceId` pointing to the hub's resource ID and assign its own managed identity. Private endpoints for the hub are defined as child resources of type `Microsoft.Network/privateEndpoints` targeting the `amlworkspace` sub-resource, linked to your VNet subnet. The managed identity is granted roles (Storage Blob Data Contributor, Cognitive Services User) via `Microsoft.Authorization/roleAssignments` resources scoped to the dependent services. Wrapping everything in a Bicep module with parameters for environment name, VNet resource ID, and subnet resource ID makes the template deployable across dev/staging/prod with `az deployment group create --template-file main.bicep --parameters env=prod`.",
+    "fj": "Use the Azure Portal to create the Foundry hub interactively and then export the ARM template from the resource group to reuse in other environments.",
+    "fs": "Portal-exported ARM templates capture the current state including hardcoded resource IDs and subscription-specific values, making them brittle across environments. They also capture existing dependent resources, leading to conflicts on re-deploy. Bicep authored from scratch with parameters is the IaC best practice: it is declarative, parameterized, idempotent, and stored in source control for auditability.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bicep",
+        "label": "Foundry hub with managed VNet and private endpoint",
+        "lines": [
+          "param location string = resourceGroup().location",
+          "param hubName string",
+          "param subnetId string",
+          "",
+          "resource hub 'Microsoft.MachineLearningServices/workspaces@2024-10-01' = {",
+          "  name: hubName",
+          "  location: location",
+          "  kind: 'Hub'",
+          "  identity: { type: 'SystemAssigned' }",
+          "  properties: {",
+          "    publicNetworkAccess: 'Disabled'",
+          "    managedNetwork: {",
+          "      isolationMode: 'AllowOnlyApprovedOutbound'",
+          "    }",
+          "  }",
+          "}",
+          "",
+          "resource hubPe 'Microsoft.Network/privateEndpoints@2023-09-01' = {",
+          "  name: '${hubName}-pe'",
+          "  location: location",
+          "  properties: {",
+          "    subnet: { id: subnetId }",
+          "    privateLinkServiceConnections: [{",
+          "      name: 'hub-plsc'",
+          "      properties: {",
+          "        privateLinkServiceId: hub.id",
+          "        groupIds: ['amlworkspace']",
+          "      }",
+          "    }]",
+          "  }",
+          "}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "genaiops-infrastructure"
+  },
+  {
+    "q": "After deploying an Azure AI Foundry project via Bicep, the CI/CD pipeline needs to provision model connections and set outbound rules programmatically. Walk through the Azure CLI commands for post-Bicep Foundry configuration.",
+    "a": "After the core Bicep deployment, you use the Azure CLI `az ml` extension (which covers Foundry projects that are surfaced as AML workspaces) and the `az cognitiveservices` namespace. To add a connection to an Azure OpenAI resource in a Foundry project you run `az ml connection create --file connection.yml --workspace-name <project-name>` where the YAML spec declares `type: azure_open_ai`, the endpoint URL, and either an API key or managed identity auth. For managed VNet outbound rules — allowing the project's managed network to reach a specific FQDN or service endpoint — you use `az ml workspace outbound-rule set --workspace-name <project-name> --rule <rule-yaml>`. Role assignments to the project's managed identity (e.g., granting it Cognitive Services OpenAI User on the Azure OpenAI resource) are done with `az role assignment create --assignee <principal-id> --role 'Cognitive Services OpenAI User' --scope <openai-resource-id>`. Wrapping these in a shell script executed as a CI/CD step after `az deployment group create` gives you a fully automated, repeatable environment provisioning pipeline.",
+    "fj": "Configure connections and role assignments inside the Bicep template itself using nested resource blocks — there is no need for post-deployment CLI steps.",
+    "fs": "Connections in Foundry store credentials that are not available until the resource is deployed, and role assignment principal IDs for system-assigned identities are only known after the hub/project is created (they are outputs of the Bicep deployment). A two-phase approach — IaC for infrastructure, CLI/script for identity-bound configuration — is the standard pattern, and it is what Microsoft's reference architectures use.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Post-deployment CLI: add OpenAI connection + RBAC",
+        "lines": [
+          "# Get managed identity principal ID from Bicep output",
+          "PRINCIPAL_ID=$(az ml workspace show \\",
+          "  --name my-foundry-project \\",
+          "  --resource-group rg-prod \\",
+          "  --query identity.principalId -o tsv)",
+          "",
+          "# Grant managed identity access to Azure OpenAI",
+          "az role assignment create \\",
+          "  --assignee $PRINCIPAL_ID \\",
+          "  --role 'Cognitive Services OpenAI User' \\",
+          "  --scope /subscriptions/$SUB/resourceGroups/rg-ai/providers/Microsoft.CognitiveServices/accounts/my-openai",
+          "",
+          "# Register the OpenAI connection in the project",
+          "az ml connection create \\",
+          "  --file openai_connection.yml \\",
+          "  --workspace-name my-foundry-project \\",
+          "  --resource-group rg-prod"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "genaiops-infrastructure"
+  },
+  {
+    "q": "Your team deployed a RAG chatbot on Azure AI Foundry. The product manager wants to know whether the bot's answers are factually grounded in the retrieved documents and whether they are relevant to the user's question. What built-in evaluators does Foundry provide, and how do groundedness and relevance differ?",
+    "a": "Azure AI Foundry (via the `azure-ai-evaluation` SDK) ships a suite of AI-assisted evaluators backed by a judge LLM. Groundedness measures whether each claim in the model's response can be traced back to the source documents (context) provided in the prompt — a response scoring 1/5 on groundedness contains claims the retrieved passages do not support, regardless of whether those claims happen to be true in the real world. Relevance measures how well the response addresses the user's question — a response could be fully grounded in the documents but still score poorly on relevance if it answers a different question than the one asked. Coherence evaluates whether the response reads as logically connected, well-structured prose. Fluency measures grammatical correctness and natural language quality. You instantiate evaluators like `GroundednessEvaluator(model_config=azure_ai_project)` and call them with `query`, `response`, and `context` arguments; they return a numeric score (1-5) and a reasoning string. In Foundry's evaluation UI you run batch evaluations against a test dataset and see per-row scores plus aggregate pass-rate at a threshold you define.",
+    "fj": "Groundedness and relevance measure the same thing — a grounded answer is automatically relevant, so you only need to run one evaluator.",
+    "fs": "They are orthogonal. A response that closely paraphrases the retrieved documents is grounded but may be irrelevant if the documents don't actually answer the question. Conversely, a response can be highly relevant to the question while hallucinating details not in the context (ungrounded). Both evaluators are needed for a complete quality picture of a RAG system.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Run groundedness + relevance evaluators with azure-ai-evaluation",
+        "lines": [
+          "from azure.ai.evaluation import (",
+          "    GroundednessEvaluator,",
+          "    RelevanceEvaluator,",
+          "    CoherenceEvaluator,",
+          "    FluencyEvaluator,",
+          ")",
+          "from azure.ai.evaluation import evaluate",
+          "",
+          "model_config = {",
+          "    'azure_endpoint': 'https://my-openai.openai.azure.com/',",
+          "    'api_key': '<key>',",
+          "    'azure_deployment': 'gpt-4o',",
+          "}",
+          "",
+          "result = evaluate(",
+          "    data='eval_dataset.jsonl',   # {query, response, context} rows",
+          "    evaluators={",
+          "        'groundedness': GroundednessEvaluator(model_config),",
+          "        'relevance': RelevanceEvaluator(model_config),",
+          "        'coherence': CoherenceEvaluator(model_config),",
+          "        'fluency': FluencyEvaluator(model_config),",
+          "    },",
+          "    evaluator_config={",
+          "        'groundedness': {'column_mapping': {",
+          "            'query': '${data.query}',",
+          "            'response': '${data.response}',",
+          "            'context': '${data.context}'",
+          "        }}",
+          "    }",
+          ")",
+          "print(result['metrics'])"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "genai-quality-observability"
+  },
+  {
+    "q": "After running batch evaluations on your Foundry RAG app, coherence scores are consistently high but groundedness scores cluster around 2/5. What does this tell you about your system, and what changes would you investigate first?",
+    "a": "High coherence with low groundedness means the model is producing fluent, well-structured answers but those answers contain claims not supported by the retrieved passages — the classic hallucination pattern in RAG. The LLM is filling knowledge gaps with parametric (training-time) memory rather than sticking to provided context. The first investigative steps should focus on the retrieval layer: check chunk sizes (too-large chunks dilute signal), re-ranking quality (are the most relevant chunks actually in the top-k passed to the model?), and the system prompt (does it firmly instruct the model to answer only from provided context and say 'I don't know' otherwise?). You should also check if the test queries are genuinely answerable from the indexed corpus — if many questions require knowledge not in the documents, groundedness will always be low. Finally, inspect whether the `context` field in your eval dataset actually contains the chunks passed to the model in the prompt; if context and prompt are mismatched, evaluator scores are invalid.",
+    "fj": "Low groundedness scores mean the model is not fluent — improve fluency by switching to a more capable model with higher fluency scores.",
+    "fs": "Fluency and groundedness are independent dimensions. High coherence already confirms the model produces fluent output. Low groundedness is specifically about factual attribution to the provided context, not language quality. Swapping to a bigger model without fixing retrieval or the grounding prompt will not improve groundedness scores.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "genai-quality-observability"
+  },
+  {
+    "q": "Your Foundry-deployed prompt flow application is serving 10,000 requests per day across three model deployments. Finance wants a weekly cost report broken down by deployment, and the SRE team wants an alert if total token consumption exceeds 2 million tokens in a rolling 24-hour window. How do you implement both?",
+    "a": "Azure AI Foundry integrates with Azure Monitor and Application Insights for observability. Token consumption (prompt tokens, completion tokens, total tokens) per deployment is emitted as metrics to Azure Monitor under the `microsoft.machinelearningservices/workspaces` namespace. For the finance cost report you navigate to the AML workspace's Metrics blade in the Azure Portal, select the `Token Usage` metric, apply a split by `DeploymentName`, and scope to a weekly time range — you can export this to a Log Analytics workbook or schedule a Metrics export to Storage for CSV download. For the SRE alert you create an Azure Monitor metric alert rule: set the resource to the workspace, metric to `Total Token Usage`, aggregation to `Sum`, period to `PT24H`, threshold to `2000000`, and action group to an email or webhook. In Foundry's monitoring UI under the project you can also configure online evaluation monitors that run quality checks on sampled production traffic and surface token-cost dashboards alongside quality metrics, giving a unified view of cost and quality.",
+    "fj": "Parse the prompt flow application's stdout logs to count tokens by scraping the JSON log lines — this is the most granular data source.",
+    "fs": "Log scraping is fragile, adds latency, misses requests that don't log token counts, and cannot trigger Azure Monitor alerts. Azure Monitor metrics are the authoritative, low-latency token usage signal — emitted by the platform, queryable via KQL, and natively integrated with alerting and dashboards without any custom instrumentation.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "bash",
+        "label": "Create Azure Monitor alert for 24h token threshold",
+        "lines": [
+          "az monitor metrics alert create \\",
+          "  --name 'high-token-usage-alert' \\",
+          "  --resource-group rg-prod \\",
+          "  --scopes /subscriptions/$SUB/resourceGroups/rg-prod/providers/Microsoft.MachineLearningServices/workspaces/my-foundry-ws \\",
+          "  --condition 'total TokenUsage > 2000000' \\",
+          "  --window-size PT24H \\",
+          "  --evaluation-frequency PT1H \\",
+          "  --action /subscriptions/$SUB/resourceGroups/rg-prod/providers/microsoft.insights/actionGroups/sre-oncall \\",
+          "  --description 'Alert when 24h rolling token consumption exceeds 2M'"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "genai-quality-observability"
+  },
+  {
+    "q": "Your Azure AI Search-backed RAG system performs well on semantic queries but misses exact product codes and acronyms that users frequently search for. How does hybrid search address this, and what does the ranking fusion step look like?",
+    "a": "Hybrid search in Azure AI Search runs a vector (semantic/embedding-based) query and a full-text BM25 keyword query in parallel against the same index, then merges the two ranked lists using Reciprocal Rank Fusion (RRF). RRF computes a combined score for each document as the sum of `1 / (k + rank_in_list)` across both result sets, where `k` is a smoothing constant (default 60). Documents that rank highly in both lists get a strongly boosted combined score, while documents that appear in only one list still receive credit. This naturally addresses the complementarity problem: BM25 excels at exact-match terms (product codes like `SKU-4821-X`, acronyms like `SLA`), while vector search captures semantic intent (`what's our uptime guarantee?`). In the Azure AI Search REST API you compose a hybrid query by including both `search` (BM25 text) and `vectors` (embedding vector + `vectorQueries`) in the same request body. Optionally, you layer semantic ranking on top of the RRF output — the L2 semantic ranker re-scores the top-50 RRF results using a Bing-adapted cross-encoder for additional relevance improvement at the cost of one extra ML inference step.",
+    "fj": "Run vector search and BM25 search separately and take the union of results, then let the application-layer code re-rank by combining the two scores with a weighted average.",
+    "fs": "Application-layer score combination requires normalizing two incomparable score distributions (BM25 scores vary by corpus TF-IDF statistics; cosine similarities are bounded [-1,1]) — a weighted average of unnormalized scores is not meaningful. RRF is rank-based, not score-based, so it avoids scale mismatch entirely. It is also computed inside the Azure AI Search service, reducing latency and eliminating a round-trip to the application.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Hybrid search query with RRF via Azure AI Search SDK",
+        "lines": [
+          "from azure.search.documents import SearchClient",
+          "from azure.search.documents.models import VectorizedQuery",
+          "from azure.core.credentials import AzureKeyCredential",
+          "",
+          "client = SearchClient(",
+          "    endpoint='https://my-search.search.windows.net',",
+          "    index_name='product-docs',",
+          "    credential=AzureKeyCredential('<key>')",
+          ")",
+          "",
+          "# Generate embedding for the query",
+          "query_embedding = embed('What is our SLA for SKU-4821-X?')",
+          "",
+          "vector_query = VectorizedQuery(",
+          "    vector=query_embedding,",
+          "    k_nearest_neighbors=50,",
+          "    fields='content_vector'",
+          ")",
+          "",
+          "results = client.search(",
+          "    search_text='SKU-4821-X SLA uptime guarantee',  # BM25",
+          "    vector_queries=[vector_query],                   # vector",
+          "    query_type='semantic',",
+          "    semantic_configuration_name='my-semantic-config',",
+          "    top=5",
+          ")",
+          "",
+          "for r in results:",
+          "    print(r['@search.score'], r['@search.reranker_score'], r['title'])"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "genai-optimization"
+  },
+  {
+    "q": "Your hybrid search system returns relevant documents for most queries, but for long-tail technical queries the semantic ranker is adding 400ms of latency and the additional relevance gain is marginal. How do you tune hybrid search to balance latency and relevance in Azure AI Search?",
+    "a": "Azure AI Search exposes several levers for latency-relevance tradeoff. First, `k_nearest_neighbors` on the vector query controls how many candidates are passed to the RRF merger — reducing from 50 to 20 cuts HNSW traversal time with minimal recall loss for focused queries. Second, semantic ranking is optional and additive: it re-scores the top-50 RRF results using a cross-encoder, adding roughly 100-400ms per query depending on document length. You can conditionally skip semantic ranking by routing long-tail queries to a hybrid-only path (no `query_type: 'semantic'`) and reserving the semantic reranker for short, ambiguous queries where it adds the most value. Third, `exhaustiveKnn` (exact nearest neighbor instead of HNSW) is available for small indexes where HNSW overhead dominates — for large indexes HNSW is faster. Fourth, `vectorFilterMode` set to `preFilter` applies metadata filters before the vector search, shrinking the candidate set and improving speed. Benchmark each combination against your P95 latency budget using the search service's query statistics in Azure Monitor before shipping a configuration change.",
+    "fj": "Disable hybrid search and use pure vector search — semantic similarity alone is sufficient for technical queries and eliminates BM25 overhead.",
+    "fs": "For technical documents with exact product codes, part numbers, and acronyms, pure vector search misses exact-match terms because embeddings generalize semantics and may not distinguish `SKU-4821-X` from `SKU-4822-X`. BM25 is computationally cheap relative to semantic reranking and provides exact-match precision that vector search cannot. The correct tuning target is the semantic reranker, which is the expensive step, not the BM25 component.",
+    "level": "Staff",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "genai-optimization"
+  }
+]

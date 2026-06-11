@@ -1,0 +1,447 @@
+[
+  {
+    "q": "How do AWS Glue job bookmarks track incremental loads, and what configuration is required to enable them correctly?",
+    "a": "Glue job bookmarks persist state information between job runs so that a re-run processes only newly added data rather than the full dataset. For S3 sources, bookmarks use the last-modified timestamp of objects; for JDBC sources, they use a bookmark key—by default the primary key—which must be strictly monotonically increasing (no gaps). To enable bookmarks, set the Job bookmark option to 'Enable' in the job definition and pass a `transformation_ctx` string to every `create_dynamic_frame` or `create_data_frame_from_catalog` call in your script. The `transformation_ctx` value is the key Glue uses to look up the bookmark state for that specific source. Omitting `transformation_ctx` silently disables bookmarks for that source even when the job-level setting is enabled. You can also set the option to 'Pause' to read bookmark state without advancing it, which is useful for replaying a window of data without moving the checkpoint forward.",
+    "fj": "Glue job bookmarks work automatically as long as you enable the 'Enable' setting; no script changes are needed.",
+    "fs": "Without specifying `transformation_ctx` on each DynamicFrame read call, bookmarks are not tracked for that source. The job-level setting alone is insufficient—the per-source context key is mandatory for bookmarks to function.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Glue bookmark with transformation_ctx",
+        "lines": [
+          "import sys",
+          "from awsglue.context import GlueContext",
+          "from awsglue.job import Job",
+          "from pyspark.context import SparkContext",
+          "",
+          "sc = SparkContext()",
+          "glueContext = GlueContext(sc)",
+          "job = Job(glueContext)",
+          "job.init('my_job', args)",
+          "",
+          "# transformation_ctx is required for bookmarks",
+          "dyf = glueContext.create_dynamic_frame.from_catalog(",
+          "    database='sales_db',",
+          "    table_name='orders',",
+          "    transformation_ctx='orders_bookmark'  # unique key per source",
+          ")",
+          "",
+          "# ... transform ...",
+          "",
+          "job.commit()  # advances the bookmark checkpoint"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-and-transformation"
+  },
+  {
+    "q": "What Glue job parameters control batch processing performance, and how do you tune DPU allocation for large incremental loads?",
+    "a": "AWS Glue jobs accept parameters at run-time via `--job-bookmark-option`, `--TempDir`, and custom `--key value` pairs accessible through `getResolvedOptions`. For performance tuning the critical levers are: (1) Worker type and count — G.1X, G.2X, G.4X, G.8X, or G.025X for Python Shell; more DPUs means more parallel Spark executors; (2) `--enable-auto-scaling` — lets Glue dynamically add/remove workers during the job based on actual data volume, preventing over-provisioning for variable incremental sizes; (3) `--conf spark.sql.shuffle.partitions` to right-size shuffle partitions (default 200 is too high for small increments); (4) `--enable-glue-datacatalog` to push down predicates via the Glue Catalog for partition pruning. For incremental loads specifically, bookmark-filtered datasets are small, so start with 2 G.1X workers and auto-scaling enabled before scaling up, because idle DPUs are billed in 1-second increments after the first 10 minutes.",
+    "fj": "Increasing DPU count always improves Glue job performance because more workers process data faster.",
+    "fs": "For small incremental datasets produced by bookmarks, adding excessive DPUs increases startup overhead and cost without proportional speedup. Auto-scaling and right-sized shuffle partitions are more effective for variable incremental workloads.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-ingestion-and-transformation"
+  },
+  {
+    "q": "How do you build a REST API ingestion pipeline on AWS that handles pagination, authentication, and fan-out to S3?",
+    "a": "The canonical AWS pattern uses EventBridge Scheduler (or Step Functions) to invoke a Lambda function on a schedule. Lambda calls the REST API, handles OAuth 2.0 or API key authentication using credentials stored in Secrets Manager, and manages cursor- or offset-based pagination in a loop. Because Lambda has a 15-minute timeout, long-running paginated APIs are better handled by Step Functions with a Map or iterator state that pages through results in parallel. Each Lambda invocation writes a raw JSON response as an S3 object under a date-partitioned prefix (e.g., `s3://raw-bucket/api-name/year=YYYY/month=MM/day=DD/`). A Glue crawler or Athena table definition on top of that prefix allows downstream querying. For SaaS sources (Salesforce, ServiceNow, Marketo), Amazon AppFlow is the managed alternative—it handles OAuth flows, pagination, incremental sync via watermarks, and schema mapping to S3, Redshift, or Snowflake with no custom code.",
+    "fj": "Amazon AppFlow can replace API Gateway + Lambda for any REST API ingestion use case.",
+    "fs": "AppFlow only supports its built-in catalog of 70+ SaaS connectors. For custom REST APIs or any source not in the AppFlow connector library, you must build your own pipeline with Lambda or Glue; AppFlow does not support arbitrary HTTP endpoints.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Lambda paginated REST ingest to S3",
+        "lines": [
+          "import boto3, requests, json, os",
+          "from datetime import date",
+          "",
+          "s3 = boto3.client('s3')",
+          "sm = boto3.client('secretsmanager')",
+          "",
+          "def handler(event, context):",
+          "    secret = json.loads(sm.get_secret_value(SecretId='api/token')['SecretString'])",
+          "    headers = {'Authorization': f\"Bearer {secret['token']}\"} ",
+          "    url = 'https://api.example.com/records'",
+          "    page, results = 1, []",
+          "    while url:",
+          "        resp = requests.get(url, headers=headers, params={'page': page}).json()",
+          "        results.extend(resp['data'])",
+          "        url = resp.get('next_page_url')  # None when done",
+          "        page += 1",
+          "    key = f\"api-name/year={date.today().year}/data.json\"",
+          "    s3.put_object(Bucket=os.environ['BUCKET'], Key=key,",
+          "                  Body=json.dumps(results))"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-and-transformation"
+  },
+  {
+    "q": "What AWS patterns implement retry logic, dead-letter queues, and circuit breakers to make data pipelines fault-tolerant?",
+    "a": "AWS provides native fault-tolerance primitives that compose into resilient pipelines. For queue-based ingestion, SQS visibility timeout and the `maxReceiveCount` on a redrive policy automatically retry failed messages up to N times before routing them to a dead-letter queue (DLQ) for inspection and replay. Lambda event source mappings to SQS support `bisect-on-error` to halve the batch on failure, isolating the bad record. For streaming pipelines, Kinesis Data Streams and MSK both support enhanced fan-out and consumer checkpointing; failed shards can be re-read from the last committed sequence number. Step Functions state machines support per-state `Retry` blocks with exponential backoff (`intervalSeconds`, `maxAttempts`, `backoffRate`) and `Catch` blocks to route errors to alternative states or DLQs. Circuit-breaker behavior can be implemented in Step Functions using a Choice state that checks an SSM Parameter or DynamoDB flag—if a downstream service has returned >N consecutive failures (tracked in DynamoDB), the pipeline halts and raises an alarm rather than hammering the degraded service. EventBridge rules with DLQs provide dead-lettering for event-driven pipelines when target invocations fail after retries.",
+    "fj": "Lambda automatically retries failed SQS-triggered invocations indefinitely until they succeed.",
+    "fs": "Lambda retries SQS message processing only up to the `maxReceiveCount` defined in the SQS redrive policy; after that threshold the message moves to the DLQ and is no longer retried. Lambda itself also has its own retry count for asynchronous invocations (default 2), but for SQS event sources the SQS redrive policy controls total retry attempts.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "json",
+        "label": "Step Functions retry + catch block (ASL)",
+        "lines": [
+          "{",
+          "  \"Type\": \"Task\",",
+          "  \"Resource\": \"arn:aws:lambda:...:function:TransformData\",",
+          "  \"Retry\": [{",
+          "    \"ErrorEquals\": [\"Lambda.ServiceException\", \"States.TaskFailed\"],",
+          "    \"IntervalSeconds\": 2,",
+          "    \"MaxAttempts\": 3,",
+          "    \"BackoffRate\": 2.0",
+          "  }],",
+          "  \"Catch\": [{",
+          "    \"ErrorEquals\": [\"States.ALL\"],",
+          "    \"Next\": \"SendToDLQ\"",
+          "  }]",
+          "}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-and-transformation"
+  },
+  {
+    "q": "When should you use AWS Step Functions Standard Workflows versus Express Workflows for data pipeline orchestration?",
+    "a": "Standard Workflows provide exactly-once execution semantics, can run for up to one year, log full execution history retrievable via `GetExecutionHistory` for 90 days, and emit events to EventBridge. They are priced per state transition. Use Standard Workflows for long-running ETL orchestration, multi-day batch pipelines, human-approval loops, and any workflow where audit trail and exactly-once guarantees are required. Express Workflows provide at-least-once semantics, run for a maximum of 5 minutes, and are priced per execution-duration-plus-invocation, making them much cheaper for high-frequency invocations. They do not support `GetExecutionHistory` for audit; logs go to CloudWatch Logs. Express Workflows have two sub-types: Synchronous Express (caller blocks and receives the result inline—useful for API-triggered transforms) and Asynchronous Express (fire-and-forget—useful for event fan-out). For a streaming data pipeline that triggers thousands of micro-batches per hour, Express Workflows are the right choice; for a daily Glue-based DW load with human sign-off, Standard Workflows are appropriate.",
+    "fj": "Express Workflows are always cheaper than Standard Workflows because they are serverless.",
+    "fs": "Both are serverless. Express Workflows are cheaper for high-frequency, short-duration workloads, but for low-frequency long-running workflows, Standard Workflows can actually cost less because they charge per state transition (not per duration) and their free tier covers many typical ETL patterns. Cost depends on invocation frequency, execution duration, and number of state transitions.",
+    "level": "Sr",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-ingestion-and-transformation"
+  },
+  {
+    "q": "What software engineering practices should you apply to AWS data pipelines—version control, testing, structured logging, and monitoring?",
+    "a": "Treat pipeline code (Glue scripts, Lambda, Step Functions ASL) as first-class software: store it in Git, review via pull requests, and deploy through CI/CD (CodePipeline or GitHub Actions). Unit-test transformation logic by extracting pure functions—take a Spark DataFrame in, return a DataFrame out—and run tests with pytest and a local SparkSession or AWS Glue's `--local` mode. Integration-test against ephemeral resources (a Glue dev endpoint or Docker Spark) using test fixtures. Use structured JSON logging (Python `logging` + `json_log_formatter`) so CloudWatch Logs Insights can query fields like `job_name`, `run_id`, `records_processed`, and `error_code` with SQL-like syntax. Configure CloudWatch Metric Filters to turn log patterns into metrics (e.g., ERROR count per job) and attach CloudWatch Alarms to those metrics. For Glue specifically, enable `--enable-continuous-cloudwatch-log` and `--enable-job-insights` to surface driver logs and auto-detect common performance issues. Tag all resources (Glue jobs, S3 buckets, DynamoDB tables) with `env`, `team`, and `pipeline` tags for cost attribution and alerting filters.",
+    "fj": "You should test Glue jobs by running them against production data in a staging environment to ensure accuracy.",
+    "fs": "Running against production data in staging risks exposing PII and incurring unnecessary cost. Best practice is to test with synthesized or masked sample data in isolated dev accounts, relying on unit tests for transformation logic and small integration datasets for end-to-end validation before promoting to production.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "Structured logging in a Glue job",
+        "lines": [
+          "import logging, json",
+          "",
+          "logger = logging.getLogger()",
+          "logger.setLevel(logging.INFO)",
+          "",
+          "def log(level, msg, **kwargs):",
+          "    record = {'level': level, 'message': msg, **kwargs}",
+          "    logger.info(json.dumps(record))",
+          "",
+          "# Usage inside job",
+          "log('INFO', 'transform_complete',",
+          "    job_name='orders_transform',",
+          "    run_id=args['JOB_RUN_ID'],",
+          "    records_written=df.count())"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-and-transformation"
+  },
+  {
+    "q": "How do you use AWS CDK or CloudFormation to manage data engineering infrastructure as code, including cross-stack references for shared resources?",
+    "a": "In CDK v2, each logical group of resources—ingestion layer (Kinesis, Lambda), transformation layer (Glue jobs, workflows), and storage layer (S3, Glue Catalog)—lives in its own Stack class. Resources in one stack export values to other stacks using `CfnOutput` with `exportName`, and the consuming stack imports with `Fn.importValue()` (CloudFormation) or by passing the construct directly as a constructor argument between CDK stacks in the same App (CDK handles the CFn export/import automatically). Nested stacks (`NestedStack` in CDK) let you decompose a large monolithic stack into logical sub-stacks that deploy as a unit—useful for a complex Glue workflow where the catalog, jobs, and triggers are co-dependent. For data engineering, parameterize environment differences (dev vs. prod bucket names, Glue worker counts) via `CfnParameter` or CDK context values (`cdk.json` or `--context` CLI flags) rather than hard-coding. Use CDK Aspects to enforce tagging and encryption policies across all resources in the app. CI/CD pipelines (CDK Pipelines construct) can synthesize, diff, and deploy stacks automatically on merge to main.",
+    "fj": "Cross-stack references in CloudFormation are just environment variables passed between stacks.",
+    "fs": "Cross-stack references in CloudFormation use `Outputs` with `Export` in the producing stack and `Fn::ImportValue` in the consuming stack. This creates a hard dependency—you cannot delete the producing stack while the export is in use. CDK resolves this at synth time by generating the correct CFn tokens, but the underlying mechanism is CFn exports, not environment variables.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "CDK cross-stack S3 bucket reference",
+        "lines": [
+          "from aws_cdk import Stack, CfnOutput, aws_s3 as s3",
+          "from constructs import Construct",
+          "",
+          "class StorageStack(Stack):",
+          "    def __init__(self, scope: Construct, id: str, **kwargs):",
+          "        super().__init__(scope, id, **kwargs)",
+          "        self.raw_bucket = s3.Bucket(self, 'RawBucket',",
+          "            versioned=True,",
+          "            encryption=s3.BucketEncryption.S3_MANAGED)",
+          "",
+          "class GlueStack(Stack):",
+          "    def __init__(self, scope, id, raw_bucket: s3.Bucket, **kwargs):",
+          "        super().__init__(scope, id, **kwargs)",
+          "        # CDK auto-generates the CFn export/import token",
+          "        bucket_name = raw_bucket.bucket_name"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-ingestion-and-transformation"
+  },
+  {
+    "q": "How does AWS DMS perform CDC replication from an RDS source into S3 or Redshift, and what are the key configuration tradeoffs?",
+    "a": "DMS uses database-native change capture mechanisms—binary log (binlog) for MySQL, logical replication slots for PostgreSQL, Redo log mining for Oracle—to stream INSERT, UPDATE, and DELETE events continuously after an initial full-load migration. For an S3 target, DMS writes CSV or Parquet files partitioned by time and operation type under the configured S3 prefix; you then process these with a Glue job or Athena to apply the changes to your Delta/Iceberg table. For a Redshift target, DMS uses S3 as a staging area, writes CSV files, and then issues COPY commands; it defaults to batch-apply mode, which accumulates changes and applies them in bulk for higher throughput. Key configuration decisions: (1) Multi-AZ replication instance for high availability; (2) `BatchApplyEnabled=true` for Redshift to reduce per-row overhead; (3) `ParallelApplyThreads` (up to 32) for CDC fan-out throughput; (4) LOB columns require `LobColumnSettings` tuning to avoid truncation. DMS does not guarantee sub-second CDC latency—typical latency is seconds to minutes depending on load and network; it is not a substitute for Kinesis or MSK for real-time streaming.",
+    "fj": "AWS DMS provides real-time, sub-second CDC replication similar to Debezium with Kafka.",
+    "fs": "DMS CDC latency is measured in seconds to minutes and has no SLA guarantees. For true sub-second change propagation, Debezium with MSK or Kinesis Data Streams is the right architecture. DMS is designed for managed migrations and ongoing near-real-time replication, not strict real-time streaming.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-ingestion-and-transformation"
+  },
+  {
+    "q": "How do you maintain Apache Iceberg tables on S3 using AWS Glue and Athena—including compaction, time travel, schema evolution, and snapshot expiry?",
+    "a": "Iceberg tables on S3 are managed through the Glue Data Catalog and queried via Athena (Iceberg v2 is supported natively). Small-file compaction is critical after frequent incremental writes: in Athena run `OPTIMIZE table_name REWRITE DATA USING BIN_PACK` to merge small Parquet files into target-size files (default 512 MB). AWS Glue Data Catalog table optimization (enabled on the catalog table) can automate snapshot compaction and orphan file removal on a daily schedule without manual SQL. Time travel lets you query a historical snapshot: `SELECT * FROM table FOR SYSTEM_VERSION AS OF <snapshot-id>` or `FOR SYSTEM_TIME AS OF TIMESTAMP '2024-01-15 00:00:00'`. Schema evolution—add, rename, or drop columns—is performed with Athena DDL (`ALTER TABLE ADD COLUMNS`, `ALTER TABLE CHANGE COLUMN`) and Iceberg tracks the change in its metadata without rewriting existing data files. Snapshot expiration removes old metadata and data files: `VACUUM table_name` in Athena, or set `history.expire.max-snapshot-age-ms` in table properties to automate retention. Partition evolution (adding or changing partition specs) is also supported and takes effect only for new data files without rewriting old partitions.",
+    "fj": "Running OPTIMIZE on an Iceberg table rewrites all existing data files and invalidates historical time-travel snapshots.",
+    "fs": "OPTIMIZE rewrites only data files for compaction but Iceberg's snapshot model retains the old snapshots and their file references until you explicitly run VACUUM or expire snapshots. Time travel continues to work against older snapshots as long as they have not been expired.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "Iceberg maintenance: compaction + time travel + snapshot expiry",
+        "lines": [
+          "-- Compact small files",
+          "OPTIMIZE db.orders REWRITE DATA USING BIN_PACK",
+          "  WHERE event_date >= DATE '2024-01-01';",
+          "",
+          "-- Time travel query",
+          "SELECT * FROM db.orders",
+          "FOR SYSTEM_TIME AS OF TIMESTAMP '2024-06-01 00:00:00';",
+          "",
+          "-- Expire snapshots older than 7 days",
+          "VACUUM db.orders",
+          "  RETAIN 168 HOURS;",
+          "",
+          "-- Schema evolution: add a column",
+          "ALTER TABLE db.orders ADD COLUMNS (discount_pct DOUBLE);"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-store-management"
+  },
+  {
+    "q": "What are the differences between HNSW and IVF vector index types, and when would you choose each for Amazon OpenSearch or Aurora pgvector?",
+    "a": "HNSW (Hierarchical Navigable Small World) builds a multi-layer graph where each node links to its nearest neighbors across layers, enabling logarithmic-time approximate nearest-neighbor search by navigating from sparse top layers down to dense bottom layers. IVF (Inverted File Index, typically IVFFlat) partitions vectors into k clusters via k-means at build time and at query time probes only the nearest `nprobes` clusters. HNSW provides higher recall (typically 95%+) and lower query latency with a better speed-recall tradeoff, but uses 2–5x more memory than IVFFlat and has 4–32x slower build times. IVFFlat builds much faster, uses less memory, but recall depends on the `nprobes` setting and degrades for dynamic datasets because the cluster centroids are fixed at build time—new inserts dilute cluster quality over time without a rebuild. For OpenSearch, HNSW is the default and recommended method for production semantic search; IVF is available for memory-constrained deployments at the cost of recall. For pgvector in Aurora, use HNSW (added in pgvector 0.5.0) for production read-heavy workloads with frequent queries, and IVFFlat for datasets where index build time or memory is the bottleneck and the dataset is relatively static.",
+    "fj": "IVFFlat always provides better recall than HNSW because it performs exhaustive search within each cluster.",
+    "fs": "IVFFlat searches only the top `nprobes` clusters, not all clusters, so it is approximate. Recall depends on nprobes—setting it to the full list_count approaches exhaustive but defeats the purpose. HNSW typically achieves higher recall at a given latency budget by navigating the graph rather than probing clusters.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "pgvector: create HNSW vs IVFFlat index",
+        "lines": [
+          "-- HNSW index (recommended for production queries)",
+          "CREATE INDEX ON embeddings",
+          "USING hnsw (embedding vector_cosine_ops)",
+          "WITH (m = 16, ef_construction = 64);",
+          "",
+          "-- IVFFlat index (faster build, less memory)",
+          "CREATE INDEX ON embeddings",
+          "USING ivfflat (embedding vector_cosine_ops)",
+          "WITH (lists = 100);",
+          "",
+          "-- At query time, tune probes for recall vs speed",
+          "SET ivfflat.probes = 10;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-store-management"
+  },
+  {
+    "q": "How do you use AWS Glue DataBrew for no-code data preparation, and what are its data quality rules and profiling capabilities?",
+    "a": "Glue DataBrew is a visual data preparation service that lets data analysts clean and transform data without writing code. You create a DataBrew project by pointing it at a dataset (S3, Glue Catalog, Redshift, RDS), then build a recipe—an ordered list of transformation steps—from 250+ built-in transformations covering string manipulation, type casting, outlier handling, pivot, join, and custom formulas. Recipes are versioned and reusable across datasets. The profiling job analyzes a dataset and produces a data profile report with column statistics (completeness, cardinality, min/max, top-N values, distribution histograms, and correlation between columns). Data quality rules are custom validation checks you define on a dataset—for example, 'column email must match regex', 'column age must be between 0 and 120', 'duplicates in order_id must be 0'. Rules can be configured to emit CloudWatch metrics (pass/fail counts) and fail the DataBrew job if thresholds are breached, enabling pipeline-gating data quality checks without code. DataBrew jobs can be scheduled via cron or triggered via EventBridge and output results to S3 in CSV, Parquet, or other formats.",
+    "fj": "DataBrew replaces AWS Glue ETL jobs for all data transformation needs.",
+    "fs": "DataBrew is purpose-built for exploratory data prep and no-code cleaning, not for large-scale distributed ETL. It does not support complex PySpark transformations, streaming, Iceberg/Delta writes, or multi-dataset fan-out. For production-grade ETL at scale, Glue ETL jobs or Glue Studio are the right tool; DataBrew is best for initial data profiling and ad-hoc preparation by analysts.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-operations-and-support"
+  },
+  {
+    "q": "When should you choose Redshift Serverless over a provisioned cluster, and how does the Glue serverless vs. EMR tradeoff compare?",
+    "a": "Redshift Serverless charges per RPU-second (Redshift Processing Unit) only while queries are running, with automatic scaling and no idle cost. It is ideal for intermittent BI queries, development environments, and variable-workload analytics. Provisioned Redshift is better for steady 24/7 workloads where Reserved Instances (1- or 3-year) reduce cost by 41–76%. The break-even point is typically around 40–60% average cluster utilization—below that, serverless wins on cost; above it, provisioned reserved wins. For ETL, Glue Serverless (standard Glue jobs) eliminates cluster management; workers spin up per job and you pay per DPU-second with no minimum. EMR on EC2 gives full control over Spark configuration, instance types, spot integration, and open-source tooling (Hudi, Iceberg, Flink) but requires cluster lifecycle management. EMR Serverless provides the flexibility of EMR without cluster management: pre-initialized capacity keeps workers warm to reduce startup latency. Choose Glue for teams that want fully managed ETL with the Glue Catalog and minimal Spark tuning; choose EMR/EMR Serverless when you need advanced Spark configuration, custom JARs, or specific open-source frameworks not supported by Glue.",
+    "fj": "Glue Serverless and EMR Serverless are the same product with different names.",
+    "fs": "Glue Serverless is a fully managed ETL service with a visual interface and native Glue Catalog integration, optimized for ETL developers. EMR Serverless is a managed cluster service running Apache Spark/Hive/Presto, giving full control over Spark configurations and custom libraries. They have different pricing models, API surfaces, and supported use cases.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-operations-and-support"
+  },
+  {
+    "q": "How do you implement monitoring and observability for AWS data pipelines using CloudWatch metrics, alarms, and structured logging across Glue, EMR, and Redshift?",
+    "a": "For Glue jobs, enable `--enable-continuous-cloudwatch-log` (streams driver logs in near-real-time) and `--enable-job-insights` (auto-detects memory pressure, skew, and inefficient joins). Glue natively publishes metrics like `glue.driver.aggregate.numFailedTasks`, `glue.driver.aggregate.recordsRead`, and `glue.ALL.jvm.heap.used` to CloudWatch. Create CloudWatch Alarms on `glue.driver.aggregate.numFailedTasks > 0` to alert on task failures. For EMR, enable the EMR Console metrics export to CloudWatch and alert on `HDFSUtilization`, `YARNMemoryAvailablePercentage`, and `UnhealthyNodes`. For Redshift, enable `EnhancedVPCRouting`, and monitor `CPUUtilization`, `DatabaseConnections`, `ReadLatency`, and `QueuedQueries` metrics; set alarms on `QueuedQueries > threshold` as an early signal of cluster saturation. Use structured JSON logging in all Lambda and Glue scripts so CloudWatch Logs Insights can query by `pipeline_name`, `run_id`, `records_processed`, and `error_type` using the `fields` and `filter` syntax. Route critical alarm notifications to SNS→Slack or SNS→PagerDuty. For end-to-end pipeline lineage and visibility, AWS Glue workflows provide a dependency graph view across crawlers, jobs, and triggers.",
+    "fj": "CloudWatch automatically generates all useful metrics for Glue jobs without any additional configuration.",
+    "fs": "Glue publishes some default metrics but continuous log streaming and job insights must be explicitly enabled via job parameters. Without `--enable-continuous-cloudwatch-log`, logs are only available after job completion, which makes real-time debugging impossible for long-running jobs.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "python",
+        "label": "CloudWatch alarm on Glue task failures (CDK)",
+        "lines": [
+          "from aws_cdk import aws_cloudwatch as cw",
+          "",
+          "metric = cw.Metric(",
+          "    namespace='Glue',",
+          "    metric_name='glue.driver.aggregate.numFailedTasks',",
+          "    dimensions_map={'JobName': 'orders_transform'},",
+          "    period=cdk.Duration.minutes(5),",
+          "    statistic='Sum'",
+          ")",
+          "",
+          "alarm = cw.Alarm(self, 'GlueTaskFailureAlarm',",
+          "    metric=metric,",
+          "    threshold=1,",
+          "    evaluation_periods=1,",
+          "    comparison_operator=cw.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD",
+          ")"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-operations-and-support"
+  },
+  {
+    "q": "How do you use AWS CloudTrail and CloudTrail Lake to audit API calls for data engineering resources, and how do you integrate with EventBridge for security alerting?",
+    "a": "CloudTrail logs every management-plane API call (S3 GetObject, Glue CreateJob, Redshift DeleteCluster, IAM AttachRolePolicy) as structured JSON events delivered to an S3 bucket or a CloudTrail Lake event data store. Enable log file integrity validation so CloudTrail generates SHA-256 digest files every hour; the `validate-logs` CLI command confirms no tampering. CloudTrail Lake stores events in Apache ORC format and lets you run SQL queries directly without ETL—e.g., `SELECT userIdentity.arn, requestParameters, eventTime FROM eds WHERE eventName = 'DeleteBucket' AND eventTime > '2024-01-01'`—useful for incident investigation across multi-account organizations. To get real-time security alerts, create EventBridge rules that match CloudTrail events by `detail.eventName` (e.g., `DeleteTrail`, `StopLogging`, `PutBucketPolicy` with public access). EventBridge routes matched events to an SNS topic, a Lambda remediation function, or a Security Hub finding. For data governance, audit Lake Formation `GrantPermissions` and `BatchGrantPermissions` calls in CloudTrail to track who was granted access to which tables and when.",
+    "fj": "CloudTrail Lake is just a name for CloudTrail logs stored in S3—you query them with Athena like any other S3 data.",
+    "fs": "CloudTrail Lake is a distinct managed service that stores events in its own immutable event data store in ORC format with a built-in SQL query engine. You query it through the CloudTrail console or API directly—no Athena table setup, Glue crawler, or S3 bucket management is required. It offers 7-year retention and multi-region, multi-account aggregation natively.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "sql",
+        "label": "CloudTrail Lake: audit S3 bucket deletions",
+        "lines": [
+          "SELECT",
+          "  eventTime,",
+          "  userIdentity.arn AS caller,",
+          "  requestParameters.bucketName AS bucket,",
+          "  sourceIPAddress",
+          "FROM eds_id_here  -- event data store ID",
+          "WHERE eventSource = 's3.amazonaws.com'",
+          "  AND eventName IN ('DeleteBucket', 'PutBucketPolicy')",
+          "  AND eventTime > '2024-01-01 00:00:00'",
+          "ORDER BY eventTime DESC",
+          "LIMIT 100;"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-operations-and-support"
+  },
+  {
+    "q": "How do SPICE and live query modes differ in Amazon QuickSight, and how do you implement row-level security and dashboard embedding?",
+    "a": "SPICE (Super-fast, Parallel, In-memory Calculation Engine) is QuickSight's in-memory store. Data is imported from S3, Redshift, RDS, or Athena into SPICE on a defined refresh schedule (incremental or full), and subsequent dashboard renders query SPICE directly—response times are sub-second at scale with no per-query charges to the source system. Live query mode skips SPICE and sends every dashboard interaction as a real-time query to the underlying data source, giving fresher data but incurring source query costs and higher latency. Use SPICE for large datasets accessed frequently; use live mode for real-time data where freshness is critical and query volume is low. Row-level security (RLS) restricts which rows each user sees: you create an RLS dataset (a table mapping QuickSight usernames or group names to dimension values like `region=us-east`) and attach it to the main dataset. QuickSight automatically injects the matching filter per user at query time. For embedding, use the QuickSight Embedding SDK and generate `EmbedUrl` via `GenerateEmbedUrlForRegisteredUser` (for known users) or `GenerateEmbedUrlForAnonymousUser` (for external portals); anonymous embedding supports tag-based RLS to pass runtime dimension values without provisioning the user in QuickSight.",
+    "fj": "SPICE data is always real-time because QuickSight automatically syncs it with the source database.",
+    "fs": "SPICE data is a snapshot that is only as fresh as the last scheduled or triggered refresh. QuickSight does not poll for changes automatically—you must configure a refresh schedule or call `CreateIngestion` via the API. For real-time data requirements, live query mode or frequent SPICE refreshes (up to hourly for some source types) are needed.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-operations-and-support"
+  },
+  {
+    "q": "How does AWS Secrets Manager handle automatic rotation for RDS and Redshift credentials, and how do you implement cross-account secret access?",
+    "a": "When you enable automatic rotation in Secrets Manager for an RDS or Redshift database, AWS uses a managed rotation function from the Serverless Application Repository that implements a four-step rotation cycle: (1) `createSecret`—creates a new secret version with a candidate password; (2) `setSecret`—updates the database user's password to the candidate; (3) `testSecret`—verifies the new credentials can authenticate; (4) `finishSecret`—marks the new version as `AWSCURRENT` and the old version as `AWSPREVIOUS`. For Redshift Serverless, native managed rotation was added in 2024 so you can rotate directly from the console without writing a custom Lambda. The rotation schedule is configured in days or using a cron expression (minimum every 4 hours). For cross-account access, attach a resource-based policy on the secret granting `secretsmanager:GetSecretValue` to the IAM role ARN in the consuming account, and also update the KMS key policy to grant `kms:Decrypt` to that role—the secret is unusable without both policies because Secrets Manager uses CMK encryption. Applications should always call `GetSecretValue` at runtime rather than caching the secret value in environment variables, so rotation takes effect without redeployment.",
+    "fj": "You must write a custom Lambda rotation function for all RDS and Redshift credential rotations.",
+    "fs": "AWS provides fully managed rotation functions for RDS (MySQL, PostgreSQL, Oracle, SQL Server), Aurora, DocumentDB, and Redshift—you do not write Lambda code. Custom rotation functions are only needed for non-database secrets (API keys, custom credentials) or when you need the 'alternating users' rotation strategy where two database users are rotated alternately to ensure zero-downtime rotation.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-security-and-governance"
+  },
+  {
+    "q": "How do LF-Tags (Lake Formation tag-based access control) differ from resource-level RBAC in Lake Formation, and when should you use ABAC patterns?",
+    "a": "Classic Lake Formation RBAC grants permissions directly on named resources—'GRANT SELECT on database.table to role analyst_role'. This works for small catalogs but becomes unmanageable at scale: adding a new table requires updating every relevant grant. LF-Tags (TBAC / ABAC) decouples policy from resource. You define tag key-value pairs (e.g., `classification=pii`, `domain=finance`, `env=prod`), attach them to databases, tables, and columns, and then grant permissions based on tag expressions: 'principal analyst_role can SELECT on resources where domain=finance AND classification=non-pii'. When a new table is created and tagged `domain=finance, classification=non-pii`, all grantees with matching tag-based grants automatically gain access—no new resource-level grant is required. ABAC via LF-Tags is ideal when: you have hundreds or thousands of tables added frequently, your access model maps naturally to business attributes (domain, sensitivity, environment), or you need column-level security at scale. RBAC is simpler for small catalogs with stable schemas. LF-Tag policies and IAM tags are independent systems—Lake Formation tag-based grants do not interact with IAM attribute-based condition keys.",
+    "fj": "LF-Tags replace IAM policies entirely—you do not need IAM policies when using Lake Formation.",
+    "fs": "Lake Formation permissions are an additional authorization layer on top of IAM, not a replacement. A principal must pass both IAM permission checks (can call Glue/Athena/S3 APIs?) and Lake Formation permission checks (is the catalog resource permitted?). Both layers must allow the operation for access to succeed.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-security-and-governance"
+  },
+  {
+    "q": "How does Amazon Macie identify PII in S3 data lakes, and how do you integrate Macie findings into a Lake Formation governance workflow?",
+    "a": "Amazon Macie runs discovery jobs against S3 buckets using machine learning and pattern matching to detect sensitive data types—names, SSNs, credit card numbers, AWS credentials, PHI—in CSV, JSON, Parquet, Avro, and text files. Each finding includes the S3 object path, exact sensitive data locations (row/column in structured files), sensitivity score, and data identifier type. Findings are written to S3 as structured JSON and can also be published to Security Hub and EventBridge. In a governance workflow: (1) Macie runs a scheduled discovery job across the raw data lake; (2) EventBridge captures findings with `detail-type = 'Macie Finding'`; (3) a Lambda function receives the finding, identifies the Glue Catalog table and column containing the PII, and updates the Lake Formation column-level permission to revoke broad SELECT access on that column; (4) optionally, the Lambda calls a Glue job to apply column masking (hashing or nulling the PII column) in the curated layer. For automated pipelines, use `BatchGrantPermissions` and `BatchRevokePermissions` in Lake Formation to apply column-level access changes programmatically based on Macie findings, ensuring newly landed PII data is quarantined before analysts can query it.",
+    "fj": "Macie automatically enforces Lake Formation permissions when it finds PII—no additional integration is needed.",
+    "fs": "Macie only detects and reports sensitive data; it takes no enforcement action. You must build the integration—EventBridge → Lambda → Lake Formation API calls—to translate Macie findings into access control changes. Macie and Lake Formation are separate services with no built-in automatic coupling.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-security-and-governance"
+  },
+  {
+    "q": "What data masking and anonymization techniques apply on AWS for GDPR and HIPAA compliance, and when do you use tokenization versus format-preserving encryption?",
+    "a": "Tokenization replaces a sensitive value (credit card number, SSN) with an opaque random token stored in a separate vault; the original value can be retrieved by authorized systems with vault access. It is preferred for PCI DSS (payment data) and HIPAA (PHI identifiers) because the token has no mathematical relationship to the original—even a compromised token is useless without vault access. Format-preserving encryption (FPE, e.g., FF3-1 cipher via AWS Encryption SDK) encrypts a value while preserving its format—a 16-digit number encrypts to another 16-digit number—so existing database schemas, validation rules, and downstream applications require no changes. FPE is useful when schema changes are impractical. GDPR pseudonymization uses either tokenization or FPE: the data is pseudonymous (not anonymous) because re-identification is possible with the key. True anonymization—hashing without salt or generalization (replacing exact age with age-range)—is irreversible and removes the data from GDPR scope entirely, but also destroys analytical utility. On AWS: implement FPE using the AWS Encryption SDK with a CMK in KMS; implement tokenization using Lambda + DynamoDB (token vault) + KMS; use Glue DataBrew or Glue ETL for column-level masking jobs; use Macie to discover PII that needs masking in existing datasets.",
+    "fj": "Hashing a column with SHA-256 is sufficient for GDPR anonymization because the hash cannot be reversed.",
+    "fs": "Hashing without a secret salt can be reversed by rainbow table attacks, especially for low-cardinality fields like names or SSNs. GDPR requires that re-identification be 'reasonably impossible'—unsalted hashing of known-domain values does not meet that bar. Proper anonymization requires either salted hashing (which becomes pseudonymization, still in GDPR scope) or generalization/suppression techniques that destroy the mapping to individuals.",
+    "level": "Mid",
+    "asked": 0,
+    "code": [],
+    "followups": [],
+    "certDomain": "data-security-and-governance"
+  },
+  {
+    "q": "How do you enforce data residency and restrict data to specific AWS Regions using S3 bucket policies, SCPs, and cross-region replication controls?",
+    "a": "Data residency enforcement operates at multiple layers. At the organization level, AWS Service Control Policies (SCPs) in AWS Organizations deny API calls that create or copy data to non-approved regions using the `aws:RequestedRegion` condition key—e.g., `Deny * where aws:RequestedRegion not in [eu-west-1, eu-central-1]`. SCPs apply to all accounts in the OU and cannot be overridden by account-level IAM policies. In November 2024, AWS introduced Resource Control Policies (RCPs), which restrict what actions can be performed on resources regardless of the calling principal—useful for preventing cross-region S3 replication at the resource level. S3 bucket policies add a second layer: deny `s3:PutObject` and `s3:ReplicateObject` from any principal unless the destination bucket is in an approved region. To prevent S3 Cross-Region Replication (CRR) from moving data out of an approved region, either remove the replication IAM role's permission to write to buckets in non-approved regions, or use SCP conditions on `s3:ReplicateObject`. Amazon Macie discovery jobs can detect when data has escaped to unexpected buckets. For comprehensive auditing, CloudTrail Lake queries on `s3:PutObject` and `s3:CreateBucket` events filtered by region confirm enforcement.",
+    "fj": "Setting S3 Object Lock on a bucket is sufficient to enforce data residency.",
+    "fs": "S3 Object Lock prevents deletion and overwrite of objects (immutability), but it does not restrict which regions buckets can be created in or prevent data from being copied to buckets in other regions. Data residency requires SCPs on region-level API calls and S3 bucket policies restricting replication destinations—Object Lock addresses a different concern (data retention, not data location).",
+    "level": "Sr",
+    "asked": 0,
+    "code": [
+      {
+        "lang": "json",
+        "label": "SCP: deny resource creation outside approved regions",
+        "lines": [
+          "{",
+          "  \"Version\": \"2012-10-17\",",
+          "  \"Statement\": [{",
+          "    \"Sid\": \"DenyOutsideApprovedRegions\",",
+          "    \"Effect\": \"Deny\",",
+          "    \"Action\": \"*\",",
+          "    \"Resource\": \"*\",",
+          "    \"Condition\": {",
+          "      \"StringNotIn\": {",
+          "        \"aws:RequestedRegion\": [",
+          "          \"eu-west-1\",",
+          "          \"eu-central-1\"",
+          "        ]",
+          "      },",
+          "      \"StringNotEquals\": {",
+          "        \"aws:PrincipalTag/exempt-residency\": \"true\"",
+          "      }",
+          "    }",
+          "  }]",
+          "}"
+        ]
+      }
+    ],
+    "followups": [],
+    "certDomain": "data-security-and-governance"
+  }
+]
