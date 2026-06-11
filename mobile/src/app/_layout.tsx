@@ -85,7 +85,9 @@ export default function RootLayout() {
             : { flex: 1 }
         }>
         <ThemeProvider value={scheme === 'dark' ? DarkTheme : DefaultTheme}>
-          <Stack screenOptions={{ headerShown: false }}>
+          {/* Web: no push/modal animation — the transition is what flashed a dimmed/blank frame
+              on every navigation (and swallowed taps mid-flight). Native keeps the platform feel. */}
+          <Stack screenOptions={{ headerShown: false, ...(isWeb && { animation: 'none' as const }) }}>
             <Stack.Screen name="(tabs)" />
             <Stack.Screen name="onboarding" />
             <Stack.Screen name="track/[slug]" />

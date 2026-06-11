@@ -180,21 +180,28 @@ export function AutopilotPlanCard({
 
       {/* Today — always expanded, fully tappable on both tiers */}
       <View style={{ paddingHorizontal: 13, paddingBottom: 10, gap: 6 }}>
-        {plan.today && (
-          <>
-            <T muted weight="800" size={10.5} style={{ letterSpacing: 0.4 }}>
-              {dayLabel(0, plan.today.date, plan.today.isMockDay, plan.today.isWarmUp)} · ~{plan.today.target} cards
-            </T>
-            {plan.today.items
-              .filter((item) => item.id !== heroItemId)
-              .map((item) => (
-                <ItemRow key={item.id} item={item} onPress={() => startItem(item)} accent={trackColor(item.isGap ? 'dbt' : 'sql')} />
-              ))}
-            {plan.today.items.some((item) => item.id === heroItemId) && (
-              <T muted size={10.5}>▲ Up next is the big card above</T>
-            )}
-          </>
-        )}
+        {plan.today && (() => {
+          // The hero card absorbs one plan item — name it (with its card share) in a stub row
+          // so the visible rows still reconcile with the "~N cards" label at a glance.
+          const heroItem = plan.today.items.find((item) => item.id === heroItemId);
+          return (
+            <>
+              <T muted weight="800" size={10.5} style={{ letterSpacing: 0.4 }}>
+                {dayLabel(0, plan.today.date, plan.today.isMockDay, plan.today.isWarmUp)} · ~{plan.today.target} cards
+              </T>
+              {heroItem && (
+                <T muted size={10.5}>
+                  ▲ {heroItem.title}{heroItem.cards > 0 ? ` · ${heroItem.cards}` : ''} — the big card above
+                </T>
+              )}
+              {plan.today.items
+                .filter((item) => item.id !== heroItemId)
+                .map((item) => (
+                  <ItemRow key={item.id} item={item} onPress={() => startItem(item)} accent={trackColor(item.isGap ? 'dbt' : 'sql')} />
+                ))}
+            </>
+          );
+        })()}
 
         {/* The run-up — Pro expands it; free sees locked day rows */}
         {plan.days.length > 1 && (
