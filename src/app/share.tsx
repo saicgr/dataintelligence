@@ -66,7 +66,7 @@ export default function ShareCard() {
         }}>
         <Row style={{ justifyContent: 'space-between' }}>
           <T color="#fff" weight="800" size={16}>
-            Field<T color="#ffe08a" weight="800" size={16}>Notes</T>
+            Byte<T color="#ffe08a" weight="800" size={16}>Shards</T>
           </T>
           <View style={{ backgroundColor: 'rgba(255,255,255,.22)', borderRadius: 999, paddingVertical: 4, paddingHorizontal: 10 }}>
             <T color="#fff" weight="800" size={10.5}>SENIOR PREP</T>

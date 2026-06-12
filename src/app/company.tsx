@@ -27,7 +27,7 @@ import { Btn, Card, Chip, H2, Row, Screen, T } from '../ui/kit';
 export default function CompanyPack() {
   const { key } = useLocalSearchParams<{ key: string }>();
   const router = useRouter();
-  const { c, track } = useTheme();
+  const { c, track, scheme } = useTheme();
   const role = useStore((s) => s.role);
   const progress = useStore((s) => s.progress);
   const unlocked = useStore(isProActive);
@@ -53,6 +53,11 @@ export default function CompanyPack() {
   const bars = packTopicBars(key, role, remote);
   const isTarget = targetCompanyKey === key;
   const roleName = roleByKey(role)?.name ?? 'your role';
+
+  // Living signal — the honest reason a (mostly static) pack belongs under a recurring plan:
+  // it sharpens as the community feeds debriefs back. Only shown when real crowd data exists.
+  const debriefN = remote[0]?.debriefs ?? 0;
+  const recentN = remote.reduce((sum, t) => sum + (t.recent ?? 0), 0);
 
   const gate = (go: () => void) => () => {
     if (unlocked) return go();
@@ -89,6 +94,26 @@ export default function CompanyPack() {
           <T size={12} weight="800" color={c.muted}>change role ›</T>
         </Pressable>
       </Row>
+
+      {debriefN > 0 && (
+        <View
+          style={{
+            flexDirection: 'row',
+            gap: 8,
+            alignItems: 'center',
+            backgroundColor: scheme === 'dark' ? 'rgba(63,185,80,.12)' : '#e3f7ec',
+            borderRadius: 12,
+            paddingVertical: 9,
+            paddingHorizontal: 12,
+          }}>
+          <T size={15}>📈</T>
+          <T size={11.5} weight="700" color={c.success} style={{ flex: 1, lineHeight: 16 }}>
+            Sharpened by {debriefN} interview debriefs
+            {recentN > 0 ? ` · ${recentN} in the last 90 days` : ''} — this pack keeps updating as
+            the community reports back.
+          </T>
+        </View>
+      )}
 
       <H2>What {set.label} asks</H2>
       <Card style={{ gap: 9 }}>

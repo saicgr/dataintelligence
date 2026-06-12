@@ -47,7 +47,7 @@ export const CertificateCard = forwardRef<View, CertificateProps>(function Certi
       {/* header: wordmark + seal */}
       <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
         <T color="#fff" weight="800" size={15}>
-          Field<T color={GOLD} weight="800" size={15}>Notes</T>
+          Byte<T color={GOLD} weight="800" size={15}>Shards</T>
         </T>
         <T size={26}>🏅</T>
       </View>

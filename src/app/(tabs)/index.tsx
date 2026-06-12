@@ -535,7 +535,7 @@ function Header({
       }}>
       <Row style={{ gap: 10 }}>
         <T size={17} weight="800">
-          Field<T color="#f76707" weight="800" size={17}>Notes</T>
+          Byte<T color="#f76707" weight="800" size={17}>Shards</T>
         </T>
         <View style={{ flex: 1 }} />
         {/* The whole streak cluster is tappable → StreakSheet (freezes, rest days, daily goal). */}

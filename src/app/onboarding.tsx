@@ -261,7 +261,7 @@ function Showcase({ c }: { c: C }) {
       {/* Wordmark + rotating motivation + the WEDGE (not a volume pile) */}
       <View style={{ alignItems: 'center', gap: 5, marginTop: 2 }}>
         <T size={28} weight="900">
-          Field<T size={28} weight="900" color={c.accentInk}>Notes</T>
+          Byte<T size={28} weight="900" color={c.accentInk}>Shards</T>
         </T>
         <T size={11.5} weight="900" color={c.muted} style={{ letterSpacing: 1, marginTop: 2 }}>WHETHER YOU&apos;RE</T>
         <RotatingPhrase color={c.accentInk} items={['interviewing soon', 'breaking into Data/AI', 'staying current']} />
