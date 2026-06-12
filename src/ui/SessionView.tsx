@@ -5,6 +5,7 @@ import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 
 import { answerFeedback, haptic, sfx } from '../lib/feedback';
+import { Icon } from './Icon';
 import { levelIndex } from '../lib/content';
 import { coverage, extractKeyPoints, suggestRating } from '../lib/keypoints';
 import { requestPermission } from '../lib/notifications';
@@ -443,7 +444,7 @@ function CardView() {
                         alignItems: 'center',
                         justifyContent: 'center',
                       }}>
-                      <T size={20}>🎙</T>
+                      <Icon name="mic" size={20} />
                     </Pressable>
                   </View>
                   {(() => {
@@ -1016,7 +1017,7 @@ function FeedbackRow({
           onPress={() => setReportOpen((o) => !o)}
           accessibilityLabel={reported ? 'Issue reported' : 'Report an issue with this card'}
           style={pill(reported || reportOpen, warn)}>
-          <T size={12.5}>⚠️</T>
+          <Icon name="warn" size={13} color={warn} />
           <T size={12} weight="800" color={reported || reportOpen ? warn : c.muted}>{reported ? 'Sent' : 'Issue'}</T>
         </Pressable>
       </Row>

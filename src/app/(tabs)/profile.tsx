@@ -11,6 +11,7 @@ import { useStore } from '../../lib/store';
 import { ACCENTS, type AccentKey, radius, useTheme } from '../../lib/theme';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
 import { HowProWorks } from '../../components/how-pro-works';
+import { Icon } from '../../ui/Icon';
 
 export default function Profile() {
   const { c } = useTheme();
@@ -131,7 +132,7 @@ export default function Profile() {
       <Card>
         {signedIn ? (
           <Row>
-            <T size={15}>✅</T>
+            <Icon name="check" size={15} color={c.success} />
             <T size={12.5} weight="600" style={{ flex: 1 }}>Signed in &amp; syncing</T>
             <Btn label="Sign out" variant="ghost" onPress={wrap(signOut)} style={{ paddingVertical: 8, paddingHorizontal: 14 }} />
           </Row>
@@ -290,7 +291,7 @@ function AccentSection() {
                 {selected ? (
                   <T size={20} weight="900" color={sw.onAccent}>✓</T>
                 ) : locked ? (
-                  <T size={16}>🔒</T>
+                  <Icon name="lock" size={16} />
                 ) : null}
               </View>
               <T size={11} weight="700" muted style={{ marginTop: 5 }}>{opt.name}</T>

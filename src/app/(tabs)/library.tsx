@@ -9,6 +9,7 @@ import { confirmAsync } from '../../lib/dialog';
 import { ROLES } from '../../lib/roles';
 import { useStore } from '../../lib/store';
 import { radius, space, useTheme } from '../../lib/theme';
+import { Icon } from '../../ui/Icon';
 import { H2, Segmented, T } from '../../ui/kit';
 import { RolePicker } from '../../ui/RolePicker';
 
@@ -96,7 +97,7 @@ export default function Library() {
               borderRadius: radius.md,
               padding: 13,
             }}>
-            <T size={18}>🔖</T>
+            <Icon name="bookmark" size={18} />
             <View style={{ flex: 1 }}>
               <T weight="800" size={14}>Saved</T>
               <T muted size={11.5}>{savedCount} card{savedCount === 1 ? '' : 's'} you bookmarked · tap to review</T>
@@ -174,7 +175,7 @@ export default function Library() {
             borderRadius: radius.md,
             paddingHorizontal: 13,
           }}>
-          <T size={15} color={c.muted}>🔍</T>
+          <Icon name="search" size={15} color={c.muted} />
           <TextInput
             value={q}
             onChangeText={setQ}

@@ -7,6 +7,7 @@ import { View } from 'react-native';
 import { useStore } from '../lib/store';
 import { radius, useTheme } from '../lib/theme';
 import { CountUp, Pop } from './anim';
+import { Icon } from './Icon';
 import { Card, Row, T } from './kit';
 
 const DAYS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
@@ -88,11 +89,17 @@ export function StreakHero({ variant = 'hero' }: { variant?: 'hero' | 'compact' 
       {streak > 0 && streak % 5 === 0 ? (
         <Pop trigger={streak} style={{ marginTop: 12 }}>
           <View style={{ backgroundColor: '#e7f5ff', borderRadius: radius.md, paddingVertical: 8, paddingHorizontal: 14 }}>
-            <T weight="800" size={12.5} color="#1c7ed6">🧊 Streak freeze earned — you have {freezes}</T>
+            <Row style={{ gap: 3 }}>
+              <Icon name="freeze" size={12.5} color="#1c7ed6" />
+              <T weight="800" size={12.5} color="#1c7ed6">Streak freeze earned — you have {freezes}</T>
+            </Row>
           </View>
         </Pop>
       ) : freezes > 0 ? (
-        <T size={11.5} weight="700" color={c.muted} style={{ marginTop: 10 }}>🧊 {freezes} freeze{freezes > 1 ? 's' : ''} banked</T>
+        <Row style={{ gap: 3, marginTop: 10 }}>
+          <Icon name="freeze" size={11.5} color={c.muted} />
+          <T size={11.5} weight="700" color={c.muted}>{freezes} freeze{freezes > 1 ? 's' : ''} banked</T>
+        </Row>
       ) : null}
     </Card>
   );

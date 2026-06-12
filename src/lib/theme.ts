@@ -141,6 +141,20 @@ export function shade(hex: string, factor: number): string {
 export const radius = { sm: 10, md: 14, lg: 18, xl: 22 } as const;
 export const space = { xs: 6, sm: 10, md: 14, lg: 18, xl: 24 } as const;
 
+/**
+ * Semantic type scale. Prefer these over ad-hoc size/weight on <T> so headings,
+ * titles, and big numbers stay consistent across screens (a generic, unscaled
+ * type ramp reads as "AI default"). A custom display typeface can later swap in
+ * here via a `family` field without touching call sites.
+ */
+export const type = {
+  display: { size: 30, weight: '900' },
+  title: { size: 22, weight: '800' },
+  heading: { size: 17, weight: '800' },
+  body: { size: 14, weight: '600' },
+  caption: { size: 12, weight: '700' },
+} as const;
+
 /** Monospace family for code panels (RN has no built-in token). */
 export const mono = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }) as string;
 

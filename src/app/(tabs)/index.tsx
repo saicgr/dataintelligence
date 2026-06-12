@@ -48,6 +48,7 @@ import { haptic, sfx } from '../../lib/feedback';
 import type { PlanItem } from '../../lib/autopilot';
 import { AnimatedProgressBar, CardEnter, CountUp, PressableScale, Shake } from '../../ui/anim';
 import { AutopilotPlanCard, useAutopilot, useStartPlanItem } from '../../ui/AutopilotPlan';
+import { Icon } from '../../ui/Icon';
 import { H2, LevelPicker, Row, Segmented, T } from '../../ui/kit';
 import { InterviewPlanCard } from '../../ui/InterviewPlanCard';
 import { QuestStrip } from '../../ui/QuestStrip';
@@ -208,7 +209,7 @@ function LearnPath() {
             borderRadius: radius.md,
             paddingHorizontal: 11,
           }}>
-          <T size={13} color={c.muted}>🔍</T>
+          <Icon name="search" size={15} color={c.muted} />
           <TextInput
             value={q}
             onChangeText={setQ}
@@ -494,7 +495,10 @@ function Streak() {
   const xp = useStore((st) => st.xp);
   return (
     <Row style={{ gap: 8 }}>
-      <T weight="800" size={14} color="#f76707">🔥 {streak}</T>
+      <Row style={{ gap: 3 }}>
+        <Icon name="streak" size={15} color="#f76707" />
+        <T weight="800" size={14} color="#f76707">{streak}</T>
+      </Row>
       <View style={{ backgroundColor: '#4263eb', borderRadius: 9, paddingHorizontal: 7, height: 24, justifyContent: 'center' }}>
         <T color="#fff" weight="800" size={11}>Lv {level(xp)}</T>
       </View>
@@ -545,16 +549,21 @@ function Header({
           scaleTo={0.96}
           accessibilityLabel="Streak details — freezes, rest days and daily goal">
           <Row style={{ gap: 8 }}>
-            {freezes > 0 && <T weight="800" size={13} color="#4dabf7">🧊 {freezes}</T>}
+            {freezes > 0 && (
+              <Row style={{ gap: 3 }}>
+                <Icon name="freeze" size={14} color="#4dabf7" />
+                <T weight="800" size={13} color="#4dabf7">{freezes}</T>
+              </Row>
+            )}
             {/* Hide the demotivating "🔥 0" — only celebrate a live streak. */}
             {streak > 0 && (
-              <Row style={{ gap: 2 }}>
-                <T weight="800" size={14} color="#f76707">🔥</T>
+              <Row style={{ gap: 3 }}>
+                <Icon name="streak" size={15} color="#f76707" />
                 <CountUp to={streak} style={{ fontWeight: '800', fontSize: 14, color: '#f76707' }} />
               </Row>
             )}
             <Row style={{ gap: 3 }}>
-              <T weight="800" size={13} color={goalMet ? c.success : c.muted}>🎯</T>
+              <Icon name="goal" size={14} color={goalMet ? c.success : c.muted} />
               <T weight="800" size={13} color={goalMet ? c.success : c.muted}>
                 {/* "cards" disambiguates this from the Daily Quests 0/3 counter below. */}
                 {goalMet ? 'Done' : `${cardsToday}/${dailyGoal} cards`}
@@ -605,7 +614,7 @@ function Header({
           </Pressable>
         )}
         <Pressable onPress={onSearch} hitSlop={8} accessibilityRole="button" accessibilityLabel={searchOpen ? 'Hide search' : 'Search tracks and questions'}>
-          <T weight="900" size={15} color={searchOpen ? '#f76707' : c.muted}>🔍</T>
+          <Icon name="search" size={18} color={searchOpen ? '#f76707' : c.muted} />
         </Pressable>
         <Pressable onPress={onMenu} hitSlop={8} accessibilityRole="button" accessibilityLabel="Role and prep settings">
           <T weight="900" size={18} color={c.muted}>⋯</T>
@@ -1045,7 +1054,7 @@ function SettingsSheet({ open, onClose }: { open: boolean; onClose: () => void }
                   borderRadius: radius.md,
                   paddingHorizontal: 11,
                 }}>
-                <T size={13} color={c.muted}>🔍</T>
+                <Icon name="search" size={15} color={c.muted} />
                 <TextInput
                   value={roleQ}
                   onChangeText={setRoleQ}

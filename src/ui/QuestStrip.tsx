@@ -25,6 +25,7 @@ import {
 import { useStore } from '../lib/store';
 import { radius, space, useTheme } from '../lib/theme';
 import { AnimatedProgressBar, CardEnter, PressableScale } from './anim';
+import { Icon } from './Icon';
 import { Row, T } from './kit';
 
 export function QuestStrip({
@@ -68,7 +69,7 @@ export function QuestStrip({
         scaleTo={0.99}
         accessibilityLabel={`Daily quests — ${doneCount} of ${quests.length} done. ${open ? 'Collapse' : 'Expand'}`}>
         <Row style={{ backgroundColor: c.card, borderWidth: 1, borderColor: c.border, borderRadius: radius.md, padding: 12, gap: 10 }}>
-          <T size={16}>🏅</T>
+          <Icon name="medal" size={16} color={c.fg} />
           <T weight="800" size={13.5} style={{ flex: 1 }}>Daily Quests</T>
           <T weight="800" size={11.5} color={doneCount === quests.length ? c.success : c.muted}>
             {doneCount}/{quests.length}

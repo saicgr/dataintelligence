@@ -1,5 +1,5 @@
 import { type Href, useRouter } from 'expo-router';
-import { useState } from 'react';
+import { type ReactNode, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
 import { buildCheatSheetFromCards } from '../../lib/cheatsheet';
@@ -11,6 +11,7 @@ import { haptic, sfx } from '../../lib/feedback';
 import { FREE_CODE_RUNS, isProActive, useStore } from '../../lib/store';
 import { radius, useTheme } from '../../lib/theme';
 import { CardEnter, PressableScale, Shake } from '../../ui/anim';
+import { Icon } from '../../ui/Icon';
 import { Btn, Card, H2, Row, Screen, T } from '../../ui/kit';
 
 /** Chips shown in "Drill a topic" before the "+N more" fold. */
@@ -81,7 +82,7 @@ export default function Practice() {
       <CardEnter>
         <Card style={{ padding: 14, gap: 11 }}>
           <Row style={{ gap: 9 }}>
-            <T size={22}>🎯</T>
+            <Icon name="target" size={22} />
             <View style={{ flex: 1 }}>
               <T weight="800" size={15}>Drill a topic</T>
               <T muted size={12}>Free-practice any track, right now — just tap one</T>
@@ -134,7 +135,7 @@ export default function Practice() {
           card count up front: "quick reps" must never open into a 40-card surprise. */}
       <CardEnter delay={30}>
         <Mode
-          icon="🎲"
+          icon={<Icon name="dice" size={26} />}
           title="Surprise me"
           sub="12 quick cards from a random topic in your prep"
           cta="Go ▶"
@@ -145,7 +146,7 @@ export default function Practice() {
       {/* Free, hands-free — answer out loud on a walk/commute. */}
       <CardEnter delay={40}>
         <Mode
-          icon="🎧"
+          icon={<Icon name="headphones" size={26} />}
           title="Commute mode"
           sub="Hands-free: questions read aloud, answer out loud"
           cta="Listen ▶"
@@ -159,9 +160,9 @@ export default function Practice() {
       {mistakesCount > 0 && (
         <CardEnter delay={30}>
           <Mode
-            icon="📕"
+            icon={<T size={26}>📕</T>}
             title={`Mistakes notebook · ${mistakesCount}`}
-            sub={unlocked ? 'Every card you’ve missed, weakest first' : `Your missed cards (first 10 free · Pro = all ${mistakesCount})`}
+            sub={unlocked ? "Every card you've missed, weakest first" : `Your missed cards (first 10 free · Pro = all ${mistakesCount})`}
             cta="Fix ▶"
             onPress={() => {
               haptic.light();
@@ -174,7 +175,7 @@ export default function Practice() {
       )}
       <CardEnter delay={40}>
         <LockedMode
-          icon="🧠"
+          icon={<Icon name="brain" size={26} />}
           title="Weak-spots drill"
           sub="Adaptive: the cards you keep missing, weakest first"
           unlocked={unlocked}
@@ -190,7 +191,7 @@ export default function Practice() {
       {savedCount > 0 && (
         <CardEnter delay={50}>
           <Mode
-            icon="🔖"
+            icon={<Icon name="bookmark" size={26} />}
             title="Saved cards"
             sub={`${savedCount} card${savedCount === 1 ? '' : 's'} you bookmarked — review them`}
             cta="Review ▶"
@@ -319,7 +320,7 @@ export default function Practice() {
       </CardEnter>
       <CardEnter delay={40}>
         <LockedMode
-          icon="📝"
+          icon={<Icon name="pencil" size={26} />}
           title="Interview Autopilot · JD analyzer"
           sub="Paste a JD — match it to tracks, find gaps, build your plan"
           unlocked={unlocked}
@@ -335,7 +336,7 @@ export default function Practice() {
       <CardEnter delay={30}>
         <Card style={{ padding: 14, gap: 11 }}>
           <Row style={{ gap: 9 }}>
-            <T size={22}>💻</T>
+            <Icon name="laptop" size={22} />
             <View style={{ flex: 1 }}>
               <T weight="800" size={15}>Code drills</T>
               <T muted size={12}>Write &amp; run real code — graded by output, not multiple choice</T>
@@ -374,7 +375,7 @@ export default function Practice() {
       </CardEnter>
       <CardEnter delay={40}>
         <LockedMode
-          icon="⏱️"
+          icon={<T size={26}>⏱️</T>}
           title="Mock interview"
           sub="Timed rapid-fire round — scored, no peeking"
           unlocked={unlocked}
@@ -385,7 +386,7 @@ export default function Practice() {
       </CardEnter>
       <CardEnter delay={50}>
         <LockedMode
-          icon="🚨"
+          icon={<Icon name="oncall" size={26} />}
           title="Production incidents"
           sub="Pick a real on-call scenario — inspect → fix → verify"
           unlocked={unlocked}
@@ -416,7 +417,7 @@ function Mode({
   cta,
   onPress,
 }: {
-  icon: string;
+  icon: ReactNode;
   title: string;
   sub: string;
   cta: string;
@@ -427,7 +428,7 @@ function Mode({
     <PressableScale onPress={onPress} sound>
       <Card style={{ padding: 16 }}>
         <Row>
-          <T size={26}>{icon}</T>
+          {icon}
           <Row style={{ flex: 1, flexDirection: 'column', alignItems: 'flex-start', gap: 2 }}>
             <T weight="800" size={15}>{title}</T>
             <T muted size={12}>{sub}</T>
@@ -474,7 +475,7 @@ function LockedMode({
   onUnlocked,
   onLocked,
 }: {
-  icon: string;
+  icon: ReactNode;
   title: string;
   sub: string;
   unlocked: boolean;
@@ -496,13 +497,13 @@ function LockedMode({
         }}>
         <Card style={{ padding: 16 }}>
           <Row>
-            <T size={26}>{icon}</T>
+            {icon}
             <Row style={{ flex: 1, flexDirection: 'column', alignItems: 'flex-start', gap: 2 }}>
               <T weight="800" size={15}>{title}</T>
               <T muted size={12}>{sub}</T>
             </Row>
             <Row style={{ gap: 3 }}>
-              <T size={12}>🔒</T>
+              <Icon name="lock" size={12} />
               <T weight="900" size={12.5} color={track('spark')}>Pro</T>
             </Row>
           </Row>

@@ -17,6 +17,7 @@ import { useTheme } from '../../lib/theme';
 import { AnimatedProgressBar } from '../../ui/anim';
 import { Btn, Card, Chip, H2, Row, Screen, T } from '../../ui/kit';
 import { StreakHero } from '../../ui/StreakHero';
+import { Icon } from '../../ui/Icon';
 
 export default function Progress() {
   const router = useRouter();
@@ -139,7 +140,7 @@ export default function Progress() {
       <H2>Interview debriefs</H2>
       <Card>
         <Row>
-          <T size={23}>📝</T>
+          <Icon name="pencil" size={23} />
           <View style={{ flex: 1 }}>
             <T weight="800" size={14.5}>Had a round? Log a debrief</T>
             <T muted size={12}>2 min while it&apos;s fresh · re-ranks your deck to what they asked</T>
@@ -243,7 +244,7 @@ function BadgesCard({ badges }: { badges: ReturnType<typeof computeBadges> }) {
                 borderWidth: 1.5,
                 borderColor: b.earned ? c.accent : c.border,
               }}>
-              <T size={22}>{b.earned ? b.icon : '🔒'}</T>
+              {b.earned ? <T size={22}>{b.icon}</T> : <Icon name="lock" size={22} color={c.muted} />}
             </View>
             <T size={10} weight="700" muted style={{ marginTop: 5, textAlign: 'center' }}>
               {b.label}
