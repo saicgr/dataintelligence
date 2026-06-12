@@ -42,7 +42,7 @@ def introduces_dup(old, new):
 
 def get_field(card, field):
     """Return (container, key) so caller can read/write, or None if unsupported."""
-    m = re.match(r'followup\[(\d+)\]\.(\w+)', field)
+    m = re.match(r'followups?\[(\d+)\]\.(\w+)', field)
     if m:
         i = int(m.group(1)); k = m.group(2)
         fu = card.get('followups') or []
@@ -68,6 +68,8 @@ def main():
         cards = cards if isinstance(cards, list) else (cards.get('cards') or cards.get('questions'))
 
         for issue in rec.get('issues', []):
+            if issue.get('applied'):
+                continue  # monotonic: never un-apply a fix landed by a prior pass
             issue['applied'] = False
             sev, conf, fix = issue.get('severity'), issue.get('confidence'), issue.get('fix')
             claim = issue.get('claim') or ''
