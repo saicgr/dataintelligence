@@ -389,8 +389,8 @@ function CardView() {
                       it's self-graded — the in-session retry promise must hold. */}
                   <Row style={{ gap: 9, marginTop: checkOk != null || jotTicks != null ? 8 : 14 }}>
                     <RateBtn label="🔁 Again" sub={dueLabel('again')} kind="again" suggested={suggestedGrade === 'again'} onPress={() => { answerFeedback(false); rate('again'); }} />
-                    <RateBtn label="✅ Got it" sub={dueLabel('good')} kind="good" suggested={suggestedGrade === 'good'} onPress={() => { answerFeedback(true); rate('good', { retry: checkOk === false }); }} />
-                    <RateBtn label="⚡ Easy" sub={dueLabel('easy')} kind="easy" suggested={suggestedGrade === 'easy'} onPress={() => { sfx.correct(); haptic.success(); rate('easy', { retry: checkOk === false }); }} />
+                    <RateBtn label="✅ Got it" sub={dueLabel('good')} kind="good" suggested={suggestedGrade === 'good'} onPress={() => { answerFeedback(true); rate('good', { retry: checkOk === false, proven: checkOk === true }); }} />
+                    <RateBtn label="⚡ Easy" sub={dueLabel('easy')} kind="easy" suggested={suggestedGrade === 'easy'} onPress={() => { sfx.correct(); haptic.success(); rate('easy', { retry: checkOk === false, proven: checkOk === true }); }} />
                   </Row>
                   <Row style={{ justifyContent: 'space-between', marginTop: 12 }}>
                     <T muted size={11.5} weight="800">← swipe: Again</T>
@@ -469,31 +469,38 @@ function CardView() {
                           // answer key) — the tester couldn't tell which one they'd selected.
                           const bd = showState && o.ok ? c.success : picked ? c.danger : c.border;
                           return (
-                            <Pressable
-                              key={i}
-                              disabled={checkPick != null}
-                              onPress={() => {
-                                setCheckPick(i);
-                                setCheckOk(o.ok);
-                                noteCheck(o.ok);
-                                answerFeedback(o.ok);
-                              }}
-                              style={{
-                                borderWidth: 2,
-                                borderColor: bd,
-                                borderRadius: radius.md,
-                                padding: 12,
-                                backgroundColor: showState && o.ok ? c.success + '14' : picked ? c.danger + '12' : c.surface,
-                                opacity: showState && !o.ok && !picked ? 0.55 : 1,
-                              }}>
-                              <Row style={{ gap: 7, alignItems: 'flex-start' }}>
-                                {showState && (o.ok || picked) ? (
-                                  <T size={12.5} weight="900" color={o.ok ? c.success : c.danger}>{o.ok ? '✓' : '✗'}</T>
-                                ) : null}
-                                <T size={12.5} style={{ lineHeight: 18, flex: 1 }}>{o.t}</T>
-                                {picked ? <T size={10} weight="800" color={o.ok ? c.success : c.danger}>your pick</T> : null}
-                              </Row>
-                            </Pressable>
+                            <View key={i}>
+                              <Pressable
+                                disabled={checkPick != null}
+                                onPress={() => {
+                                  setCheckPick(i);
+                                  setCheckOk(o.ok);
+                                  noteCheck(o.ok);
+                                  answerFeedback(o.ok);
+                                }}
+                                style={{
+                                  borderWidth: 2,
+                                  borderColor: bd,
+                                  borderRadius: radius.md,
+                                  padding: 12,
+                                  backgroundColor: showState && o.ok ? c.success + '14' : picked ? c.danger + '12' : c.surface,
+                                  opacity: showState && !o.ok && !picked ? 0.55 : 1,
+                                }}>
+                                <Row style={{ gap: 7, alignItems: 'flex-start' }}>
+                                  {showState && (o.ok || picked) ? (
+                                    <T size={12.5} weight="900" color={o.ok ? c.success : c.danger}>{o.ok ? '✓' : '✗'}</T>
+                                  ) : null}
+                                  <T size={12.5} style={{ lineHeight: 18, flex: 1 }}>{o.t}</T>
+                                  {picked ? <T size={10} weight="800" color={o.ok ? c.success : c.danger}>your pick</T> : null}
+                                </Row>
+                              </Pressable>
+                              {/* On reveal, every option explains itself so the wrong ones are reviewable. */}
+                              {showState && o.why ? (
+                                <T size={11} color={c.muted} style={{ marginTop: 4, marginLeft: 8, lineHeight: 15.5 }}>
+                                  {o.why}
+                                </T>
+                              ) : null}
+                            </View>
                           );
                         })}
                         {checkPick == null ? (
@@ -910,13 +917,13 @@ function RedFlag({ fj, fs }: { fj: string; fs: string }) {
     <View style={{ borderLeftWidth: 3, borderLeftColor: c.danger, paddingLeft: 12, marginTop: 11 }}>
       <T size={12.5} style={{ lineHeight: 19 }}>
         <T color={c.danger} weight="800" size={12.5}>
-          Junior:{' '}
+          Common mistake:{' '}
         </T>
         {fj}
       </T>
       <T size={12.5} style={{ lineHeight: 19 }}>
         <T color={c.success} weight="800" size={12.5}>
-          Senior:{' '}
+          Strong answer:{' '}
         </T>
         {fs}
       </T>
@@ -1038,8 +1045,10 @@ const REPORT_CATS: { cat: import('../lib/store').ReportCategory; label: string }
 function ReportPanel({ cardId, reported, onDone }: { cardId: string; reported: boolean; onDone: () => void }) {
   const { c } = useTheme();
   const reportCard = useStore((s) => s.reportCard);
-  const [cat, setCat] = useState<import('../lib/store').ReportCategory | null>(null);
+  const [cats, setCats] = useState<import('../lib/store').ReportCategory[]>([]);
   const [note, setNote] = useState('');
+  const toggle = (cat: import('../lib/store').ReportCategory) =>
+    setCats((prev) => (prev.includes(cat) ? prev.filter((x) => x !== cat) : [...prev, cat]));
   if (reported) {
     return (
       <T size={12} weight="700" color={c.success} style={{ marginTop: 10, textAlign: 'center' }}>
@@ -1051,26 +1060,29 @@ function ReportPanel({ cardId, reported, onDone }: { cardId: string; reported: b
     <View style={{ marginTop: 10, gap: 8 }}>
       <T muted size={11.5} weight="800">What&apos;s wrong with this card?</T>
       <Row style={{ flexWrap: 'wrap', gap: 7 }}>
-        {REPORT_CATS.map((rc) => (
-          <Pressable
-            key={rc.cat}
-            onPress={() => { haptic.selection(); setCat(rc.cat); }}
-            style={{
-              borderWidth: 1.5,
-              borderColor: cat === rc.cat ? c.accentInk : c.border,
-              backgroundColor: cat === rc.cat ? c.surface : 'transparent',
-              borderRadius: 999,
-              paddingVertical: 6,
-              paddingHorizontal: 11,
-            }}>
-            <T size={11.5} weight="800" color={cat === rc.cat ? c.accentInk : c.muted}>{rc.label}</T>
-          </Pressable>
-        ))}
+        {REPORT_CATS.map((rc) => {
+          const on = cats.includes(rc.cat);
+          return (
+            <Pressable
+              key={rc.cat}
+              onPress={() => { haptic.selection(); toggle(rc.cat); }}
+              style={{
+                borderWidth: 1.5,
+                borderColor: on ? c.accentInk : c.border,
+                backgroundColor: on ? c.surface : 'transparent',
+                borderRadius: 999,
+                paddingVertical: 6,
+                paddingHorizontal: 11,
+              }}>
+              <T size={11.5} weight="800" color={on ? c.accentInk : c.muted}>{on ? '✓ ' : ''}{rc.label}</T>
+            </Pressable>
+          );
+        })}
       </Row>
       <TextInput
         value={note}
         onChangeText={setNote}
-        placeholder={cat === 'alt-answer' ? 'Your better answer…' : 'Anything else? (optional)'}
+        placeholder={cats.includes('alt-answer') ? 'Your better answer…' : 'Anything else? (optional)'}
         placeholderTextColor={c.muted}
         multiline
         style={{
@@ -1089,8 +1101,8 @@ function ReportPanel({ cardId, reported, onDone }: { cardId: string; reported: b
         label="Send report"
         variant="navy"
         onPress={() => {
-          if (!cat) { haptic.error(); return; }
-          reportCard(cardId, cat, note);
+          if (!cats.length) { haptic.error(); return; }
+          reportCard(cardId, cats, note);
           haptic.success();
           onDone();
         }}

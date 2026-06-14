@@ -74,7 +74,7 @@ export interface FeedbackEvent {
  *  and the founder reviews them in Studio (no in-app triage). */
 export type ReportCategory = 'inaccurate' | 'outdated' | 'typo' | 'unclear' | 'alt-answer';
 export interface CardReport {
-  cat: ReportCategory;
+  cat: ReportCategory[];
   note?: string;
   at: number;
 }
@@ -324,13 +324,13 @@ interface State {
   choose: (i: number) => void;
   /** `retry` marks an objectively-missed card (wrong recall pick / wrong MCQ) so it re-queues
    *  at the end of this session even when the user self-grades it kindly. */
-  rate: (r: Rating, o?: { retry?: boolean }) => void;
+  rate: (r: Rating, o?: { retry?: boolean; proven?: boolean }) => void;
   /** Schedule-only grade for a card outside the live session (audio recall #16). No idx/streak side effects. */
   rateById: (cardId: string, r: Rating) => void;
   toggleSave: (id: string) => void;
   setFeedback: (id: string, v: 'like' | 'dislike') => void;
   /** File a content-quality report for a card (#7). Queued offline; pushed when signed in. */
-  reportCard: (id: string, cat: ReportCategory, note?: string) => void;
+  reportCard: (id: string, cat: ReportCategory[], note?: string) => void;
   replay: () => void;
   // backend-wired
   setUserId: (id: string | null) => void;
@@ -810,6 +810,8 @@ export const useStore = create<State>()(
         const today = dayKey(now);
         // First card EVER rated — inherently one-time (existing users always have progress).
         const firstEver = !!card && Object.keys(st.progress).length === 0;
+        // A "new" card has never been answered (reps 0 / no progress yet). Capture BEFORE scheduling.
+        const wasNew = !!card && ((st.progress[card.id]?.reps ?? 0) === 0);
         const progress = { ...st.progress };
         if (card) progress[card.id] = schedule(progress[card.id], r, now);
         // Duolingo-style in-session retry: a card rated Again comes back at the END of this
@@ -818,14 +820,18 @@ export const useStore = create<State>()(
         // copy; single-card sessions skip it (they would loop forever).
         let sessionDeck = deck;
         const missed = r === 'again' || !!o?.retry;
+        // Re-queue when missed OR when a brand-new card was just revealed without being PROVEN
+        // (no passed recall check) — a first-exposure "Got it" hasn't demonstrated recall yet, so
+        // it should come back once this session. SRS calendar scheduling above is untouched.
+        const reQueue = missed || (wasNew && !o?.proven);
         if (
-          missed &&
+          reQueue &&
           card &&
           st.sessionKind !== 'single' &&
           deck.length > 1 &&
           !deck.slice(st.idx + 1).some((cd) => cd.id === card.id)
         ) {
-          sessionDeck = [...deck, { ...card, tag: '↻ Missed earlier — round 2' }];
+          sessionDeck = [...deck, { ...card, tag: missed ? '↻ Missed earlier — round 2' : '↻ New — one more look this session' }];
         }
         const nextIdx = st.idx + 1;
         const nextCombo = missed ? 0 : st.sessionCombo + 1;
@@ -987,10 +993,10 @@ export const useStore = create<State>()(
         const st = get();
         const at = Date.now();
         const reports = { ...st.reports, [id]: { cat, note: note?.trim() || undefined, at } };
-        track('card_reported', { cat });
+        track('card_reported', { cat: cat.join(',') });
         if (st.userId) {
           set({ reports });
-          void pushReport(st.userId, id, cat, note?.trim() || null, at);
+          void pushReport(st.userId, id, cat.join(','), note?.trim() || null, at);
         } else {
           // Signed out → queue; flushed on the next cloud hydrate (sign-in).
           set({ reports, pendingReports: [...new Set([...st.pendingReports, id])] });
@@ -1029,7 +1035,7 @@ export const useStore = create<State>()(
         if (pendingReports.length) {
           for (const cardId of pendingReports) {
             const r = reports[cardId];
-            if (r) void pushReport(uid, cardId, r.cat, r.note ?? null, r.at);
+            if (r) void pushReport(uid, cardId, (Array.isArray(r.cat) ? r.cat : [r.cat]).join(','), r.note ?? null, r.at);
           }
           set({ pendingReports: [] });
         }

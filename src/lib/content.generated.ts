@@ -156,6 +156,9 @@ export interface GeneratedCard {
   /** Optional MCQ format: when `opts` is present the card renders as a choice card. */
   opts?: { t: string; ok: boolean; why?: string }[];
   why?: string;
+  /** Authored recall-check options for FLIP cards (kept separate from `opts` so the card
+   *  stays a flip with its full `a` reveal). One `ok:true` + plausible-wrong, each with `why`. */
+  recall?: { t: string; ok: boolean; why?: string }[];
   strict?: boolean;
   /** Guided-tradeoff variant (#8): several ok:true positions, each `why` argues its side. */
   tradeoff?: boolean;

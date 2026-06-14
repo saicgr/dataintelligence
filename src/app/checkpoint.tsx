@@ -3,7 +3,7 @@ import { safeBack } from '../lib/nav';
 import { useMemo, useState } from 'react';
 import { Pressable, View } from 'react-native';
 
-import { checkpointDeck, checkpointKey, type SessionCard } from '../lib/content';
+import { CHAPTER_SIZE, checkpointDeck, checkpointKey, lessonCount, type SessionCard } from '../lib/content';
 import { answerFeedback, sfx } from '../lib/feedback';
 import { useStore } from '../lib/store';
 import { space, useTheme } from '../lib/theme';
@@ -23,6 +23,12 @@ export default function Checkpoint() {
   const slug = params.slug ?? '';
   const chapter = Number(params.chapter ?? 0) || 0;
   const completeCheckpoint = useStore((s) => s.completeCheckpoint);
+  const startLesson = useStore((s) => s.startLesson);
+  // First lesson of the next chapter — present when one exists, so a finished chapter flows
+  // straight into the next instead of forcing back → track → next.
+  const nextLessonIdx = (chapter + 1) * CHAPTER_SIZE;
+  const hasNextChapter = nextLessonIdx < lessonCount(slug);
+  const goNextChapter = () => { startLesson(slug, nextLessonIdx); router.replace('/'); };
 
   const deck = useMemo<SessionCard[]>(() => checkpointDeck(slug, chapter), [slug, chapter]);
   const col = track(deck[0]?.tk ?? 'sql');
@@ -94,7 +100,10 @@ export default function Checkpoint() {
             {!passed && (
               <Btn label="↻ Try again" variant="navy" onPress={() => { setIdx(0); setCorrect(0); setRevealed(false); setPhase('quiz'); }} />
             )}
-            <Btn label="Back to path" variant={passed ? 'green' : 'ghost'} onPress={() => safeBack(router)} />
+            {passed && hasNextChapter && (
+              <Btn label="Next chapter →" variant="green" onPress={goNextChapter} />
+            )}
+            <Btn label="Back to path" variant={passed && hasNextChapter ? 'ghost' : passed ? 'green' : 'ghost'} onPress={() => safeBack(router)} />
           </View>
         </Card>
       </Screen>

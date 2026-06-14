@@ -198,6 +198,9 @@ export interface SessionCard {
   // MCQ
   opts?: ChoiceOption[];
   why?: string;
+  // Authored recall-check options for FLIP cards (correct + plausible-wrong, each with `why`).
+  // Distinct from `opts` so the card stays a flip (keeps its full `a` reveal) — see recallCheck.ts.
+  recall?: ChoiceOption[];
   strict?: boolean; // code-choice cards: a wrong first pick rates 'again' (not 'good')
   // Guided tradeoff (#8): a design call with SEVERAL defensible (ok:true) options — picking any
   // of them is success; the learning is in each option's `why`. Indefensible picks rate 'again'.
@@ -572,6 +575,7 @@ function cardFromGenerated(t: Track, c: GeneratedCard, i: number): SessionCard {
     strict: c.strict,
     tradeoff: c.tradeoff,
     lines: c.lines,
+    recall: c.recall,
   };
 }
 

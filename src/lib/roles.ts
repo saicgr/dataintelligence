@@ -189,7 +189,7 @@ export const ROLE_TRACKS: Record<RoleKey, string[]> = {
   'palantir-fde': ['python-drills', 'sql-coding', 'palantir', 'python', 'typescript', 'sql', 'modeling', 'data-integration', ...SHIP, ...CRAFT],
   'integration-dev': ['data-integration', 'snaplogic', 'sql-coding', 'sql', 'python', 'kafka', 'airflow', 'git', 'cicd', 'data-reliability', ...CRAFT],
   'aem-dev': ['java-coding', 'aem', 'java', 'typescript', 'apis', 'architecture', 'databases', 'sql', ...SHIP, ...CRAFT],
-  'workfront-dev': ['workfront', 'apis', 'data-integration', 'snaplogic', 'sql', 'python', ...SHIP, ...CRAFT],
+  'workfront-dev': ['workfront', 'apis', 'data-integration', 'sql', 'python', ...SHIP, ...CRAFT],
   // Business & Management
   tpm: ['program-management', 'agile-pm', 'stakeholder-mgmt', 'sysd', 'architecture', 'sql', ...CRAFT],
   pm: ['agile-pm', 'program-management', 'stakeholder-mgmt', ...CRAFT],

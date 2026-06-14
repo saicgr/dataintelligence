@@ -10,7 +10,7 @@ import type { SessionCard } from './content';
 
 export interface RecallCheck {
   prompt: string;
-  opts: { t: string; ok: boolean }[];
+  opts: { t: string; ok: boolean; why?: string }[];
 }
 
 /** Options longer than this read as paragraphs, not pills — skip the check.
@@ -49,6 +49,21 @@ const usable = (s: string | undefined): s is string =>
  */
 export function buildRecallCheck(card: SessionCard, pool: SessionCard[]): RecallCheck | null {
   if (card.kind !== 'flip') return null;
+
+  // Preferred path: authored recall options (one ok:true + plausible-wrong, each with `why`).
+  // These are real ANSWERS to the question, so the check actually tests the question — and the
+  // wrong options carry an explanation the player shows on reveal.
+  if (card.recall && card.recall.length >= 2) {
+    const ok = card.recall.filter((o) => o.ok).length;
+    if (ok === 1) {
+      const s = hashSeed(card.id);
+      const rot = s % card.recall.length;
+      const shuffled = [...card.recall.slice(rot), ...card.recall.slice(0, rot)];
+      return { prompt: 'Which answer holds up?', opts: shuffled };
+    }
+  }
+
+  // Legacy fallback (cards not yet rewritten): fs = correct, fj = trap, sibling fs = distractor.
   if (!usable(card.fs) || !usable(card.fj)) return null;
   if (card.fs.trim() === card.fj.trim()) return null;
 
